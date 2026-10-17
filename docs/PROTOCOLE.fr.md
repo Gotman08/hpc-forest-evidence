@@ -2,7 +2,7 @@
 
 _Version 1.0 · 16 octobre 2026 · Nicolas Marano et Romain Despoullain._
 
-## 🎯 Question et unité d’expérience
+## Question et unité d’expérience
 
 On évalue la capacité d’un système à produire un programme correct et plus rapide à partir d’une référence fournie, dans un budget fixé. Le contrat décrit les entrées, sorties et contrôles observables ; il n’impose pas de fonctionnement interne au système.
 
@@ -22,7 +22,7 @@ Une recherche indépendante correspond à **un sujet × une configuration de sys
 
 Les remises externes, appels internes, consommations et plafonds sont distincts. Publier la part connue et les compteurs manquants. Un arrêt fondé sur un compteur après appel ne prouve pas à lui seul une borne stricte avant l’inférence suivante. L’infrastructure d’inférence est décrite séparément de la machine exécutant les programmes.
 
-## 📋 Préparer les sujets et la cible
+## Préparer les sujets et la cible
 
 Figer les sources, les exigences, les formats, les cas et leurs SHA-256, les sorties attendues, les options de compilation et les limites avant la recherche. Compiler la référence et vérifier ses sorties sur la vraie cible. Une incompatibilité de référence est un problème de préparation ; elle ne devient pas un échec du système ni une occasion d’assouplir l’oracle.
 
@@ -39,7 +39,7 @@ Les sources publiques sont les [énoncés 2020](http://lspd.mackenzie.br/maratho
 
 Les exclusions historiques sont Jacobi 2020, primes 2020, Johnson 2021 et path 2023, pour des limites de préparation ou d’observabilité. La correction sur un jeu fini ne certifie pas tout le domaine ni la fidélité à un algorithme imposé. Pour N-body, conserver notamment l’en-tête binaire présent dans la référence ; pour quicksort, le générateur et le contrôle MD5 appartiennent au contrat.
 
-## 🧪 Déroulement et confirmation
+## Déroulement et confirmation
 
 1. Créer un essai neuf, avec identifiant, contexte et registre propres, sans gagnant hérité.
 2. Fournir la référence et les contraintes publiques au système. Garder les cas et réponses de l’évaluateur dans un environnement réellement inaccessible au système ; un nom de dossier ne garantit aucune isolation.
@@ -54,7 +54,7 @@ La convention historique initialise une fois `random.Random(24)` pour la premiè
 
 Mesurer le temps mural de la commande complète. Préciser ce qui est inclus : lancement, calcul et entrées/sorties ; les ouvertures de fichiers et la création de répertoires doivent être situées explicitement par rapport au chronomètre. Compilation et contrôles consomment le budget de recherche même lorsqu’ils sont exclus du temps du programme.
 
-## 📊 Calculs et négatifs
+## Calculs et négatifs
 
 Avec `T0` moyenne des cinq temps de la référence et `T` moyenne du candidat dans la même série : réduction `100 × (1 − T/T0)`, accélération `T0/T`, secondes économisées `T0 − T`. Calculer aussi l’écart-type d’échantillon, diviseur `n − 1`, et la médiane. Garder les valeurs brutes non arrondies.
 
@@ -62,7 +62,7 @@ Une référence conservée après recherche et confirmation exploitables a un ga
 
 Apparier sujet, configuration, graine et contrat pour comparer deux systèmes. Conserver les durées de référence propres aux séries et leurs rapports normalisés. Plusieurs recherches neuves sont nécessaires pour étudier la stabilité ; les répétitions d’un même binaire décrivent seulement sa dispersion de temps.
 
-## 🧭 Diagnostic de montée en cœurs
+## Diagnostic de montée en cœurs
 
 Ce diagnostic distinct conserve les mêmes octets exécutables, sans nouvelle compilation ou recherche. Qualifier chaque couple programme/entrée, puis allouer seize cœurs physiques distincts, 16 Gio et zéro GPU. Tester 1, 2, 4, 8 et 16 cœurs accessibles, affinités et variables de threads cohérentes, une chauffe puis cinq passages intercalés.
 

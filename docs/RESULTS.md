@@ -2,7 +2,7 @@
 
 _Observed on 16 October 2026 · two distinct experiments · no model ranking._
 
-## 📊 Controller overhead
+## Controller overhead
 
 The controller dataset uses four anonymous implementation variants. `kernel-A`/`kernel-B` compare two narrow kernels; `system-A`/`system-B` compare two policies within the same larger processing pipeline. The pair types perform different work and must not be mixed into a claim about whole-system speed.
 
@@ -19,7 +19,7 @@ The narrow kernel pair gives 2.615644 → 2.124604 ms/cycle at eight cycles, and
 
 This result is a difference of milliseconds in bookkeeping. It is not a 26% improvement in model inference time, total research cost or the runtime of a generated program. The mean ratio `A/B` is about 1.35; the **time reduction** `100 × (1 − B/A)` is about 26%. Those percentages must not be interchanged.
 
-## 🧭 Core scaling of frozen programs
+## Core scaling of frozen programs
 
 The CPU dataset contains **all four largest cases** from one audited allocation, including the cases with near-flat scaling. It is an explicit 200-timing subset of an original batch with 1,400 timings. Two binaries per subject, five core counts and five repetitions give 40 public configurations. No timing is duplicated as an independent execution.
 
@@ -38,7 +38,7 @@ CPU/wall is the mean of per-launch CPU-seconds/wall-seconds ratios. It indicates
 
 The selected executables came from earlier searches. **No new optimization search, code edit or compilation took place in the core-scaling allocation.** The dataset does not contain those earlier search trajectories or their complete costs, so it cannot support a model-efficiency comparison. These curves are not an ablation of the controller variants above.
 
-## ✅ Validation and provenance
+## Validation and provenance
 
 The original controller archive was received, restored into a fresh directory and checked before/after a read-only audit: 2,243 files, including 541 project sources. Its project suite has 196 passing tests and one optional skipped MCP check; the measurement suite has seven passing tests. The public verifier has its own tests; these counts describe different codebases.
 
@@ -46,6 +46,6 @@ The original CPU batch audit covers 280 configurations and 1,400 timings, with e
 
 Original archive SHA-256 identifiers and the exact public projection are recorded in [controller provenance](../evidence/controller/provenance.json) and [CPU provenance](../evidence/cpu-scaling/provenance.json). [Reproducibility](REPRODUCIBILITY.md) describes what readers can check directly.
 
-## 🧪 Still unproven
+## Still unproven
 
 No real-model matched result demonstrates a quality improvement from the new controller comparison. No weight-learning result is available. No general superiority, exact thread count, full-domain correctness, official contest rank or universal speedup follows from these datasets. Read the [limitations](LIMITATIONS.md) before reusing the numbers.

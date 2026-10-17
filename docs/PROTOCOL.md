@@ -2,7 +2,7 @@
 
 _Version 1.0 · 16 October 2026 · independent of the system’s internal implementation._
 
-## 🎯 Experimental unit and common conditions
+## Experimental unit and common conditions
 
 One experimental unit is **one subject × one system configuration × one seed × one frozen evaluation contract**. Multiple timings of the same executable describe timing dispersion; they are not multiple independent optimization searches.
 
@@ -22,7 +22,7 @@ One experimental unit is **one subject × one system configuration × one seed �
 
 The resource profile describes candidate execution, not the inference provider’s hardware. Record inference resources separately as observed, unknown or unavailable. A ceiling or reservation is not observed consumption; internal model calls are distinct from external program deliveries. Report missing token counters instead of inventing exact totals or claiming a hard token cap from an after-call counter.
 
-## 📋 Prepare before generating candidates
+## Prepare before generating candidates
 
 Freeze source, statement, input/output contract, compiler flags, environment, time limits and case digests before the first search. Identify each system by a stable configuration ID; the internal implementation may remain confidential. To isolate the effect of one system change, keep model identity, effort, assistance rights, transport and budgets equal.
 
@@ -32,7 +32,7 @@ Keep evaluator inputs and expected outputs outside the evaluated system’s read
 
 The historical candidate corpus contains fifteen subjects from the 2020–2023 Parallel Programming Marathon, listed in the [French protocol](PROTOCOLE.fr.md). Exact benchmark preparation must be supplied and qualified separately. Official problem statements remain the authoritative source for their original requirements.[^1]
 
-## 🧪 Run and confirm
+## Run and confirm
 
 1. Create a fresh directory, context, session and record. Use the frozen reference, with no candidate inherited from an earlier winning search.
 2. Start the declared budget. Record deliveries, known consumption, errors and stop causes. An operator does not advise on algorithms or repair candidate code.
@@ -47,7 +47,7 @@ The historical confirmation convention initializes `random.Random(24)` once for 
 
 Measure elapsed wall time around the complete target command. Preserve which setup, file-opening, compilation and I/O costs are inside or outside each timer. Compilation and correctness checking still consume the search budget even when excluded from program runtime.
 
-## 📊 Calculate and report
+## Calculate and report
 
 Let `T0` be the mean of the five reference confirmation timings and `T` the mean of the candidate’s five timings, from the same series:
 
@@ -62,13 +62,13 @@ A reference retained after usable search and confirmation has 0% admitted gain. 
 
 Compare independent searches by matched subject/configuration/seed and contract. Keep both reference durations visible. Do not pool raw means across allocations or treat only-success averages as all-run performance. Several independent searches are needed to assess stability; five timings of one binary do not provide that replication.
 
-## 🧭 Optional core-scaling diagnosis
+## Optional core-scaling diagnosis
 
 Core scaling is a separate post-hoc experiment on already received and audited programs. Freeze the executable bytes and input. Allocate sixteen distinct physical CPU cores, 16 GiB and zero GPU; check physical topology and inherited affinity. Test accessible counts 1, 2, 4, 8 and 16, with coherent thread settings, an excluded warmup and five interleaved repetitions.
 
 For the same binary and input, `S(p) = T(1) / T(p)` and efficiency `E(p) = S(p) / p`. These are distinct from speedup against another reference program. CPU/wall time is an occupancy indicator, not an exact thread count. Preserve flat curves and incorrect/incomplete cases; do not start another optimization search because a curve is disappointing.
 
-## 📚 Returned evidence
+## Returned evidence
 
 Use the [blank templates](../templates/README.md). Return the frozen plan, environment, raw timings, code/binary digests, correctness evidence, schedule, actual costs, stop causes and final outcomes. A reviewer can compare these without receiving an internal orchestration design. The [comparison guide](COMPARING.md) gives the practical steps.
 

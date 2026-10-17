@@ -11,7 +11,7 @@ HPC Forest studies a practical question: **can a system produce correct programs
 
 This repository publishes the evaluation method, selected audited observations and the tools needed to recalculate them. It is the **public evidence repository**; the internal optimization engine and protected evaluation inputs are not distributed here.
 
-## 📊 What is measured so far
+## What is measured so far
 
 | Observation | Result | What it measures |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ The controller and CPU observations are **separate experiments**. The CPU curves
 
 ![Core-scaling curves for all four largest cases in the released CPU subset; N-body reaches 14.38 times its one-core performance while the other curves remain close to one.](docs/assets/cpu-scaling.png)
 
-## ✅ Verify in under a minute
+## Verify in under a minute
 
 Python **3.11 or later** is sufficient. The verification tools and tests use the standard library, work offline and do not call models, compile candidates or execute evaluated binaries.
 
@@ -41,7 +41,7 @@ python -m unittest discover -s tests -v
 
 The verifier checks file hashes, local documentation links, design completeness and the published arithmetic: **144 controller series, 2,400 measured cycles, and 200 CPU timings across 40 configurations**. It does not certify the original execution environment or independently reproduce program correctness. [Reproduction scope](docs/REPRODUCIBILITY.md) explains the distinction.
 
-## 🧪 The evaluation idea
+## The evaluation idea
 
 The following diagram describes the **external evaluation contract**, not the internal engine.
 
@@ -60,7 +60,7 @@ The main comparison profile uses 1,800 seconds and a declared 1.5 million-token 
 
 Read the [full protocol](docs/PROTOCOL.md), [limitations](docs/LIMITATIONS.md), and [guide to comparing your own system](docs/COMPARING.md) before drawing conclusions.
 
-## 🗂️ Find your way around
+## Find your way around
 
 | Path | Contents |
 | --- | --- |
@@ -75,7 +75,7 @@ Read the [full protocol](docs/PROTOCOL.md), [limitations](docs/LIMITATIONS.md), 
 | [tools/](tools/recompute.py) | Read-only arithmetic and integrity checks |
 | [tests/](tests/test_evidence.py) | Rejection tests for incomplete or inconsistent evidence |
 
-## 📚 Project status and citation
+## Project status and citation
 
 This is an experimental research record, version **0.1.0**, dated 16 October 2026. New real-model comparisons and weight-learning experiments remain future work; no unexecuted experiment is counted as a result. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
 

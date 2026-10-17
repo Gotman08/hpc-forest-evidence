@@ -2,7 +2,7 @@
 
 _Future work is listed as planned, not as evidence._
 
-## ✅ Available in this release
+## Available in this release
 
 - External comparison protocol in English and French
 - Complete fixed-trace controller timing records
@@ -10,7 +10,7 @@ _Future work is listed as planned, not as evidence._
 - Offline integrity/arithmetic verification and rejection tests
 - Figures, provenance and blank comparison templates
 
-## 🧪 Planned evaluations
+## Planned evaluations
 
 | Question | Status | Evidence needed before a claim |
 | --- | --- | --- |
@@ -19,7 +19,7 @@ _Future work is listed as planned, not as evidence._
 | Does weight learning help beyond a frozen model? | Not demonstrated | Qualified training/inference, frozen episodes, disjoint data, reload checks and all learning costs |
 | Can another implementation be compared fairly? | Protocol available | Benchmark qualification and new observations under matched external conditions |
 
-## 📦 How future evidence enters
+## How future evidence enters
 
 Retain previous releases and their raw records. Admit a new cohort only after verifying source identity, environment, correctness, timing completeness, provenance and budgets. Preserve incidents, rejections, missing results and no-gain outcomes. Review the documentation and figures against recalculated values before updating any claim.
 

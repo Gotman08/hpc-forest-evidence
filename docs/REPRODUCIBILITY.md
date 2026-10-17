@@ -2,7 +2,7 @@
 
 _Offline verification with Python 3.11+; optional plotting with a separate environment._
 
-## ✅ Verify the release
+## Verify the release
 
 From a fresh clone:
 
@@ -24,7 +24,7 @@ python -m tools.recompute
 
 Integer nanosecond counters must agree exactly with their recorded cycle sums. Derived floating-point values are compared at relative tolerance `1e-12`, absolute tolerance `1e-15`, to accommodate arithmetic differences across Python versions. This tolerance applies to recomputation, **not** to the evaluated programs’ output oracle.
 
-## 📦 What is in the public projection
+## What is in the public projection
 
 | Dataset | Public data | Transformation |
 | --- | --- | --- |
@@ -37,7 +37,7 @@ The CPU subset selection is explicit and includes all four subjects in that larg
 
 The provenance files also record original private-archive hashes and audit counts. Those hashes support identity if the original archives are later inspected. Since the archives are not distributed here, the public checks cannot establish their contents or authenticity independently.
 
-## 📊 Render the figures
+## Render the figures
 
 Figure rendering is optional and separate from evidence verification. Use Python 3.13 and a new environment:
 
@@ -50,7 +50,7 @@ python -m tools.plot_results
 
 This regenerates PNG and SVG figures from [results.json](../evidence/results.json). Recalculate/check the results before plotting. Numerical values should agree; fonts and image bytes can vary across platforms. The distributed figures were rendered with Matplotlib 3.10.8. Any changed figure must be reviewed before updating the release manifest.
 
-## 🧪 Recalculation versus experimental reproduction
+## Recalculation versus experimental reproduction
 
 Public readers can verify record completeness, hash consistency and arithmetic. They can inspect the protocol and run an independent system against a separately prepared benchmark.
 

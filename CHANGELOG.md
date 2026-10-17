@@ -2,7 +2,7 @@
 
 _Public versions preserve the evidence and its interpretation._
 
-## 📦 0.1.0 — 2026-10-16
+## 0.1.0 — 2026-10-16
 
 - Publish the external comparison protocol in English and French
 - Release every fixed-trace controller series and an explicit four-largest-case CPU subset

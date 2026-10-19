@@ -1,0 +1,53 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <atomic>\n#include <cstdint>\n#include <iostream>\n#include <memory>\n#include <vector>\n#ifdef _OPENMP\n#include <omp.h>\n#endif\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\nusing namespace std;\n\nconst uint32_t MOD = 1000000007;\n\nstruct alignas(64) Progress {\n    atomic<int> rows;\n    Progress() : rows(0) {}\n};\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\nstatic inline uint32x4_t add_mod(uint32x4_t a, uint32x4_t b) {\n    const uint32x4_t sum = vaddq_u32(a, b);\n    const uint32x4_t modulus = vdupq_n_u32(MOD);\n    return vsubq_u32(sum, vandq_u32(vcgeq_u32(sum, modulus), modulus));\n}\n#endif\n\nstatic inline uint32_t scan_open_run(uint32_t* dp, int begin, int end,\n                                     uint32_t carry) {\n    int j = begin;\n#if defined(__aarch64__) && defined(__ARM_NEON)\n    const uint32x4_t zero = vdupq_n_u32(0);\n    for (; j + 4 <= end; j += 4) {\n        uint32x4_t values = vld1q_u32(dp + j);\n        values = add_mod(values, vextq_u32(zero, values, 3));\n        values = add_mod(values, vextq_u32(zero, values, 2));\n        values = add_mod(values, vdupq_n_u32(carry));\n        vst1q_u32(dp + j, values);\n        carry = vgetq_lane_u32(values, 3);\n    }\n#endif\n    for (; j < end; ++j) {\n        uint32_t value = dp[j] + carry;\n        if (value >= MOD) value -= MOD;\n        dp[j] = carry = value;\n    }\n    return carry;\n}\n\nstatic inline uint32_t update_row(uint32_t* dp, int begin, int width,\n                                   const vector<int>& blocked, uint32_t left) {\n    int x = 0;\n    auto obstacle = lower_bound(blocked.begin(), blocked.end(), begin);\n    while (obstacle != blocked.end() && *obstacle - begin < width) {\n        const int stop = *obstacle - begin;\n        scan_open_run(dp, x, stop, left);\n        dp[stop] = 0;\n        left = 0;\n        x = stop + 1;\n        ++obstacle;\n    }\n    return scan_open_run(dp, x, width, left);\n}\n\nint main() {\n    int n, m;\n    if (!(cin >> n >> m)) return 0;\n    vector<vector<int>> blocked(n);\n    for (int c = 0; c < m; ++c) {\n        int i, j;\n        cin >> i >> j;\n        blocked[i].push_back(j);\n    }\n    for (auto& row : blocked) {\n        sort(row.begin(), row.end());\n        row.erase(unique(row.begin(), row.end()), row.end());\n    }\n\n    int requested = 1;\n#ifdef _OPENMP\n    if (n >= 512)\n        requested = min(4, omp_get_max_threads());\n#endif\n    if (requested == 1) {\n        vector<uint32_t> dp(n, 0);\n        dp[0] = 1;\n        for (int i = 0; i < n; ++i)\n            update_row(dp.data(), 0, n, blocked[i], 0);\n        cout << dp[n - 1] << endl;\n        return 0;\n    }\n\n    vector<uint32_t> boundary(static_cast<size_t>(requested - 1) * n);\n    unique_ptr<Progress[]> progress(new Progress[requested]);\n    uint32_t result = 0;\n#pragma omp parallel num_threads(requested)\n    {\n        int tid = 0;\n        int team = 1;\n#ifdef _OPENMP\n        tid = omp_get_thread_num();\n        team = omp_get_num_threads();\n#endif\n        const int begin = static_cast<int>(static_cast<long long>(n) * tid / team);\n        const int end = static_cast<int>(static_cast<long long>(n) * (tid + 1) / team);\n        const int width = end - begin;\n        vector<uint32_t> dp(width, 0);\n        if (tid == 0) dp[0] = 1;\n        const int batchSize = 64;\n        for (int first = 0; first < n; first += batchSize) {\n            const int last = min(n, first + batchSize);\n            if (tid != 0) {\n                while (progress[tid - 1].rows.load(memory_order_acquire) < last) {\n                }\n            }\n            for (int i = first; i < last; ++i) {\n                const uint32_t incoming = tid == 0 ? 0 : boundary[static_cast<size_t>(tid - 1) * n + i];\n                const uint32_t outgoing = update_row(dp.data(), begin, width, blocked[i], incoming);\n                if (tid + 1 < team)\n                    boundary[static_cast<size_t>(tid) * n + i] = outgoing;\n            }\n            if (tid + 1 < team)\n                progress[tid].rows.store(last, memory_order_release);\n        }\n        if (tid + 1 == team) result = dp.back();\n    }\n    cout << result << endl;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Combining the sparse-obstacle stripe pipeline with four-lane NEON open-run prefix scans may shorten each stripe's recurrence dependency chain and improve full-program runtime.",
+    "notes": "One unmeasured integration candidate. Incoming stripe carries enter the first open run; every obstacle resets the DP entry and carry. Scalar fallback, duplicate removal, partial vectors and partial batches are retained. No commands or evaluations were run.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [
+      "0d36db7591ae425e",
+      "a53329fa10f644a9"
+    ],
+    "transformations": [
+      "Retain sorted, deduplicated per-row obstacle lists and open-span traversal.",
+      "Retain at most four private column stripes and 64-row release/acquire boundary handoffs.",
+      "Integrate four-lane NEON modular prefix scans into open spans, accepting and returning the horizontal carry across vector chunks and stripe boundaries.",
+      "Retain in-place DP, explicit obstacle resets and conditional modular subtraction, with scalar handling of tails and non-NEON targets."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "f595c59db7cd40cc910522cc0d40ea8f",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "medium",
+  "request_sha256": "f638746388c418f2931f446ce3561c7339ab5f7525cf9874cad42fb4ea638f40",
+  "session_id": "43aca875f83b450ba3cf30fc8907236c",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "902e9c69cbe5c27ab6c08e17f713998dfb15fa976942e42cb3b9de948be997c2",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 22098,
+        "output_tokens": 1794,
+        "reasoning_output_tokens": 183
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "medium",
+    "token_accounting": "exact",
+    "tokens": 23892,
+    "tool_events": []
+  }
+}

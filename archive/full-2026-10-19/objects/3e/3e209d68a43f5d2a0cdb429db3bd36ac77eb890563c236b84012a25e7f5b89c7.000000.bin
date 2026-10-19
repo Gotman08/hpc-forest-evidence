@@ -1,0 +1,290 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#define N_ITER 10
+#define DT 0.01f
+#define SOFTENING 1e-9f
+#define FORCE_TILE 48
+#define FORCE_LANES 8
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static inline void body_force_one(Body *p, float dt, int n, int i) {
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  for (int j = 0; j < n; ++j) {
+    float dx = p[j].x - p[i].x;
+    float dy = p[j].y - p[i].y;
+    float dz = p[j].z - p[i].z;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  p[i].vx += dt*fx;
+  p[i].vy += dt*fy;
+  p[i].vz += dt*fz;
+}
+
+void body_force(Body *p, float dt, int n) {
+  #pragma omp parallel for schedule(static) if(n >= 2 * FORCE_TILE)
+  for (int i = 0; i < n; ++i) {
+    body_force_one(p, dt, n, i);
+  }
+}
+
+static void direct_simulation(Body *p, int n) {
+  #pragma omp parallel if(n >= 2 * FORCE_TILE)
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        body_force_one(p, DT, n, i);
+      }
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        p[i].x += p[i].vx * DT;
+        p[i].y += p[i].vy * DT;
+        p[i].z += p[i].vz * DT;
+      }
+    }
+  }
+}
+
+/* Called only with finite coordinates and positive softened distances. */
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER)
+__attribute__((optimize("no-math-errno")))
+#endif
+static void make_tile(const float *restrict x,
+                      const float *restrict y,
+                      const float *restrict z,
+                      int a, int na, int b, int nb,
+                      float *restrict coefficient) {
+  for (int j = 0; j < nb; ++j) {
+    const float sx = x[b+j];
+    const float sy = y[b+j];
+    const float sz = z[b+j];
+    #pragma omp simd
+    for (int i = 0; i < na; ++i) {
+      float dx = sx - x[a+i];
+      float dy = sy - y[a+i];
+      float dz = sz - z[a+i];
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      coefficient[j*FORCE_TILE+i] = inv_dist3;
+    }
+  }
+}
+
+/* SIMD lanes are destinations; each lane visits sources sequentially. */
+static void accumulate_tile(const float *restrict x,
+                            const float *restrict y,
+                            const float *restrict z,
+                            float *restrict fx,
+                            float *restrict fy,
+                            float *restrict fz,
+                            int d, int nd, int s, int ns,
+                            const float *restrict coefficient) {
+  int k = 0;
+  for (; k + FORCE_LANES <= nd; k += FORCE_LANES) {
+    float ax[FORCE_LANES], ay[FORCE_LANES], az[FORCE_LANES];
+    float px[FORCE_LANES], py[FORCE_LANES], pz[FORCE_LANES];
+    #pragma omp simd
+    for (int lane = 0; lane < FORCE_LANES; ++lane) {
+      ax[lane] = fx[d+k+lane];
+      ay[lane] = fy[d+k+lane];
+      az[lane] = fz[d+k+lane];
+      px[lane] = x[d+k+lane];
+      py[lane] = y[d+k+lane];
+      pz[lane] = z[d+k+lane];
+    }
+    for (int j = 0; j < ns; ++j) {
+      const float sx = x[s+j];
+      const float sy = y[s+j];
+      const float sz = z[s+j];
+      const float *c = coefficient + j*FORCE_TILE + k;
+      #pragma omp simd
+      for (int lane = 0; lane < FORCE_LANES; ++lane) {
+        float dx = sx - px[lane];
+        float dy = sy - py[lane];
+        float dz = sz - pz[lane];
+        ax[lane] += dx * c[lane];
+        ay[lane] += dy * c[lane];
+        az[lane] += dz * c[lane];
+      }
+    }
+    #pragma omp simd
+    for (int lane = 0; lane < FORCE_LANES; ++lane) {
+      fx[d+k+lane] = ax[lane];
+      fy[d+k+lane] = ay[lane];
+      fz[d+k+lane] = az[lane];
+    }
+  }
+  for (; k < nd; ++k) {
+    float ax = fx[d+k];
+    float ay = fy[d+k];
+    float az = fz[d+k];
+    const float px = x[d+k];
+    const float py = y[d+k];
+    const float pz = z[d+k];
+    for (int j = 0; j < ns; ++j) {
+      float dx = x[s+j] - px;
+      float dy = y[s+j] - py;
+      float dz = z[s+j] - pz;
+      float c = coefficient[j*FORCE_TILE+k];
+      ax += dx * c;
+      ay += dy * c;
+      az += dz * c;
+    }
+    fx[d+k] = ax;
+    fy[d+k] = ay;
+    fz[d+k] = az;
+  }
+}
+
+static void simulate(Body *p, int n) {
+  if (n < 2 * FORCE_TILE) {
+    direct_simulation(p, n);
+    return;
+  }
+
+  const size_t stride = ((size_t)n + 15u) & ~(size_t)15u;
+  if (stride > (SIZE_MAX - 63u) / (6u * sizeof(float))) {
+    direct_simulation(p, n);
+    return;
+  }
+  void *allocation = malloc(6u * stride * sizeof(float) + 63u);
+  if (allocation == NULL) {
+    direct_simulation(p, n);
+    return;
+  }
+  float *x = (float *)(((uintptr_t)allocation + 63u) & ~(uintptr_t)63u);
+  float *y = x + stride;
+  float *z = y + stride;
+  float *fx = z + stride;
+  float *fy = fx + stride;
+  float *fz = fy + stride;
+  const int ntiles = (n - 1) / FORCE_TILE + 1;
+  int nonfinite = 0;
+
+  #pragma omp parallel
+  {
+    float coefficient[FORCE_TILE*FORCE_TILE];
+    float transposed[FORCE_TILE*FORCE_TILE];
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      #pragma omp single
+      {
+        nonfinite = 0;
+      }
+      #pragma omp for schedule(static) reduction(|:nonfinite)
+      for (int i = 0; i < n; ++i) {
+        x[i] = p[i].x;
+        y[i] = p[i].y;
+        z[i] = p[i].z;
+        fx[i] = 0.0f;
+        fy[i] = 0.0f;
+        fz[i] = 0.0f;
+        nonfinite |= !(isfinite(x[i]) && isfinite(y[i]) && isfinite(z[i]));
+      }
+
+      if (nonfinite) {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          body_force_one(p, DT, n, i);
+        }
+      } else {
+        /* Tile pairs on one anti-diagonal have disjoint destinations.
+           For any row block r, partner blocks arrive in ascending order. */
+        for (int wave = 0; wave <= 2 * (ntiles - 1); ++wave) {
+          const int first = wave < ntiles ? 0 : wave - ntiles + 1;
+          const int last = wave / 2;
+          #pragma omp for schedule(static)
+          for (int a = first; a <= last; ++a) {
+            const int b = wave - a;
+            const int alo = a * FORCE_TILE;
+            const int blo = b * FORCE_TILE;
+            int na = n - alo;
+            int nb = n - blo;
+            if (na > FORCE_TILE) na = FORCE_TILE;
+            if (nb > FORCE_TILE) nb = FORCE_TILE;
+
+            make_tile(x, y, z, alo, na, blo, nb, coefficient);
+            accumulate_tile(x, y, z, fx, fy, fz,
+                            alo, na, blo, nb, coefficient);
+            if (a != b) {
+              for (int i = 0; i < na; ++i) {
+                #pragma omp simd
+                for (int j = 0; j < nb; ++j) {
+                  transposed[i*FORCE_TILE+j] = coefficient[j*FORCE_TILE+i];
+                }
+              }
+              accumulate_tile(x, y, z, fx, fy, fz,
+                              blo, nb, alo, na, transposed);
+            }
+          }
+        }
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          p[i].vx += DT*fx[i];
+          p[i].vy += DT*fy[i];
+          p[i].vz += DT*fz[i];
+        }
+      }
+
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        p[i].x += p[i].vx * DT;
+        p[i].y += p[i].vy * DT;
+        p[i].z += p[i].vz * DT;
+      }
+    }
+  }
+  free(allocation);
+}
+
+/* Read a binary dataset with initialized bodies. */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/* Write simulation results into a binary dataset. */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+
+  simulate(bodies, nbodies);
+
+  write_dataset(nbodies, bodies);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

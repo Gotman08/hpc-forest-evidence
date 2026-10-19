@@ -1,0 +1,169 @@
+"""Reconcile only request/delivery/process/SHA and scalar closed-ledger metadata.
+
+No response body or model reasoning is decoded, printed, or copied from the active worker.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+BASE = OUT.parents[2]
+SCOPE = "hpc-forest-primes-native-max-r2c"
+JOB = "752139"
+MODEL = "gpt-6-astra"
+SESSION = "979ef61f50d041639c1cd46e1942a3f3"
+SOURCE = "ade344bfec4322e8aaecc99cfbf7bd502e6d39b55c62180e8f552a3d6391e680"
+PLAN = "bac579fdb44850c636a6522c014175f95d4ce867bab502d86dd15c1bff31032e"
+RESTORED = OUT / "restauration-neuve-privee"
+OUTPUT = RESTORED / ("results-" + JOB)
+CACHE = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2b" / ("worker-" + SESSION)
+
+
+def need(value, reason):
+    if not value:
+        raise ValueError(reason)
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def metadata(path):
+    need(path.is_file() and not path.is_symlink() and path.stat().st_size <= 8 * 1024**2, "Invalid metadata file")
+    need(not path.name.endswith("response.json") and not path.name.endswith(".response.json")
+         and not path.name.endswith("codex.jsonl"), "Response/JSONL body decoding is outside metadata-only scope")
+    return json.loads(path.read_bytes())
+
+
+def save(name, value):
+    with (OUT / name).open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def inventory(root, operational_lock=False):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        need(not path.is_symlink() and path.resolve().is_relative_to(root.resolve()), "Linked metadata source refused")
+        if not path.is_file():
+            continue
+        first = path.stat()
+        relative = path.relative_to(root).as_posix()
+        if operational_lock and relative == "worker.lock":
+            result[relative] = {"bytes": first.st_size, "sha256": None, "read": False,
+                "reason": "Owned operational lock preserved without opening or stopping"}
+            continue
+        need(first.st_size <= 128 * 1024**2, "Metadata hash input exceeds bound")
+        hashed = sha(path)
+        last = path.stat()
+        need((first.st_size, first.st_mtime_ns) == (last.st_size, last.st_mtime_ns), "Private file changed during opaque hashing")
+        result[relative] = {"bytes": first.st_size, "sha256": hashed}
+    return result
+
+
+archive_before = inventory(RESTORED)
+cache_before = inventory(CACHE, operational_lock=True)
+save("inventaire-cache-metadonnees-avant.json", cache_before)
+expected_cell = {"scope_id": SCOPE, "model": MODEL, "effort": "max", "session_id": SESSION,
+    "job_id": JOB, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+    "remote_root": "/scratch_p/nimarano/" + SCOPE + "-" + SESSION}
+need(metadata(CACHE / "CELL-BINDING.json") == expected_cell, "Actual cache full cell binding differs")
+for owner in (metadata(CACHE / "OWNER.json"), metadata(OUTPUT / "mailbox/OWNER.json")):
+    need(all(owner.get(key) == value for key, value in expected_cell.items()), "Archive/cache OWNER binding differs")
+requests = sorted((OUTPUT / "mailbox/requests").glob("*.request.json"))
+records = []
+seen = set()
+for request_file in requests:
+    request = metadata(request_file)
+    nonce = request.get("nonce")
+    need(isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{32}", nonce)
+         and request_file.name == nonce + ".request.json" and nonce not in seen,
+         "Duplicate or malformed actual request nonce")
+    seen.add(nonce)
+    need(request.get("kind") == "source-proposal" and request.get("model") == MODEL
+         and request.get("reasoning_effort") == "max" and request.get("session_id") == SESSION,
+         "Actual request metadata is for another identity")
+    response_file = OUTPUT / "mailbox/responses" / (nonce + ".response.json")
+    ready = metadata(OUTPUT / "mailbox/responses" / (nonce + ".ready.json"))
+    delivered = metadata(OUTPUT / "mailbox/logs" / (nonce + ".delivered.json"))
+    invocation = metadata(OUTPUT / "mailbox/logs" / (nonce + ".invocation.json"))
+    process = metadata(OUTPUT / "mailbox/logs" / (nonce + ".codex.jsonl.json"))
+    request_sha, response_sha = sha(request_file), sha(response_file)
+    need(ready.get("sha256") == delivered.get("response_sha256") == response_sha
+         and ready.get("bytes") == response_file.stat().st_size
+         and delivered.get("request_sha256") == invocation.get("request_sha256") == request_sha,
+         "Request/opaque-response/ready/delivery/invocation SHA mismatch")
+    need(all(delivered.get(key) == expected_cell[key] for key in
+        ("scope_id", "model", "effort", "session_id", "job_id", "source_zip_sha256", "plan_sha256")),
+        "Actual delivered metadata belongs to another cell")
+    need(invocation.get("model") == MODEL and invocation.get("reasoning_effort") == "max"
+         and invocation.get("source_execution_allowed") is False and process.get("argv") == invocation.get("argv"),
+         "Actual CLI/process metadata differs")
+    local = CACHE / nonce
+    claim = metadata(local / "generation-claimed.json")
+    local_delivery = metadata(local / "delivered.json")
+    need(claim.get("request_sha256") == request_sha == sha(local / "downloaded-request.json")
+         and local_delivery == delivered and sha(local / "response.json") == response_sha,
+         "Actual claimed/cache/delivered opaque hashes differ")
+    for local_name, remote_suffix in (("response-ready.json", ".ready.json"), ("invocation.json", ".invocation.json"),
+        ("codex.jsonl.json", ".codex.jsonl.json"), ("codex.jsonl", ".codex.jsonl")):
+        remote = (OUTPUT / "mailbox/responses" if local_name == "response-ready.json" else OUTPUT / "mailbox/logs") / (nonce + remote_suffix)
+        need(sha(local / local_name) == sha(remote), "Actual cache/archive metadata or opaque-log SHA differs")
+    records.append({"nonce": nonce, "mother_call": bool(request.get("meta_role")),
+        "request_sha256": request_sha, "response_sha256": response_sha, "response_bytes": response_file.stat().st_size,
+        "claimed_once_marker_present": True, "delivered_and_ready_sha_verified": True,
+        "cache_archive_opaque_bytes_sha_equal": True, "invocation_metadata_present": True,
+        "process_returncode": process.get("returncode"), "timed_out": process.get("timed_out"),
+        "process_seconds": process.get("seconds"), "response_body_decoded_or_copied_from_cache": False})
+cache_nonces = {path.name for path in CACHE.iterdir() if path.is_dir() and re.fullmatch(r"[0-9a-f]{32}", path.name)}
+need(seen and cache_nonces == seen, "Actual cache claims are not exhausted by the terminal archive requests")
+for subfolder, suffix in (("responses", ".response.json"), ("logs", ".invocation.json"), ("logs", ".delivered.json")):
+    need({path.name.removesuffix(suffix) for path in (OUTPUT / "mailbox" / subfolder).glob("*" + suffix)} == seen,
+         "Unreconciled extra terminal request/response/invocation/delivery")
+registry = OUTPUT / ("primes-max-" + MODEL) / "registry.sqlite3"
+need(registry.is_file() and all(not Path(str(registry) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")),
+     "Only closed restored SQLite without sidecars is admitted; never repair or open live registry")
+database = sqlite3.connect(registry.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+database.row_factory = sqlite3.Row
+try:
+    need(database.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "Closed scalar ledger integrity failed")
+    slots = [dict(row) for row in database.execute("SELECT id,phase,purpose,tokens_reserved,tokens_used,usage_known,created FROM slots ORDER BY created,id")]
+    counts = {"trials": database.execute("SELECT count(*) FROM trials").fetchone()[0],
+        "recorded_evaluations": database.execute("SELECT count(*) FROM evaluations").fetchone()[0],
+        "recorded_model_trial_evaluations": database.execute("SELECT count(*) FROM evaluations e JOIN trials t ON e.experiment_id=t.id").fetchone()[0]}
+finally:
+    database.close()
+need(all(row["usage_known"] in {0, 1, 2} and type(row["tokens_used"]) is int and row["tokens_used"] >= 0
+         and type(row["tokens_reserved"]) is int and row["tokens_reserved"] >= 0 for row in slots), "Invalid scalar token ledger")
+costs = {"registered_slots": len(slots),
+    "exact_known_tokens": sum(row["tokens_used"] for row in slots if row["usage_known"] == 1),
+    "exact_usage_slots": sum(row["usage_known"] == 1 for row in slots),
+    "upper_bound_usage_slots": sum(row["usage_known"] == 2 for row in slots),
+    "unknown_usage_slots": sum(row["usage_known"] == 0 for row in slots),
+    "upper_bound_tokens_only_not_consumption": sum(row["tokens_used"] for row in slots if row["usage_known"] == 2),
+    "tokens_reserved_only_not_consumption": sum(row["tokens_reserved"] for row in slots),
+    "all_invocations_exact_total_tokens": None}
+cache_after = inventory(CACHE, operational_lock=True)
+need(cache_before == cache_after and archive_before == inventory(RESTORED), "Evidence/cache metadata changed during reconciliation")
+save("inventaire-cache-metadonnees-apres.json", cache_after)
+save("inventaire-archive-apres-reconciliation.json", inventory(RESTORED))
+report = {"schema": "hpc-forest-r2c-failed-cohort-metadata-reconciliation-v1", **expected_cell,
+    "verified": False, "verification_scope": "All terminal claim/delivery/process/opaque SHA and scalar closed-ledger metadata only",
+    "all_terminal_claim_delivery_metadata_reconciled": True, "known_request_count": len(records),
+    "native_invocation_metadata_count": len(records), "mother_invocations": sum(row["mother_call"] for row in records),
+    "normal_invocations": sum(not row["mother_call"] for row in records), "calls": records, "scalar_cost_ledger": costs,
+    "closed_registry_scalar_counts": counts, "response_or_reasoning_body_decoded_or_exposed": False,
+    "active_cache_body_copied": False, "cache_metadata_before_after_identical": True,
+    "complete_cache_snapshot_received": False, "worker_lock_opened_or_copied": False,
+    "source_worker_or_process_changed": False, "first_normal_evaluation_requires_separate_actual_receipt": True,
+    "native_research_admitted": False, "independent_performance_audit_verified": False,
+    "independent_raw_stdout_per_candidate_verified": False}
+save("RECONCILIATION-METADONNEES-NEGATIF.json", report)
+save("registre-slots-scalaires-prive.json", {"slots": slots, "private_metadata_only": True, "no_payload_trial_result_or_response_selected": True})
+print(json.dumps({"job_id": JOB, "all_terminal_claim_delivery_metadata_reconciled": True,
+    "request_count": len(records), "invocations": len(records), "costs": costs, "registry_counts": counts,
+    "complete_cache_snapshot_received": False, "native_research_admitted": False}))

@@ -1,0 +1,80 @@
+"""Inspect typed checker and measured sample records without executing a binary."""
+from __future__ import annotations
+
+import math
+import statistics
+from pathlib import Path
+
+from audit_common import (
+    CAMPAIGN,
+    FLAGS,
+    JOB,
+    need,
+    original_root,
+    read_json,
+    rebased,
+    sha,
+)
+
+
+def evaluation_evidence(outcome, phase, root, repetitions, *, expected_worktree=None, expected_commit=None, git=None):
+    status = outcome["status"]
+    logs = [rebased(name, root) for name in outcome.get("logs", [])]
+    if status not in {"valid", "incorrect", "build_failed", "runtime_failed"}:
+        return {"status": status, "evaluated": False}
+    need(logs and len(logs) == len(set(logs)) and logs[0].name == "build.log", "Actual build log missing")
+    build = read_json(Path(str(logs[0]) + ".json"))
+    need(logs[0].is_file() and len(build.get("argv", [])) == 5 and build["argv"][2] == "build", "Wrong build process evidence")
+    trusted = str(original_root(build["argv"][1]) / ("results-" + JOB) / CAMPAIGN / "trusted")
+    need(build["argv"][1] == trusted + "/contract_tool.py", "Build did not invoke the fixed protected checker")
+    actual_worktree = rebased(build["argv"][3], root)
+    if expected_worktree is not None:
+        need(actual_worktree == rebased(expected_worktree, root), "Compilation used another candidate worktree")
+        need(expected_commit == outcome.get("commit") and git is not None, "Compilation commit binding missing")
+        from audit_source_binding_r2 import worktree_evidence
+        worktree_evidence(root, build["argv"][3], expected_commit, git)
+    build_dir = rebased(build["argv"][4], root)
+    command = read_json(build_dir / "compiler-command.json")
+    need(command.get("compiler_flags") == FLAGS and all(flag in command.get("argv", []) for flag in FLAGS), "Actual candidate compiler flags differ")
+    expected_command = ["-I", build["argv"][3] + "/src", build["argv"][3] + "/src/model-view/primetest.c", *FLAGS, "-o", build["argv"][4] + "/solution"]
+    need(command.get("argv", [])[1:] == expected_command, "Compiler source/binary command binding differs")
+    need((build_dir / "compiler.stdout").is_file() and (build_dir / "compiler.stderr").is_file(), "Actual compiler streams missing")
+    if status == "build_failed":
+        need(outcome.get("correct") is False and outcome.get("score") == 0
+             and (build.get("returncode") != 0 or build.get("timed_out") is True), "Build negative not preserved")
+        return {"status": status, "evaluated": True}
+    need(build.get("returncode") == 0 and build.get("timed_out") is False, "Successful candidate has failed build provenance")
+    binary = build_dir / "solution"
+    need(sha(binary.read_bytes()) == outcome.get("binary_sha256"), "Executable hash differs from evaluation")
+    check = next((p for p in logs if p.name == "correctness.log"), None)
+    need(check is not None, "Protected checker log missing")
+    process = read_json(Path(str(check) + ".json"))
+    argv = process.get("argv", [])
+    need(len(argv) == 5 and argv[0] == build["argv"][0] and argv[1] == trusted + "/contract_tool.py" and argv[2] == "check" and argv[-1] == phase
+         and argv[3] == build["argv"][4] + "/solution", "Wrong checker phase/binary")
+    if status == "incorrect":
+        need(outcome.get("correct") is False and outcome.get("score") == 0
+             and (process.get("returncode") != 0 or process.get("timed_out") is True or read_json(check).get("correct") is False), "Incorrect negative not preserved")
+        return {"status": status, "evaluated": True}
+    checked = read_json(check)
+    need(process.get("returncode") == 0 and checked.get("correct") is True
+         and type(checked.get("cases")) is int and checked["cases"] == 6 and process.get("timed_out") is False, "Typed successful checker output missing")
+    samples, failed = [], False
+    for path in logs:
+        record = read_json(Path(str(path) + ".json"))
+        need(path.is_file(), "Measured process log missing")
+        if path.name.startswith(("sample-", "warmup-")):
+            need(record.get("argv") == ["/bin/sh", build["argv"][1].rsplit("/", 1)[0] + "/benchmark.sh", build["argv"][4] + "/solution"], "Benchmark executable differs")
+            failed |= record.get("returncode") != 0 or record.get("timed_out") is True
+        if path.name.startswith("sample-"):
+            samples.append(record["seconds"])
+    if status == "runtime_failed":
+        need(failed and outcome.get("correct") is False and outcome.get("score") == 0, "Runtime negative not preserved")
+    else:
+        need({p.name for p in logs if p.name.startswith("sample-")} == {f"sample-{n}.log" for n in range(repetitions)}, "Recorded sample indices differ")
+        need(type(outcome.get("mean_seconds")) in {int, float} and math.isfinite(outcome["mean_seconds"]) and outcome["mean_seconds"] > 0, "Invalid measured mean")
+        need(outcome.get("correct") is True and not failed and len(samples) == len(outcome.get("times", [])) == repetitions
+             and all(type(t) in {int, float} and math.isfinite(t) and t > 0 for t in samples)
+             and all(math.isclose(a, b, rel_tol=1e-12) for a, b in zip(samples, outcome["times"], strict=True))
+             and math.isclose(statistics.mean(samples), outcome["mean_seconds"], rel_tol=1e-12), "Three/five samples differ from evaluation")
+    return {"status": status, "evaluated": True, "samples": len(samples)}

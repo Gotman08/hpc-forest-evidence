@@ -1,0 +1,254 @@
+"""R2-only technical reader closures. All generated evidence is NEUTRAL."""
+from __future__ import annotations
+
+import copy
+import json
+import zipfile
+from pathlib import Path
+
+import audit_cache_preservation_r2 as preservation
+import audit_common as c
+import pytest
+from audit_evaluations import evaluation_evidence
+from audit_formats_r2 import KNOWN_WARNING, parse_native_jsonl
+from audit_source_binding_r2 import (
+    PROTOCOL_COMMANDS,
+    frozen_protocol_evidence,
+    proposal_evidence,
+    worktree_evidence,
+)
+from audit_transport import mailbox_and_cache
+from test_audit_neutral import evaluation_fixture, put, transport_fixture
+
+WARN = "2026-10-17T22:54:17.248252Z  WARN " + KNOWN_WARNING
+
+
+def test_exact_received_warning_format_and_separator_preserve_bytes():
+    raw = (WARN + "\n\n" + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 2}}) + "\n").encode()
+    result = parse_native_jsonl(raw)
+    assert result["recognized_warnings"][0]["original_text"] == WARN
+    assert result["recognized_warning_separator_lines"] == [2]
+    assert result["raw_sha256"] == c.sha(raw)
+    assert len(result["events"]) == 1
+
+
+@pytest.mark.parametrize("line", ["WARN unknown", WARN.replace("invalid transport", "other error"), WARN.replace("relecteur_parcours_joueur", "other_role"),
+                                  "{malformed", "", "null", "2026-99-17T22:54:17.248252Z  WARN " + KNOWN_WARNING])
+def test_unknown_malformed_or_wrong_warning_refused(line):
+    with pytest.raises(ValueError):
+        parse_native_jsonl((line + "\n").encode())
+
+
+def test_two_blank_separators_not_generally_ignored():
+    with pytest.raises(ValueError):
+        parse_native_jsonl((WARN + "\n\n\n").encode())
+
+
+def test_two_exact_roots_only_remap_to_same_restored_bytes(tmp_path):
+    member = "/results-751992/x.json"
+    target = put(tmp_path / "results-751992/x.json", {"NEUTRAL": 1})
+    for original in c.REMOTE_ROOTS:
+        assert c.rebased(str(original) + member, tmp_path) == target
+        assert c.read_json(c.rebased(str(original) + member, tmp_path)) == {"NEUTRAL": 1}
+
+
+@pytest.mark.parametrize("suffix", ["/results-751993/x", "/results-751992/../escape", "/results-751992//x", "/results-751992/./x"])
+def test_wrong_job_or_traversal_refused(tmp_path, suffix):
+    with pytest.raises(c.AuditError):
+        c.rebased(str(c.REMOTE_ROOTS[1]) + suffix, tmp_path)
+
+
+@pytest.mark.parametrize("root", [str(c.REMOTE_ROOTS[1]).replace("c804", "d804"), str(c.REMOTE_ROOTS[1]) + "-other", "/gpfs/scratch/other", "/scratch_p/other"])
+def test_unproved_root_or_session_alias_refused(tmp_path, root):
+    with pytest.raises(c.AuditError):
+        c.rebased(root + "/results-751992/x", tmp_path)
+
+
+def test_missing_remapped_evidence_not_substituted(tmp_path):
+    with pytest.raises(c.AuditError, match="Missing"):
+        c.read_json(c.rebased(str(c.REMOTE_ROOTS[1]) + "/results-751992/missing.json", tmp_path))
+
+
+def proposal_fixture(tmp_path):
+    generation = "NEUTRAL-h01"
+    folder = tmp_path / "logs" / generation
+    data = {"hypothesis": "NEUTRAL", "transformations": [], "sources_kept": [], "notes": "NEUTRAL",
+            "files": [{"path": "src/x.c", "content": "NEUTRAL nonexecuted source bytes"}]}
+    response = put(tmp_path / "mailbox/response.json", {"data": data, "error": None, "infrastructure_error": False})
+    put(folder / "codex-response.json", c.read_json(response))
+    generated = put(folder / "agent-result.json", data)
+    calls = {"response_refs_by_mission": {generation: {"path": str(response), "sha256": c.sha(response.read_bytes())}}}
+    return generation, generated, calls, data
+
+
+def test_response_data_exactly_binds_model_file_bytes(tmp_path):
+    generation, generated, calls, data = proposal_fixture(tmp_path)
+    assert proposal_evidence(generation, generated, calls) == data
+
+
+@pytest.mark.parametrize("mutation", ["agent-content", "agent-extra", "campaign-envelope", "response-changed"])
+def test_substituted_agent_result_or_response_rejected(tmp_path, mutation):
+    generation, generated, calls, data = proposal_fixture(tmp_path)
+    if mutation == "agent-content":
+        data["files"][0]["content"] = "SUBSTITUTED"
+        put(generated, data)
+    elif mutation == "agent-extra":
+        put(generated, {**data, "unknown": "SUBSTITUTED"})
+    elif mutation == "campaign-envelope":
+        put(generated.parent / "codex-response.json", {"data": data, "error": "OTHER"})
+    else:
+        put(Path(calls["response_refs_by_mission"][generation]["path"]), {"data": data, "unknown": "CHANGED"})
+    with pytest.raises(c.AuditError):
+        proposal_evidence(generation, generated, calls)
+
+
+class NeutralGit:
+    def __init__(self, raw=b"NEUTRAL A"):
+        self.raw = raw
+
+    def files_at(self, commit):
+        return {"src/model-view/primetest.c": self.raw}
+
+
+def test_full_worktree_bytes_bound_to_selected_commit(tmp_path):
+    original = str(c.REMOTE) + "/results-751992/worktree"
+    folder = c.rebased(original, tmp_path)
+    (folder / "src/model-view").mkdir(parents=True)
+    (folder / "src/model-view/primetest.c").write_bytes(b"NEUTRAL A")
+    worktree_evidence(tmp_path, original, "selected", NeutralGit())
+    with pytest.raises(c.AuditError, match="selected Git commit"):
+        worktree_evidence(tmp_path, original, "other", NeutralGit(b"NEUTRAL B"))
+
+
+@pytest.mark.parametrize("mutation", ["other-worktree", "other-commit", "other-five-measurements"])
+def test_build_or_confirmation_other_candidate_rejected(tmp_path, mutation):
+    root, outcome = evaluation_fixture(tmp_path)
+    build_log = c.rebased(outcome["logs"][0], root)
+    record = c.read_json(Path(str(build_log) + ".json"))
+    original = record["argv"][3]
+    folder = c.rebased(original, root)
+    (folder / "src/model-view").mkdir(parents=True)
+    (folder / "src/model-view/primetest.c").write_bytes(b"NEUTRAL A")
+    outcome["commit"] = "selected"
+    if mutation == "other-worktree":
+        expected = original + "-other"
+        commit = "selected"
+    elif mutation == "other-commit":
+        expected, commit = original, "different"
+    else:
+        expected, commit = original, "selected"
+        sample = c.rebased(outcome["logs"][-1], root)
+        process = c.read_json(Path(str(sample) + ".json"))
+        process["argv"][-1] = process["argv"][-1].replace("/builds/NEUTRAL/", "/builds/OTHER/")
+        put(Path(str(sample) + ".json"), process)
+    with pytest.raises(c.AuditError):
+        evaluation_evidence(outcome, "confirmation", root, 5, expected_worktree=expected, expected_commit=commit, git=NeutralGit())
+
+
+def protocol_fixture(tmp_path):
+    source = Path(__file__).resolve().parents[1] / "HPC-Forest-Primes-Natif-MAX-r1/revision-r1b/HPC-Forest-Primes-Natif-MAX-r1.zip"
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    with zipfile.ZipFile(source) as archive:
+        frozen = archive.read("HPC-Forest/src/hpc_forest/contracts.py")
+    (trusted / "contract_tool.py").write_bytes(frozen)
+    bench = {"name": "benchmark-case-1", "argv": [], "files": [], "capture_files": [], "stdin": "fixtures/benchmark/0/stdin"}
+    script = '#!/bin/sh\nset -eu\nbinary="$1"\nresources="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"\ncd "$(dirname "$binary")"\nexec "$binary"  < "$resources/"fixtures/benchmark/0/stdin\n'
+    (trusted / "benchmark.sh").write_text(script, encoding="utf8", newline="")
+    return trusted, {"benchmark": bench}, copy.deepcopy(PROTOCOL_COMMANDS), source
+
+
+def test_frozen_certified_script_bytes_and_commands(tmp_path):
+    assert frozen_protocol_evidence(*protocol_fixture(tmp_path))["benchmark_and_correctness_scripts_verified"] is True
+
+
+@pytest.mark.parametrize("mutation", ["noop-benchmark", "wrong-input", "shortcut-correctness", "checker-noop", "different-args"])
+def test_self_consistent_manifest_cannot_authorize_changed_scripts(tmp_path, mutation):
+    trusted, contract, protocol, source = protocol_fixture(tmp_path)
+    if mutation == "noop-benchmark":
+        (trusted / "benchmark.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf8")
+    elif mutation == "wrong-input":
+        (trusted / "benchmark.sh").write_text((trusted / "benchmark.sh").read_text(encoding="utf8").replace("fixtures/benchmark/0/stdin", "OTHER"), encoding="utf8")
+    elif mutation == "shortcut-correctness":
+        protocol["check"] = ["/bin/true"]
+    elif mutation == "checker-noop":
+        (trusted / "contract_tool.py").write_text('print("correct true")', encoding="utf8")
+    else:
+        protocol["benchmark"].append("OTHER")
+    # Recomputing an internally consistent digest must not substitute for frozen bytes.
+    manifest = c.inventory(trusted)
+    assert c.digest({"manifest": manifest, "protocol": protocol})
+    with pytest.raises(c.AuditError):
+        frozen_protocol_evidence(trusted, contract, protocol, source)
+
+
+@pytest.mark.parametrize("folder,suffix", [("logs", ".invocation.json"), ("logs", ".codex.jsonl"), ("logs", ".codex.jsonl.json"), ("responses", ".response.json")])
+def test_each_orphan_call_artifact_refused(tmp_path, folder, suffix):
+    mailbox, cache, _ = transport_fixture(tmp_path)
+    (mailbox / folder / ("f" * 32 + suffix)).write_bytes(b"NEUTRAL")
+    with pytest.raises(c.AuditError, match="Orphan"):
+        mailbox_and_cache(mailbox, cache)
+
+
+@pytest.mark.parametrize("where", ["cache", "requests", "responses", "logs", "invalid-nonce-file"])
+def test_unexpected_directory_or_nonce_artifact_refused(tmp_path, where):
+    mailbox, cache, _ = transport_fixture(tmp_path)
+    if where == "cache":
+        (cache / "NOT-A-NONCE").mkdir()
+    elif where == "invalid-nonce-file":
+        (mailbox / "logs/NOT-A-NONCE.invocation.json").write_bytes(b"NEUTRAL")
+    else:
+        (mailbox / where / "nested-unexpected").mkdir()
+    with pytest.raises(c.AuditError):
+        mailbox_and_cache(mailbox, cache)
+
+
+def cache_fixture(tmp_path, monkeypatch):
+    cache = tmp_path / "snapshot"
+    cache.mkdir()
+    for n in range(132):
+        (cache / f"NEUTRAL-{n}").write_bytes(str(n).encode())
+    files = c.inventory(cache)
+    before = dict(files)
+    metadata = {**files, "worker.lock": {"bytes": 1, "bytes_read": False, "sha256": None, "path": preservation.SOURCE_LOCK}}
+    b, a = put(tmp_path / "before.json", before), put(tmp_path / "after.json", before)
+    mb, ma = put(tmp_path / "metadata-before.json", metadata), put(tmp_path / "metadata-after.json", metadata)
+    ref = lambda p: {"path": str(p.resolve()), "sha256": c.sha(p.read_bytes())}
+    receipt = {"preservation_phase": "pre_stop_owned_lock_pending", "owned_operational_lock_exception": {"NEUTRAL": True},
+               "source_inventory_before": ref(b), "source_inventory_after": ref(a), "source_full_metadata_before": ref(mb), "source_full_metadata_after": ref(ma), "files": files, "source_files_observed": 133}
+    # Unit-test double only. No owned-lock or production-positive receipt is created.
+    monkeypatch.setattr(preservation, "verify_owned_lock_exception", lambda value: {"owner_identity_ref": {"sha256": "NEUTRAL"}})
+    return cache, receipt, ref
+
+
+def test_pre_stop_preservation_never_claims_133_bytes_hashes(tmp_path, monkeypatch):
+    cache, receipt, _ = cache_fixture(tmp_path, monkeypatch)
+    result = preservation.cache_preservation(receipt, cache)
+    assert result["all_model_artifacts_preserved"] is True
+    assert result["snapshot_files_verified"] == 132
+    assert result["total_cache_bytes_preservation_complete"] is False
+    assert result["worker_lock_sha256_before"] is None
+
+
+@pytest.mark.parametrize("mutation", ["missing-readable", "other-exclusion", "invented-before-sha", "fake-lock-bytes", "missing-post-stop"])
+def test_no_general_cache_exclusion_or_false_complete(tmp_path, monkeypatch, mutation):
+    cache, receipt, ref = cache_fixture(tmp_path, monkeypatch)
+    if mutation == "missing-readable":
+        (cache / "NEUTRAL-0").unlink()
+    elif mutation in {"other-exclusion", "invented-before-sha"}:
+        key = "source_full_metadata_before" if mutation == "invented-before-sha" else "source_inventory_before"
+        p = Path(receipt[key]["path"])
+        value = c.read_json(p)
+        if mutation == "other-exclusion":
+            value["NEUTRAL-0"] = {"bytes": 1, "read_errno": 13, "sha256": None}
+        else:
+            value["worker.lock"]["sha256"] = "0" * 64
+        put(p, value)
+        receipt[key] = ref(p)
+    elif mutation == "fake-lock-bytes":
+        (cache / "worker.lock").write_bytes(b"X")
+        receipt["files"] = c.inventory(cache)
+    else:
+        receipt["preservation_phase"] = "complete_after_owned_stop"
+    with pytest.raises(c.AuditError):
+        preservation.cache_preservation(receipt, cache)

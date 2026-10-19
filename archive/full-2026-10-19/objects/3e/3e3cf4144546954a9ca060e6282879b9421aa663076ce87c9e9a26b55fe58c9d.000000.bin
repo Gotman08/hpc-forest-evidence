@@ -1,0 +1,166 @@
+#include "knn.h"
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#include <stdint.h>
+#endif
+
+static inline void insert_neighbor(float d, char label, int k,
+                                   float *distances, char *labels) {
+    for (int x = 0; x < k; x++) {
+        if (d < distances[x] || distances[x] == -1.0f) {
+            for (int y = k - 1; y > x; y--) {
+                distances[y] = distances[y - 1];
+                labels[y] = labels[y - 1];
+            }
+            distances[x] = d;
+            labels[x] = label;
+            break;
+        }
+    }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline float32x4_t rejection_radius(float cutoff) {
+    float32x4_t radius = vsqrtq_f32(vdupq_n_f32(cutoff));
+    uint32x4_t bits = vreinterpretq_u32_f32(radius);
+    uint32x4_t finite_positive = vandq_u32(
+        vcgtq_u32(bits, vdupq_n_u32(0u)),
+        vcltq_u32(bits, vdupq_n_u32(0x7f800000u)));
+
+    /* Round the radius outward. Zero and infinity are already exact. */
+    bits = vaddq_u32(bits,
+                     vandq_u32(finite_positive, vdupq_n_u32(1u)));
+    return vreinterpretq_f32_u32(bits);
+}
+
+static inline uint32x4_t candidate_mask(const Point *points,
+                                       float32x4_t query_x,
+                                       float32x4_t query_y,
+                                       float32x4_t radius) {
+    float32x4x2_t xy = vld2q_f32((const float *)points);
+    float32x4_t dx = vabsq_f32(vsubq_f32(xy.val[0], query_x));
+    float32x4_t dy = vabsq_f32(vsubq_f32(xy.val[1], query_y));
+    return vcltq_f32(vmaxq_f32(dx, dy), radius);
+}
+#endif
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * k);
+    float *distances = (float *)malloc(sizeof(float) * k);
+    int ordered = 1;
+    int i;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const float32x4_t query_x = vdupq_n_f32(to_evaluate.x);
+    const float32x4_t query_y = vdupq_n_f32(to_evaluate.y);
+#endif
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        int j = 0;
+
+        /* Preserve the original scan until the buffer is full and ordered. */
+        while (j < g.length &&
+               (!ordered || distances[k - 1] == -1.0f)) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            insert_neighbor(d, g.label, k, distances, labels);
+            if (d != d) {
+                ordered = 0;
+            }
+            j++;
+        }
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if (j <= g.length - 8) {
+            float cutoff = distances[k - 1];
+            float32x4_t radius = rejection_radius(cutoff);
+
+            for (; j <= g.length - 8; j += 8) {
+                uint32x4_t first = candidate_mask(g.points + j,
+                                                 query_x, query_y, radius);
+                uint32x4_t second = candidate_mask(g.points + j + 4,
+                                                  query_x, query_y, radius);
+
+                if (vmaxvq_u32(vorrq_u32(first, second)) != 0u) {
+                    uint32_t candidates[8];
+                    vst1q_u32(candidates, first);
+                    vst1q_u32(candidates + 4, second);
+
+                    /* A batch uses a conservative, possibly stale cutoff.
+                       Consume survivors in the original point order. */
+                    for (int lane = 0; lane < 8; lane++) {
+                        if (candidates[lane] != 0u) {
+                            float d = euclidean_distance_no_sqrt(
+                                to_evaluate, g.points[j + lane]);
+                            if (d < distances[k - 1]) {
+                                insert_neighbor(d, g.label, k,
+                                                distances, labels);
+                            }
+                        }
+                    }
+
+                    if (distances[k - 1] != cutoff) {
+                        cutoff = distances[k - 1];
+                        radius = rejection_radius(cutoff);
+                    }
+                }
+            }
+        }
+#endif
+
+        for (; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            if (d < distances[k - 1]) {
+                insert_neighbor(d, g.label, k, distances, labels);
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+
+    Group *groups = (Group *)malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

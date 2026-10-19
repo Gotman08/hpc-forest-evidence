@@ -1,0 +1,198 @@
+"""R2d neutral lane/session negatives: no CLI, C, subprocess, socket or model."""
+from __future__ import annotations
+
+import copy
+import json
+import subprocess
+import time
+
+import pytest
+
+from hpc_forest import codex_worker
+from hpc_forest import native_r2max as native
+from hpc_forest import primes_lane_contract as lane
+from hpc_forest.core import InfrastructureError, atomic_json, file_digest
+
+OLD_SESSIONS = {"gpt-6-astra": "979ef61f50d041639c1cd46e1942a3f3",
+    "gpt-5.6-terra": "a35692d6da3f46278fe3840f5c56984e",
+    "gpt-6.1-sol": "0fbe579c95f74ec7b90ebe702877434b"}
+
+
+@pytest.fixture(autouse=True)
+def no_processes(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("No real process"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("No real process"))
+    monkeypatch.setattr(codex_worker, "check_dependencies", codex_worker.check_dependencies)
+
+
+def neutral_lane(tmp_path, *, count=0, mode="received_absent", observed=1000.0):
+    binding = {"scope_id": native.SCOPE, "source_zip_sha256": "1" * 64,
+        "plan_sha256": "2" * 64, "model": "gpt-6-astra", "effort": "max",
+        "session_id": native.CELLS["gpt-6-astra"], "job_id": "999999", "remote_root": "/NEUTRAL"}
+    evidence = {key: "3" * 64 for key in lane.EVIDENCE_FIELDS}
+    evidence.update(scientific_reception=lane.SCIENCE_SHA, reconciliation=lane.RECON_SHA)
+    if mode == "live":
+        evidence.update({key: None for key in lane.ABSENCE_FIELDS})
+    contribution, preserved = (1, True) if mode == "live" else (0, False)
+    projection = {**binding, "schema": lane.PROJECTION_SCHEMA, "verified": True,
+        "source_only_state": mode, "source_only_preserved": preserved,
+        "source_only_active_workers": contribution, "other_native_workers_count": count - contribution,
+        "active_native_workers_before_start": count, "maximum_native_workers_total": 4,
+        "observed_at": observed, "observation_origin": "parent-private-Windows-census",
+        "windows_census_observed_by_arm": False, "full_census_exported": False,
+        "foreign_configuration_or_credentials_exported": False, "evidence_sha256": evidence}
+    path = tmp_path / "NEUTRAL-projection.json"
+    atomic_json(path, projection)
+    value = {**binding, "schema": lane.LANE_SCHEMA, "verified": True,
+        "maximum_native_workers_total": 4, "active_native_workers_before_start": count,
+        "full_census_locally_verified": True, "source_only_preserved": preserved,
+        "new_cache_registry_root": True, "native_calls_started": 0, "observed_at": observed,
+        "private_full_census_sha256": evidence["private_full_census"],
+        "minimal_owned_observations": {"path": str(path.resolve()), "sha256": file_digest(path)},
+        "source_only_state": mode, "source_only_active_workers": contribution}
+    return value, binding, projection, path
+
+
+def change_projection(value, projection, path, **updates):
+    projection.update(updates)
+    atomic_json(path, projection)
+    value["minimal_owned_observations"]["sha256"] = file_digest(path)
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3])
+def test_closed_source_only_contributes_zero_and_available_lanes_are_typed(tmp_path, count):
+    value, binding, _, _ = neutral_lane(tmp_path, count=count)
+    assert lane.validate_lane_v2(value, binding, native.artifact, now=1000.0) is value
+    assert value["source_only_active_workers"] == 0
+    assert value["source_only_preserved"] is False
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_live_source_only_is_still_honestly_counted(tmp_path, count):
+    value, binding, _, _ = neutral_lane(tmp_path, count=count, mode="live")
+    lane.validate_lane_v2(value, binding, native.artifact, now=1000.0)
+
+
+@pytest.mark.parametrize("count", [4, 5, -1, True, 1.0])
+def test_fifth_worker_and_untyped_counts_refused(tmp_path, count):
+    value, binding, _, _ = neutral_lane(tmp_path, count=count)
+    with pytest.raises(ValueError):
+        lane.validate_lane_v2(value, binding, native.artifact, now=1000.0)
+
+
+@pytest.mark.parametrize(("field", "bad"), [("source_only_preserved", True),
+    ("source_only_active_workers", 1), ("native_calls_started", 1),
+    ("maximum_native_workers_total", 2), ("unexpected", True)])
+def test_contradictory_closed_state_or_unknown_lane_fields_refused(tmp_path, field, bad):
+    value, binding, _, _ = neutral_lane(tmp_path)
+    value[field] = bad
+    with pytest.raises(ValueError):
+        lane.validate_lane_v2(value, binding, native.artifact, now=1000.0)
+
+
+@pytest.mark.parametrize("field", ["source_only_absence", "prior_owned_census",
+    "cold_absence_census", "owned_descendant_review", "observer_release",
+    "local_projection_producer_review"])
+def test_closed_state_requires_every_absence_descendant_review_digest(tmp_path, field):
+    value, binding, projection, path = neutral_lane(tmp_path)
+    projection["evidence_sha256"][field] = None
+    change_projection(value, projection, path)
+    with pytest.raises(ValueError):
+        lane.validate_lane_v2(value, binding, native.artifact, now=1000.0)
+
+
+@pytest.mark.parametrize("field", ["windows_census_observed_by_arm", "full_census_exported",
+    "foreign_configuration_or_credentials_exported"])
+def test_transport_cannot_claim_arm_observation_or_export_foreign_state(tmp_path, field):
+    value, binding, projection, path = neutral_lane(tmp_path)
+    change_projection(value, projection, path, **{field: True})
+    with pytest.raises(ValueError):
+        lane.validate_lane_v2(value, binding, native.artifact, now=1000.0)
+
+
+def test_fresh_start_refuses_stale_but_bound_existing_worker_can_read_immutable_evidence(tmp_path):
+    value, binding, _, _ = neutral_lane(tmp_path)
+    with pytest.raises(ValueError, match="stale"):
+        lane.validate_lane_v2(value, binding, native.artifact, now=1601.0)
+    lane.validate_lane_v2(value, binding, native.artifact, initial=False, now=1601.0)
+
+
+def test_forged_projection_digest_or_duplicate_json_cannot_enter(tmp_path):
+    value, binding, _, path = neutral_lane(tmp_path)
+    path.write_text('{"schema":1,"schema":2}', encoding="utf8")
+    with pytest.raises(InfrastructureError):
+        lane.validate_lane_v2(value, binding, native.artifact, now=1000.0)
+    value["minimal_owned_observations"]["sha256"] = file_digest(path)
+    with pytest.raises(ValueError, match="Duplicate"):
+        lane.validate_lane_v2(value, binding, native.artifact, now=1000.0)
+
+
+def test_wrapper_cannot_override_nested_counts_or_time(tmp_path):
+    value, binding, _, _ = neutral_lane(tmp_path)
+    wrapper = {"maximum_native_workers": 4, "active_native_workers_before_start": 0,
+        "observed_at": 1000.0, "lane_v2": value}
+    native.verify_lane_admission(wrapper, binding, now=1000.0)
+    wrapper["observed_at"] = 1001.0
+    with pytest.raises(InfrastructureError, match="contradicts"):
+        native.verify_lane_admission(wrapper, binding, now=1001.0)
+
+
+def test_wrapper_cap_requires_exact_integer():
+    with pytest.raises(InfrastructureError):
+        native.verify_worker_lane({"maximum_native_workers": 4.0, "active_native_workers_before_start": 0})
+
+
+@pytest.mark.parametrize("model", sorted(OLD_SESSIONS))
+def test_started_historical_sessions_cannot_be_replayed_as_r2d(model):
+    with pytest.raises(InfrastructureError):
+        native.selected_identity({"model": model, "effort": "max", "session_id": OLD_SESSIONS[model]})
+    assert native.CELLS[model] != OLD_SESSIONS[model]
+    assert native.selected_identity({"model": model, "effort": "max",
+        "session_id": native.CELLS[model]}) == (model, native.CELLS[model])
+
+
+def test_luna_is_excluded_and_fourteen_admissions_unchanged():
+    assert len(native.ARTIFACTS) == 14
+    assert set(native.CELLS) == set(OLD_SESSIONS)
+    with pytest.raises(InfrastructureError):
+        native.selected_identity({"model": "gpt-6-luna", "effort": "max", "session_id": native.LUNA_SESSION})
+
+
+def test_only_frozen_initial_gate_can_request_historical_lane_reads(tmp_path, monkeypatch):
+    from hpc_forest import codex_mailbox, codex_process
+    for module in (codex_mailbox, codex_process, codex_worker):
+        monkeypatch.setattr(module, "MODEL", module.MODEL)
+        monkeypatch.setattr(module, "EFFORT", module.EFFORT)
+    monkeypatch.setattr(codex_process, "check_dependencies", codex_process.check_dependencies)
+    refs = {}
+    for key in native.ARTIFACTS:
+        path = tmp_path / (key + ".json")
+        atomic_json(path, {"neutral_fixture": key})
+        refs[key] = {"path": str(path.resolve()), "sha256": file_digest(path)}
+    model = "gpt-6-astra"
+    state = {"model": model, "effort": "max", "session_id": native.CELLS[model],
+        "job_id": "999999", "remote_root": "/NEUTRAL", "artifacts": refs}
+    receipt = tmp_path / "NEUTRAL-auth.json"
+    atomic_json(receipt, state)
+    initial_flags = []
+
+    def inert_validator(*args, **kwargs):
+        initial_flags.append(kwargs.get("initial_lane", True))
+        return copy.deepcopy(state)
+
+    monkeypatch.setattr(native, "validate_receipt", inert_validator)
+    native.install_identity(receipt, prepared=False)
+    codex_worker.check_dependencies(receipt, {native.SCOPE})
+    assert initial_flags == [True, False]
+    changed = json.loads(receipt.read_text(encoding="utf8"))
+    changed["job_id"] = "999998"
+    atomic_json(receipt, changed)
+    with pytest.raises(InfrastructureError, match="replaced"):
+        codex_worker.check_dependencies(receipt, {native.SCOPE})
+    assert initial_flags == [True, False]
+
+
+def test_future_observation_is_refused_even_for_existing_worker(tmp_path):
+    value, binding, _, _ = neutral_lane(tmp_path, observed=time.time() + 1000)
+    with pytest.raises(ValueError):
+        lane.validate_lane_v2(value, binding, native.artifact, initial=False)

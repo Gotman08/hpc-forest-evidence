@@ -1,0 +1,100 @@
+#include <iostream>
+#include <vector>
+#include <cstdio>
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <arm_neon.h>
+#include <omp.h>
+
+int main() {
+    int n, s;
+    std::cin >> n >> s;
+
+    // Flatten matrix into contiguous 1D array for better spatial locality
+    std::vector<int> mat(n * n);
+    for (int i = 0; i < n; ++i) {
+        int* row = &mat[i * n];
+        for (int j = 0; j < n; ++j) {
+            scanf("%d", &row[j]);
+        }
+    }
+
+    // Integral image (summed-area table) using int64_t to avoid overflow and match NEON types
+    const int np1 = n + 1;
+    std::vector<int64_t> pref(np1 * np1, 0LL);
+
+    // First pass: horizontal cumulative sums per row
+    for (int i = 0; i < n; ++i) {
+        int64_t row_sum = 0;
+        const int base_i = (i + 1) * np1;
+        const int mat_base = i * n;
+        for (int j = 0; j < n; ++j) {
+            row_sum += mat[mat_base + j];
+            pref[base_i + (j + 1)] = row_sum;
+        }
+    }
+
+    // Second pass: vertical accumulation to complete the integral image
+    for (int i = 0; i < n; ++i) {
+        const int base_cur = (i + 1) * np1;
+        const int base_prev = i * np1;
+        for (int j = 0; j < n; ++j) {
+            pref[base_cur + (j + 1)] += pref[base_prev + (j + 1)];
+        }
+    }
+
+    // Precompute row offsets for faster access in search loop
+    std::vector<int> row_offset(np1);
+    for (int i = 0; i < np1; ++i) {
+        row_offset[i] = i * np1;
+    }
+
+    int64_t mxSum = LLONG_MIN;
+    const int rows = n - s + 1;
+    const int cols = n - s + 1;
+
+#pragma omp parallel for collapse(2) schedule(static) reduction(max:mxSum)
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols; ) {
+            // Process two columns at once using NEON if possible
+            if (j + 2 <= cols) {
+                const int64_t* base_is_js = &pref[row_offset[i + s] + j + s];
+                const int64_t* base_i_js  = &pref[row_offset[i]     + j + s];
+                const int64_t* base_is_j  = &pref[row_offset[i + s] + j];
+                const int64_t* base_i_j   = &pref[row_offset[i]     + j];
+
+                // Load four prefix values needed for two submatrix sums:
+                // sum_k = ps[i+s][j+k+s] - ps[i][j+k+s] - ps[i+s][j+k] + ps[i][j+k]
+                int64x2_t v_ps_is_js = vld1q_s64(base_is_js);  // [k=0, k=1]
+                int64x2_t v_ps_i_js  = vld1q_s64(base_i_js);
+                int64x2_t v_ps_is_j  = vld1q_s64(base_is_j);
+                int64x2_t v_ps_i_j   = vld1q_s64(base_i_j);
+
+                // Compute (A - B) - (C - D) = A - B - C + D
+                int64x2_t diff1 = vsubq_s64(v_ps_is_js, v_ps_i_js);
+                int64x2_t diff2 = vsubq_s64(v_ps_is_j,  v_ps_i_j);
+                int64x2_t sum_vec = vsubq_s64(diff1, diff2);
+
+                // Extract both sums and update max
+                alignas(16) int64_t sums[2];
+                vst1q_s64(sums, sum_vec);
+                mxSum = std::max(mxSum, sums[0]);
+                mxSum = std::max(mxSum, sums[1]);
+
+                j += 2;
+            } else {
+                // Scalar remainder for the last column (if cols is odd)
+                int64_t sum = pref[row_offset[i + s] + j + s]
+                            - pref[row_offset[i]     + j + s]
+                            - pref[row_offset[i + s] + j]
+                            + pref[row_offset[i]     + j];
+                mxSum = std::max(mxSum, sum);
+                ++j;
+            }
+        }
+    }
+
+    printf("%d\n", static_cast<int>(mxSum));
+    return 0;
+}

@@ -7470,7 +7470,7 @@ Les formules de réduction, d’accélération, d’efficacité et d’écart-ty
 
 ### K.1. Index des fichiers de cette édition
 
-Les fichiers ci-dessous accompagnent les PDF. Les fichiers JSON de registres contiennent les contrats, les finalistes, les missions, les sources d’intégration, les résultats et les paramètres ; le CSV brut contient chacune des répétitions CPU. Les chemins locaux des archives originales sont conservés dans index-campagnes.json et audit-calculs.json. Les compléments Luna d’origine sont details-missions-couverture-luna-max.json, episodes-harnais-couverture-luna-max.json et arbres-couverture-luna-max.json. Les fichiers Astra correspondants emploient le suffixe couverture-astra-max ; les appels sans compteur et interruptions restent explicitement identifiés. Leurs hypothèses déclarées restent des données de modèle. L’article n’affirme pas qu’un dépôt public existe.
+Les fichiers ci-dessous accompagnent les PDF. Les fichiers JSON de registres contiennent les contrats, les finalistes, les missions, les sources d’intégration, les résultats et les paramètres ; le CSV brut contient chacune des répétitions CPU. Les chemins locaux des archives originales sont conservés dans index-campagnes.json et audit-calculs.json. Les compléments Luna d’origine sont details-missions-couverture-luna-max.json, episodes-harnais-couverture-luna-max.json et arbres-couverture-luna-max.json. Les fichiers Astra correspondants emploient le suffixe couverture-astra-max ; les appels sans compteur et interruptions restent explicitement identifiés. Leurs hypothèses déclarées restent des données de modèle. Les données et éditions publiques sont accessibles dans le [dépôt HPC-Forest](https://github.com/Gotman08/hpc-forest-evidence) ; la comparaison R1/R2 et ses niveaux de preuve sont détaillés en annexe L.
 
 | Fichier relatif | Contenu |
 |---|---|
@@ -7489,3 +7489,139 @@ Les fichiers ci-dessous accompagnent les PDF. Les fichiers JSON de registres con
 
 
 La réception d’origine contrôle l’archive annoncée, son empreinte distante et locale, sa restauration dans un dossier neuf, puis l’inventaire avant/après audit en lecture seule. La réanalyse éditoriale s’appuie sur ces reçus positifs et relit les registres immuables ; elle ne prétend pas avoir réexécuté tous les programmes. Les archives originales, les erreurs de lecteurs et les premières versions ne sont pas effacées.
+
+
+## L. Comparaison R1/R2 : couverture, échantillons et limites
+
+Cette annexe prolonge les résultats historiques sans les remplacer. Les données R2 reçues décrivent un premier lot audité et une finale produite par la source ; aucun nouveau gain indépendant R2 ni paire finale R1/R2 n'est admis. Les soixante identités partagent les quinze sujets et quatre modèles MAX enregistrés, mais l'ordre temporel, les conditions et l'effort effectif diffèrent. NA signifie une mesure absente ; un facteur 1 signifie que R1 conserve sa référence.
+
+Les fichiers [matrice CSV](donnees-r1-r2/matrix15-comparison.csv), [données et niveaux de preuve JSON](donnees-r1-r2/comparison.json), [temps individuels CSV](donnees-r1-r2/timing-samples.csv) et [provenance](donnees-r1-r2/provenance.json) accompagnent les figures [couverture SVG](edition-professionnelle/figures/comparaison-r1-r2/couverture-r1-r2.svg), [chronométrages SVG](edition-professionnelle/figures/comparaison-r1-r2/quicksort-repetitions-r1-r2.svg) et [coûts SVG](edition-professionnelle/figures/comparaison-r1-r2/cout-et-couverture-r1-r2.svg). Les sources vectorielles PDF de chaque figure portent le même nom.
+
+### L.1. Matrice complète
+
+| Sujet | Modèle MAX | Facteur R1 | Sélection R1 | Réception R2 |
+|---|---|---|---|---|
+| 2023-count | Sol | 9,868154 | Candidat confirmé | NA |
+| 2023-count | Luna | 9,979436 | Candidat confirmé | NA |
+| 2023-count | Astra | 10,725201 | Candidat confirmé | NA |
+| 2023-count | Terra | 3,464843 | Candidat confirmé | NA |
+| 2020-tropical | Sol | 1,000000 | Référence retenue | NA |
+| 2020-tropical | Luna | 1,000000 | Référence retenue | NA |
+| 2020-tropical | Astra | 1,000000 | Référence retenue | NA |
+| 2020-tropical | Terra | 1,000000 | Référence retenue | NA |
+| 2020-quicksort | Sol | 4,548979 | Candidat confirmé | NA |
+| 2020-quicksort | Luna | 2,423475 | Candidat confirmé | Premier lot audité ; finale source seule |
+| 2020-quicksort | Astra | 3,976701 | Candidat confirmé | NA |
+| 2020-quicksort | Terra | 4,320507 | Candidat confirmé | NA |
+| 2020-permutations | Sol | 15,731860 | Candidat confirmé | NA |
+| 2020-permutations | Luna | 20,723464 | Candidat confirmé | NA |
+| 2020-permutations | Astra | 21,609856 | Candidat confirmé | NA |
+| 2020-permutations | Terra | 21,484897 | Candidat confirmé | NA |
+| 2020-graph | Sol | 2,030861 | Candidat confirmé | NA |
+| 2020-graph | Luna | 2,200178 | Candidat confirmé | NA |
+| 2020-graph | Astra | 1,960242 | Candidat confirmé | NA |
+| 2020-graph | Terra | 2,141463 | Candidat confirmé | NA |
+| 2021-graph | Sol | 1,476261 | Candidat confirmé | NA |
+| 2021-graph | Luna | 1,364212 | Candidat confirmé | NA |
+| 2021-graph | Astra | 1,596251 | Candidat confirmé | NA |
+| 2021-graph | Terra | 1,597056 | Candidat confirmé | NA |
+| 2021-metrics | Sol | 1,744907 | Candidat confirmé | NA |
+| 2021-metrics | Luna | 1,795871 | Candidat confirmé | NA |
+| 2021-metrics | Astra | 1,757656 | Candidat confirmé | NA |
+| 2021-metrics | Terra | 1,000000 | Référence retenue | NA |
+| 2021-sokoban | Sol | 1,000000 | Référence retenue | NA |
+| 2021-sokoban | Luna | 1,000000 | Référence retenue | NA |
+| 2021-sokoban | Astra | 1,000000 | Référence retenue | NA |
+| 2021-sokoban | Terra | 1,000000 | Référence retenue | NA |
+| 2021-jacobi | Sol | 1,576944 | Candidat confirmé | NA |
+| 2021-jacobi | Luna | 1,511510 | Candidat confirmé | NA |
+| 2021-jacobi | Astra | 1,587959 | Candidat confirmé | NA |
+| 2021-jacobi | Terra | 1,455285 | Candidat confirmé | NA |
+| 2022-knn | Sol | 91,841306 | Candidat confirmé | NA |
+| 2022-knn | Luna | 76,664759 | Candidat confirmé | NA |
+| 2022-knn | Astra | 85,291148 | Candidat confirmé | NA |
+| 2022-knn | Terra | 83,310012 | Candidat confirmé | NA |
+| 2022-sum | Sol | 14,266205 | Candidat confirmé | NA |
+| 2022-sum | Luna | 2,350934 | Candidat confirmé | NA |
+| 2022-sum | Astra | 14,102157 | Candidat confirmé | NA |
+| 2022-sum | Terra | 12,682149 | Candidat confirmé | NA |
+| 2022-nbody | Sol | 7,388508 | Candidat confirmé | NA |
+| 2022-nbody | Luna | 3,890667 | Candidat confirmé | NA |
+| 2022-nbody | Astra | 3,895303 | Candidat confirmé | NA |
+| 2022-nbody | Terra | 3,896861 | Candidat confirmé | NA |
+| 2022-bucketsort | Sol | 25,093080 | Candidat confirmé | NA |
+| 2022-bucketsort | Luna | 37,878028 | Candidat confirmé | NA |
+| 2022-bucketsort | Astra | 37,940688 | Candidat confirmé | NA |
+| 2022-bucketsort | Terra | 32,650915 | Candidat confirmé | NA |
+| 2023-sum | Sol | 8,309671 | Candidat confirmé | NA |
+| 2023-sum | Luna | 10,489699 | Candidat confirmé | NA |
+| 2023-sum | Astra | 3,455277 | Candidat confirmé | NA |
+| 2023-sum | Terra | 1,000000 | Référence retenue | NA |
+| 2023-npbonacci | Sol | 3,702877 | Candidat confirmé | NA |
+| 2023-npbonacci | Luna | 3,822291 | Candidat confirmé | NA |
+| 2023-npbonacci | Astra | 3,771633 | Candidat confirmé | NA |
+| 2023-npbonacci | Terra | 1,000000 | Référence retenue | NA |
+
+
+### L.2. Répétitions exactes du cas concordant
+
+Les temps ci-dessous sont en secondes. La confirmation R1, le premier lot R2 et la finale R2 sont conservés comme séries distinctes. Les références R1 sont celles de 748259 ; aucune répétition de 749843 source-only n'est substituée. Les champs JSON gardent la précision numérique complète, la provenance et le niveau de preuve.
+
+| Série | Programme | Répétition | Temps (s) |
+|---|---|---|---|
+| R1 · confirmation | Référence | 1 | 0,069108725525 |
+| R1 · confirmation | Référence | 2 | 0,068945400417 |
+| R1 · confirmation | Référence | 3 | 0,068812732585 |
+| R1 · confirmation | Référence | 4 | 0,068846074864 |
+| R1 · confirmation | Référence | 5 | 0,068680447526 |
+| R1 · confirmation | Candidat | 1 | 0,028659142554 |
+| R1 · confirmation | Candidat | 2 | 0,028320717625 |
+| R1 · confirmation | Candidat | 3 | 0,028293710202 |
+| R1 · confirmation | Candidat | 4 | 0,028390956111 |
+| R1 · confirmation | Candidat | 5 | 0,028442732058 |
+| R2 · lot audité | Référence | 1 | 0,070286947303 |
+| R2 · lot audité | Référence | 2 | 0,070247394964 |
+| R2 · lot audité | Référence | 3 | 0,070207619108 |
+| R2 · lot audité | Candidat | 1 | 0,061421416700 |
+| R2 · lot audité | Candidat | 2 | 0,061244620942 |
+| R2 · lot audité | Candidat | 3 | 0,061352682300 |
+| R2 · finale source seule | Référence | 1 | 0,070650454611 |
+| R2 · finale source seule | Référence | 2 | 0,070148352534 |
+| R2 · finale source seule | Référence | 3 | 0,070837363601 |
+| R2 · finale source seule | Référence | 4 | 0,070156831294 |
+| R2 · finale source seule | Référence | 5 | 0,069878596812 |
+| R2 · finale source seule | Candidat | 1 | 0,061374148354 |
+| R2 · finale source seule | Candidat | 2 | 0,061233542860 |
+| R2 · finale source seule | Candidat | 3 | 0,060708336532 |
+| R2 · finale source seule | Candidat | 4 | 0,060976299457 |
+| R2 · finale source seule | Candidat | 5 | 0,060763696209 |
+
+
+### L.3. Coûts, incidents et niveau de preuve
+
+Les deux appels R2 déjà audités totalisent 32 765 jetons exacts ; aucun compteur inconnu n'est complété par une réservation. Le coût connu du cas R1 concordant vaut 261 707 jetons. La comparaison concerne un cas R1 clos et une réception R2 partielle, avec audit dans l'horloge d'origine : elle n'établit aucune efficacité relative par jeton.
+
+L'incident Sol/MAX/count 755766 s'est produit avant admission et avant appel de modèle. Il est conservé comme incident technique, sans temps de candidat ni résultat algorithmique. Les autres cellules sans mesure reçue restent NA, même lorsqu'une préparation technique existe. Les statuts de jobs ne sont pas utilisés comme substituts à des résultats de performance.
+
+Le statut source seule de la finale R2 conserve les cinq temps et les déclarations du programme sans promouvoir une remesure indépendante. Les empreintes publiques du dataset et les références numériques permettent d'inspecter cette distinction. Les textes de modèles, arguments CLI, chemins privés de skills, recensements de processus et implémentations privées ne sont pas ajoutés à cette édition.
+
+
+### L.4. Conditions et chronologie du cas concordant
+
+Le modèle, l'effort MAX, la graine 23, le contrat de vérification, les commandes déclarées, les plafonds communs et l'empreinte du compilateur concordent. Les nœuds, les allocations, les identifiants de protocole et les implémentations de contrôleur diffèrent. Le premier lot R2 a été interrompu pour audit dans son horloge d'origine ; aucune durée ni consommation n'a été remise à zéro. Les dates du point d'arrêt et du reçu de libération ci-dessous sont des métadonnées archivées de fichiers et ne constituent pas une mesure exacte de temps d'attente ou de CPU.
+
+| Rubrique | R1 / R2 |
+|---|---|
+| Jobs et nœuds | R1 : 748259 / romeo-a041 ; R2 : 755562 / romeo-a057 |
+| Archive source R1 historique | `cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18` |
+| Archive source R2 | `b79e6fdc3e1e0dae5d9d240353510c504ffc1298265a6d425f248a8f2b5489d4` |
+| Protocole R1 | `da707adbad2797c21ce92f72e8b7b33630878a814445125709251a1b4d366be5` |
+| Protocole R2 | `afc54473852a57f801fb42d776195f1ccbcce7949ed8cda85a76d685ae115392` |
+| Effort réalisé | R1 : huit programmes, dix appels natifs ; R2 : un programme, deux appels reçus |
+| Point d'arrêt archivé R2 | 19 octobre 2026, 10:49:24.356543 UTC |
+| Reçu de libération archivé R2 | 19 octobre 2026, 11:10:38.431345 UTC |
+| Intervalle de métadonnées | 1274,074801683426 s ; aucune interprétation comme CPU ou attente opérateur exacte |
+| Fin des admissions de recherche | Événement source 11:10:38.447683 UTC : No remaining search admission |
+| Échéances initiales conservées | Recherche 11:13:04.369661 UTC ; campagne 11:15:04.369661 UTC |
+| Fenêtre minimale d'une nouvelle génération R2 | 600 s ; ce contrôle diffère du contrôleur historique |
+| Conclusion autorisée | Description des séries et de leur couverture ; aucune supériorité causale R1/R2 |

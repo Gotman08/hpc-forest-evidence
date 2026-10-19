@@ -4,6 +4,9 @@ _Public versions preserve the evidence and its interpretation._
 
 ## Received evidence update — 2026-10-19
 
+- Integrate received R2 observations into article r5, section 3.9 and Appendix L, with three R1/R2 figures and public numeric figure-rebuild inputs
+- Publish the 60-cell comparison and 26 timing samples at the 11:40:35.931 UTC source cutoff: one source-confirmed R2 cell, 59 R2 cells without measurements, zero scientifically admitted gains and zero admitted R1/R2 pairs
+- Preserve the exact r4 PDF, HTML, Markdown, provenance and 275 figures under `docs/article/history/r4`, along with the unchanged earlier data snapshots
 - Add the first audited native R2 search batch for Luna MAX on 2020-quicksort: three initial timings, contemporary reference, two calls and 32,765 exact tokens, with a separate 11:11:41.348 UTC ARM acceptance cutoff
 - Preserve command-stream-v1 limitations, pre-admission bootstrap and audit-reader incidents, original deadlines, and the absence of final confirmation, admitted scientific gain or campaign completion
 - Add the subsequently received zero-model qualification of all fifteen references: 75 timings, exact arithmetic checks, private provenance digests and explicit baseline-only scope
@@ -17,7 +20,7 @@ _Public versions preserve the evidence and its interpretation._
 - Preserve negative observations, unknown costs and historical non-MAX observations without adding them to the new MAX-only plan
 - Define the next campaign as fifteen subjects × four models at MAX after one completed primes pilot and technical qualification
 
-The PDFs preserve the exact received r4 bytes and their dated technical snapshot. The prior edition remains in Git history; the historical received-data projection is retained, and the r4 supplement records the newer operational evidence separately. Private source, prompts, credentials, account paths, evaluated binaries and protected inputs remain excluded.
+The current PDFs carry the received article r5 comparison; the exact r4 bytes and their dated technical snapshot remain in the self-contained history directory. The historical received-data projection, r4 supplement, qualification and first-batch snapshot are retained. Private source, prompts, credentials, account paths, evaluated binaries and protected inputs remain excluded.
 
 ## 0.1.0 — 2026-10-16
 

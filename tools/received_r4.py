@@ -203,6 +203,8 @@ class HTMLReferences(HTMLParser):
 
 def verify_article(root):
     folder = Path(root) / "docs/article"
+    if load(folder / "provenance.json").get("edition") != "2026-10-19-r4":
+        folder = folder / "history/r4"
     provenance = load(folder / "provenance.json")
     need(provenance["edition"] == "2026-10-19-r4" and provenance["technical_snapshot_utc"] == CUTOFF,
          "Article edition or cutoff differs")

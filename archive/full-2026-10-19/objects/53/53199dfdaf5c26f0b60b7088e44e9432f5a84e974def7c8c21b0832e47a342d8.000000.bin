@@ -1,0 +1,264 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include <stdint.h>
+
+#define INPUT_CAPACITY (1u << 16)
+#define OUTPUT_CAPACITY (1u << 16)
+
+typedef struct {
+    unsigned char data[INPUT_CAPACITY];
+    size_t position;
+    size_t length;
+} Input;
+
+typedef struct {
+    char data[OUTPUT_CAPACITY];
+    size_t length;
+} Output;
+
+static void fail(void)
+{
+    exit(EXIT_FAILURE);
+}
+
+static int input_get(Input *input)
+{
+    if (input->position == input->length) {
+        input->length = fread(input->data, 1, sizeof(input->data), stdin);
+        input->position = 0;
+        if (input->length == 0)
+            return EOF;
+    }
+
+    return input->data[input->position++];
+}
+
+static int input_long(Input *input, long *value)
+{
+    int c;
+    int negative = 0;
+    unsigned long number = 0;
+    int has_digit = 0;
+
+    do {
+        c = input_get(input);
+    } while (c != EOF && c <= ' ');
+
+    if (c == EOF)
+        return 0;
+
+    if (c == '-' || c == '+') {
+        negative = (c == '-');
+        c = input_get(input);
+    }
+
+    while (c >= '0' && c <= '9') {
+        unsigned long digit = (unsigned long)(c - '0');
+        if (number > (ULONG_MAX - digit) / 10)
+            return 0;
+        number = number * 10 + digit;
+        has_digit = 1;
+        c = input_get(input);
+    }
+
+    if (!has_digit)
+        return 0;
+
+    if (negative) {
+        unsigned long limit = (unsigned long)LONG_MAX + 1UL;
+        if (number > limit)
+            return 0;
+        *value = (number == limit) ? LONG_MIN : -(long)number;
+    } else {
+        if (number > (unsigned long)LONG_MAX)
+            return 0;
+        *value = (long)number;
+    }
+
+    return 1;
+}
+
+static int input_token(Input *input, char *destination, size_t capacity)
+{
+    int c;
+    size_t length = 0;
+
+    do {
+        c = input_get(input);
+    } while (c != EOF && c <= ' ');
+
+    if (c == EOF)
+        return 0;
+
+    while (c > ' ') {
+        if (length + 1 >= capacity)
+            return 0;
+        destination[length++] = (char)c;
+        c = input_get(input);
+    }
+
+    destination[length] = '\0';
+    return 1;
+}
+
+static char *load_strings(size_t *count, size_t *stride)
+{
+    Input input = { { 0 }, 0, 0 };
+    long declared_length;
+    long records;
+    long ignored;
+    size_t bytes;
+    char *strings;
+
+    if (!input_long(&input, &declared_length) ||
+        !input_long(&input, &records) ||
+        !input_long(&input, &ignored) ||
+        !input_long(&input, &ignored))
+        fail();
+
+    if (declared_length < 0 || records < 0 ||
+        (unsigned long)declared_length >= SIZE_MAX ||
+        (unsigned long)records > SIZE_MAX)
+        fail();
+
+    *stride = (size_t)declared_length + 1;
+    *count = (size_t)records;
+
+    if (*count != 0 && *stride > SIZE_MAX / *count)
+        fail();
+    bytes = *count * *stride;
+
+    strings = (char *)malloc(bytes == 0 ? 1 : bytes);
+    if (strings == NULL)
+        fail();
+
+    for (size_t i = 0; i < *count; ++i) {
+        char *record = strings + i * *stride;
+        memset(record, 0, *stride);
+        if (!input_token(&input, record, *stride)) {
+            free(strings);
+            fail();
+        }
+    }
+
+    return strings;
+}
+
+static char *radix_sort(char *keys, size_t count, size_t stride)
+{
+    char *scratch;
+    char *source;
+    char *destination;
+    size_t total;
+
+    if (count < 2 || stride < 2)
+        return keys;
+
+    total = count * stride;
+    scratch = (char *)malloc(total);
+    if (scratch == NULL)
+        fail();
+
+    source = keys;
+    destination = scratch;
+
+    for (size_t digit = stride - 1; digit-- != 0;) {
+        size_t frequencies[256] = { 0 };
+        char *slots[256];
+        char *cursor;
+        const char *record;
+
+        record = source;
+        for (size_t i = 0; i < count; ++i, record += stride)
+            ++frequencies[(unsigned char)record[digit]];
+
+        cursor = destination;
+        for (size_t value = 0; value < 256; ++value) {
+            slots[value] = cursor;
+            cursor += frequencies[value] * stride;
+        }
+
+        record = source;
+        for (size_t i = 0; i < count; ++i, record += stride) {
+            unsigned char value = (unsigned char)record[digit];
+            memcpy(slots[value], record, stride);
+            slots[value] += stride;
+        }
+
+        {
+            char *temporary = source;
+            source = destination;
+            destination = temporary;
+        }
+    }
+
+    if (source != keys) {
+        free(keys);
+        return source;
+    }
+
+    free(scratch);
+    return keys;
+}
+
+static void output_flush(Output *output)
+{
+    if (output->length != 0) {
+        fwrite(output->data, 1, output->length, stdout);
+        output->length = 0;
+    }
+}
+
+static void output_write(Output *output, const char *data, size_t length)
+{
+    while (length != 0) {
+        size_t available = sizeof(output->data) - output->length;
+        size_t chunk;
+
+        if (available == 0) {
+            output_flush(output);
+            available = sizeof(output->data);
+        }
+
+        chunk = length < available ? length : available;
+        memcpy(output->data + output->length, data, chunk);
+        output->length += chunk;
+        data += chunk;
+        length -= chunk;
+    }
+}
+
+static void save_strings(const char *strings, size_t count, size_t stride)
+{
+    Output output = { { 0 }, 0 };
+
+    for (size_t i = 0; i < count; ++i) {
+        const char *record = strings + i * stride;
+        size_t length = 0;
+
+        while (length < stride && record[length] != '\0')
+            ++length;
+
+        output_write(&output, record, length);
+        if (output.length == sizeof(output.data))
+            output_flush(&output);
+        output.data[output.length++] = '\n';
+    }
+
+    output_flush(&output);
+}
+
+int main(void)
+{
+    size_t count;
+    size_t stride;
+    char *strings = load_strings(&count, &stride);
+
+    strings = radix_sort(strings, count, stride);
+    save_strings(strings, count, stride);
+    free(strings);
+
+    return EXIT_SUCCESS;
+}

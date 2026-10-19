@@ -1,0 +1,130 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute gravitational forces using Structure-of-Arrays layout.
+ */
+void body_force(float *restrict x, float *restrict y, float *restrict z,
+                float *restrict vx, float *restrict vy, float *restrict vz,
+                float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    float xi = x[i];
+    float yi = y[i];
+    float zi = z[i];
+
+    for (int j = 0; j < n; ++j) {
+      float dx = x[j] - xi;
+      float dy = y[j] - yi;
+      float dz = z[j] - zi;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1.0f / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    vx[i] += dt*fx;
+    vy[i] += dt*fy;
+    vz[i] += dt*fz;
+  }
+}
+
+/*
+ * Read binary dataset and convert to SoA.
+ */
+void read_dataset(float **x, float **y, float **z,
+                  float **vx, float **vy, float **vz,
+                  int *nbodies) {
+  if (fread(nbodies, sizeof(*nbodies), 1, stdin) != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  size_t sz = *nbodies * sizeof(float);
+  if (posix_memalign((void**)x, 16, sz) ||
+      posix_memalign((void**)y, 16, sz) ||
+      posix_memalign((void**)z, 16, sz) ||
+      posix_memalign((void**)vx, 16, sz) ||
+      posix_memalign((void**)vy, 16, sz) ||
+      posix_memalign((void**)vz, 16, sz)) {
+    fprintf(stderr,"\nError allocating aligned memory\n");
+    exit(EXIT_FAILURE);
+  }
+
+  Body *tmp = (Body *)malloc(*nbodies * sizeof(Body));
+  if (!tmp) { perror("malloc"); exit(EXIT_FAILURE); }
+  if (fread(tmp, *nbodies * sizeof(Body), 1, stdin) != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  for (int i = 0; i < *nbodies; ++i) {
+    (*x)[i] = tmp[i].x;
+    (*y)[i] = tmp[i].y;
+    (*z)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+  free(tmp);
+}
+
+/*
+ * Write SoA data back to AoS binary format.
+ */
+void write_dataset(int nbodies, float *x, float *y, float *z,
+                   float *vx, float *vy, float *vz) {
+  Body *tmp = (Body *)malloc(nbodies * sizeof(Body));
+  if (!tmp) { perror("malloc"); exit(EXIT_FAILURE); }
+
+  for (int i = 0; i < nbodies; ++i) {
+    tmp[i].x = x[i];
+    tmp[i].y = y[i];
+    tmp[i].z = z[i];
+    tmp[i].vx = vx[i];
+    tmp[i].vy = vy[i];
+    tmp[i].vz = vz[i];
+  }
+
+  if (fwrite(tmp, nbodies * sizeof(Body), 1, stdout) != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+  free(tmp);
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  float *x, *y, *z, *vx, *vy, *vz;
+
+  read_dataset(&x, &y, &z, &vx, &vy, &vz, &nbodies);
+
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(x, y, z, vx, vy, vz, DT, nbodies);
+
+    for (int i = 0; i < nbodies; ++i) {
+      x[i] += vx[i] * DT;
+      y[i] += vy[i] * DT;
+      z[i] += vz[i] * DT;
+    }
+  }
+
+  write_dataset(nbodies, x, y, z, vx, vy, vz);
+
+  free(x); free(y); free(z); free(vx); free(vy); free(vz);
+  return 0;
+}

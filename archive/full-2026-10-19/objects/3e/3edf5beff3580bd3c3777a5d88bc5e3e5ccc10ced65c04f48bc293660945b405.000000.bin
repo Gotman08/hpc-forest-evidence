@@ -1,0 +1,280 @@
+"""Freeze named actual startup metadata using a supplied auth observation. No CLI/auth access."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+HERE = Path(__file__).resolve().parent
+COMMON = HERE / 'commun.py'
+COMMON_SHA = 'fd416324a4332ceb71d0f194cf7636264980bb1aee52f0beaa7821008806aec5'
+if hashlib.sha256(COMMON.read_bytes()).hexdigest() != COMMON_SHA:
+    raise ValueError('Changed exact pure common metadata module before import')
+spec = importlib.util.spec_from_file_location('r2e_initial_metadata_common', COMMON)
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+READER = c.BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2e/reception-premier-batch-r1/controler-reception-bornee.py'
+READER_SHA = '7d704cfa7dc2abbb360a137eb82ce86ed9d13b88c20a09eed4cfb10fd15219bf'
+NAMES = ('CELL-BINDING.json', 'OWNER.json', 'worker-ready.json')
+AUTH_FIELDS = {'schema', 'verified', 'observed_at', 'auth_mode', 'api_key_in_auth_present',
+    'OPENAI_API_KEY_environment_present', 'CODEX_API_KEY_environment_present', 'secrets_exported',
+    'authentication_changed', 'cli_executable_sha256'}
+IDENTITY_FIELDS = {'ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate'}
+
+
+def check_input_paths(launch_path, auth_path):
+    # Close the namespace BEFORE any hash/read, including a rejected input.
+    c.need(auth_path.is_absolute() and '..' not in auth_path.parts
+        and auth_path.parent == c.OPS and auth_path.name == 'AUTH-METADATA-PARENT.json',
+        'Only the named parent OPS auth metadata may be read')
+    c.need(launch_path.is_absolute() and '..' not in launch_path.parts
+        and launch_path.name == 'LANCEMENTS-POSSEDES-RECUS.json'
+        and launch_path.parent.parent == c.FACTORY / 'helper-lancement-possedes',
+        'Actual owned-launch reception in the exact new helper output required')
+    for path in (launch_path, auth_path):
+        c.need(not any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)()
+                       for p in (path, *path.parents)), 'Aliased initial metadata path forbidden')
+
+
+def utc_timestamp(value):
+    c.need(isinstance(value, str), 'Explicit initial UTC timestamp required')
+    stamp = datetime.fromisoformat(value)
+    c.need(stamp.tzinfo is not None, 'Timezone-aware initial timestamp required')
+    return stamp.timestamp()
+
+
+def census_rows(value):
+    rows = value.get('rows')
+    c.need(value.get('schema') == 'hpc-forest-dynamic-r4b-full-cim-v1'
+        and value.get('complete_census') is True and value.get('strict_utf8_decoding') is True
+        and isinstance(rows, list) and type(value.get('rows_count')) is int
+        and value['rows_count'] == len(rows)
+        and all(isinstance(row, dict) and IDENTITY_FIELDS <= set(row)
+                and type(row.get('ProcessId')) is int and row['ProcessId'] >= 0 for row in rows)
+        and len({row['ProcessId'] for row in rows}) == len(rows),
+        'Exact complete initial census and unique PID rows required')
+    return {row['ProcessId']: row for row in rows}, utc_timestamp(value.get('captured_at_utc'))
+
+
+def frozen_validator(factory):
+    # Reuse the one exact reviewed pure function, with the NEW factory scope.
+    # Never import the old first-batch controller or its old factory globals.
+    c.pinned(READER, READER_SHA)
+    tree = ast.parse(READER.read_text(encoding='utf8'))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name == 'verify_frozen_authorizations']
+    c.need(len(functions) == 1, 'Exactly one pinned frozen authorization function required')
+    dependencies = {node.attr for node in ast.walk(functions[0])
+                    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id == 'm'}
+    c.need(dependencies == {'SCOPE', 'need'}, 'Pinned frozen verifier dependency API changed')
+    c.need(c.SCOPE == 'hpc-forest-primes-native-max-r2g' and callable(c.need),
+           'Exact sealed R2f scope and pure guard required before any cell configure')
+    # The function originally used reception_bornee's SCOPE/need interface.
+    # The factory exposes require and may still have SCOPE=None before configure.
+    # Bind its complete two-member API explicitly, without mutable factory globals.
+    namespace = {'m': SimpleNamespace(SCOPE=c.SCOPE, need=c.need)}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(READER), 'exec'), namespace)  # noqa: S102 -- one exact SHA-bound pure function
+    return namespace['verify_frozen_authorizations']
+
+
+def check_auth_metadata(value, cli_sha):
+    c.need(isinstance(value, dict) and set(value) == AUTH_FIELDS
+        and value.get('schema') == 'hpc-forest-r2e-parent-auth-metadata-observation-v1'
+        and value.get('verified') is True and value.get('auth_mode') == 'chatgpt'
+        and value.get('cli_executable_sha256') == cli_sha
+        and all(value.get(key) is False for key in ('api_key_in_auth_present',
+            'OPENAI_API_KEY_environment_present', 'CODEX_API_KEY_environment_present',
+            'secrets_exported', 'authentication_changed')),
+        'Actual closed secret-free parent auth metadata required; never infer these flags from ready')
+    c.fresh(value)
+
+
+def validate_ready(binding, owner, ready, policy_sha, cli, pair, *, before_census,
+                   after_census, lane_observed_at):
+    expected_owner = {'protocol': 'hpc-forest-codex-mailbox-v1', 'owner': binding['job_id'],
+        'reasoning_effort': 'max', **binding}
+    c.need(owner == expected_owner and all(ready.get(k) == v for k, v in expected_owner.items()),
+           'Actual initial OWNER/ready must bind the exact source/job/session/MAX')
+    c.need(ready.get('mode') == 'codex' and ready.get('authentication') == 'existing-local-ChatGPT'
+        and ready.get('codex_executable') == str(cli)
+        and ready.get('codex_executable_sha256') == c.sha(cli)
+        and ready.get('codex_cli_version') == 'codex-cli 0.163.0-alpha.10.2'
+        and ready.get('task_cli_policy_sha256') == policy_sha
+        and ready.get('task_cli_policy_candidate_count') == 236
+        and ready.get('local_skill_paths_exported') is False
+        and ready.get('weight_digest_available') is False and ready.get('model_weights_on_romeo') is False,
+        'Actual ready lacks exact CLI/OAuth/policy startup evidence')
+    c.need(type(ready.get('pid')) is int and ready['pid'] > 0
+        and type(ready.get('started_at')) in (float, int) and math.isfinite(ready['started_at'])
+        and ready['started_at'] <= time.time() and isinstance(pair, list) and len(pair) == 2
+        and ready['pid'] in {r.get('ProcessId') for r in pair}, 'Ready PID must belong to the actual received launch pair')
+    c.need(all(isinstance(r, dict) and type(r.get('ProcessId')) is int and r['ProcessId'] > 0
+        and type(r.get('ParentProcessId')) is int and r['ParentProcessId'] >= 0
+        and all(isinstance(r.get(k), str) and r[k] for k in
+            ('ExecutablePath', 'CommandLine', 'CreationDate')) for r in pair)
+        and len({r['ProcessId'] for r in pair}) == 2
+        and (pair[0]['ParentProcessId'] == pair[1]['ProcessId'] or pair[1]['ParentProcessId'] == pair[0]['ProcessId']),
+        'Actual two full owned startup identities required')
+    before, captured_before = census_rows(before_census)
+    after, captured_after = census_rows(after_census)
+    c.need(captured_before <= captured_after <= time.time(), 'Initial census chronology differs')
+    # The launch helper records [launcher, real Python child], in that order.
+    c.need(pair[1]['ParentProcessId'] == pair[0]['ProcessId'] and ready['pid'] == pair[1]['ProcessId']
+        and utc_timestamp(pair[1]['CreationDate']) <= ready['started_at'],
+           'Ready must name the exact main Python child, never its launcher')
+    for row in pair:
+        full = {key: row[key] for key in IDENTITY_FIELDS}
+        actual = after.get(row['ProcessId'])
+        prior = before.get(row['ProcessId'])
+        c.need(actual is not None and {key: actual[key] for key in IDENTITY_FIELDS} == full
+            and (prior is None or {key: prior[key] for key in IDENTITY_FIELDS} != full)
+            and captured_before <= utc_timestamp(row['CreationDate']) <= captured_after,
+            'Owned initial pair is not the exact newly created pair in the received after census')
+    c.need(type(lane_observed_at) in (float, int) and math.isfinite(lane_observed_at),
+           'Frozen typed lane observation must be a finite numeric timestamp, never bool or ISO text')
+    observed = lane_observed_at
+    c.need(0 <= ready['started_at'] - observed <= 600,
+           'Actual readiness must follow its frozen initial lane observation within600seconds')
+
+
+def save(path, value):
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    return c.ref(path)
+
+
+def receive(launch_path, launch_sha, auth_path, auth_sha, output_name):
+    check_input_paths(launch_path, auth_path)
+    c.pinned(launch_path, launch_sha)
+    c.pinned(auth_path, auth_sha)
+    factory = c.load_factory()
+    auth = c.read(auth_path)
+    check_auth_metadata(auth, factory.m.CLI_SHA)
+    verify_frozen = frozen_validator(factory)
+    launched = c.read(launch_path)
+    c.need(launched.get('schema') == 'hpc-forest-r2e-three-owned-worker-launch-reception-v1'
+        and launched.get('verified') is True and launched.get('native_worker_count') == 3
+        and launched.get('maximum_native_workers') == 4
+        and launched.get('no_automatic_retry') is True
+        and launched.get('foreign_processes_adopted_or_stopped') is False,
+        'Actual exact owned-three-worker startup receipt required')
+    rows = launched.get('workers', [])
+    c.need(isinstance(rows, list) and len(rows) == 3
+        and {r.get('model') for r in rows} == {m for m, _ in c.MODELS.values()}, 'Exact three new models required')
+    censuses = {}
+    for name in ('before_census', 'after_census'):
+        path = Path(launched[name])
+        c.need(path.parent == launch_path.parent and path.name == ('cim-complet-avant.json' if name == 'before_census' else 'cim-complet-apres.json'),
+               'Initial census reference outside the exact owned launch output')
+        c.ref(path)
+        censuses[name] = c.read(path)
+        census_rows(censuses[name])
+    for name, expected in factory.m.CLI_FILES.items():
+        c.pinned(factory.m.CLI.parent / name, expected)
+    pending = []
+    for slug, (model, session) in c.MODELS.items():
+        factory.m.configure(c.ref(c.BINDINGS), model)
+        admission = c.FACTORY / ('admissions-' + slug + '-reelles')
+        local_path, remote_path = admission / 'authorization-local.json', admission / 'authorization-remote.json'
+        upload = c.read(admission / 'upload-manifest-propose.json')
+        mirrors = [*upload['dependencies'], *upload['existing_qualified_files']]
+        local, _remote = verify_frozen(factory.m.native(), local_path, remote_path,
+            factory.m.remote_resolver(mirrors))
+        c.need(local.get('model') == model and local.get('session_id') == session, 'Initial authorization identity differs')
+        selected = [row for row in rows if row.get('model') == model]
+        c.need(len(selected) == 1 and selected[0].get('session_id') == session
+            and selected[0].get('job_id') == local['job_id'], 'Actual launch pair differs from authorization')
+        binding = {'scope_id': c.SCOPE, 'model': model, 'effort': 'max', 'session_id': session,
+            'job_id': local['job_id'], 'remote_root': local['remote_root'], 'source_zip_sha256': c.SOURCE, 'plan_sha256': c.PLAN}
+        cache = factory.m.LAUNCH / ('worker-' + session)
+        raw = {}
+        for name in NAMES:
+            path = cache / name
+            c.ref(path)
+            c.need(path.stat().st_size <= 32768, 'Bounded named startup metadata required')
+            raw[name] = path.read_bytes()
+        c.need(json.loads(raw['CELL-BINDING.json']) == binding, 'Initial cache cell binding differs')
+        policy_ref = c.ref(factory.m.POLICY_DIRECTORY / ('cli-policy-' + session + '.json'))
+        factory.m.checked_task_cli_policy(policy_ref, local['job_id'],
+            factory.m.read(factory.m.artifact(local['artifacts']['cli_identity'])))
+        lane = factory.m.read(factory.m.artifact(local['artifacts']['worker_lane_admission']))
+        c.need(lane.get('observed_at') == lane.get('lane_v2', {}).get('observed_at'),
+               'Frozen lane wrapper and typed observation differ')
+        validate_ready(binding, json.loads(raw['OWNER.json']), json.loads(raw['worker-ready.json']),
+            policy_ref['sha256'], factory.m.CLI, selected[0]['full_identities'],
+            before_census=censuses['before_census'], after_census=censuses['after_census'],
+            lane_observed_at=lane['observed_at'])
+        pending.append((slug, model, session, local, local_path, remote_path, cache, raw, policy_ref))
+    c.need(output_name.isidentifier(), 'Simple exclusive initial snapshot output name required')
+    output = c.OPS / output_name
+    c.need(not output.exists() and not (c.OPS / 'authentification-oauth-verifiee.json').exists(),
+           'Initial snapshot or OAuth receipt exists; preserve it, never overwrite')
+    check_auth_metadata(auth, factory.m.CLI_SHA)
+    output.mkdir()
+    oauth_rows = []
+    for slug, model, session, local, local_path, remote_path, cache, raw, policy_ref in pending:
+        directory = output / slug
+        directory.mkdir()
+        for name in NAMES:
+            target = directory / name
+            c.need((cache / name).read_bytes() == raw[name], 'Startup bytes changed before copy')
+            with target.open('xb') as stream:
+                stream.write(raw[name])
+                stream.flush()
+                os.fsync(stream.fileno())
+            c.need(target.read_bytes() == (cache / name).read_bytes() == raw[name], 'Startup bytes changed during copy')
+        ready_ref = c.ref(directory / 'worker-ready.json')
+        ident = {k: local[k] for k in ('scope_id', 'model', 'effort', 'session_id', 'job_id')}
+        ident.update(source_zip_sha256=c.SOURCE, plan_sha256=c.PLAN)
+        save(directory / 'installation-initiale-recue.json', {**ident,
+            'schema': 'hpc-forest-r2e-initial-installation-received-v1', 'verified': True,
+            'authorization_local': c.ref(local_path), 'authorization_remote': c.ref(remote_path),
+            'worker_ready': ready_ref, 'source_bindings': c.ref(c.BINDINGS), 'cli_policy': policy_ref,
+            'initial_fresh_gate_completed_before_ready': True, 'new_worker_authorized_by_this_receipt': False,
+            'calls_replayed': 0, 'evidence_refs': [c.ref(launch_path), c.ref(auth_path),
+                c.ref(local_path.parent / 'worker-argv-only.json'), c.ref(c.OPS / slug / 'ready-upload-result.json'),
+                c.ref(Path(launched['before_census'])), c.ref(Path(launched['after_census']))]})
+        oauth_rows.append({'model': model, 'job_id': local['job_id'], 'authentication': 'existing-local-ChatGPT',
+            'worker_ready': ready_ref, 'codex_executable_sha256': factory.m.CLI_SHA})
+    c.pinned(auth_path, auth_sha)
+    c.pinned(launch_path, launch_sha)
+    receipt = save(c.OPS / 'authentification-oauth-verifiee.json', {
+        'schema': 'hpc-forest-three-native-workers-oauth-observation-v1', 'verified': True,
+        'observed_at': auth['observed_at'], 'cli_login_status': 'Logged in using ChatGPT',
+        'cli_login_status_evidence_origin': 'Owned source110 worker-ready after its actual successful login status check',
+        'auth_mode': auth['auth_mode'], 'api_key_in_auth_present': False,
+        'OPENAI_API_KEY_environment_present': False, 'CODEX_API_KEY_environment_present': False,
+        'same_copied_cli': True, 'workers': oauth_rows, 'secrets_exported': False,
+        'new_CLI_status_auth_file_or_environment_access_by_this_helper': False,
+        'normal_model_delivery_and_evaluation_proved_by_this_receipt': False,
+        'evidence_refs': [c.ref(launch_path), c.ref(auth_path), c.ref(factory.m.CLI)]})
+    return receipt
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for flag in ('launch-receipt', 'auth-metadata'):
+        parser.add_argument('--' + flag, type=Path, required=True)
+        parser.add_argument('--' + flag + '-sha256', required=True)
+    parser.add_argument('--output-name', default='installation-initiale')
+    args = parser.parse_args()
+    result = receive(args.launch_receipt.absolute(), args.launch_receipt_sha256,
+        args.auth_metadata.absolute(), args.auth_metadata_sha256, args.output_name)
+    print(json.dumps({'oauth_receipt': result, 'workers_frozen': 3, 'native_calls': 0,
+        'CLI_or_authentication_access_by_helper': False, 'secrets_exported': False}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

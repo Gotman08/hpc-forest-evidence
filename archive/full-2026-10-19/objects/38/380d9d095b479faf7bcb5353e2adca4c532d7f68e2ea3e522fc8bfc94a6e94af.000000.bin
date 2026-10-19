@@ -1,0 +1,358 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+typedef struct {
+  float *x, *y, *z;
+} Coordinates;
+
+/* Force-only operation, also used if the scratch allocation fails. */
+void body_force(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; j++) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+typedef struct {
+  float32x4_t dx, dy, dz, sqrd_dist;
+} NBodyDelta4;
+
+static inline NBodyDelta4 nbody_delta4(float32x4_t sx,
+                                      float32x4_t sy,
+                                      float32x4_t sz,
+                                      float32x4_t x,
+                                      float32x4_t y,
+                                      float32x4_t z) {
+  NBodyDelta4 d;
+  d.dx = vsubq_f32(sx, x);
+  d.dy = vsubq_f32(sy, y);
+  d.dz = vsubq_f32(sz, z);
+  d.sqrd_dist = vaddq_f32(vmulq_f32(d.dx, d.dx),
+                         vmulq_f32(d.dy, d.dy));
+  d.sqrd_dist = vaddq_f32(d.sqrd_dist, vmulq_f32(d.dz, d.dz));
+  d.sqrd_dist = vaddq_f32(d.sqrd_dist, vdupq_n_f32(SOFTENING));
+  return d;
+}
+
+static inline float32x4_t inverse_distance4(float32x4_t squared) {
+  const float64x2_t one = vdupq_n_f64(1.0);
+  const float64x2_t lo = vcvt_f64_f32(vget_low_f32(squared));
+  const float64x2_t hi = vcvt_f64_f32(vget_high_f32(squared));
+
+  /* Match the reference's double sqrt and division before narrowing. */
+  const float64x2_t inv_lo = vdivq_f64(one, vsqrtq_f64(lo));
+  const float64x2_t inv_hi = vdivq_f64(one, vsqrtq_f64(hi));
+  return vcombine_f32(vcvt_f32_f64(inv_lo), vcvt_f32_f64(inv_hi));
+}
+
+static inline void nbody_accumulate4(NBodyDelta4 d,
+                                     float32x4_t inv_dist,
+                                     float32x4_t *fx,
+                                     float32x4_t *fy,
+                                     float32x4_t *fz) {
+  const float32x4_t inv_dist2 = vmulq_f32(inv_dist, inv_dist);
+  const float32x4_t inv_dist3 = vmulq_f32(inv_dist2, inv_dist);
+  *fx = vaddq_f32(*fx, vmulq_f32(d.dx, inv_dist3));
+  *fy = vaddq_f32(*fy, vmulq_f32(d.dy, inv_dist3));
+  *fz = vaddq_f32(*fz, vmulq_f32(d.dz, inv_dist3));
+}
+#endif
+
+static inline void advance_one(const Body *restrict p,
+                               Body *restrict next,
+                               const Coordinates source,
+                               Coordinates destination,
+                               float dt, int n, int i) {
+  const float x = source.x[i];
+  const float y = source.y[i];
+  const float z = source.z[i];
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  for (int j = 0; j < n; ++j) {
+    float dx = source.x[j] - x;
+    float dy = source.y[j] - y;
+    float dz = source.z[j] - z;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  const float vx = p[i].vx + dt*fx;
+  const float vy = p[i].vy + dt*fy;
+  const float vz = p[i].vz + dt*fz;
+  const float nx = x + vx*dt;
+  const float ny = y + vy*dt;
+  const float nz = z + vz*dt;
+  next[i].vx = vx;
+  next[i].vy = vy;
+  next[i].vz = vz;
+  next[i].x = nx;
+  next[i].y = ny;
+  next[i].z = nz;
+  destination.x[i] = nx;
+  destination.y[i] = ny;
+  destination.z[i] = nz;
+}
+
+/* Four targets share source loads while every force sum stays ordered. */
+static inline void advance_four(const Body *restrict p,
+                                Body *restrict next,
+                                const Coordinates source,
+                                Coordinates destination,
+                                float dt, int n, int i) {
+  float fx[4] = {0.0f};
+  float fy[4] = {0.0f};
+  float fz[4] = {0.0f};
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  const float32x4_t xv = vld1q_f32(source.x + i);
+  const float32x4_t yv = vld1q_f32(source.y + i);
+  const float32x4_t zv = vld1q_f32(source.z + i);
+  float32x4_t fxv = vdupq_n_f32(0.0f);
+  float32x4_t fyv = vdupq_n_f32(0.0f);
+  float32x4_t fzv = vdupq_n_f32(0.0f);
+  const int source_end = n - n % 4;
+  int j = 0;
+
+  for (; j < source_end; j += 4) {
+    const float32x4_t sx = vld1q_f32(source.x + j);
+    const float32x4_t sy = vld1q_f32(source.y + j);
+    const float32x4_t sz = vld1q_f32(source.z + j);
+    const NBodyDelta4 d0 = nbody_delta4(vdupq_laneq_f32(sx, 0),
+                                       vdupq_laneq_f32(sy, 0),
+                                       vdupq_laneq_f32(sz, 0), xv, yv, zv);
+    const NBodyDelta4 d1 = nbody_delta4(vdupq_laneq_f32(sx, 1),
+                                       vdupq_laneq_f32(sy, 1),
+                                       vdupq_laneq_f32(sz, 1), xv, yv, zv);
+    const NBodyDelta4 d2 = nbody_delta4(vdupq_laneq_f32(sx, 2),
+                                       vdupq_laneq_f32(sy, 2),
+                                       vdupq_laneq_f32(sz, 2), xv, yv, zv);
+    const NBodyDelta4 d3 = nbody_delta4(vdupq_laneq_f32(sx, 3),
+                                       vdupq_laneq_f32(sy, 3),
+                                       vdupq_laneq_f32(sz, 3), xv, yv, zv);
+    const float32x4_t inv0 = inverse_distance4(d0.sqrd_dist);
+    const float32x4_t inv1 = inverse_distance4(d1.sqrd_dist);
+    const float32x4_t inv2 = inverse_distance4(d2.sqrd_dist);
+    const float32x4_t inv3 = inverse_distance4(d3.sqrd_dist);
+
+    /* Batch independent distances without reassociating force additions. */
+    nbody_accumulate4(d0, inv0, &fxv, &fyv, &fzv);
+    nbody_accumulate4(d1, inv1, &fxv, &fyv, &fzv);
+    nbody_accumulate4(d2, inv2, &fxv, &fyv, &fzv);
+    nbody_accumulate4(d3, inv3, &fxv, &fyv, &fzv);
+  }
+
+  for (; j < n; ++j) {
+    const NBodyDelta4 d = nbody_delta4(vdupq_n_f32(source.x[j]),
+                                      vdupq_n_f32(source.y[j]),
+                                      vdupq_n_f32(source.z[j]), xv, yv, zv);
+    const float32x4_t inv = inverse_distance4(d.sqrd_dist);
+    nbody_accumulate4(d, inv, &fxv, &fyv, &fzv);
+  }
+
+  vst1q_f32(fx, fxv);
+  vst1q_f32(fy, fyv);
+  vst1q_f32(fz, fzv);
+#else
+  const float x[4] = {source.x[i], source.x[i+1],
+                      source.x[i+2], source.x[i+3]};
+  const float y[4] = {source.y[i], source.y[i+1],
+                      source.y[i+2], source.y[i+3]};
+  const float z[4] = {source.z[i], source.z[i+1],
+                      source.z[i+2], source.z[i+3]};
+
+  for (int j = 0; j < n; ++j) {
+    const float xj = source.x[j];
+    const float yj = source.y[j];
+    const float zj = source.z[j];
+
+    #pragma omp simd
+    for (int lane = 0; lane < 4; ++lane) {
+      float dx = xj - x[lane];
+      float dy = yj - y[lane];
+      float dz = zj - z[lane];
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      fx[lane] += dx * inv_dist3;
+      fy[lane] += dy * inv_dist3;
+      fz[lane] += dz * inv_dist3;
+    }
+  }
+#endif
+
+  for (int lane = 0; lane < 4; ++lane) {
+    const int k = i + lane;
+    const float vx = p[k].vx + dt*fx[lane];
+    const float vy = p[k].vy + dt*fy[lane];
+    const float vz = p[k].vz + dt*fz[lane];
+    const float nx = source.x[k] + vx*dt;
+    const float ny = source.y[k] + vy*dt;
+    const float nz = source.z[k] + vz*dt;
+    next[k].vx = vx;
+    next[k].vy = vy;
+    next[k].vz = vz;
+    next[k].x = nx;
+    next[k].y = ny;
+    next[k].z = nz;
+    destination.x[k] = nx;
+    destination.y[k] = ny;
+    destination.z[k] = nz;
+  }
+}
+
+static void simulate(Body *p, float dt, int n) {
+  if (n <= 0) return;
+
+  const size_t count = (size_t)n;
+  const size_t stride = (count + 15u) & ~(size_t)15u;
+  Body *scratch = (Body *)malloc(count * sizeof(Body));
+  void *storage = NULL;
+  if (scratch != NULL && stride <= (SIZE_MAX - 63u) / (6u * sizeof(float))) {
+    storage = malloc(6u * stride * sizeof(float) + 63u);
+  }
+
+  if (scratch == NULL || storage == NULL) {
+    free(storage);
+    free(scratch);
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      body_force(p, dt, n);
+      for (int i = 0; i < n; ++i) {
+        p[i].x += p[i].vx * dt;
+        p[i].y += p[i].vy * dt;
+        p[i].z += p[i].vz * dt;
+      }
+    }
+    return;
+  }
+
+  float *packed = (float *)(((uintptr_t)storage + 63u) & ~(uintptr_t)63u);
+  const Coordinates initial = {packed, packed + stride, packed + 2u*stride};
+  const Coordinates spare = {packed + 3u*stride, packed + 4u*stride,
+                              packed + 5u*stride};
+  const int nfull = n / 4;
+  const int nblocks = nfull + (n % 4 != 0);
+
+  #pragma omp parallel if(n >= 128)
+  {
+    Body *current = p;
+    Body *next = scratch;
+    Coordinates source = initial;
+    Coordinates destination = spare;
+
+    #pragma omp for schedule(static)
+    for (int i = 0; i < n; ++i) {
+      source.x[i] = p[i].x;
+      source.y[i] = p[i].y;
+      source.z[i] = p[i].z;
+    }
+
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      #pragma omp for schedule(static)
+      for (int block = 0; block < nblocks; ++block) {
+        const int start = block * 4;
+        if (block < nfull) {
+          advance_four(current, next, source, destination, dt, n, start);
+        } else {
+          for (int i = start; i < n; ++i) {
+            advance_one(current, next, source, destination, dt, n, i);
+          }
+        }
+      }
+
+      /* The barrier completes both next buffers before their next use. */
+      Body *body_swap = current;
+      current = next;
+      next = body_swap;
+      Coordinates coordinate_swap = source;
+      source = destination;
+      destination = coordinate_swap;
+    }
+  }
+
+  if (N_ITER % 2 != 0) {
+    memcpy(p, scratch, count * sizeof(Body));
+  }
+  free(storage);
+  free(scratch);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+  simulate(bodies, DT, nbodies);
+  write_dataset(nbodies, bodies);
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

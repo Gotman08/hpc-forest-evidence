@@ -1,0 +1,89 @@
+"""Prepared pure in-memory guards, not run by the author. No restoration/main."""
+import gzip
+import hashlib
+import importlib.util
+import io
+from pathlib import Path
+import tarfile
+
+import pytest
+
+SPEC = importlib.util.spec_from_file_location('Q_R8_reader_guards_only', Path(__file__).parent / 'recevoir-et-auditer-froid-Q754857-R8.py')
+R = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(R)
+
+
+def archive(rows):
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode='w', format=tarfile.PAX_FORMAT) as target:
+        for name, payload, kind, fields in rows:
+            item = tarfile.TarInfo(name)
+            item.type = kind
+            item.size = len(payload)
+            item.pax_headers = fields
+            if kind == tarfile.SYMTYPE:
+                item.linkname = '../NEUTRAL-outside'
+            target.addfile(item, io.BytesIO(payload))
+    return gzip.compress(stream.getvalue(), mtime=0)
+
+
+@pytest.mark.parametrize('name', ['../x', 'a/../b', '/x', 'a\\b', 'a/CON.txt', 'a/x:stream', 'a/x.', 'a/x '])
+def test_unsafe_member_names_refused_before_filesystem(name):
+    with pytest.raises(ValueError):
+        R.safe_name(name)
+
+
+@pytest.mark.parametrize('name', ['plain.json', 'x' * 120 + '/long.json'])
+def test_regular_or_exact_path_pax_is_data_only(name):
+    data = b'NEUTRAL metadata only'
+    blob = archive([(name, data, tarfile.REGTYPE, {})])
+    members, count = R.regular_members(blob, {name: hashlib.sha256(data).hexdigest()})
+    assert members == {name: data}
+    assert count == int(len(name) > 100)
+
+
+def test_symlink_physical_header_is_never_recreated():
+    blob = archive([('link', b'', tarfile.SYMTYPE, {})])
+    with pytest.raises(ValueError, match='regular physical'):
+        R.regular_members(blob, {'link': hashlib.sha256(b'').hexdigest()})
+
+
+@pytest.mark.parametrize('names', [('same', 'same'), ('A/x', 'a/y')])
+def test_duplicate_member_or_parent_casefold_collision_refused(names):
+    blob = archive([(name, b'x', tarfile.REGTYPE, {}) for name in names])
+    with pytest.raises(ValueError):
+        R.regular_members(blob, {name: hashlib.sha256(b'x').hexdigest() for name in names})
+
+
+def test_wrong_actual_receipt_sha_refused():
+    blob = archive([('x', b'x', tarfile.REGTYPE, {})])
+    with pytest.raises(ValueError, match='Member set/SHA'):
+        R.regular_members(blob, {'x': '0' * 64})
+
+
+def test_unapproved_pax_key_refused():
+    blob = archive([('x', b'x', tarfile.REGTYPE, {'mtime': '1'})])
+    with pytest.raises(ValueError, match='Only path PAX'):
+        R.regular_members(blob, {'x': hashlib.sha256(b'x').hexdigest()})
+
+
+def test_json_keeps_exact_large_integer_and_rejects_duplicate_nonfinite():
+    exact = 2**60 + 7
+    assert R.decode(('{"large":' + str(exact) + '}').encode()) == {'large': exact}
+    for value in [b'{"x":1,"x":2}', b'{"x":NaN}']:
+        with pytest.raises(ValueError):
+            R.decode(value)
+
+
+def test_one_zero_block_is_not_complete_tar_footer():
+    full = archive([('x', b'x', tarfile.REGTYPE, {})])
+    physical = gzip.decompress(full)
+    short = gzip.compress(physical[:1024] + bytes(512), mtime=0)
+    with pytest.raises(ValueError, match='Two-zero TAR footer'):
+        R.regular_members(short, {'x': hashlib.sha256(b'x').hexdigest()})
+
+
+def test_only_actual_text_tool_shape_is_accepted():
+    assert R.tool({'tool': 'job_status', 'content_texts': ['{"ok":true}'], 'isError': False}, 'job_status') == {'ok': True}
+    with pytest.raises(ValueError):
+        R.tool({'tool': 'job_status', 'structuredContent': {'ok': True}}, 'job_status')

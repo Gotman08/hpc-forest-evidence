@@ -1,0 +1,159 @@
+#include <iostream>
+#include <vector>
+#include <utility>
+
+using namespace std;
+
+typedef vector<vector<bool>> adjacency_matrix;
+
+adjacency_matrix readGraph();
+
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2);
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2, const int *equivalence);
+inline void printPermutation(const int *equivalence, int size);
+
+int main(){
+    adjacency_matrix g1 = readGraph();
+    adjacency_matrix g2 = readGraph();
+
+    if(!testIsomorphism(g1, g2))
+        cout << "The graphs are not isomorphic" << endl;
+
+    return 0;
+}
+
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2){
+    if(g1.size() != g2.size()) return false;
+
+    const int vertex_count = static_cast<int>(g1.size());
+    vector<int> equivalence(vertex_count, 0);
+    vector<int> exchange_counter(vertex_count, 0);
+    int exchange_index = 1;
+
+    for(int i = 0; i < vertex_count; ++i)
+        equivalence[i] = i;
+
+    if(verifyPermutation(g1, g2, equivalence.data())){
+        printPermutation(equivalence.data(), vertex_count);
+        return true;
+    }
+
+    bool isomorphism_found = false;
+
+    // Keep small searches serial so OpenMP setup does not dominate their work.
+    const int parallel_threshold = 8;
+    if(vertex_count < parallel_threshold){
+        while(exchange_index < vertex_count){
+            if(exchange_counter[exchange_index] < exchange_index){
+                if(exchange_index % 2 == 0)
+                    swap(equivalence[0], equivalence[exchange_index]);
+                else
+                    swap(equivalence[exchange_counter[exchange_index]], equivalence[exchange_index]);
+                if(verifyPermutation(g1, g2, equivalence.data())){
+                    printPermutation(equivalence.data(), vertex_count);
+                    isomorphism_found = true;
+                }
+
+                exchange_counter[exchange_index]++;
+                exchange_index = 1;
+            }else{
+                exchange_counter[exchange_index] = 0;
+                exchange_index++;
+            }
+        }
+        return isomorphism_found;
+    }
+
+    // Generate contiguous Heap-order batches serially, validate each batch in
+    // parallel, then emit matches serially to retain the original output order.
+    const int batch_capacity = 1024;
+    vector<int> candidates(batch_capacity * vertex_count);
+    vector<unsigned char> matches(batch_capacity, 0);
+    int batch_count = 0;
+    int batch_found = 0;
+
+    #pragma omp parallel
+    {
+        while(true){
+            #pragma omp single
+            {
+                batch_count = 0;
+                batch_found = 0;
+                while(batch_count < batch_capacity && exchange_index < vertex_count){
+                    if(exchange_counter[exchange_index] < exchange_index){
+                        if(exchange_index % 2 == 0)
+                            swap(equivalence[0], equivalence[exchange_index]);
+                        else
+                            swap(equivalence[exchange_counter[exchange_index]], equivalence[exchange_index]);
+
+                        int *candidate = candidates.data() + batch_count * vertex_count;
+                        for(int i = 0; i < vertex_count; ++i)
+                            candidate[i] = equivalence[i];
+                        ++batch_count;
+
+                        exchange_counter[exchange_index]++;
+                        exchange_index = 1;
+                    }else{
+                        exchange_counter[exchange_index] = 0;
+                        exchange_index++;
+                    }
+                }
+            }
+
+            if(batch_count == 0) break;
+
+            #pragma omp for schedule(static) reduction(|:batch_found)
+            for(int k = 0; k < batch_count; ++k){
+                const int *candidate = candidates.data() + k * vertex_count;
+                const int matched = verifyPermutation(g1, g2, candidate);
+                matches[k] = static_cast<unsigned char>(matched);
+                batch_found |= matched;
+            }
+
+            #pragma omp single
+            {
+                if(batch_found != 0){
+                    isomorphism_found = true;
+                    for(int k = 0; k < batch_count; ++k){
+                        if(matches[k] != 0)
+                            printPermutation(candidates.data() + k * vertex_count, vertex_count);
+                    }
+                }
+            }
+        }
+    }
+
+    return isomorphism_found;
+}
+
+adjacency_matrix readGraph(){
+    int vertices, edges, source, destination;
+
+    cin >> vertices;
+    adjacency_matrix read(vertices);
+    for (int i = 0; i < vertices; ++i)
+        read[i].resize(vertices);
+
+    cin >> edges;
+    for (int i = 0; i < edges; i++) {
+       cin >> source >> destination;
+       read[destination][source] = read[source][destination] = true;
+    }
+
+    return read;
+}
+
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2, const int *equivalence){
+    for (int i = 0; i < static_cast<int>(equivalence ? g1.size() : 0); ++i) {
+        for (int j = 0; j <= i; ++j) {
+            if(g1[i][j] != g2[equivalence[i]][equivalence[j]]) return false;
+        }
+    }
+   return true;
+}
+
+inline void printPermutation(const int *equivalence, int size){
+    for (int i = 0; i < size; ++i)
+        cout << equivalence[i] << " ";
+    cout << endl;
+}

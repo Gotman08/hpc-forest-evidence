@@ -1,0 +1,150 @@
+#include "knn.h"
+#include <string.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+static inline int first_insertion_position(const float * distances, int k,
+                                           float d, int ordered) {
+    int x = 0;
+    int limit = k;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const float32x4_t candidate = vdupq_n_f32(d);
+    const float32x4_t empty = vdupq_n_f32(-1.0f);
+
+    if (ordered) {
+        /* Four independent probes divide the remaining range five ways. */
+        while (limit - x >= 20) {
+            const int base = x;
+            const int step = (limit - base) / 5;
+            float32x4_t probes = vdupq_n_f32(distances[base + step]);
+            probes = vsetq_lane_f32(distances[base + 2 * step], probes, 1);
+            probes = vsetq_lane_f32(distances[base + 3 * step], probes, 2);
+            probes = vsetq_lane_f32(distances[base + 4 * step], probes, 3);
+
+            const uint32x4_t matches = vorrq_u32(
+                vcltq_f32(candidate, probes), vceqq_f32(probes, empty));
+
+            /* Unsigned mask addition yields the number of false lanes. */
+            const int before = (int) (4u + vaddvq_u32(matches));
+            const int boundary = base + step * before;
+            x = boundary + (before != 0);
+            limit = before == 4 ? limit : boundary + step;
+        }
+    }
+
+    /* Resolve the earliest match, also supporting unordered NaN entries. */
+    for (; x <= limit - 4; x += 4) {
+        const float32x4_t stored = vld1q_f32(distances + x);
+        const uint32x4_t matches = vorrq_u32(
+            vcltq_f32(candidate, stored), vceqq_f32(stored, empty));
+        if (vmaxvq_u32(matches) != 0) {
+            break;
+        }
+    }
+#else
+    (void) ordered;
+#endif
+
+    for (; x < limit; x++) {
+        if (d < distances[x] || distances[x] == -1) {
+            return x;
+        }
+    }
+    return limit;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *) malloc(sizeof(char) * k);
+    float * distances = (float *) malloc(sizeof(float) * k);
+
+    int i, j;
+    int ordered_distances = 1;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            float farthest = distances[k - 1];
+
+            /* Equal distances retain their original encounter order. */
+            if (farthest != -1.0f && d >= farthest) {
+                continue;
+            }
+
+            int x = first_insertion_position(distances, k, d,
+                                             ordered_distances);
+            if (x < k) {
+                size_t shifted = (size_t) (k - x - 1);
+
+                /* These shifts overlap; memmove preserves their dependencies. */
+                if (shifted != 0) {
+                    memmove(distances + x + 1, distances + x,
+                            shifted * sizeof(*distances));
+                    memmove(labels + x + 1, labels + x,
+                            shifted * sizeof(*labels));
+                }
+
+                distances[x] = d;
+                labels[x] = g.label;
+
+                /* A NaN can break monotonicity; conservatively retain fallback. */
+                if (d != d) {
+                    ordered_distances = 0;
+                }
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

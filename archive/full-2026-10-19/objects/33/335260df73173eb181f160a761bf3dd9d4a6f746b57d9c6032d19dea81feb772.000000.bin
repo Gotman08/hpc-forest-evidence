@@ -1,0 +1,103 @@
+"""Targeted revision review: fake census dictionaries only; no process or cache API."""
+import copy
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RX = HERE.parent.parent
+R1 = RX / "arret-individuel-prepare-r1"
+R2 = RX / "arret-individuel-prepare-r2"
+
+
+def module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+g = module(R2 / "preparer-arret.py", "review_r2_pure")
+old = module(R1 / "preparer-arret.py", "review_r1_pure")
+assert hashlib.sha256((R2 / "preparer-arret.py").read_bytes()).hexdigest() == "aacff4c6d9556f453cb39fffd1ecbf5ae8111515869f16cb2fc29d3765e51257"
+NOW = g.datetime.fromisoformat("2026-10-18T05:00:02.0000000Z").timestamp()
+
+
+def row(pid, parent=100, command="NEUTRAL unrelated program", born="2026-10-18T04:00:00.1234567Z"):
+    return {"ProcessId": pid, "ParentProcessId": parent, "ExecutablePath": "C:/NEUTRAL/program.exe",
+            "CommandLine": command, "CreationDate": born}
+
+
+def fixture():
+    owned = [row(pid) for pid in g.OWNED_ORDER]
+    preserved = [row(pid) for pid in g.PRESERVED_ORDER]
+    baseline = {"captured_at_utc": "2026-10-18T05:00:00.0000000Z", "complete_census": True,
+                "strict_utf8_decoding": True, "rows": owned + preserved + [row(100, 0)],
+                "rows_count": len(owned) + len(preserved) + 1}
+    current = copy.deepcopy(baseline)
+    current["captured_at_utc"] = "2026-10-18T05:00:02.0000000Z"
+    return current, baseline, owned, preserved
+
+
+def add(census, *values):
+    census["rows"].extend(values)
+    census["rows_count"] = len(census["rows"])
+
+
+def newborn(pid, parent=100, **kw):
+    return row(pid, parent=parent, born="2026-10-18T05:00:01.0000000Z", **kw)
+
+
+results = []
+
+
+def refused(label, current, baseline, owned, preserved, reader=g):
+    try:
+        reader.classify(current, baseline, owned, preserved, now=NOW)
+    except ValueError as error:
+        results.append({"case": label, "expected": "refusal", "passed": True, "diagnostic": str(error)})
+    else:
+        raise AssertionError(label + " was incorrectly accepted")
+
+
+c, b, o, p = fixture()
+add(c, newborn(101), newborn(102, 101))
+refused("r1 realistic unrelated births after baseline", c, b, o, p, old)
+result = g.classify(c, b, o, p, now=NOW)
+assert result["present_owned"] == list(g.OWNED_ORDER)
+assert len(result["new_independent_foreign_identities"]) == 2
+assert all(r["never_targeted"] for r in result["new_independent_foreign_identities"])
+results.append({"case": "r2 same two independent births recorded; target partition unchanged", "expected": "accept metadata only", "passed": True})
+
+for label, extra in (("unknown orphan", [newborn(101, 999)]),
+                     ("ancestry cycle", [newborn(101, 102), newborn(102, 101)]),
+                     ("owned descendant", [newborn(101, g.OWNED_ORDER[0])]),
+                     ("preserved observer descendant", [newborn(101, g.PRESERVED_ORDER[0])])):
+    c, b, o, p = fixture()
+    add(c, *extra)
+    refused(label, c, b, o, p)
+
+c, b, o, p = fixture()
+c["rows"][-1]["CreationDate"] = "2026-10-18T05:00:01.5000000Z"
+add(c, newborn(101))
+refused("baseline parent PID reused/born after child", c, b, o, p)
+
+for label, command in (("unknown worker even in baseline", "python -m hpc_forest.UNKNOWN_worker"),
+                       ("unknown uppercase bootstrap even in baseline", 'python "C:/NEUTRAL/BOOTSTRAP_WORKER.PY"'),
+                       ("active CLI exec even in baseline", '"C:/NEUTRAL/codex.EXE" "exec" --fixture-only')):
+    c, b, o, p = fixture()
+    extra = row(101, command=command)
+    add(c, extra)
+    add(b, copy.deepcopy(extra))
+    refused(label, c, b, o, p)
+
+c, b, o, p = fixture()
+c["rows"][0]["CreationDate"] = "2026-10-18T04:00:00.1234568Z"
+refused("target creation seventh digit differs", c, b, o, p)
+
+with (HERE / "CONTROLES-R2-CIBLES.json").open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps({"verified": True, "cases": results, "count": len(results),
+        "scope": "synthetic pure classification only", "process_or_CIM_or_live_cache_or_stop_calls": 0,
+        "earlier_fixture_precision": "The new regression births occur strictly between baseline and current census; the original first r1 fixture had an older birth and is preserved unchanged."}, indent=2) + "\n")
+print(json.dumps({"passed": len(results), "live_calls": 0}))

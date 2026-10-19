@@ -1,0 +1,512 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define SOURCE_BLOCK 128
+#define PAIR_TILE 32
+#define PAIR_CACHE_BYTES (64u * 1024u * 1024u)
+#define PAIR_CACHE_ALIGNMENT 128u
+
+/* Positions and velocities of one body. */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+typedef struct { float *x, *y, *z; } Coordinates;
+
+static Coordinates allocate_coordinates(int n, void **allocation) {
+  Coordinates positions = {NULL, NULL, NULL};
+  *allocation = NULL;
+  if (n <= 0) return positions;
+
+  const size_t count = (size_t)n;
+  if (count > (size_t)-1 - 15u) return positions;
+  const size_t stride = (count + 15u) & ~(size_t)15u;
+  if (stride > (((size_t)-1 - 63u) / sizeof(float)) / 3u)
+    return positions;
+
+  void *storage = malloc(3u * stride * sizeof(float) + 63u);
+  if (storage == NULL) return positions;
+  positions.x = (float *)(((uintptr_t)storage + 63u) & ~(uintptr_t)63u);
+  positions.y = positions.x + stride;
+  positions.z = positions.y + stride;
+  *allocation = storage;
+  return positions;
+}
+
+static float *allocate_coefficients(int n, size_t *stride,
+                                    void **allocation) {
+  *stride = 0;
+  *allocation = NULL;
+  if (n <= 0) return NULL;
+
+  const size_t count = (size_t)n;
+  if (count > (size_t)-1 - ((size_t)PAIR_TILE - 1u)) return NULL;
+  const size_t padded =
+      ((count + (size_t)PAIR_TILE - 1u) / (size_t)PAIR_TILE) *
+      (size_t)PAIR_TILE;
+  if (padded > ((size_t)PAIR_CACHE_BYTES / sizeof(float)) / count)
+    return NULL;
+
+  const size_t bytes = count * padded * sizeof(float);
+  void *storage = malloc(bytes + (size_t)PAIR_CACHE_ALIGNMENT - 1u);
+  if (storage == NULL) return NULL;
+  const uintptr_t address =
+      ((uintptr_t)storage + (uintptr_t)PAIR_CACHE_ALIGNMENT - 1u) &
+      ~((uintptr_t)PAIR_CACHE_ALIGNMENT - 1u);
+  *stride = padded;
+  *allocation = storage;
+  return (float *)address;
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("no-math-errno")
+#endif
+
+static inline void finish_body(const Body *current, Body *next,
+                               float dt, int i,
+                               float fx, float fy, float fz,
+                               int integrate) {
+  const float vx = current[i].vx + dt*fx;
+  const float vy = current[i].vy + dt*fy;
+  const float vz = current[i].vz + dt*fz;
+  next[i].vx = vx;
+  next[i].vy = vy;
+  next[i].vz = vz;
+  if (integrate) {
+    next[i].x = current[i].x + vx*dt;
+    next[i].y = current[i].y + vy*dt;
+    next[i].z = current[i].z + vz*dt;
+  }
+}
+
+static inline float inverse_cube(float dx, float dy, float dz) {
+  float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+  float inv_dist = 1 / sqrt(sqrd_dist);
+  return inv_dist * inv_dist * inv_dist;
+}
+
+/* Four independent targets, with the reference double sqrt and division. */
+static inline void pair_scales_four(const float x[4], const float y[4],
+                                    const float z[4],
+                                    float xj, float yj, float zj,
+                                    float dx[4], float dy[4], float dz[4],
+                                    float scales[4]) {
+  float sqrd_dist[4];
+  float inv_dist[4];
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+  for (int lane = 0; lane < 4; ++lane) {
+    float ddx = xj - x[lane];
+    float ddy = yj - y[lane];
+    float ddz = zj - z[lane];
+    dx[lane] = ddx;
+    dy[lane] = ddy;
+    dz[lane] = ddz;
+    sqrd_dist[lane] = ddx*ddx + ddy*ddy + ddz*ddz + SOFTENING;
+  }
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  const float64x2_t one = vdupq_n_f64(1.0);
+  const float32x4_t distances = vld1q_f32(sqrd_dist);
+  const float64x2_t dist_lo = vcvt_f64_f32(vget_low_f32(distances));
+  const float64x2_t dist_hi = vcvt_f64_f32(vget_high_f32(distances));
+  const float64x2_t inv_lo = vdivq_f64(one, vsqrtq_f64(dist_lo));
+  const float64x2_t inv_hi = vdivq_f64(one, vsqrtq_f64(dist_hi));
+  vst1q_f32(inv_dist, vcombine_f32(vcvt_f32_f64(inv_lo),
+                                 vcvt_f32_f64(inv_hi)));
+#else
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+  for (int lane = 0; lane < 4; ++lane) {
+    inv_dist[lane] = 1 / sqrt(sqrd_dist[lane]);
+  }
+#endif
+
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+  for (int lane = 0; lane < 4; ++lane) {
+    float inv = inv_dist[lane];
+    scales[lane] = inv * inv * inv;
+  }
+}
+
+/* Independent panel production never rounds a force product in storage. */
+static inline void force_one(const Coordinates *positions,
+                             const Body *current, Body *next,
+                             float dt, int n, int i, int integrate,
+                             const float *coefficients,
+                             size_t coefficient_stride) {
+  const float xi = positions != NULL ? positions->x[i] : current[i].x;
+  const float yi = positions != NULL ? positions->y[i] : current[i].y;
+  const float zi = positions != NULL ? positions->z[i] : current[i].z;
+  const float *row = coefficients != NULL ?
+      coefficients + (size_t)i * coefficient_stride : NULL;
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+  float dx[SOURCE_BLOCK], dy[SOURCE_BLOCK], dz[SOURCE_BLOCK];
+  float scales[SOURCE_BLOCK];
+
+  for (int jb = 0; jb < n; ) {
+    int count = n - jb;
+    if (count > SOURCE_BLOCK) count = SOURCE_BLOCK;
+#ifdef _OPENMP
+#pragma omp simd
+#elif defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+    for (int k = 0; k < count; ++k) {
+      const int j = jb + k;
+      const float sx = positions != NULL ? positions->x[j] : current[j].x;
+      const float sy = positions != NULL ? positions->y[j] : current[j].y;
+      const float sz = positions != NULL ? positions->z[j] : current[j].z;
+      float ddx = sx - xi;
+      float ddy = sy - yi;
+      float ddz = sz - zi;
+      dx[k] = ddx;
+      dy[k] = ddy;
+      dz[k] = ddz;
+      scales[k] = row != NULL ? row[j] : inverse_cube(ddx, ddy, ddz);
+    }
+
+    /* Retain the original ascending-source multiply/add expressions. */
+    for (int k = 0; k < count; ++k) {
+      fx += dx[k] * scales[k];
+      fy += dy[k] * scales[k];
+      fz += dz[k] * scales[k];
+    }
+    jb += count;
+  }
+  finish_body(current, next, dt, i, fx, fy, fz, integrate);
+}
+
+static inline void force_block(const Coordinates *restrict positions,
+                               const Body *current, Body *next,
+                               float dt, int n, int i, int integrate,
+                               const float *coefficients,
+                               size_t coefficient_stride) {
+  if (coefficients != NULL || n - i < 4) {
+    int lanes = n - i;
+    if (lanes > 4) lanes = 4;
+    for (int lane = 0; lane < lanes; ++lane) {
+      force_one(positions, current, next, dt, n, i + lane, integrate,
+                coefficients, coefficient_stride);
+    }
+    return;
+  }
+
+  const float x[4] = {positions->x[i], positions->x[i+1],
+                      positions->x[i+2], positions->x[i+3]};
+  const float y[4] = {positions->y[i], positions->y[i+1],
+                      positions->y[i+2], positions->y[i+3]};
+  const float z[4] = {positions->z[i], positions->z[i+1],
+                      positions->z[i+2], positions->z[i+3]};
+  float fx[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float fy[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float fz[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int j = 0; j < n; ++j) {
+    float dx[4], dy[4], dz[4], scales[4];
+    pair_scales_four(x, y, z,
+                     positions->x[j], positions->y[j], positions->z[j],
+                     dx, dy, dz, scales);
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int lane = 0; lane < 4; ++lane) {
+      fx[lane] += dx[lane] * scales[lane];
+      fy[lane] += dy[lane] * scales[lane];
+      fz[lane] += dz[lane] * scales[lane];
+    }
+  }
+
+  for (int lane = 0; lane < 4; ++lane) {
+    finish_body(current, next, dt, i + lane,
+                fx[lane], fy[lane], fz[lane], integrate);
+  }
+}
+
+static inline void store_pair(const Coordinates *positions,
+                              float *coefficients, size_t stride,
+                              int i, int j, float scale) {
+  coefficients[(size_t)i * stride + (size_t)j] = scale;
+  if (i != j) {
+    float reverse = scale;
+    if (isnan(scale)) {
+      reverse = inverse_cube(positions->x[i] - positions->x[j],
+                             positions->y[i] - positions->y[j],
+                             positions->z[i] - positions->z[j]);
+    }
+    coefficients[(size_t)j * stride + (size_t)i] = reverse;
+  }
+}
+
+/* One owner produces an upper-triangular tile and its transpose. */
+static inline void fill_coefficient_tile(const Coordinates *positions,
+                                         float *coefficients,
+                                         size_t stride,
+                                         int n, int nblocks, size_t tile) {
+  int lo = 0;
+  int hi = nblocks;
+  while (lo + 1 < hi) {
+    int mid = lo + (hi - lo) / 2;
+    size_t base = (size_t)mid *
+        (2u * (size_t)nblocks - (size_t)mid + 1u) / 2u;
+    if (base <= tile)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  const size_t base = (size_t)lo *
+      (2u * (size_t)nblocks - (size_t)lo + 1u) / 2u;
+  const int block_j = lo + (int)(tile - base);
+  const int i_begin = lo * PAIR_TILE;
+  const int j_begin = block_j * PAIR_TILE;
+  int i_end = i_begin + PAIR_TILE;
+  int j_end = j_begin + PAIR_TILE;
+  if (i_end > n) i_end = n;
+  if (j_end > n) j_end = n;
+
+  for (int i = i_begin; i < i_end; ) {
+    int lanes = i_end - i;
+    if (lanes > 4) lanes = 4;
+    int first_j = j_begin;
+    if (lo == block_j) {
+      /* The small diagonal group is triangular, including self pairs. */
+      for (int lane = 0; lane < lanes; ++lane) {
+        const int target = i + lane;
+        for (int j = target; j < i + lanes; ++j) {
+          float scale = inverse_cube(positions->x[j] - positions->x[target],
+                                     positions->y[j] - positions->y[target],
+                                     positions->z[j] - positions->z[target]);
+          store_pair(positions, coefficients, stride, target, j, scale);
+        }
+      }
+      first_j = i + lanes;
+    }
+
+    if (lanes == 4) {
+      const float x[4] = {positions->x[i], positions->x[i+1],
+                          positions->x[i+2], positions->x[i+3]};
+      const float y[4] = {positions->y[i], positions->y[i+1],
+                          positions->y[i+2], positions->y[i+3]};
+      const float z[4] = {positions->z[i], positions->z[i+1],
+                          positions->z[i+2], positions->z[i+3]};
+      for (int j = first_j; j < j_end; ++j) {
+        float dx[4], dy[4], dz[4], scales[4];
+        pair_scales_four(x, y, z,
+                         positions->x[j], positions->y[j], positions->z[j],
+                         dx, dy, dz, scales);
+        for (int lane = 0; lane < 4; ++lane) {
+          store_pair(positions, coefficients, stride, i + lane, j,
+                     scales[lane]);
+        }
+      }
+    } else {
+      for (int lane = 0; lane < lanes; ++lane) {
+        const int target = i + lane;
+        for (int j = first_j; j < j_end; ++j) {
+          float scale = inverse_cube(positions->x[j] - positions->x[target],
+                                     positions->y[j] - positions->y[target],
+                                     positions->z[j] - positions->z[target]);
+          store_pair(positions, coefficients, stride, target, j, scale);
+        }
+      }
+    }
+    i += lanes;
+  }
+}
+
+/* Preserve the force-only operation for independent and repeated calls. */
+void body_force(Body *p, float dt, int n) {
+  if (n <= 0) return;
+
+  void *position_allocation = NULL;
+  Coordinates positions = allocate_coordinates(n, &position_allocation);
+  if (position_allocation == NULL) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n >= 4)
+#endif
+    for (int i = 0; i < n; ++i) {
+      force_one(NULL, p, p, dt, n, i, 0, NULL, 0);
+    }
+    return;
+  }
+
+  size_t coefficient_stride = 0;
+  void *coefficient_allocation = NULL;
+  float *coefficients = allocate_coefficients(n, &coefficient_stride,
+                                              &coefficient_allocation);
+  const int nblocks = n / 4 + (n % 4 != 0);
+  const int pair_blocks = n / PAIR_TILE + (n % PAIR_TILE != 0);
+  const size_t tile_count = coefficients != NULL ?
+      (size_t)pair_blocks * ((size_t)pair_blocks + 1u) / 2u : 0;
+#ifdef _OPENMP
+#pragma omp parallel if (nblocks >= 4)
+#endif
+  {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (int i = 0; i < n; ++i) {
+      positions.x[i] = p[i].x;
+      positions.y[i] = p[i].y;
+      positions.z[i] = p[i].z;
+    }
+    if (coefficients != NULL) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (size_t tile = 0; tile < tile_count; ++tile) {
+        fill_coefficient_tile(&positions, coefficients, coefficient_stride,
+                              n, pair_blocks, tile);
+      }
+    }
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (int block = 0; block < nblocks; ++block) {
+      force_block(&positions, p, p, dt, n, 4 * block, 0,
+                  coefficients, coefficient_stride);
+    }
+  }
+  free(coefficient_allocation);
+  free(position_allocation);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+  Body *scratch = NULL;
+  Body *result = bodies;
+  Coordinates positions = {NULL, NULL, NULL};
+  void *position_allocation = NULL;
+  void *coefficient_allocation = NULL;
+  float *coefficients = NULL;
+  size_t coefficient_stride = 0;
+
+  if (nbodies > 0) {
+    const size_t count = (size_t)nbodies;
+    if (count <= (size_t)-1 / sizeof(*scratch)) {
+      scratch = (Body *)malloc(count * sizeof(*scratch));
+    }
+    positions = allocate_coordinates(nbodies, &position_allocation);
+    if (scratch != NULL && position_allocation != NULL) {
+      coefficients = allocate_coefficients(nbodies, &coefficient_stride,
+                                            &coefficient_allocation);
+    }
+  }
+
+  if (scratch != NULL && position_allocation != NULL) {
+    const int nblocks = nbodies / 4 + (nbodies % 4 != 0);
+    const int pair_blocks =
+        nbodies / PAIR_TILE + (nbodies % PAIR_TILE != 0);
+    const size_t tile_count = coefficients != NULL ?
+        (size_t)pair_blocks * ((size_t)pair_blocks + 1u) / 2u : 0;
+#ifdef _OPENMP
+#pragma omp parallel if (nblocks >= 4)
+#endif
+    {
+      Body *current = bodies;
+      Body *next = scratch;
+
+      for (int iter = 0; iter < N_ITER; ++iter) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < nbodies; ++i) {
+          positions.x[i] = current[i].x;
+          positions.y[i] = current[i].y;
+          positions.z[i] = current[i].z;
+        }
+
+        if (coefficients != NULL) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+          for (size_t tile = 0; tile < tile_count; ++tile) {
+            fill_coefficient_tile(&positions, coefficients,
+                                  coefficient_stride,
+                                  nbodies, pair_blocks, tile);
+          }
+        }
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int block = 0; block < nblocks; ++block) {
+          force_block(&positions, current, next, DT,
+                      nbodies, 4 * block, 1,
+                      coefficients, coefficient_stride);
+        }
+
+        Body *temporary = current;
+        current = next;
+        next = temporary;
+      }
+    }
+    if (N_ITER % 2 != 0) {
+      result = scratch;
+    }
+  } else {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      body_force(bodies, DT, nbodies);
+      for (int i = 0; i < nbodies; ++i) {
+        bodies[i].x += bodies[i].vx * DT;
+        bodies[i].y += bodies[i].vy * DT;
+        bodies[i].z += bodies[i].vz * DT;
+      }
+    }
+  }
+
+  write_dataset(nbodies, result);
+  free(coefficient_allocation);
+  free(position_allocation);
+  free(scratch);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

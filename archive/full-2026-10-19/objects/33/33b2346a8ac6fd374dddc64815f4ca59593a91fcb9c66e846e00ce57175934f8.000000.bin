@@ -1,0 +1,118 @@
+"""Neutral fixtures only: never call the main gate or a live process/cache."""
+import importlib.util
+import tempfile
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SPEC = importlib.util.spec_from_file_location('stop_gate_neutral', HERE / 'preparer-fermeture-r2f.py')
+GATE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(GATE)
+
+
+def row(pid=11900, parent=55836, birth='2026-10-18T09:01:06.2289040Z', exe='C:\\owned\\python.exe'):
+    return {'ProcessId': pid, 'ParentProcessId': parent, 'ExecutablePath': exe,
+            'CommandLine': 'NEUTRAL fixture only', 'CreationDate': birth}
+
+
+class NeutralClosureTests(unittest.TestCase):
+    def test_exact_three_constants(self):
+        self.assertEqual(GATE.TARGET_IDS, [58892, 37692, 39648])
+        self.assertEqual([c[4] for c in GATE.CELLS], GATE.TARGET_IDS)
+        self.assertEqual([c[5] for c in GATE.CELLS], [41768, 23420, 30624])
+
+    def test_fresh_complete_census(self):
+        now = datetime.now(UTC)
+        value = {'complete_census': True, 'rows_count': 1, 'rows': [row()], 'captured_at_utc': now.isoformat()}
+        self.assertEqual(list(GATE.current_rows(value, now)), [11900])
+
+    def test_stale_future_incomplete_duplicate_and_SO_refused(self):
+        now = datetime.now(UTC)
+        cases = [{'complete_census': True, 'rows_count': 1, 'rows': [row()], 'captured_at_utc': (now-timedelta(seconds=46)).isoformat()},
+                 {'complete_census': True, 'rows_count': 1, 'rows': [row()], 'captured_at_utc': (now+timedelta(seconds=1)).isoformat()},
+                 {'complete_census': False, 'rows_count': 1, 'rows': [row()], 'captured_at_utc': now.isoformat()},
+                 {'complete_census': True, 'rows_count': 2, 'rows': [row(), row()], 'captured_at_utc': now.isoformat()},
+                 {'complete_census': True, 'rows_count': 1, 'rows': [{**row(), 'CommandLine': 'hpc_forest.ablation_worker'}], 'captured_at_utc': now.isoformat()}]
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                GATE.current_rows(value, now)
+
+    def test_full_identity_refuses_opaque_fields(self):
+        for key in ('ExecutablePath', 'CommandLine', 'CreationDate'):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                GATE.full_identity({**row(), key: None})
+
+    def test_no_child_is_safe(self):
+        GATE.check_descendants({11900: row()}, row())
+
+    def test_known_transport_child_observed_not_targeted(self):
+        child = row(88, 11900, '2026-10-18T09:10:00.0000000Z', 'C:\\owned\\ssh.exe')
+        GATE.check_descendants({11900: row(), 88: child}, row())
+        self.assertEqual(GATE.TARGET_IDS, [58892, 37692, 39648])
+
+    def test_codex_direct_and_descendant_refused(self):
+        bridge = row(88, 11900, '2026-10-18T09:10:00.0000000Z', 'C:\\owned\\mcp.exe')
+        for parent in (11900, 88):
+            child = row(99, parent, '2026-10-18T09:11:00.0000000Z', 'C:\\owned\\codex.exe')
+            with self.subTest(parent=parent), self.assertRaises(ValueError):
+                GATE.check_descendants({11900: row(), 88: bridge, 99: child}, row())
+
+    def test_opaque_possible_child_refused(self):
+        for key in ('ExecutablePath', 'CommandLine', 'CreationDate'):
+            child = {**row(88, 11900, '2026-10-18T09:10:00.0000000Z'), key: None}
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                GATE.check_descendants({11900: row(), 88: child}, row())
+
+    def test_full_older_child_is_not_adopted(self):
+        child = row(99, 11900, '2026-10-17T09:11:00.0000000Z', 'C:\\foreign\\codex.exe')
+        GATE.check_descendants({11900: row(), 99: child}, row())
+
+    def test_live_exact_root_lock_is_never_hashed(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / 'worker.lock').write_bytes(b'0')
+            (root / 'CELL-BINDING.json').write_bytes(b'NEUTRAL opaque bytes')
+            old_sha = GATE.sha
+            def guarded_sha(path):
+                self.assertNotEqual(Path(path), root / 'worker.lock')
+                return old_sha(path)
+            GATE.sha = guarded_sha
+            try:
+                self.assertEqual(set(GATE.opaque_inventory(root, True)), {'CELL-BINDING.json'})
+            finally:
+                GATE.sha = old_sha
+
+    def test_lock_wrong_size_refused(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / 'worker.lock').write_bytes(b'00')
+            with self.assertRaises(ValueError):
+                GATE.opaque_inventory(root, True)
+
+    def test_case_variant_root_lock_never_hashed(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / 'WORKER.LOCK').write_bytes(b'0')
+            old_sha = GATE.sha
+            def forbidden_sha(_):
+                self.fail('A root lock spelling variant must never be opened')
+            GATE.sha = forbidden_sha
+            try:
+                self.assertEqual(GATE.opaque_inventory(root, True), {})
+            finally:
+                GATE.sha = old_sha
+
+    def test_PS_only_one_individual_stop_and_durable_intent(self):
+        text = (HERE / 'fermer-trois-python-r2f.ps1').read_text(encoding='utf8')
+        self.assertEqual(text.count('Stop-Process -InputObject $taskOwnedProcess -Force'), 1)
+        self.assertIn('$taskStream.Flush($true)', text)
+        self.assertIn("[IO.FileMode]::CreateNew", text)
+        self.assertIn("'58892,37692,39648'", text)
+        self.assertIn('if (-not $Execute)', text)
+        for bad in ('taskkill', 'Stop-Process -Name', 'Stop-Process -Id', '/T /F'):
+            self.assertNotIn(bad, text)
+
+
+if __name__ == '__main__':
+    unittest.main()

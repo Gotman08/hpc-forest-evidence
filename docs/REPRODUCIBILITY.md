@@ -2,6 +2,8 @@
 
 _Offline verification with Python 3.11+; optional plotting with a separate environment._
 
+The [19 October received-data inventory](../evidence/received-2026-10-19/README.md) documents the additional complete historical projection, source hashes, retained columns and exclusions. The same verification command also validates that supplement. The original 0.1.0 subset and its calculations below remain available unchanged. Article and appendix PDFs are byte-identical to the reviewed edition identified by [article provenance](article/provenance.json); the public bundle does not rebuild the private research pipeline.
+
 ## Verify the release
 
 From a fresh clone:

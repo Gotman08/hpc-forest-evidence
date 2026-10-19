@@ -4,6 +4,12 @@ _Protocole public et observations vérifiables sur l’optimisation de programme
 
 [English](README.md) · [Protocole](docs/PROTOCOLE.fr.md) · [Résultats](docs/RESULTS.md) · [Vérification](docs/REPRODUCIBILITY.md)
 
+## Données reçues et article · 19 octobre 2026
+
+L’[article de recherche (19 pages)](docs/article/ARTICLE.pdf), les [annexes techniques (308 pages)](docs/article/ANNEXES-TECHNIQUES.pdf), leurs sources Markdown et les 275 figures sont publiés. L’[inventaire des données reçues](evidence/received-2026-10-19/README.md) complète le sous-ensemble initial par les mesures historiques admises, confirmations, registres de recherche et projections des coûts réconciliés. L’arrêté historique reste le 18 octobre 2026 à 05:03:23.898140 UTC ; le supplément Sol R2h et l’état technique de l’article sont datés séparément du 19 octobre.
+
+La paire de programmes Sol MAX sur les nombres premiers a été remesurée sur une allocation distincte : 43,8546 ms pour la référence contre 4,9124 ms pour le candidat (8,9273×), douze entrées certifiées et cinq paires de mesures. La portée reste ce benchmark fini et la même implémentation de l’évaluateur. Les échecs et les coûts inconnus restent distingués. Voir les [observations actualisées et la suite de campagne](docs/RECEIVED-2026-10-19.md).
+
 HPC Forest étudie une question concrète : **un système peut-il produire des programmes corrects et plus rapides dans un budget fixé ?** L’évaluation repose sur un programme de départ figé, un contrôle externe des sorties, des temps bruts et une confirmation finale séparée. Un autre système peut suivre ce contrat sans exposer son fonctionnement interne.
 
 Ce dépôt rassemble le protocole, une sélection explicite de données auditées et des vérificateurs publics. Le moteur interne et les entrées réservées à l’évaluateur restent hors de ce dépôt.
@@ -45,4 +51,4 @@ Le [protocole français](docs/PROTOCOLE.fr.md) décrit les budgets, la compilati
 - [Travaux restant à réaliser](docs/ROADMAP.md)
 - [Contribuer](CONTRIBUTING.md)
 
-Version **0.1.0**, 16 octobre 2026. Auteurs : **Nicolas Marano et Romain Despoullain**. La [licence MIT](LICENSE) couvre les fichiers originaux de cette publication ; les programmes et énoncés tiers ne sont pas redistribués. Pour citer les observations, utiliser [CITATION.cff](CITATION.cff) avec la révision exacte.
+Première version **0.1.0**, 16 octobre 2026 ; les données du 19 octobre s’y ajoutent dans la révision courante. La suite porte sur quinze sujets et quatre modèles, tous en MAX, après un seul pilote nombres premiers terminé et la qualification technique restante. Auteurs : **Nicolas Marano et Romain Despoullain**. La [licence MIT](LICENSE) couvre les fichiers originaux de cette publication ; les programmes et énoncés tiers ne sont pas redistribués. Pour citer les observations, utiliser [CITATION.cff](CITATION.cff) avec la révision exacte.

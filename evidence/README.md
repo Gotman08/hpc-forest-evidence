@@ -2,6 +2,8 @@
 
 _A curated timing projection with explicit provenance and reproduction limits._
 
+The [19 October received-data inventory](received-2026-10-19/README.md) adds the complete admitted historical data and the Sol R2h supplement. The table below describes the preserved initial release subset; overlapping timings must not be counted twice as independent samples. The [article and appendices](../docs/RECEIVED-2026-10-19.md) explain the additional cohorts.
+
 | File | Coverage | Unit |
 | --- | --- | --- |
 | [controller/timings.jsonl](controller/timings.jsonl) | 144 series; 24 warmups excluded; 2,400 measured cycles | Integer wall/CPU nanoseconds per cycle |

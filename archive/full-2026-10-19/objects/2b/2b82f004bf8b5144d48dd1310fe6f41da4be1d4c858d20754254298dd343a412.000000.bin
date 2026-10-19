@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\n/*\n * Compute the gravitational impact among all pairs of bodies in\n * the system.\n */\n#if defined(__GNUC__) && !defined(__clang__)\n__attribute__((optimize(\"no-math-errno\")))\n#endif\nvoid body_force(Body *p, float dt, int n) {\n  enum { LANES = 4 };\n  const int blocks = n / LANES;\n\n  #pragma omp parallel for schedule(static) if (n >= 128)\n  for (int block = 0; block < blocks; ++block) {\n    const int base = block * LANES;\n    float x[LANES], y[LANES], z[LANES];\n    float fx[LANES], fy[LANES], fz[LANES];\n\n    for (int lane = 0; lane < LANES; ++lane) {\n      x[lane] = p[base + lane].x;\n      y[lane] = p[base + lane].y;\n      z[lane] = p[base + lane].z;\n      fx[lane] = 0.0f;\n      fy[lane] = 0.0f;\n      fz[lane] = 0.0f;\n    }\n\n    /* SIMD spans independent targets, not the ordered j reduction. */\n    for (int j = 0; j < n; ++j) {\n      const float jx = p[j].x;\n      const float jy = p[j].y;\n      const float jz = p[j].z;\n\n      #pragma omp simd simdlen(4)\n      for (int lane = 0; lane < LANES; ++lane) {\n        float dx = jx - x[lane];\n        float dy = jy - y[lane];\n        float dz = jz - z[lane];\n        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n        float inv_dist = 1 / sqrt(sqrd_dist);\n        float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n        fx[lane] += dx * inv_dist3;\n        fy[lane] += dy * inv_dist3;\n        fz[lane] += dz * inv_dist3;\n      }\n    }\n\n    for (int lane = 0; lane < LANES; ++lane) {\n      p[base + lane].vx += dt*fx[lane];\n      p[base + lane].vy += dt*fy[lane];\n      p[base + lane].vz += dt*fz[lane];\n    }\n  }\n\n  /* Preserve the original calculation for an incomplete target tile. */\n  for (int i = blocks * LANES; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n\n  /*\n   * At each simulation iteration, interbody forces are computed,\n   * and bodies' positions are integrated.\n   */\n  for (int iter = 0; iter < N_ITER; iter++) {\n    body_force(bodies, DT, nbodies);\n\n    for (int i = 0; i < nbodies; i++) {\n      bodies[i].x += bodies[i].vx * DT;\n      bodies[i].y += bodies[i].vy * DT;\n      bodies[i].z += bodies[i].vz * DT;\n    }\n  }\n\n  write_dataset(nbodies, bodies);\n\n  free(bodies);\n  \n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "SIMD across four independent target bodies can accelerate ARM64 force calculations without reordering each body's source-body accumulation. Independent target tiles can also use the existing OpenMP thread budget.",
+    "notes": "Retains double sqrt/division, float accumulators, increasing j order, and the force/integration barrier. No approximate arithmetic or reduction pragma. Not executed; correctness and speed require controller evaluation.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Tile targets into four private coordinate and accumulator lanes; SIMD-vectorize the lane loop while keeping source bodies sequential.",
+      "Distribute independent tiles with OpenMP static scheduling, avoiding thread-launch overhead for small systems; handle remaining targets with the original scalar calculation.",
+      "Enable function-local GCC no-math-errno to permit vector sqrt lowering without enabling reassociation or replacing double sqrt with sqrtf."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "9e9732d0007f4a6baad0889abfbcb2f7",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "d62c4d28cf7604c75cfef92cb901229b383e8ae5f1804cb8787e69994c468930",
+  "session_id": "e102a585de23492ca9019858dac5af4d",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "d749a5a81ccf51b32f55e25548c6d34f4d469c9dcf56a66d93268d445babeead",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 11697,
+        "output_tokens": 10424,
+        "reasoning_output_tokens": 8743
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 22121,
+    "tool_events": []
+  }
+}

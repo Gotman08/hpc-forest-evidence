@@ -1,0 +1,112 @@
+import argparse
+import hashlib
+import json
+import subprocess
+import tarfile
+import tempfile
+import zipfile
+from collections import Counter
+from pathlib import Path, PurePosixPath
+
+project = Path(r"C:\Users\nicol\Documents\Codex\2026-10-15\cr\outputs\HPC-Forest")
+evidence = project / "evidence" / "romeo"
+parser = argparse.ArgumentParser()
+parser.add_argument("job")
+parser.add_argument("--revision", default="r4")
+args = parser.parse_args()
+tarpath = evidence / f"results-{args.job}.tar.gz"
+root = evidence / f"results-{args.job}"
+
+with tarfile.open(tarpath) as archive:
+    for member in archive.getmembers():
+        path = PurePosixPath(member.name)
+        assert not path.is_absolute() and ".." not in path.parts
+        assert path.parts[0] == root.name
+        if not member.isfile() or any(p in path.parts for p in [".git", "repo", "worktrees", "builds"]):
+            continue
+        destination = evidence.joinpath(*path.parts)
+        assert root.resolve() in destination.resolve().parents
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        data = archive.extractfile(member).read()
+        if destination.exists():
+            assert destination.read_bytes() == data
+        else:
+            destination.write_bytes(data)
+
+results = json.loads((root / "results.json").read_text(encoding="utf-8"))
+assert results["complete"] and len(results["models"]) == 2
+cleanup = json.loads((root / "cleanup.json").read_text())
+assert cleanup["owned_cache_removed"] and cleanup["owned_server_stopped"]
+payload = Path(__file__).parent / f"payload-manifest-{args.revision}.json"
+manifest = json.loads(payload.read_text())
+wheelpath = Path(__file__).parent / f"dist-{args.revision}" / "hpc_forest-0.1.0-py3-none-any.whl"
+assert hashlib.sha256(wheelpath.read_bytes()).hexdigest() == manifest["files"][wheelpath.name]
+source_manifest = json.loads((root / "source-manifest.json").read_text())
+with zipfile.ZipFile(wheelpath) as wheel:
+    for path, expected in source_manifest.items():
+        assert hashlib.sha256(wheel.read("hpc_forest/" + path)).hexdigest() == expected, path
+
+checks = {"job_id": args.job, "source_commit": manifest["source_commit"],
+          "wheel_sha256": manifest["files"][wheelpath.name],
+          "archive_sha256": hashlib.sha256(tarpath.read_bytes()).hexdigest(),
+          "archive_bytes": tarpath.stat().st_size, "cleanup": cleanup, "models": []}
+for model in results["models"]:
+    assert model["complete"] and model["costs"]["unknown_usage_calls"] == 0
+    label = model["model"].replace(":", "-")
+    campaign = root / label
+    calls = [v for v in model["generation_usage"] if v.get("llm_calls") == 1]
+    replies = sorted(campaign.glob("logs/*/ollama-response.json"))
+    assert len(calls) == len(replies)
+    prompt = completion = 0
+    for path in replies:
+        reply = json.loads(path.read_text())
+        assert reply["model"] == model["model"] and reply["done"]
+        prompt += reply["prompt_eval_count"]
+        completion += reply["eval_count"]
+    assert prompt + completion == model["costs"]["tokens_used"]
+    best = model["best_confirmed"]
+    package = campaign / "submission.zip"
+    assert hashlib.sha256(package.read_bytes()).hexdigest() == model["package_sha256"]
+    with zipfile.ZipFile(package) as archive, tempfile.TemporaryDirectory(
+        prefix=f"verify-{args.job}-", dir=Path(__file__).parent
+    ) as temporary:
+        assert archive.testzip() is None
+        receipt = json.loads(archive.read("HPC_FOREST_MANIFEST.json"))
+        assert receipt["commit"] == best["commit"]
+        assert receipt["confirmation"]["correct"] is True
+        destination = Path(temporary)
+        executables = []
+        regular = []
+        for member in archive.infolist():
+            path = PurePosixPath(member.filename)
+            assert not path.is_absolute() and ".." not in path.parts
+            if member.is_dir() or member.filename == "HPC_FOREST_MANIFEST.json":
+                continue
+            assert member.filename in ["Makefile", "run.sh"] or path.parts[0] == "src"
+            output = destination.joinpath(*path.parts)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(archive.read(member))
+            regular.append(member.filename)
+            if member.external_attr >> 16 & 0o111:
+                executables.append(member.filename)
+        def git(*arguments):
+            return subprocess.check_output(["git", "-C", str(destination), *arguments], text=True).strip()
+        git("init", "--quiet")
+        git("config", "core.autocrlf", "false")
+        git("add", "--", *regular)
+        for path in regular:
+            git("update-index", "--chmod=" + ("+x" if path in executables else "-x"), "--", path)
+        tree = git("write-tree")
+        assert tree == receipt["confirmation"]["tree_hash"], (tree, receipt["confirmation"]["tree_hash"])
+    report = json.loads((campaign / "report" / "experiments.json").read_text(encoding="utf-8"))
+    confirmations = [v for v in report["evaluations"] if v["phase"] == "confirmation"]
+    counts = dict(Counter(t["outcome"]["status"] for t in model["trials"]))
+    checks["models"].append({"model": model["model"], "digest": model["identity"]["model_digest"],
+        "calls": len(calls), "prompt_tokens": prompt, "completion_tokens": completion,
+        "trial_statuses": counts, "confirmation_count": len(confirmations),
+        "all_confirmations_correct": all(v["outcome"]["correct"] is True for v in confirmations),
+        "confirmed_tree_matches_submission": True, "best": best,
+        "generation_seconds": sum(v["seconds"] for v in calls),
+        "elapsed_seconds": model["elapsed_seconds"]})
+(evidence / f"checks-{args.job}.json").write_text(json.dumps(checks, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(checks, indent=2))

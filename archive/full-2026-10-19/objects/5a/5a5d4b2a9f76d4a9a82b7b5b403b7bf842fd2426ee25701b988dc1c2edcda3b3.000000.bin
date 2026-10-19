@@ -1,0 +1,133 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+namespace {
+constexpr int MOD = 1000000007;
+constexpr int TILE = 128;
+constexpr int WORDS_PER_DIAGONAL = (TILE + 63) / 64;
+constexpr int LOCAL_DIAGONALS = 2 * TILE - 1;
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n, m;
+    if (!(std::cin >> n >> m)) return 0;
+
+    std::vector<std::vector<int> > blocked_rows(n);
+    for (int c = 0; c < m; ++c) {
+        int y, x;
+        std::cin >> y >> x;
+        blocked_rows[y].push_back(x);
+    }
+
+    const int tiles = (n + TILE - 1) / TILE;
+    std::vector<std::size_t> next_blocked(n, 0);
+    std::vector<int> top_boundary(n, 0);
+    std::vector<int> left_boundary(n, 0);
+    top_boundary[0] = 1;
+
+#ifdef _OPENMP
+#pragma omp parallel if(tiles >= 8)
+#endif
+    {
+        int frontier[2][TILE + 1] = {};
+        std::uint64_t blocked_diagonals[LOCAL_DIAGONALS * WORDS_PER_DIAGONAL];
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int y = 0; y < n; ++y) {
+            std::sort(blocked_rows[y].begin(), blocked_rows[y].end());
+        }
+
+        for (int wave = 0; wave < 2 * tiles - 1; ++wave) {
+            const int first_tile_row = std::max(0, wave - tiles + 1);
+            const int last_tile_row = std::min(tiles - 1, wave);
+
+            // Tiles on this wave have disjoint row and column boundaries.
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (int tile_y = first_tile_row; tile_y <= last_tile_row; ++tile_y) {
+                const int tile_x = wave - tile_y;
+                const int y0 = tile_y * TILE;
+                const int x0 = tile_x * TILE;
+                const int height = std::min(TILE, n - y0);
+                const int width = std::min(TILE, n - x0);
+
+                std::fill(blocked_diagonals,
+                          blocked_diagonals + LOCAL_DIAGONALS * WORDS_PER_DIAGONAL,
+                          std::uint64_t(0));
+
+                // Each block row advances left to right across successive waves.
+                // Duplicate coordinates coalesce in these thread-local bitsets.
+                for (int local_y = 0; local_y < height; ++local_y) {
+                    const int y = y0 + local_y;
+                    const std::vector<int>& row = blocked_rows[y];
+                    std::size_t& next = next_blocked[y];
+                    while (next < row.size() && row[next] < x0 + width) {
+                        const int local_x = row[next] - x0;
+                        const int diagonal = local_y + local_x;
+                        blocked_diagonals[diagonal * WORDS_PER_DIAGONAL
+                                          + (local_x >> 6)]
+                            |= std::uint64_t(1) << (local_x & 63);
+                        ++next;
+                    }
+                }
+
+                for (int diagonal = 0; diagonal < width + height - 1; ++diagonal) {
+                    int* previous = frontier[diagonal & 1];
+                    int* current = frontier[(diagonal & 1) ^ 1];
+
+                    // Supply predecessors outside the tile from its boundaries.
+                    if (diagonal < height) {
+                        previous[0] = left_boundary[y0 + diagonal];
+                    }
+                    if (diagonal < width) {
+                        previous[diagonal + 1] = top_boundary[x0 + diagonal];
+                    }
+
+                    const int first_x = std::max(0, diagonal - height + 1);
+                    const int last_x = std::min(width - 1, diagonal);
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+                    for (int x = first_x; x <= last_x; ++x) {
+                        const int sum = previous[x] + previous[x + 1];
+                        current[x + 1] = sum >= MOD ? sum - MOD : sum;
+                    }
+
+                    // Clear blocked destinations before the next diagonal reads them.
+                    for (int word = 0; word < WORDS_PER_DIAGONAL; ++word) {
+                        std::uint64_t bits = blocked_diagonals[
+                            diagonal * WORDS_PER_DIAGONAL + word];
+                        while (bits != 0) {
+                            const int x = 64 * word + __builtin_ctzll(bits);
+                            current[x + 1] = 0;
+                            bits &= bits - 1;
+                        }
+                    }
+
+                    // Incoming boundary entries have already been consumed when
+                    // their corresponding outgoing entries overwrite them.
+                    if (diagonal >= height - 1) {
+                        const int x = diagonal - height + 1;
+                        top_boundary[x0 + x] = current[x + 1];
+                    }
+                    if (diagonal >= width - 1) {
+                        const int y = diagonal - width + 1;
+                        left_boundary[y0 + y] = current[width];
+                    }
+                }
+            }
+            // The worksharing barrier publishes boundaries for the next wave.
+        }
+    }
+
+    std::cout << top_boundary[n - 1] << '\n';
+    return 0;
+}

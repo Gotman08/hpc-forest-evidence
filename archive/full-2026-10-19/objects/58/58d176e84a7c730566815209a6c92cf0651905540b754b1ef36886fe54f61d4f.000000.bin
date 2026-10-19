@@ -1,0 +1,170 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+  return bodies;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+
+  // Convert AoS input to SoA arrays for cache-friendly access.
+  size_t arr_bytes = (size_t)nbodies * sizeof(float);
+  float *restrict x;
+  float *restrict y;
+  float *restrict z;
+  float *restrict vx;
+  float *restrict vy;
+  float *restrict vz;
+
+  if (posix_memalign((void **)&x, 64, arr_bytes) != 0 ||
+      posix_memalign((void **)&y, 64, arr_bytes) != 0 ||
+      posix_memalign((void **)&z, 64, arr_bytes) != 0 ||
+      posix_memalign((void **)&vx, 64, arr_bytes) != 0 ||
+      posix_memalign((void **)&vy, 64, arr_bytes) != 0 ||
+      posix_memalign((void **)&vz, 64, arr_bytes) != 0) {
+    perror("aligned alloc");
+    exit(EXIT_FAILURE);
+  }
+
+  for (int i = 0; i < nbodies; ++i) {
+    x[i] = bodies[i].x;
+    y[i] = bodies[i].y;
+    z[i] = bodies[i].z;
+    vx[i] = bodies[i].vx;
+    vy[i] = bodies[i].vy;
+    vz[i] = bodies[i].vz;
+  }
+
+  // Single parallel region spans all iterations to reuse the thread team.
+  #pragma omp parallel
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      // Compute gravitational forces and update velocities.
+      // Static scheduling preserves exact per-body accumulation order;
+      // SIMD is intentionally not used here to avoid reassociating sums.
+      #pragma omp for schedule(static)
+      for (int i = 0; i < nbodies; ++i) {
+        float xi = x[i];
+        float yi = y[i];
+        float zi = z[i];
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
+
+        int j = 0;
+        // Manual unroll by 4, preserving exact per-j accumulation order.
+        for (; j + 3 < nbodies; j += 4) {
+          float dx0 = x[j] - xi;
+          float dy0 = y[j] - yi;
+          float dz0 = z[j] - zi;
+          float d0 = dx0*dx0 + dy0*dy0 + dz0*dz0 + SOFTENING;
+          float inv0 = 1 / sqrt(d0);
+          float inv30 = inv0 * inv0 * inv0;
+          fx += dx0 * inv30;
+          fy += dy0 * inv30;
+          fz += dz0 * inv30;
+
+          float dx1 = x[j+1] - xi;
+          float dy1 = y[j+1] - yi;
+          float dz1 = z[j+1] - zi;
+          float d1 = dx1*dx1 + dy1*dy1 + dz1*dz1 + SOFTENING;
+          float inv1 = 1 / sqrt(d1);
+          float inv31 = inv1 * inv1 * inv1;
+          fx += dx1 * inv31;
+          fy += dy1 * inv31;
+          fz += dz1 * inv31;
+
+          float dx2 = x[j+2] - xi;
+          float dy2 = y[j+2] - yi;
+          float dz2 = z[j+2] - zi;
+          float d2 = dx2*dx2 + dy2*dy2 + dz2*dz2 + SOFTENING;
+          float inv2 = 1 / sqrt(d2);
+          float inv32 = inv2 * inv2 * inv2;
+          fx += dx2 * inv32;
+          fy += dy2 * inv32;
+          fz += dz2 * inv32;
+
+          float dx3 = x[j+3] - xi;
+          float dy3 = y[j+3] - yi;
+          float dz3 = z[j+3] - zi;
+          float d3 = dx3*dx3 + dy3*dy3 + dz3*dz3 + SOFTENING;
+          float inv3 = 1 / sqrt(d3);
+          float inv33 = inv3 * inv3 * inv3;
+          fx += dx3 * inv33;
+          fy += dy3 * inv33;
+          fz += dz3 * inv33;
+        }
+        for (; j < nbodies; ++j) {
+          float dx = x[j] - xi;
+          float dy = y[j] - yi;
+          float dz = z[j] - zi;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+          fx += dx * inv_dist3;
+          fy += dy * inv_dist3;
+          fz += dz * inv_dist3;
+        }
+
+        vx[i] += DT*fx;
+        vy[i] += DT*fy;
+        vz[i] += DT*fz;
+      }
+
+      // Update positions using the newly computed velocities.
+      // Elementwise and independent, so SIMD is safe here.
+      #pragma omp for simd schedule(static) aligned(x,y,z,vx,vy,vz:64)
+      for (int i = 0; i < nbodies; ++i) {
+        x[i] += vx[i] * DT;
+        y[i] += vy[i] * DT;
+        z[i] += vz[i] * DT;
+      }
+    }
+  }
+
+  // Convert SoA results back to the required AoS output layout.
+  for (int i = 0; i < nbodies; ++i) {
+    bodies[i].x = x[i];
+    bodies[i].y = y[i];
+    bodies[i].z = z[i];
+    bodies[i].vx = vx[i];
+    bodies[i].vy = vy[i];
+    bodies[i].vz = vz[i];
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(x); free(y); free(z); free(vx); free(vy); free(vz);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

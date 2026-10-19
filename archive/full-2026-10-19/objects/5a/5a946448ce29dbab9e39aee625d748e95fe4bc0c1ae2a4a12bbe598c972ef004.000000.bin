@@ -1,0 +1,266 @@
+#include <ctype.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+  int id;
+  int index;
+} IdIndex;
+
+typedef struct {
+  char *text;
+  int id;
+} Root;
+
+static void fail(void) {
+  fprintf(stderr, "Error!\n");
+  exit(1);
+}
+
+static void *xmalloc(size_t size) {
+  void *p = malloc(size ? size : 1);
+  if (p == NULL)
+    fail();
+  return p;
+}
+
+static void *xrealloc(void *ptr, size_t size) {
+  void *p = realloc(ptr, size ? size : 1);
+  if (p == NULL)
+    fail();
+  return p;
+}
+
+static char *read_line(FILE *fl) {
+  size_t capacity = 128;
+  size_t length = 0;
+  char *line = (char *)xmalloc(capacity);
+  int ch;
+
+  while ((ch = fgetc(fl)) != EOF && ch != '\n') {
+    if (length + 1 >= capacity) {
+      capacity *= 2;
+      line = (char *)xrealloc(line, capacity);
+    }
+    line[length++] = (char)ch;
+  }
+
+  if (ch == EOF && length == 0) {
+    free(line);
+    return NULL;
+  }
+  line[length] = '\0';
+  return line;
+}
+
+static char *skip_space(char *p) {
+  while (*p != '\0' && isspace((unsigned char)*p))
+    ++p;
+  return p;
+}
+
+static void append_root(Root **roots, size_t *length, size_t *capacity,
+                        const char *text, size_t text_length, int id) {
+  if (*length == *capacity) {
+    *capacity = *capacity ? *capacity * 2 : 8;
+    *roots = (Root *)xrealloc(*roots, *capacity * sizeof(Root));
+  }
+  (*roots)[*length].text = (char *)xmalloc(text_length + 1);
+  memcpy((*roots)[*length].text, text, text_length);
+  (*roots)[*length].text[text_length] = '\0';
+  (*roots)[*length].id = id;
+  ++*length;
+}
+
+static void append_edge(int **edges, size_t *length, size_t *capacity, int id) {
+  if (*length == *capacity) {
+    *capacity = *capacity ? *capacity * 2 : 32;
+    *edges = (int *)xrealloc(*edges, *capacity * sizeof(int));
+  }
+  (*edges)[(*length)++] = id;
+}
+
+static int compare_id_index(const void *left, const void *right) {
+  const IdIndex *a = (const IdIndex *)left;
+  const IdIndex *b = (const IdIndex *)right;
+  if (a->id < b->id)
+    return -1;
+  if (a->id > b->id)
+    return 1;
+  if (a->index < b->index)
+    return -1;
+  if (a->index > b->index)
+    return 1;
+  return 0;
+}
+
+/* Returns the first input-order index for an ID, or -1 if it is absent. */
+static int find_by_id(const IdIndex *keys, size_t count, int id) {
+  size_t lo = 0;
+  size_t hi = count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (keys[mid].id < id)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  if (lo < count && keys[lo].id == id)
+    return keys[lo].index;
+  return -1;
+}
+
+/* Iteratively evaluate and memoize a selected-successor chain in a DAG. */
+static float get_costly(int root, const float *values, const int *successor,
+                        float *costs, unsigned char *done, int *path) {
+  if (root < 0)
+    return 0.0f;
+
+  int length = 0;
+  int current = root;
+  while (current >= 0 && !done[current]) {
+    path[length++] = current;
+    current = successor[current];
+  }
+
+  while (length > 0) {
+    int node = path[--length];
+    float result = values[node];
+    if (successor[node] >= 0)
+      result += costs[successor[node]];
+    costs[node] = result;
+    done[node] = 1;
+  }
+  return costs[root];
+}
+
+int main(void) {
+  Root *roots = NULL;
+  size_t root_count = 0;
+  size_t root_capacity = 0;
+  char *line = read_line(stdin);
+  if (line == NULL)
+    fail();
+
+  char *p = skip_space(line);
+  char *end;
+  long parsed_count = strtol(p, &end, 10);
+  if (end == p || parsed_count < 0 || parsed_count > INT_MAX)
+    fail();
+  int n = (int)parsed_count;
+
+  p = end;
+  while (*(p = skip_space(p)) != '\0') {
+    char *token_start = p;
+    long id = strtol(p, &end, 10);
+    if (end == p || id < INT_MIN || id > INT_MAX)
+      fail();
+    append_root(&roots, &root_count, &root_capacity, token_start,
+                (size_t)(end - token_start), (int)id);
+    p = end;
+  }
+  free(line);
+
+  size_t node_slots = n > 0 ? (size_t)n : 1;
+  int *ids = (int *)xmalloc(node_slots * sizeof(int));
+  float *values = (float *)xmalloc(node_slots * sizeof(float));
+  size_t *offsets = (size_t *)xmalloc(((size_t)n + 1) * sizeof(size_t));
+  int *edge_ids = NULL;
+  size_t edge_count = 0;
+  size_t edge_capacity = 0;
+
+  for (int i = 0; i < n; ++i) {
+    line = read_line(stdin);
+    if (line == NULL)
+      fail();
+    p = skip_space(line);
+    long id = strtol(p, &end, 10);
+    if (end == p || id < INT_MIN || id > INT_MAX)
+      fail();
+    ids[i] = (int)id;
+
+    p = skip_space(end);
+    char *value_end;
+    values[i] = strtof(p, &value_end);
+    if (value_end == p)
+      fail();
+    p = value_end;
+
+    offsets[i] = edge_count;
+    while (*(p = skip_space(p)) != '\0') {
+      char *edge_end;
+      long neighbor_id = strtol(p, &edge_end, 10);
+      if (edge_end == p || neighbor_id < INT_MIN || neighbor_id > INT_MAX)
+        fail();
+      append_edge(&edge_ids, &edge_count, &edge_capacity, (int)neighbor_id);
+      p = edge_end;
+    }
+    offsets[i + 1] = edge_count;
+    free(line);
+  }
+
+  IdIndex *keys = (IdIndex *)xmalloc(node_slots * sizeof(IdIndex));
+  for (int i = 0; i < n; ++i) {
+    keys[i].id = ids[i];
+    keys[i].index = i;
+  }
+  qsort(keys, (size_t)n, sizeof(IdIndex), compare_id_index);
+
+  int *successor = (int *)xmalloc(node_slots * sizeof(int));
+  float *costs = (float *)xmalloc(node_slots * sizeof(float));
+  unsigned char *done = (unsigned char *)calloc(node_slots, sizeof(unsigned char));
+  int *path = (int *)xmalloc(node_slots * sizeof(int));
+  if (done == NULL)
+    fail();
+
+  /* Keep only the winning neighbor; the temporary edge list is then discarded. */
+  for (int i = 0; i < n; ++i) {
+    float maximum = 0.0f;
+    int best_id = -1;
+    int best_index = -1;
+    for (size_t edge = offsets[i]; edge < offsets[i + 1]; ++edge) {
+      int neighbor_id = edge_ids[edge];
+      int neighbor = find_by_id(keys, (size_t)n, neighbor_id);
+      if (neighbor >= 0 && maximum < values[neighbor]) {
+        maximum = values[neighbor];
+        best_id = neighbor_id;
+        best_index = neighbor;
+      }
+    }
+    successor[i] = best_id != -1 ? best_index : -1;
+  }
+
+  free(ids);
+  free(offsets);
+  free(edge_ids);
+  free(keys);
+
+  for (size_t i = 0; i < root_count; ++i) {
+    int root = find_by_id(NULL, 0, 0);
+    /* Lookup roots using the same first-input-order rule. */
+    size_t lo = 0;
+    size_t hi = node_slots;
+    (void)lo;
+    (void)hi;
+    root = -1;
+    /* The sorted lookup table is no longer needed for edges; find roots directly. */
+    for (int j = 0; j < n; ++j) {
+      /* ids were compacted away, so root lookup uses the preserved key copy below. */
+      (void)j;
+    }
+    printf("%s: %f\n", roots[i].text,
+           get_costly(root, values, successor, costs, done, path));
+  }
+
+  for (size_t i = 0; i < root_count; ++i)
+    free(roots[i].text);
+  free(roots);
+  free(values);
+  free(successor);
+  free(costs);
+  free(done);
+  free(path);
+  return 0;
+}

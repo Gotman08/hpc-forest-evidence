@@ -1,0 +1,219 @@
+"""Inert metadata-only tests; never import source projects, clients or received code."""
+import hashlib
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import audit_cli_g as private
+import audit_context as context
+import audit_formats_g as formats
+import audit_transport as transport
+
+
+def save(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    return path
+
+
+def base_cell():
+    model = "gpt-6-astra"
+    return {"scope_id": context.SCOPE_VALUE, "model": model, "effort": "max", "session_id": context.CELLS[model],
+        "job_id": "753498", "remote_root": "/scratch_p/nimarano/" + context.SCOPE_VALUE + "-" + context.CELLS[model],
+        "source_zip_sha256": context.SOURCE_VALUE, "plan_sha256": context.PLAN_VALUE}
+
+
+def policy(cell):
+    return {"schema": "hpc-forest-r2g-local-cli-policy-v1", **cell,
+        "cli_executable_sha256": private.CLI, "code_mode_host_executable_sha256": private.HOST,
+        "cli_feature_overrides": dict(private.FEATURES), "filesystem_metadata_sha256": "a" * 64,
+        "is_actual_CLI_discovery_receipt": False, "instruction_or_SKILL_body_read": False,
+        "skill_candidate_directories": ["C:/NEUTRAL/skills/fake"]}
+
+
+def make_projection(raw, path, kind, checksum):
+    argv = raw["argv"]
+    index = next(i for i, value in enumerate(argv) if value.startswith("skills.config="))
+    return {"schema": "hpc-forest-r2e-private-cli-metadata-projection-v1", "kind": kind,
+        "record_without_private_argv": {k: v for k, v in raw.items() if k != "argv"},
+        "argv_public": argv[:index - 1] + argv[index + 1:],
+        "private_record_sha256": private.sha(path.read_bytes()),
+        "private_argv_sha256": private.sha(json.dumps(argv, ensure_ascii=False, sort_keys=True).encode()),
+        "private_skill_override_sha256": private.sha(argv[index].encode()),
+        "task_cli_policy_sha256": checksum, "private_skill_path_count": 1, "private_review_required": True,
+        "private_argv_verified": False, "projection_is_executable": False, "raw_record_exported": False}
+
+
+@pytest.fixture
+def frozen(tmp_path, monkeypatch):
+    cell = base_cell()
+    configured = policy(cell)
+    checksum = private.sha(json.dumps(configured, sort_keys=True).encode())
+    cli = {"executable_path": "C:/NEUTRAL/codex.exe", "executable_sha256": private.CLI, "task_cli_policy_sha256": checksum}
+    binding = SimpleNamespace(**cell, cache_source_root=context.CACHE_PARENT + "/worker-" + cell["session_id"],
+        cli_json=json.dumps(cli), private_cli_policy_json=json.dumps(configured))
+    monkeypatch.setattr(context, "recheck", lambda: binding)
+    context._binding = binding
+    yield SimpleNamespace(cell=cell, policy=configured, cli=cli, binding=binding, checksum=checksum, root=tmp_path)
+    context._binding = None
+
+
+@pytest.mark.parametrize("model", tuple(context.CELLS))
+def test_G_identity_exact(model):
+    session = context.CELLS[model]
+    value = {**base_cell(), "model": model, "session_id": session, "schema": "hpc-forest-primes-r2g-native-cell-audit-expectation-v1",
+        "remote_root": "/scratch_p/nimarano/" + context.SCOPE_VALUE + "-" + session,
+        "cache_source_root": context.CACHE_PARENT + "/worker-" + session}
+    assert context.validate_identity(value)[-2:] == (model, session)
+
+
+@pytest.mark.parametrize("key,value", [("scope_id", "old"), ("source_zip_sha256", "0" * 64),
+    ("session_id", "0" * 32), ("effort", "medium"), ("schema", "hpc-forest-primes-r2c-native-cell-audit-expectation-v2")])
+def test_G_identity_rejects_old(key, value):
+    cell = base_cell()
+    data = {**cell, "schema": "hpc-forest-primes-r2g-native-cell-audit-expectation-v1",
+        "cache_source_root": context.CACHE_PARENT + "/worker-" + cell["session_id"]}
+    data[key] = value
+    with pytest.raises(ValueError):
+        context.validate_identity(data)
+
+
+def test_policy_exact(frozen):
+    assert private.validate_policy(frozen.policy, frozen.cell, frozen.cli, frozen.checksum) == frozen.policy
+
+
+@pytest.mark.parametrize("key,value", [("code_mode_host", False), ("shell_tool", True), ("code_mode", True),
+    ("code_mode_only", True), ("skip_host_skill_discovery", True), ("code_mode_host", 1)])
+def test_policy_feature_mismatch(frozen, key, value):
+    frozen.policy["cli_feature_overrides"][key] = value
+    with pytest.raises(ValueError):
+        private.validate_policy(frozen.policy, frozen.cell, frozen.cli, frozen.checksum)
+
+
+@pytest.mark.parametrize("key,value", [("schema", "old"), ("code_mode_host_executable_sha256", "0" * 64),
+    ("cli_executable_sha256", "0" * 64), ("instruction_or_SKILL_body_read", True), ("is_actual_CLI_discovery_receipt", True)])
+def test_policy_metadata_mismatch(frozen, key, value):
+    frozen.policy[key] = value
+    with pytest.raises(ValueError):
+        private.validate_policy(frozen.policy, frozen.cell, frozen.cli, frozen.checksum)
+
+
+def call_fixture(frozen, dirty=False):
+    nonce = "a" * 32
+    local = frozen.root / "cache" / nonce
+    mailbox = frozen.root / "restoration/mailbox"
+    request = {"kind": "source-proposal", "model": frozen.cell["model"], "reasoning_effort": "max",
+        "session_id": frozen.cell["session_id"], "nonce": nonce, "mission_id": "NEUTRAL-h01",
+        "messages": [{"role": "system", "content": "NEUTRAL INSTRUCTION"}, {"role": "user", "content": "NEUTRAL"}]}
+    req_path = save(mailbox / "requests" / (nonce + ".request.json"), request)
+    request_sha = private.sha(req_path.read_bytes())
+    save(local / "downloaded-request.json", request)
+    save(local / "request.json", request)
+    save(local / "generation-claimed.json", {"request_sha256": request_sha})
+    (local / "instructions.txt").write_text("NEUTRAL INSTRUCTION", encoding="utf8")
+    argv = private.expected_argv(frozen.cli, frozen.cell["model"], frozen.binding.cache_source_root + "/" + nonce, frozen.policy)
+    raw_inv = {"argv": argv, "request_sha256": request_sha, "model": frozen.cell["model"], "reasoning_effort": "max", "source_execution_allowed": False}
+    raw_proc = {"argv": argv, "returncode": 0, "timed_out": False}
+    for kind, name, raw in (("invocation", "invocation.json", raw_inv), ("process", "codex.jsonl.json", raw_proc)):
+        path = save(local / name, raw)
+        projected = make_projection(raw, path, kind, frozen.checksum)
+        save(mailbox / "logs" / (nonce + "." + name), projected)
+        save(local / (name + ".arm-projection.json"), projected)
+    events = [{"type": "thread.started", "thread_id": "NEUTRAL"}, {"type": "turn.started"},
+        {"type": "item.completed", "item": {"id": "N", "type": "agent_message", "text": "NEUTRAL"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 1}}]
+    if dirty:
+        events.insert(2, {"type": "warning", "message": "NEUTRAL"})
+    raw_events = "\n".join(json.dumps(e) for e in events) + "\n"
+    log = local / "codex.jsonl"
+    log.write_text(raw_events, encoding="utf8")
+    (mailbox / "logs" / (nonce + ".codex.jsonl")).write_bytes(log.read_bytes())
+    diag = save(local / "cli-diagnostics.json", formats.diagnostics_from_events(log))
+    usage, _ = formats.usage_from_events(log, frozen.cell["model"])
+    usage.update(cli_diagnostics_sha256=private.sha(diag.read_bytes()), cli_diagnostic_count=len(formats.diagnostics_from_events(log)["findings"]))
+    response = {"nonce": nonce, "request_sha256": request_sha, "session_id": frozen.cell["session_id"],
+        "model": frozen.cell["model"], "reasoning_effort": "max", "infrastructure_error": dirty, "error": "NEUTRAL" if dirty else None, "usage": usage}
+    response_path = save(local / "response.json", response)
+    (mailbox / "responses").mkdir()
+    (mailbox / "responses" / (nonce + ".response.json")).write_bytes(response_path.read_bytes())
+    ready = {"sha256": private.sha(response_path.read_bytes()), "bytes": response_path.stat().st_size}
+    delivered = {**frozen.cell, "request_sha256": request_sha, "response_sha256": ready["sha256"]}
+    save(local / "response-ready.json", ready)
+    save(local / "delivered.json", delivered)
+    save(mailbox / "responses" / (nonce + ".ready.json"), ready)
+    save(mailbox / "logs" / (nonce + ".delivered.json"), delivered)
+    return mailbox, local.parent, nonce
+
+
+def test_real_transport_G_projection_chain_neutral(frozen):
+    mailbox, cache, _ = call_fixture(frozen)
+    result = transport.mailbox_and_cache(mailbox, cache)
+    assert result["exact_known_tokens"] == 3 and result["exact_known_native_invocations"] == 1
+    assert result["unresolved_nonces"] == []
+
+
+def test_dirty_transport_preserves_exact_usage_blocks_admission(frozen):
+    mailbox, cache, nonce = call_fixture(frozen, dirty=True)
+    result = transport.mailbox_and_cache(mailbox, cache)
+    assert result["exact_known_tokens"] == 3 and result["unknown_native_invocations"] == 0
+    assert result["unresolved_nonces"] == [nonce]
+
+
+def test_exact_technical_hold_stays_closed(frozen):
+    mailbox, cache, nonce = call_fixture(frozen, dirty=True)
+    local = cache / nonce
+    save(cache / 'cli-technical-hold.json', {'schema': 'hpc-forest-r2e-delivered-technical-hold-v1',
+        'scope_id': context.SCOPE_VALUE, 'nonce': nonce, 'created_at': 100.0,
+        'response_sha256': private.sha((local / 'response.json').read_bytes()),
+        'delivered_sha256': private.sha((local / 'delivered.json').read_bytes()),
+        'cli_diagnostics_sha256': private.sha((local / 'cli-diagnostics.json').read_bytes()),
+        'new_generations_allowed': False, 'byte_identical_retransmissions_only': True,
+        'process_stop_or_retry': False, 'model_algorithmic_negative_repaired': False})
+    result = transport.mailbox_and_cache(mailbox, cache)
+    assert result['technical_hold']['new_generations_allowed'] is False
+    assert result['unresolved_nonces'] == [nonce] and result['exact_known_tokens'] == 3
+
+
+def test_hold_false_promotion_rejected(frozen):
+    mailbox, cache, nonce = call_fixture(frozen, dirty=True)
+    save(cache / 'cli-technical-hold.json', {'schema': 'hpc-forest-r2e-delivered-technical-hold-v1',
+        'scope_id': context.SCOPE_VALUE, 'nonce': nonce, 'created_at': 100.0,
+        'response_sha256': 'a'*64, 'delivered_sha256': 'b'*64,
+        'new_generations_allowed': True, 'byte_identical_retransmissions_only': True,
+        'process_stop_or_retry': False, 'model_algorithmic_negative_repaired': False})
+    with pytest.raises(ValueError):
+        transport.mailbox_and_cache(mailbox, cache)
+
+
+@pytest.mark.parametrize("field", ["projection_is_executable", "private_argv_verified", "raw_record_exported"])
+def test_projection_false_promotions_refused(frozen, field):
+    mailbox, cache, nonce = call_fixture(frozen)
+    path = mailbox / "logs" / (nonce + ".invocation.json")
+    projection = json.loads(path.read_bytes())
+    projection[field] = True
+    save(path, projection)
+    with pytest.raises(ValueError):
+        transport.mailbox_and_cache(mailbox, cache)
+
+
+@pytest.mark.parametrize("event", [{"type": "item.completed", "item": {}}, {"type": "item.completed", "item": None},
+    {"type": "unknown"}, {"type": "item.completed", "item": {"id": "N", "type": "command_execution", "text": "NEUTRAL"}}])
+def test_unknown_and_tools_refused_without_erasing_exact_usage(tmp_path, event):
+    log = tmp_path / "events.jsonl"
+    log.write_text(json.dumps(event) + '\n' + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 1}}), encoding="utf8")
+    assert formats.diagnostics_from_events(log)["clean"] is False
+    assert formats.usage_from_events(log, "NEUTRAL")[0]["tokens"] == 3
+
+
+def test_scientific_components_remain_byte_identical():
+    here = Path(__file__).resolve().parent
+    derivation = json.loads((here / "DERIVATION-FERMEE.json").read_bytes())
+    assert set(derivation["byte_identical_scientific_components"]) == {
+        "audit_common.py", "audit_cache_preservation_r2.py", "audit_cli_namespaces.py", "audit_campaign.py",
+        "audit_evaluations.py", "audit_private_r2c.py", "audit_source_binding_r2.py", "git_loose_readonly.py"}
+    for name in derivation["byte_identical_scientific_components"]:
+        assert hashlib.sha256((here / name).read_bytes()).hexdigest() == derivation["predecessor_component_sha256"][name]

@@ -1,0 +1,264 @@
+"""Future allocated R4b contracts/pilot staging. Importing this file does nothing."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tarfile
+import time
+import uuid
+from pathlib import Path
+
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE = "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3"
+PLAN = "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b"
+MODEL = "gpt-6-luna"
+PHASES = ("roots", "advice", "harvest")
+WAIT_SECONDS = 600
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf8"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def save(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf8")
+    temporary.replace(path)
+
+
+def ref(path):
+    return {"path": str(Path(path).resolve()), "sha256": sha(path)}
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def verify_source(shared):
+    require(sha(shared / "project.zip") == SOURCE and sha(shared / "dynamic-plan.json") == PLAN,
+            "Frozen source/plan mismatch")
+    expected = read(shared / "runtime-manifest.json")
+    paths = list((shared / "project").rglob("*"))
+    require(not any(p.is_symlink() for p in paths), "Runtime source symbolic alias refused")
+    actual = {p.relative_to(shared / "project").as_posix(): sha(p) for p in paths if p.is_file()}
+    require(actual == expected and len(actual) == 103, "Exact 103-file runtime required")
+    sys.path[:0] = [str(shared / "project/src"), str(shared / "project/examples/marathon22")]
+    from hpc_forest.target_profile import allocation_facts
+    allocation = allocation_facts()
+    require(hasattr(os, "sched_getaffinity") and len(os.sched_getaffinity(0)) == 4,
+            "Exactly four allocated CPU affinity entries required")
+    return read(shared / "dynamic-plan.json"), allocation
+
+
+def qualification_gate(path):
+    from hpc_forest.dynamic_admission import read_ref
+    value = read(path)
+    require(value.get("schema") == "hpc-forest-dynamic-r4b-mechanical-reception-v1"
+            and value.get("verified") is True and value.get("scope_id") == SCOPE
+            and value.get("source_zip_sha256") == SOURCE and value.get("plan_sha256") == PLAN
+            and value.get("native_model_calls") == 0 and value.get("source_files_exact") is True
+            and value.get("privacy_neutral_tests_passed") is True
+            and value.get("target_profile_verified") is True and value.get("reference_contracts_reviewed") is True,
+            "Real independently received R4b qualification missing")
+    for key in ("archive", "qualification", "independent_audit"):
+        read_ref(value[key])
+    return value
+
+
+def neutral_payload(phase, target):
+    statement = ("SYNTHETIC JSON INTERFACE CONTRACT ONLY. This is not a contest problem, "
+                 "candidate, oracle or measured program. Produce only the requested bounded "
+                 "schema response; no optimization/code/tool action is admitted.")
+    source = {"src/interface_fixture.c": "/* Synthetic interface data only; no contest algorithm. */\n"}
+    if phase == "roots":
+        return {"official_statement_as_data": statement, "official_source_as_data": source,
+                "target_as_data": target, "max_roots": 8}
+    if phase == "advice":
+        return {"branch_id": "synthetic-interface-branch", "own_direction_as_data": {
+            "id": "synthetic-interface-branch", "title": "Synthetic schema interface",
+            "objective": "Validate this JSON advice interface only; no program transformation.", "requires": []},
+            "official_statement_as_data": statement, "own_source_as_data": source,
+            "own_observations_as_data": {}, "target_as_data": target}
+    require(phase == "harvest", "Unknown technical phase")
+    return {"official_statement_as_data": statement, "target_as_data": target, "max_sources": 2,
+            "admissible_programs_as_data": [{"id": identifier, "root": identifier,
+                "commit": None, "mean_seconds": None, "transformations": [], "source_as_data": source}
+                for identifier in ("fixture-a", "fixture-b")]}
+
+
+def make_request(phase, session, target, *, now=None, nonce=None):
+    from hpc_forest.codex_mailbox import PROTOCOL, TOKEN_CEILING
+    from hpc_forest.dynamic_mother import render_meta
+    now = time.time() if now is None else now
+    return {"protocol": PROTOCOL, "kind": "source-proposal", "meta_role": "mother-dynamic-" + phase,
+            "owner_key": "synthetic-interface-contract:" + phase + ":" + session,
+            "nonce": nonce or uuid.uuid4().hex, "session_id": session, "model": MODEL,
+            "reasoning_effort": "max", "mission_id": "mother-dynamic-" + phase + "-contract-" + session[:16],
+            "integration_source_ids": [], "token_ceiling": TOKEN_CEILING,
+            "expires_at": now + 600, **render_meta(phase, neutral_payload(phase, target))}
+
+
+def wait_authorization(admission, marker, request_digest=None):
+    from hpc_forest.dynamic_admission import read_ref
+    from hpc_forest.native_matrix import validate_receipt
+    deadline = time.monotonic() + WAIT_SECONDS
+    ready_path = admission / "authorization-ready.json"
+    while not ready_path.is_file():
+        require(time.monotonic() < deadline, "Authorization wait expired; no invocation/replay")
+        time.sleep(.25)
+    ready = read(ready_path)
+    expected = {k: marker[k] for k in ("scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "session_id", "job_id")}
+    require(ready.get("schema") == "hpc-forest-dynamic-r4b-authorization-ready-v1"
+            and ready.get("verified") is True and all(ready.get(k) == v for k,v in expected.items()),
+            "Ready marker differs from this exact cell")
+    authorization_path = admission / "authorization.json"
+    require(ready.get("authorization_sha256") == sha(authorization_path), "Ready authorization hash mismatch")
+    for item in ready["dependencies"]:
+        read_ref(item)
+    value = validate_receipt(authorization_path, {SCOPE})
+    require(all(value.get(k) == marker[k] for k in ("model", "effort", "session_id", "job_id", "remote_root")),
+            "Authorization differs from actual allocation marker")
+    require(value["purpose"] == ("pilot" if marker["phase"] == "pilot" else "technical-contract"), "Wrong admission purpose")
+    if request_digest is not None:
+        require(value.get("technical_phase") == marker["phase"]
+                and value.get("allowed_request_sha256") == request_digest
+                and ready.get("request_digest") == request_digest, "Wrong exact phase request digest")
+    return authorization_path
+
+
+def allocation_marker(plan, allocation, phase, session, admission, remote_root):
+    marker = {"schema": "hpc-forest-dynamic-r4b-allocation-marker-v1", "verified": True,
+        "verification_scope": "actual allocated staging/source identity only; zero model calls",
+        "scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+        "model": MODEL, "effort": "max", "phase": phase, "session_id": session,
+        "job_id": allocation["slurm_job_id"], "remote_root": str(remote_root),
+        "canonical_remote_root": str(remote_root.resolve()), "allocation": allocation,
+        "cpu_affinity": sorted(os.sched_getaffinity(0)), "native_model_calls": 0,
+        "native_generation_admitted": False, "source_files": 103,
+        "created_at": time.time(), "admission_root": str(admission),
+        "native_root_absent_before_stage": not remote_root.exists()}
+    require(marker["native_root_absent_before_stage"], "Native root already exists; refuse reuse")
+    return marker
+
+
+def archive_phase(root, job):
+    path = root / ("contract-results-" + job + ".tar.gz")
+    with tarfile.open(path, "w:gz") as stream:
+        stream.add(root / ("results-" + job), arcname="results-" + job)
+    return path
+
+
+def one_contract(shared, plan, allocation, phase, admission, root):
+    from hpc_forest import codex_mailbox as mailbox
+    from hpc_forest.core import digest
+    from hpc_forest.dynamic_mother import validate_advice, validate_directions, validate_harvest
+    from hpc_forest.native_matrix import install_identity
+    from hpc_forest.target_profile import prepare_target_profile
+    session = plan["contract_cells"][MODEL][phase]
+    marker = allocation_marker(plan, allocation, phase, session, admission, root)
+    admission.mkdir(parents=True, exist_ok=False)
+    root.mkdir(parents=True, exist_ok=False)
+    output = root / ("results-" + allocation["slurm_job_id"])
+    channel = output / "mailbox"
+    for folder in ("requests", "responses", "logs"):
+        (channel / folder).mkdir(parents=True)
+    # Honest pre-admission owner metadata only: no request is published yet.
+    save(channel / "OWNER.json", {"protocol": mailbox.PROTOCOL, "session_id": session,
+        "model": MODEL, "reasoning_effort": "max", "job_id": allocation["slurm_job_id"]})
+    target = prepare_target_profile()
+    save(output / "target-profile.json", target)
+    request = make_request(phase, session, target)
+    request_path = output / "request-prepared.json"
+    request_path.write_bytes(mailbox.json_bytes(request))
+    marker.update(request_digest=digest(request), request_sha256=sha(request_path),
+                  request_prepared=ref(request_path), target_profile=ref(output / "target-profile.json"),
+                  owner=ref(channel / "OWNER.json"), requests_published=0,
+                  cache_claims_registry_created=False)
+    save(admission / "allocation-marker.json", marker)
+    print(json.dumps({"event": "technical_allocation_ready", "phase": phase, "job_id": allocation["slurm_job_id"],
+        "session_id": session, "marker": str(admission / "allocation-marker.json"), "model_calls": 0}), flush=True)
+    result = {"schema": "hpc-forest-dynamic-r4b-contract-source-result-v1", "verified": False,
+        "scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+        "phase": phase, "model": MODEL, "effort": "max", "session_id": session,
+        "job_id": allocation["slurm_job_id"], "receiver_required": True,
+        "global_admission_verified": False, "performance_verified": False, "error": None}
+    try:
+        authorization = wait_authorization(admission, marker, digest(request))
+        shutil.copyfile(authorization, output / "authorization-original.json")
+        shutil.copyfile(authorization, output / "CELL-BINDING.json")
+        shutil.copyfile(admission / "authorization-ready.json", output / "authorization-ready-original.json")
+        install_identity(MODEL, "max", authorization)
+        from romeo_harness_comparison import verify_worker
+        worker = verify_worker(channel, session, WAIT_SECONDS)
+        save(output / "model-identity.json", worker)
+        request_sha = mailbox.publish_request(channel, request)
+        response = mailbox.wait_response(channel, request, request_sha)
+        save(output / "response-received-private.json", response)
+        require(response.get("error") is None and response.get("infrastructure_error") is not True,
+                "Technical native response failed; do not replay")
+        if phase == "roots":
+            validate_directions(response["data"], 8, ["cpu", "c", "cxx", "openmp"])
+        elif phase == "advice":
+            validate_advice(response["data"])
+        else:
+            validate_harvest(response["data"], {"fixture-a", "fixture-b"}, 2)
+        result.update(native_response_received=True, closed_schema_locally_valid=True,
+            usage=response.get("usage"), request_sha256=request_sha, request_digest=digest(request),
+            native_calls_replayed=0)
+    except Exception as exc:  # noqa: BLE001 - preserve failure, never retry native calls
+        result.update(error=type(exc).__name__, native_response_received=False, native_calls_replayed=0)
+        save(output / "private-technical-error.json", {"never_model_input": True,
+                                                       "type": type(exc).__name__, "detail": str(exc)})
+    finally:
+        save(output / "contract-source-result.json", result)
+        archive_phase(root, allocation["slurm_job_id"])
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shared", type=Path, required=True)
+    parser.add_argument("--qualification-reception", type=Path, required=True)
+    parser.add_argument("--phase", choices=[*PHASES, "pilot"], required=True)
+    parser.add_argument("--admission-root", type=Path, required=True)
+    parser.add_argument("--root", type=Path, required=True)
+    args = parser.parse_args()
+    shared = args.shared.resolve(strict=True)
+    plan, allocation = verify_source(shared)
+    qualification_gate(args.qualification_reception)
+    phase = args.phase
+    session = plan["cells"][MODEL] if phase == "pilot" else plan["contract_cells"][MODEL][phase]
+    expected_root = Path("/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session)
+    expected_admission = Path("/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + session)
+    require(args.root == expected_root and args.admission_root == expected_admission,
+            "Exact selected session roots required; no arbitrary path")
+    if phase != "pilot":
+        result = one_contract(shared, plan, allocation, phase, args.admission_root, args.root)
+        return 0 if result.get("native_response_received") else 1
+    marker = allocation_marker(plan, allocation, phase, session, args.admission_root, args.root)
+    args.admission_root.mkdir(parents=True, exist_ok=False)
+    save(args.admission_root / "allocation-marker.json", marker)
+    print(json.dumps({"event": "pilot_allocation_ready", "job_id": allocation["slurm_job_id"],
+                     "session_id": session, "native_model_calls": 0}), flush=True)
+    authorization = wait_authorization(args.admission_root, marker)
+    # Same frozen source entrypoint; explicit bootstrap retains -I isolation.
+    from dynamic_archive import main as pilot
+    sys.argv = ["dynamic_archive", "--authorization", str(authorization), "--root", str(args.root),
+        "--shared", str(shared), "--model", MODEL, "--effort", "max", "--session-id", session,
+        "--subjects", "2023-count"]
+    return pilot()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

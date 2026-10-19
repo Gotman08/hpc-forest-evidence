@@ -1,0 +1,92 @@
+param(
+    [Parameter(Mandatory=$true)][string]$AuditPath,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$AuditSha256,
+    [switch]$Execute
+)
+$ErrorActionPreference = 'Stop'
+$receiptRoot = $PSScriptRoot
+$baseRoot = Split-Path (Split-Path (Split-Path $receiptRoot -Parent) -Parent) -Parent
+$pythonPath = Join-Path $baseRoot 'work/.venv/Scripts/python.exe'
+$preparerPath = Join-Path $receiptRoot 'preparer-arret-possede.py'
+$planPath = Join-Path $receiptRoot 'plan-arret-individuel.json'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+function Write-NewJson($value,[string]$path) {
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($value | ConvertTo-Json -Depth 60) + "`n")
+    $stream = [System.IO.File]::Open($path,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)
+    try { $stream.Write($bytes,0,$bytes.Length) } finally { $stream.Dispose() }
+}
+function Save-Progress($value,[string]$name) {
+    [System.IO.File]::WriteAllText((Join-Path $receiptRoot $name),($value | ConvertTo-Json -Depth 60) + "`n",[System.Text.UTF8Encoding]::new($false))
+}
+function File-Ref([string]$path) {
+    return @{path=(Resolve-Path -LiteralPath $path).Path;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+}
+function Fresh-Census {
+    $rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{Name='CreationDate';Expression={if ($null -eq $_.CreationDate) {$null} else {$_.CreationDate.ToUniversalTime().ToString('o')}}})
+    $path = Join-Path $receiptRoot ('cim-frais-' + [guid]::NewGuid().ToString('N') + '.json')
+    Write-NewJson @{schema='hpc-forest-primes-r2max-fresh-full-cim-v1';complete_census=$true;captured_at_utc=[DateTime]::UtcNow.ToString('o');rows_count=$rows.Count;rows=$rows} $path
+    return $path
+}
+function Validate-Current([bool]$writePlan) {
+    $freshPath = Fresh-Census
+    $arguments = @('-B',$preparerPath,'--audit',$AuditPath,'--audit-sha256',$AuditSha256,'--fresh-cim',$freshPath,'--fresh-cim-sha256',(File-Ref $freshPath).sha256,'--allow-absent-owned')
+    if ($writePlan) {$arguments += @('--plan-out',$planPath)}
+    $resultText = & $pythonPath @arguments
+    if ($LASTEXITCODE -ne 0) {throw 'Complete audit/cache/fresh-CIM preparation refused; no individual stop permitted'}
+    return ($resultText | ConvertFrom-Json)
+}
+function Same-Identity($actual,$expected) {
+    if ($null -eq $actual) {return $false}
+    return ([int]$actual.ProcessId -eq [int]$expected.ProcessId -and
+        [int]$actual.ParentProcessId -eq [int]$expected.ParentProcessId -and
+        [string]$actual.ExecutablePath -ceq [string]$expected.ExecutablePath -and
+        [string]$actual.CommandLine -ceq [string]$expected.CommandLine -and
+        ([datetime]$actual.CreationDate).ToUniversalTime().Ticks -eq ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+}
+function Fresh-One([int]$targetPid) {
+    return Get-CimInstance Win32_Process -Filter "ProcessId=$targetPid" | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine
+}
+$prepared = Validate-Current (-not (Test-Path -LiteralPath $planPath))
+$plan = Get-Content -LiteralPath $planPath -Raw -Encoding utf8 | ConvertFrom-Json
+if ($plan.schema -ne 'hpc-forest-primes-r2max-owned-individual-stop-plan-v1' -or $plan.job_id -ne '751992' -or $plan.session_id -ne 'c8044062692149138d826d3f388a08ef' -or $plan.pre_stop_audit_sha256 -cne $AuditSha256 -or $plan.owner_identity_sha256 -cne 'dd3e98c9f64528569c6b9fae6814c17f13847ce5f4dd89dd7b3dbc9c4688f3db') {throw 'Wrong exact owned stop plan'}
+foreach ($identity in @($plan.owned_targets_in_stop_order) + @($plan.preserve_source_only_relay_identities)) {
+    $peer = @($prepared.owned_targets_in_stop_order + $prepared.preserve_source_only_relay_identities | Where-Object {$_.ProcessId -eq $identity.ProcessId})
+    if ($peer.Count -ne 1 -or -not (Same-Identity $peer[0] $identity)) {throw 'Plan/full baseline identity mismatch'}
+}
+$preflight = @{schema='hpc-forest-primes-r2max-owned-stop-preflight-v1';verified=$true;verification_scope='Audit/cache and complete fresh CIM gate only; no stop';job_id='751992';session_id=$plan.session_id;scope_id=$plan.scope_id;source_zip_sha256=$plan.source_zip_sha256;plan_sha256=$plan.plan_sha256;preparation_manifest_sha256=$plan.preparation_manifest_sha256;model=$plan.model;effort=$plan.effort;at_utc=[DateTime]::UtcNow.ToString('o');executed=$false;pre_stop_audit_sha256=$AuditSha256;owner_identity_sha256=$plan.owner_identity_sha256;stop_plan_ref=(File-Ref $planPath);fresh_classification=$prepared.classification;worker_lock_bytes_read=$false;native_research_admitted=$false}
+Write-NewJson $preflight (Join-Path $receiptRoot ('prevol-' + [guid]::NewGuid().ToString('N') + '.json'))
+if (-not $Execute) {$preflight | ConvertTo-Json -Depth 30; return}
+$intentPath = Join-Path $receiptRoot 'arret-individuel-intention.json'
+# Exclusive CreateNew is the replay barrier. Never delete/replace an existing intent.
+Write-NewJson $preflight $intentPath
+$actions = @()
+try {
+    foreach ($expected in $plan.owned_targets_in_stop_order) {
+        $currentGate = Validate-Current $false
+        $current = Fresh-One ([int]$expected.ProcessId)
+        if ($null -eq $current) {
+            $actions += @{ProcessId=$expected.ProcessId;action='exited_naturally_before_individual_stop';at_utc=[DateTime]::UtcNow.ToString('o');expected_full_identity=$expected}
+        } else {
+            if (-not (Same-Identity $current $expected)) {throw 'Changed/reused process identity preserved; stop blocked'}
+            $ownedProcess = Get-Process -Id ([int]$expected.ProcessId)
+            try {
+                $stableHandle = $ownedProcess.Handle
+                $deltaTicks = [math]::Abs($ownedProcess.StartTime.ToUniversalTime().Ticks - ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+                if ($deltaTicks -ge 10) {throw 'Stable handle start instant differs by at least 10 ticks'}
+                if (-not (Same-Identity (Fresh-One ([int]$expected.ProcessId)) $expected)) {throw 'Full CIM identity changed after stable handle open'}
+                Stop-Process -InputObject $ownedProcess -Force
+                $actions += @{ProcessId=$expected.ProcessId;action='stopped_individually_after_full_identity_and_stable_handle';at_utc=[DateTime]::UtcNow.ToString('o');full_identity=$expected;start_delta_ticks=$deltaTicks;stable_handle_opened=$true}
+            } finally {$ownedProcess.Dispose()}
+        }
+        Save-Progress $actions 'arret-individuel-actions.json'
+    }
+    $after = Validate-Current $false
+    if (@($after.classification.present_owned).Count -ne 0) {throw 'An original owned process identity remains; no positive stop receipt'}
+    $result = @{schema='hpc-forest-primes-r2max-owned-stop-receipt-v1';verified=$true;verification_scope='Owned individual stop or observed natural exits after pre-stop reconciliation';owned_stop_verified=$true;scope_id=$plan.scope_id;source_zip_sha256=$plan.source_zip_sha256;plan_sha256=$plan.plan_sha256;preparation_manifest_sha256=$plan.preparation_manifest_sha256;model=$plan.model;effort=$plan.effort;job_id='751992';session_id=$plan.session_id;owner_identity_sha256=$plan.owner_identity_sha256;pre_stop_audit_sha256=$AuditSha256;pre_stop_audit_ref=$plan.pre_stop_audit_ref;stop_plan_ref=(File-Ref $planPath);intent_ref=(File-Ref $intentPath);actions=$actions;all_owned_process_identities_absent_after_stop=$true;source_only_relay_identities_preserved=$true;preserved_source_only_full_identities=$after.classification.source_only_full_identities_preserved;final_full_cim_ref=$after.fresh_cim_ref;recursive_stop=$false;stop_by_name=$false;foreign_processes_targeted=$false;worker_lock_bytes_read=$false;worker_lock_sha256_before=$null;secondary_route_clear_required_after_verified_absence=$true;secondary_route_modified=$false;native_research_admitted=$false;independent_performance_audit_verified=$false;completed_utc=[DateTime]::UtcNow.ToString('o');limits=@('No independent raw/performance admission','Lock byte must be received separately after this owned stop; no before SHA invented','Secondary route must be cleared only by parent after verified absence')}
+    Write-NewJson $result (Join-Path $receiptRoot 'owned-worker-stopped.json')
+    $result | ConvertTo-Json -Depth 30
+} catch {
+    Write-NewJson @{schema='hpc-forest-primes-r2max-owned-stop-failed-v1';verified=$false;owned_stop_verified=$false;job_id='751992';session_id=$plan.session_id;owner_identity_sha256=$plan.owner_identity_sha256;pre_stop_audit_sha256=$AuditSha256;actions=$actions;error=$_.Exception.Message;no_retry_without_reconciliation=$true} (Join-Path $receiptRoot ('arret-refuse-' + [guid]::NewGuid().ToString('N') + '.json'))
+    throw
+}

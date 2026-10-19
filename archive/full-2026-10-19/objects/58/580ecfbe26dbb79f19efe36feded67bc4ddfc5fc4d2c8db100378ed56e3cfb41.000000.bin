@@ -1,0 +1,218 @@
+"""Real inherited parsers and wrapper coroutines, with every effect replaced by doubles."""
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from hpc_forest import codex_process, codex_worker, matrix_worker
+from hpc_forest.core import InfrastructureError, atomic_json, file_digest
+from hpc_forest.native_matrix import SCOPE
+
+SESSIONS = {
+    "gpt-6.1-sol": ["3b1de5658e4641149b15a3bea4850239", "b86d18fcf35d4031aa2ef0da49397c4e", "7c8bc0c5ae22467da05600fb735fc017"],
+    "gpt-6-astra": ["7b6c29c0e329400bb2be145b0e2dbe0a", "7be16898433e49f4b481045079abbbe8", "b6fc9cf3951d46d787f319b51905251b"],
+    "gpt-5.6-terra": ["bd2b3153a7544c909afbc19fe69902b4", "7516e40883c64ab8af8a38637d74de3f", "7d6f357d4e5741bb8349835f358563b2"],
+}
+
+
+def finish(coroutine):
+    try:
+        coroutine.send(None)
+    except StopIteration as done:
+        return done.value
+    finally:
+        coroutine.close()
+    raise AssertionError("No event loop or actual I/O is allowed")
+
+
+@pytest.fixture
+def parsers(tmp_path, monkeypatch):
+    calls = {"parsed": [], "policy_checks": 0}
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No process, CLI, auth or transport may run")
+    monkeypatch.setattr(codex_worker.RomeoFiles, "__init__", forbidden)
+    monkeypatch.setattr(codex_worker.subprocess, "run", forbidden)
+    monkeypatch.setattr(matrix_worker, "install_identity", lambda *_: None)
+    monkeypatch.setattr(codex_worker, "validate_remote_channel", lambda *_: None)
+    def policy(*_):
+        calls["policy_checks"] += 1
+        if "policy_failure" in calls:
+            raise InfrastructureError("NEUTRAL changed policy")
+        return {"skill_candidate_directories": ["C:/NEUTRAL/SKILL"]}
+    monkeypatch.setattr(matrix_worker, "verify_task_cli_policy", policy)
+    monkeypatch.setattr(matrix_worker, "verify_local_cli", lambda *_: {"executable_path": "C:/NEUTRAL/codex.exe"})
+    def inert_async(args):
+        calls["class"] = codex_worker.Worker
+        calls["inherited_argv"] = list(sys.argv)
+        return SimpleNamespace(parsed=args)
+    monkeypatch.setattr(codex_worker, "main_async", inert_async)
+    def inert_run(value):
+        calls["parsed"].append(value.parsed)
+        if "failure" in calls:
+            raise calls["failure"]
+        return 37
+    monkeypatch.setattr(codex_worker.asyncio, "run", inert_run)
+    def prepare(model="gpt-6.1-sol", phase=0, equals=False):
+        session = SESSIONS[model][phase]
+        auth = {"scope_id": SCOPE, "purpose": "technical-contract", "phase": ["roots", "advice", "harvest"][phase],
+                "model": model, "effort": "max", "session_id": session, "job_id": "900000",
+                "remote_root": "/scratch/NEUTRAL", "expires_at": 2000,
+                "artifacts": {"source_zip": {"sha256": "1" * 64}, "plan": {"sha256": "2" * 64}}}
+        calls["auth"] = auth
+        monkeypatch.setattr(matrix_worker, "validate_receipt", lambda *_: auth)
+        public = ["--dependency-receipt", str(tmp_path / "NEUTRAL-admission.json"),
+                  "--session-id", session, "--required-jobs", SCOPE,
+                  "--channel", "/scratch/NEUTRAL/results-900000/mailbox",
+                  "--output", str(tmp_path / "NEUTRAL-output"), "--executable", "C:/NEUTRAL/codex.exe",
+                  "--codex-config", str(tmp_path / "NEUTRAL.toml"), "--once", "--max-seconds", "900", "--poll-seconds", "0.75"]
+        policy_path = str(tmp_path / ("cli-policy-" + session + ".json"))
+        private = (["--cli-policy=" + policy_path, "--cli-policy-sha256=" + "b" * 64] if equals else
+                   ["--cli-policy", policy_path, "--cli-policy-sha256", "b" * 64])
+        original = ["NEUTRAL-worker", *public[:4], *private, *public[4:]]
+        monkeypatch.setattr(sys, "argv", original)
+        return original, public
+    return calls, prepare
+
+
+@pytest.mark.parametrize("model", list(SESSIONS))
+@pytest.mark.parametrize("phase", [0, 1, 2])
+@pytest.mark.parametrize("equals", [False, True])
+def test_both_real_parsers_preserve_nine_R4b_cells_and_shared_args(parsers, model, phase, equals):
+    calls, prepare = parsers
+    original, public = prepare(model, phase, equals)
+    old_class, old_policy, old_ref = codex_worker.Worker, codex_process.CLI_POLICY, codex_process.CLI_POLICY_REFERENCE
+    assert matrix_worker.main() == 37
+    assert sys.argv is original and codex_worker.Worker is old_class
+    assert codex_process.CLI_POLICY is old_policy and codex_process.CLI_POLICY_REFERENCE is old_ref
+    assert calls["inherited_argv"] == [original[0], *public]
+    parsed = calls["parsed"][0]
+    assert parsed.session_id == SESSIONS[model][phase] and parsed.once is True
+    assert parsed.required_jobs == [SCOPE] and parsed.transport_smoke is False
+    assert parsed.max_seconds == 900 and parsed.poll_seconds == 0.75
+    assert not hasattr(parsed, "cli_policy") and not hasattr(parsed, "cli_policy_sha256")
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("NEUTRAL"), SystemExit(19)])
+def test_globals_restored_on_inherited_failure(parsers, failure):
+    calls, prepare = parsers
+    original, _ = prepare()
+    old_class = codex_worker.Worker
+    calls["failure"] = failure
+    with pytest.raises(type(failure)) as caught:
+        matrix_worker.main()
+    assert caught.value is failure and sys.argv is original and codex_worker.Worker is old_class
+
+
+@pytest.mark.parametrize("unknown", ["--unknown-option", "--codex-confg"])
+def test_inherited_parser_still_refuses_unknown(parsers, unknown):
+    calls, prepare = parsers
+    original, _ = prepare()
+    original.append(unknown)
+    with pytest.raises(SystemExit) as caught:
+        matrix_worker.main()
+    assert caught.value.code == 2 and calls["parsed"] == [] and sys.argv is original
+
+
+@pytest.mark.parametrize("flag", ["--once", "--cli-policy", "--cli-policy-sha256"])
+def test_private_flags_and_once_required_before_output(parsers, flag, tmp_path):
+    calls, prepare = parsers
+    original, _ = prepare()
+    index = original.index(flag)
+    del original[index:index + (1 if flag == "--once" else 2)]
+    with pytest.raises((SystemExit, InfrastructureError)):
+        matrix_worker.main()
+    assert not (tmp_path / "NEUTRAL-output").exists() and calls["parsed"] == []
+
+
+def test_changed_policy_blocks_before_output_or_legacy_main(parsers, tmp_path):
+    calls, prepare = parsers
+    prepare()
+    calls["policy_failure"] = True
+    with pytest.raises(InfrastructureError):
+        matrix_worker.main()
+    assert not (tmp_path / "NEUTRAL-output").exists() and calls["parsed"] == []
+
+
+@pytest.mark.parametrize("name", ["invocation.json", "codex.jsonl.json", "codex.jsonl", "process.json", "response.json"])
+def test_only_two_exact_metadata_files_are_projected(tmp_path, monkeypatch, name):
+    local = tmp_path / ("a" * 32) / name
+    local.parent.mkdir()
+    local.write_bytes(b"NEUTRAL raw fixture")
+    uploads = []
+    class Transfer:
+        async def upload(self, source, remote):
+            uploads.append((source, remote))
+            return {"verified": True}
+    monkeypatch.setattr(codex_process, "cli_metadata_projection", lambda *args: {"private_paths_exported": False})
+    proxy = matrix_worker.LocalCliProjectionTransfers(Transfer(), "/scratch/NEUTRAL/mailbox", "b" * 64)
+    finish(proxy.upload(local, "/scratch/NEUTRAL/mailbox/logs/" + "a" * 32 + "." + name))
+    projected = name in {"invocation.json", "codex.jsonl.json"}
+    assert uploads[0][0] == (local.with_name(name + ".arm-projection.json") if projected else local)
+    assert local.read_bytes() == b"NEUTRAL raw fixture"
+
+
+def test_hold_is_durable_before_first_post_delivery_await(parsers, tmp_path, monkeypatch):
+    calls, prepare = parsers
+    prepare()
+    async def inherited_handle(self, filename):
+        local = self.output / filename.split(".")[0]
+        local.mkdir()
+        atomic_json(local / "response.json", {"request_sha256": "c" * 64, "infrastructure_error": True, "usage": None})
+        atomic_json(local / "delivered.json", {"request_sha256": "c" * 64, "response_sha256": file_digest(local / "response.json")})
+        atomic_json(local / "codex.jsonl.json", {"NEUTRAL": True})
+        return True
+    monkeypatch.setattr(codex_worker.Worker, "handle", inherited_handle)
+    monkeypatch.setattr(codex_worker, "check_dependencies", lambda *_: {})
+    matrix_worker.main()
+    output = tmp_path / "NEUTRAL-output"
+    class Transfer:
+        async def upload(self, *_):
+            assert (output / "cli-technical-hold.json").is_file()
+            raise OSError("NEUTRAL post-delivery sidecar failure")
+    monkeypatch.setattr(codex_process, "cli_metadata_projection", lambda *args: {"private_paths_exported": False})
+    obj = calls["class"](Transfer(), "/scratch/NEUTRAL/results-900000/mailbox", SESSIONS["gpt-6.1-sol"][0], output, tmp_path / "admission", {SCOPE})
+    with pytest.raises(OSError):
+        finish(obj.handle("a" * 32 + ".request.json"))
+    assert (output / "cli-technical-hold.json").is_file()
+    with pytest.raises(InfrastructureError, match="new claim"):
+        finish(obj.handle("b" * 32 + ".request.json"))
+
+
+@pytest.mark.parametrize("wrong_owner", [False, True])
+def test_actual_wrapper_hello_preserves_R4b_owner_and_private_ready_contract(parsers, tmp_path, monkeypatch, wrong_owner):
+    calls, prepare = parsers
+    prepare()
+    matrix_worker.main()
+    monkeypatch.setattr(codex_worker, "check_dependencies", lambda *_: {})
+    invocations, uploads = [], []
+    def inert_run(argv, **kwargs):
+        invocations.append(argv)
+        return SimpleNamespace(stdout="NEUTRAL version" if argv[-1] == "--version" else "Logged in using ChatGPT", stderr="")
+    async def inert_thread(function, *args, **kwargs):
+        assert function is inert_run
+        return function(*args, **kwargs)
+    monkeypatch.setattr(codex_worker.subprocess, "run", inert_run)
+    monkeypatch.setattr(matrix_worker.asyncio, "to_thread", inert_thread)
+    monkeypatch.setattr(matrix_worker, "file_digest", lambda _: "f" * 64)
+    auth = calls["auth"]
+    class Transfer:
+        async def download(self, remote, local):
+            assert remote.endswith("/OWNER.json")
+            atomic_json(local, {"protocol": codex_worker.PROTOCOL, "session_id": auth["session_id"],
+                "model": auth["model"], "reasoning_effort": "max", "owner": "900001" if wrong_owner else auth["job_id"]})
+        async def upload(self, local, remote):
+            uploads.append((local, remote))
+    output = tmp_path / "NEUTRAL-output"
+    obj = calls["class"](Transfer(), "/scratch/NEUTRAL/results-900000/mailbox", auth["session_id"], output, tmp_path / "auth", {SCOPE})
+    if wrong_owner:
+        with pytest.raises(InfrastructureError, match="OWNER"):
+            finish(obj.hello())
+        assert uploads == [] and not (output / "worker-ready.json").exists()
+    else:
+        finish(obj.hello())
+        ready = matrix_worker.read_json(output / "worker-ready.json")
+        assert ready["task_cli_policy_sha256"] == "b" * 64 and ready["task_cli_policy_candidate_count"] == 1
+        assert ready["local_skill_paths_exported"] is False and "skill_candidate_directories" not in ready
+        assert ready["owner"] == "900000" and ready["authentication"] == "existing-local-ChatGPT"
+        assert len(uploads) == 1
+    assert len(invocations) == 2  # Both are doubles, no actual CLI/version/login command.

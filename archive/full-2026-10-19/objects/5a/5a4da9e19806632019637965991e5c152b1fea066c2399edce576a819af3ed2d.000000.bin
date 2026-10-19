@@ -1,0 +1,129 @@
+"""Normalize and admit the audited Astra xhigh receipt; no experimental execution."""
+from __future__ import annotations
+
+import copy
+import csv
+import hashlib
+import importlib.util
+import json
+import sqlite3
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+EDITORIAL = STUDY / "edition-professionnelle"
+ROOT = HERE / "restauration-neuve/results-750205"
+VERSION = STUDY / "versions/20261017-avant-couverture-astra-xhigh-professionnelle"
+
+
+def read(p):
+    return json.loads(p.read_text(encoding="utf-8-sig"))
+
+
+def sha(p):
+    with p.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def save(p, value):
+    p.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    receipt = read(HERE / "reception-verifiee.json")
+    assert receipt["verified"] and receipt["all_118_published_requests_delivered_and_reconciled"]
+    for key in ("audit", "supplemental_audit", "reconciliation", "owned_stop"):
+        assert sha(Path(receipt[key]["path"])) == receipt[key]["sha256"]
+    spec = importlib.util.spec_from_file_location("astra_xhigh_reporting_helpers", STUDY / "consolider-couverture-luna-comparaison.py")
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+    audit = read(HERE / "audit-initial.json")
+    reconciliation = read(HERE / "reconciliation-livraisons.json")
+    others = {name: {r["subject"]: r for r in read(STUDY / f"resultats-couverture-{name}-max.json")["rows"]}
+              for name in ("luna", "astra", "terra", "sol")}
+    rows, missions, trees, comparisons, calls = [], [], [], [], []
+    for subject in audit["subjects"]:
+        slug = subject["subject"]
+        campaign = ROOT / slug
+        contract = read(campaign / "trusted/contract.json")
+        config = read(campaign / "trusted/config.json")
+        common = copy.deepcopy(contract)
+        common["benchmark"].pop("reference_seconds")
+        refs = {}
+        for name, previous in others.items():
+            previous_path = Path(previous[slug]["campaign_root"]) / "trusted/contract.json"
+            comparable = copy.deepcopy(previous[slug].get("contract") or read(previous_path))
+            comparable["benchmark"].pop("reference_seconds")
+            assert common == comparable, (slug, name, "Contract differs")
+            refs[name] = {"contract_sha256": sha(previous_path), "same_comparable_contract": True}
+        comparisons.append({"subject": slug, "astra_xhigh_contract_sha256": sha(campaign / "trusted/contract.json"),
+            "common_contract_sha256": hashlib.sha256(json.dumps(common, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "references": refs, "only_excluded_field": "benchmark.reference_seconds", "timings_pooled": False,
+            "causal_model_or_harness_ranking_proved": False})
+        with sqlite3.connect((campaign / "registry.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+            roles = dict(db.execute("SELECT id,role FROM trials"))
+        selected_calls = [c for c in reconciliation["records"] if Path(c["request_references"][0]).parts[0] == slug]
+        for item in selected_calls:
+            request = read(ROOT / item["request_references"][0])
+            role = "mère" if request.get("meta_role") else "intégration" if roles[request["mission_id"].rsplit("-h", 1)[0]] == "G" else "enfant"
+            calls.append({"session_id": item["session_id"], "nonce": item["nonce"], "subject": slug,
+                "campaign": "grille-r1/coverage-gpt-6-astra-xhigh", "kind": role,
+                "native_invocation_observed": item["native_invocation_observed"], "usage_measured": item["usage_measured"],
+                "exact_total": item["known_exact_tokens"] if item["usage_measured"] else None,
+                "state": "expired_no_native" if not item["native_invocation_observed"] else "exact" if item["usage_measured"] else "unmetered",
+                "request_sha256": item["request_sha256"], "status": item["status"]})
+        rows.append({"subject": slug, "model": "gpt-6-astra", "effort": "xhigh", "job_id": "750205",
+            "campaign_root": str(campaign), "confirmation": subject["best_confirmed"],
+            "gain_fraction": subject["confirmed_gain_fraction"], "statuses": subject["statuses"],
+            "topology": subject["topology"], "native_calls": sum(c["native_invocation_observed"] for c in selected_calls),
+            "known_exact_tokens": sum(c["known_exact_tokens"] for c in selected_calls),
+            "unmetered_calls": sum(c["native_invocation_observed"] and not c["usage_measured"] for c in selected_calls),
+            "trials": subject["trials"], "mother_requests": subject["published_mother_requests"],
+            "harness_repaired_proposals": subject["automatically_repaired_proposals"],
+            "samples": helpers.confirmation_data(campaign, subject), "contract": contract,
+            "contract_sha256": sha(campaign / "trusted/contract.json"), "budget": config["budget"], "operator_algorithm_hints": 0})
+        trees.append({"subject": slug, "topology": read(ROOT / (slug + "-progress.json")), "trials": subject["detailed_trials"]})
+        missions.extend({"subject": slug, **t} for t in subject["detailed_trials"])
+    assert len(rows) == 14 and len(calls) == 118
+    totals = Counter()
+    for row in rows:
+        totals.update(row["statuses"])
+    role_totals = {role: {"calls": sum(c["native_invocation_observed"] for c in calls if c["kind"] == role),
+        "known_exact_tokens": sum(c["exact_total"] or 0 for c in calls if c["kind"] == role),
+        "unmetered_calls": sum(c["native_invocation_observed"] and not c["usage_measured"] for c in calls if c["kind"] == role)}
+        for role in ("mère", "enfant", "intégration")}
+    cohort = {"schema": "hpc-forest-received-fourteen-subject-astra-xhigh-v1", "observed_utc": datetime.now(UTC).isoformat(),
+        "job_id": "750205", "archive_sha256": receipt["archive_sha256_announced_remote_and_local"], "rows": rows,
+        "received_subjects": 14, "native_calls": 115, "known_exact_tokens": 2091845, "unmetered_calls": 12,
+        "published_requests": 118, "expired_before_invocation": 3, "statuses": dict(totals), "trials": len(missions),
+        "scored_nodes": sum(r["topology"]["scored_nodes"] for r in rows), "retained_baselines": 2,
+        "tokens_by_role": role_totals, "model_input": False, "total_exact_consumption_available": False,
+        "universal_correctness_or_model_ranking_proved": False}
+    assert sum(c["native_invocation_observed"] for c in calls) == 115
+    assert sum(c["exact_total"] or 0 for c in calls) == 2091845
+    save(STUDY / "resultats-couverture-astra-xhigh.json", cohort)
+    save(STUDY / "details-missions-couverture-astra-xhigh.json", missions)
+    save(STUDY / "arbres-couverture-astra-xhigh.json", trees)
+    save(STUDY / "comparabilite-couverture-astra-xhigh-max.json", {"observed_utc": cohort["observed_utc"], "rows": comparisons})
+    save(HERE / "appels-natifs-figes.json", {"calls": calls, "tokens_by_role": role_totals})
+    with (STUDY / "jetons-par-appel-couverture-astra-xhigh.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(calls[0])); writer.writeheader(); writer.writerows(calls)
+    table = helpers.table(['Sujet','Référence (s)','Retenu (s)','Réduction confirmée'], [[r['subject'],f"{r['confirmation']['reference_seconds']:.9f}",f"{r['confirmation']['mean_seconds']:.9f}",f"{100*r['gain_fraction']:.4f} %"] for r in rows])
+    body = ["# Couverture R1 Astra xhigh : quatorze sujets reçus et audités", "",
+        f"750205 est clos, reçu et réconcilié. Archive annoncée/distante/locale : `{cohort['archive_sha256']}` ; 8 614 471 octets et 9 281 fichiers restaurés inchangés avant et après audit, manifeste inclus. Les 90 sources R1 sont identiques.", "",
+        "Douze programmes modifiés confirmés ; tropical et Sokoban conservent leur référence. Les 95 missions comprennent 80 valides, quatorze erreurs d'infrastructure et une génération échouée. Les sommets notés sont distincts des programmes valides chronométrés. Tous les négatifs sont conservés sans réparation ni rejeu. R1 atteint 26 groupes et 104 cellules reçues sur 300.", "", table,
+        "Les quatorze contrats correspondent aux couvertures MAX Luna/Astra/Terra/Sol après exclusion du seul benchmark.reference_seconds ; aucun temps n'est fusionné entre allocations. Une graine et l'ordre temporel ne permettent ni classement causal des efforts ou modèles, ni avantage causal général du harnais.", "",
+        "Les 118 requêtes sont toutes livrées et réconciliées : 115 invocations, 2 091 845 jetons exacts connus, douze invocations non mesurées et trois expirations établies avant invocation. Aucun total exact de consommation de cette cohorte. Cache et raisonnement sont déjà inclus ; les réservations ne sont pas ajoutées aux jetons connus.", "",
+        helpers.table(['Rôle','Invocations','Jetons exacts connus','Invocations non mesurées'], [[k,v['calls'],v['known_exact_tokens'],v['unmetered_calls']] for k,v in role_totals.items()]),
+        "Slurm COMPLETED 0:0 : 6 h 23 min 22 s, quatre CPU ARM64, 16 Gio demandés, zéro GPU ; 233,4 secondes CPU et 153,2 Mio RSS. Ces compteurs ne décrivent pas le CPU d'inférence hébergée ni un nombre exact de threads. Aucun nouveau diagnostic CPU ou conformité algorithmique stricte quicksort ajouté.", "",
+        "Une coupure de livraison initiale et la disparition ultérieure des interfaces locales sont conservées. Le claim 5580db355fa248d2852a5635835e3c7c repris sans réponse a produit l'erreur d'interface prévue, sans régénération. Les journaux et claims antérieurs restent identiques et la consommation non mesurée reste inconnue. Le lecteur isolé conserve les vérifications de hash et lie cette seule interruption aux octets préservés ; sept tests neutres vérifient ses refus. Aucun lien causal bas niveau avec le redémarrage ou une mise à jour MCP n'est établi.", "",
+        "Sept identités du relais possédé arrêtées individuellement après audit, réconciliation et deux CIM cohérents, avec revérification avant chaque cible. Aucun arrêt récursif ; source-only et processus étrangers préservés. La même file poursuit Terra xhigh / 750909, session bb34f01e2e114cf4a59ae51b02823166, via un répartiteur isolé à une seule soumission et dix-sept tests neutres. La voie R1 reste réservée.", "",
+        "Source-only atteint 30/300 issues reçues et auditées. Codex attend les 300 et son admission technique. L'admission de ces nouvelles cohortes dans l'édition professionnelle reste à réaliser après préservation, reconstruction et inspection visuelle. Aucun résultat natif Codex, gain R5 réel ou apprentissage Flash ajouté ; dépôt public et kit privé inchangés.", ""]
+    (STUDY / "BILAN-COUVERTURE-ASTRA-XHIGH.md").write_text("\n".join(body),encoding="utf8")
+    print(json.dumps({"subjects":len(rows),"missions":len(missions),"nodes":cohort["scored_nodes"],"roles":role_totals},ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,104 @@
+"""Build a new isolated source archive and prove the running pilot copy is intact."""
+from __future__ import annotations
+
+import datetime as dt
+import difflib
+import hashlib
+import json
+import zipfile
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[2]
+OUTPUT = Path(__file__).resolve().parent
+PROJECT = WORKSPACE / "work/hpc-forest-harnais-r1/project"
+PILOT = WORKSPACE / "work/marathon-gpt61sol-max/pilot-r1/project"
+BASE = WORKSPACE / "outputs/Marathon22-GPT61Sol-MAX/pilote-r1/HPC-Forest-GPT61Sol-MAX-pilote-r1.zip"
+BASE_SHA = "9b209f217ba8623ef3321de2836545f316508fffeb2acfa23144c97427b3a111"
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def files():
+    ignored = {".git", "__pycache__", ".pytest_cache", ".ruff_cache"}
+    return {p.relative_to(PROJECT).as_posix(): p for p in sorted(PROJECT.rglob("*"))
+            if p.is_file() and not (set(p.relative_to(PROJECT).parts) & ignored)
+            and p.suffix != ".pyc" and p.name != "FILES.sha256.json"}
+
+
+def main():
+    assert sha(BASE.read_bytes()) == BASE_SHA
+    final_qa = json.loads((OUTPUT / "validation-finale/verification.json").read_text(encoding="utf8"))
+    assert final_qa["local_qa_passed"] and not final_qa["real_model_called"]
+    with zipfile.ZipFile(BASE) as baseline:
+        old = {n.removeprefix("HPC-Forest/"): baseline.read(n)
+               for n in baseline.namelist() if not n.endswith("/")}
+    # The original builder reconstructed FILES.sha256.json inside the ZIP only
+    # (build_pilot_payload.py:65-71), without replacing that metadata in its checkout.
+    preserved = {name: sha((PILOT / name).read_bytes()) == sha(raw)
+                 for name, raw in old.items() if name != "FILES.sha256.json"}
+    manifest_metadata = {"archive_sha256": sha(old["FILES.sha256.json"]),
+                         "checkout_sha256": sha((PILOT / "FILES.sha256.json").read_bytes()),
+                         "reason": "Original pilot builder regenerated the archived manifest in memory"}
+    assert all(preserved.values()), "The live pilot copy differs from its frozen archive; investigate first"
+    runtime_path = PROJECT / "examples/marathon22/runtime-baseline.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf8"))
+    package = PROJECT / "src/hpc_forest"
+    names = set(runtime) | {p.relative_to(package).as_posix() for p in package.rglob("*.py")}
+    save(runtime_path, {name: sha((package / name).read_bytes()) for name in sorted(names)})
+    paths = files()
+    manifest = {name: sha(p.read_bytes()) for name, p in paths.items()}
+    save(PROJECT / "FILES.sha256.json", manifest)
+    paths["FILES.sha256.json"] = PROJECT / "FILES.sha256.json"
+    changed = sorted(name for name in paths if name not in old or sha(paths[name].read_bytes()) != sha(old[name]))
+    deleted = sorted(set(old) - set(paths))
+    assert not deleted, "Do not discard historic source files"
+    expected = {
+        "FILES.sha256.json", "docs/harnais-par-sommet.md", "examples/marathon22/romeo_codex.py",
+        "examples/marathon22/runtime-baseline.json", "examples/marathon22/harness-mixed.json",
+        "examples/marathon22/harness-neutral.json", "src/hpc_forest/node_harness.py",
+        "src/hpc_forest/harness_research.py", "src/hpc_forest/config.py", "src/hpc_forest/controller.py",
+        "src/hpc_forest/evaluator.py", "src/hpc_forest/source_request.py", "src/hpc_forest/ollama_backend.py",
+        "src/hpc_forest/codex_mailbox.py", "tests/test_codex_mailbox.py", "tests/test_node_harness.py",
+        "tests/test_harness_research.py",
+    }
+    assert set(changed) <= expected, "Changes outside the owned harness scope"
+    diff = []
+    for name in changed:
+        if name == "FILES.sha256.json":
+            continue
+        before = old.get(name, b"").decode("utf8").splitlines(keepends=True)
+        after = paths[name].read_text(encoding="utf8").splitlines(keepends=True)
+        diff.extend(difflib.unified_diff(before, after, fromfile="baseline/" + name, tofile="harness/" + name))
+    (OUTPUT / "modifications.diff").write_text("".join(diff), encoding="utf8")
+    archive = OUTPUT / "HPC-Forest-Harnais-v1.zip"
+    if archive.exists():
+        raise RuntimeError("Preserve the existing source delivery; use a new version")
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, path in sorted(paths.items()):
+            z.write(path, "HPC-Forest/" + name)
+    with zipfile.ZipFile(archive) as z:
+        assert z.testzip() is None
+        delivered = json.loads(z.read("HPC-Forest/FILES.sha256.json"))
+        assert all(sha(z.read("HPC-Forest/" + name)) == digest for name, digest in delivered.items())
+    receipt = {"schema": "hpc-forest-harness-delivery-v1", "observed_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "archive": str(archive), "archive_sha256": sha(archive.read_bytes()), "archive_bytes": archive.stat().st_size,
+        "archive_entries": len(paths), "source_archive_sha256": BASE_SHA, "owned_project": str(PROJECT),
+        "changed_or_added_files": changed, "deleted_files": deleted,
+        "pilot_original_files_checked": len(preserved), "pilot_original_files_unchanged": all(preserved.values()),
+        "pilot_manifest_metadata": manifest_metadata,
+        "runtime_fingerprints": len(names), "qa": final_qa["pytest"], "ruff_passed": True,
+        "new_real_model_calls": 0, "new_romeo_submissions": 0,
+        "native_model_contract_validated": False, "arm64_preflight_validated": False,
+        "measured_harness_gain": None, "enabled_in_active_campaigns": False}
+    save(OUTPUT / "recu-livraison.json", receipt)
+    print(json.dumps(receipt, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

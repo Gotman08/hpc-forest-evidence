@@ -1,0 +1,210 @@
+#include "knn.h"
+
+static char knn_insertion(int n_groups, Group *groups, int k, Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * (size_t)k);
+    float *distances = (float *)malloc(sizeof(float) * (size_t)k);
+    if (!labels || !distances) {
+        free(labels);
+        free(distances);
+        on_error();
+    }
+
+    int i, j, x, y;
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    qsort(labels, (size_t)k, sizeof(char), compare_for_sort);
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+static char knn_vote(const size_t *frequency) {
+    size_t best_count = 0;
+    char best = (char)-1;
+    for (int value = CHAR_MIN; value <= CHAR_MAX; value++) {
+        size_t count = frequency[(unsigned char)(char)value];
+        if (count > best_count) {
+            best_count = count;
+            best = (char)value;
+        }
+    }
+    return best;
+}
+
+static unsigned knn_bucket(const size_t *histogram, unsigned bins, size_t *rank) {
+    unsigned bucket = 0;
+    while (bucket + 1 < bins && *rank > histogram[bucket]) {
+        *rank -= histogram[bucket];
+        bucket++;
+    }
+    return bucket;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0) return (char)-1;
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t)groups[i].length;
+            if (length > SIZE_MAX - total)
+                return knn_insertion(n_groups, groups, k, to_evaluate);
+            total += length;
+        }
+    }
+
+    size_t frequency[UCHAR_MAX + 1] = {0};
+    size_t wanted = (size_t)k;
+    if (wanted >= total) {
+        for (int i = 0; i < n_groups; i++) {
+            if (groups[i].length > 0)
+                frequency[(unsigned char)groups[i].label] += (size_t)groups[i].length;
+        }
+        frequency[(unsigned char)(char)-1] += wanted - total;
+        return knn_vote(frequency);
+    }
+
+    if (total > SIZE_MAX / sizeof(uint32_t) ||
+        (size_t)n_groups > SIZE_MAX / sizeof(size_t))
+        return knn_insertion(n_groups, groups, k, to_evaluate);
+
+    uint32_t *keys = (uint32_t *)malloc(total * sizeof(*keys));
+    size_t *group_ends = (size_t *)malloc((size_t)n_groups * sizeof(*group_ends));
+    if (!keys || !group_ends) {
+        free(keys);
+        free(group_ends);
+        return knn_insertion(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t histogram[4096] = {0};
+    size_t position = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            float distance = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            uint32_t key;
+            memcpy(&key, &distance, sizeof(key));
+            key &= UINT32_C(0x7fffffff);
+            if (key > UINT32_C(0x7f800000)) {
+                free(keys);
+                free(group_ends);
+                return knn_insertion(n_groups, groups, k, to_evaluate);
+            }
+            keys[position++] = key;
+            histogram[key >> 20]++;
+        }
+    }
+
+    size_t rank = wanted;
+    unsigned high = knn_bucket(histogram, 4096, &rank);
+    memset(histogram, 0, 1024 * sizeof(histogram[0]));
+
+    /* Compact the cutoff bucket stably; group boundaries replace labels. */
+    size_t read = 0;
+    size_t write = 0;
+    for (int i = 0; i < n_groups; i++) {
+        size_t below = 0;
+        for (int j = 0; j < groups[i].length; j++) {
+            uint32_t key = keys[read++];
+            unsigned bucket = key >> 20;
+            if (bucket < high) {
+                below++;
+            } else if (bucket == high) {
+                keys[write++] = key;
+                histogram[(key >> 10) & 1023u]++;
+            }
+        }
+        frequency[(unsigned char)groups[i].label] += below;
+        group_ends[i] = write;
+    }
+
+    unsigned middle = knn_bucket(histogram, 1024, &rank);
+    memset(histogram, 0, 1024 * sizeof(histogram[0]));
+    read = 0;
+    write = 0;
+    for (int i = 0; i < n_groups; i++) {
+        size_t stop = group_ends[i];
+        size_t below = 0;
+        while (read < stop) {
+            uint32_t key = keys[read++];
+            unsigned bucket = (key >> 10) & 1023u;
+            if (bucket < middle) {
+                below++;
+            } else if (bucket == middle) {
+                keys[write++] = key;
+                histogram[key & 1023u]++;
+            }
+        }
+        frequency[(unsigned char)groups[i].label] += below;
+        group_ends[i] = write;
+    }
+
+    unsigned low = knn_bucket(histogram, 1024, &rank);
+    read = 0;
+    for (int i = 0; i < n_groups; i++) {
+        size_t below = 0;
+        size_t equal = 0;
+        size_t stop = group_ends[i];
+        while (read < stop) {
+            unsigned bucket = keys[read++] & 1023u;
+            below += bucket < low;
+            equal += bucket == low;
+        }
+        size_t take = equal < rank ? equal : rank;
+        frequency[(unsigned char)groups[i].label] += below + take;
+        rank -= take;
+    }
+
+    free(group_ends);
+    free(keys);
+    return knn_vote(frequency);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    Group *groups = (Group *)malloc(sizeof(Group) * n_groups);
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

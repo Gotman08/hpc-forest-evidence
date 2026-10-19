@@ -1,0 +1,140 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10
+#define DT 0.01f
+#define SOFTENING 1e-9f
+
+int main(int argc, char **argv) {
+    int nbodies;
+    if (fread(&nbodies, sizeof(nbodies), 1, stdin) != 1) {
+        fprintf(stderr, "\nError reading nbodie value\n");
+        exit(EXIT_FAILURE);
+    }
+    size_t count = (size_t)nbodies * 6;
+    float *tmp = (float *)malloc(count * sizeof(float));
+    if (!tmp) { perror("malloc"); exit(EXIT_FAILURE); }
+    if (fread(tmp, count * sizeof(float), 1, stdin) != 1) {
+        fprintf(stderr, "\nError reading input values\n");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t arr_size = (size_t)nbodies * sizeof(float);
+    float *px, *py, *pz, *vx, *vy, *vz;
+    if (posix_memalign((void**)&px, 64, arr_size) != 0 ||
+        posix_memalign((void**)&py, 64, arr_size) != 0 ||
+        posix_memalign((void**)&pz, 64, arr_size) != 0 ||
+        posix_memalign((void**)&vx, 64, arr_size) != 0 ||
+        posix_memalign((void**)&vy, 64, arr_size) != 0 ||
+        posix_memalign((void**)&vz, 64, arr_size) != 0) {
+        perror("aligned alloc");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < nbodies; ++i) {
+        px[i] = tmp[6*i];
+        py[i] = tmp[6*i+1];
+        pz[i] = tmp[6*i+2];
+        vx[i] = tmp[6*i+3];
+        vy[i] = tmp[6*i+4];
+        vz[i] = tmp[6*i+5];
+    }
+    free(tmp);
+
+    #pragma omp parallel
+    {
+        for (int iter = 0; iter < N_ITER; ++iter) {
+            #pragma omp for simd schedule(static) aligned(px,py,pz,vx,vy,vz:64)
+            for (int i = 0; i < nbodies; ++i) {
+                float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+                const float xi = px[i], yi = py[i], zi = pz[i];
+                int j = 0;
+                // Unroll the inner reduction by 4 to expose independent
+                // sqrt/division computations for SIMD while keeping the
+                // exact per-body accumulation order (j ascending).
+                for (; j + 3 < nbodies; j += 4) {
+                    float dx0 = px[j]   - xi;
+                    float dy0 = py[j]   - yi;
+                    float dz0 = pz[j]   - zi;
+                    float sqrd0 = dx0*dx0 + dy0*dy0 + dz0*dz0 + SOFTENING;
+                    float inv0 = 1.0f / sqrt(sqrd0);
+                    float inv3_0 = inv0 * inv0 * inv0;
+                    fx += dx0 * inv3_0;
+                    fy += dy0 * inv3_0;
+                    fz += dz0 * inv3_0;
+
+                    float dx1 = px[j+1] - xi;
+                    float dy1 = py[j+1] - yi;
+                    float dz1 = pz[j+1] - zi;
+                    float sqrd1 = dx1*dx1 + dy1*dy1 + dz1*dz1 + SOFTENING;
+                    float inv1 = 1.0f / sqrt(sqrd1);
+                    float inv3_1 = inv1 * inv1 * inv1;
+                    fx += dx1 * inv3_1;
+                    fy += dy1 * inv3_1;
+                    fz += dz1 * inv3_1;
+
+                    float dx2 = px[j+2] - xi;
+                    float dy2 = py[j+2] - yi;
+                    float dz2 = pz[j+2] - zi;
+                    float sqrd2 = dx2*dx2 + dy2*dy2 + dz2*dz2 + SOFTENING;
+                    float inv2 = 1.0f / sqrt(sqrd2);
+                    float inv3_2 = inv2 * inv2 * inv2;
+                    fx += dx2 * inv3_2;
+                    fy += dy2 * inv3_2;
+                    fz += dz2 * inv3_2;
+
+                    float dx3 = px[j+3] - xi;
+                    float dy3 = py[j+3] - yi;
+                    float dz3 = pz[j+3] - zi;
+                    float sqrd3 = dx3*dx3 + dy3*dy3 + dz3*dz3 + SOFTENING;
+                    float inv3_3 = 1.0f / sqrt(sqrd3);
+                    float inv3_3b = inv3_3 * inv3_3 * inv3_3;
+                    fx += dx3 * inv3_3b;
+                    fy += dy3 * inv3_3b;
+                    fz += dz3 * inv3_3b;
+                }
+                for (; j < nbodies; ++j) {
+                    float dx = px[j] - xi;
+                    float dy = py[j] - yi;
+                    float dz = pz[j] - zi;
+                    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+                    float inv_dist = 1.0f / sqrt(sqrd_dist);
+                    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+                    fx += dx * inv_dist3;
+                    fy += dy * inv_dist3;
+                    fz += dz * inv_dist3;
+                }
+                vx[i] += DT*fx;
+                vy[i] += DT*fy;
+                vz[i] += DT*fz;
+            }
+
+            #pragma omp for simd schedule(static) aligned(px,py,pz,vx,vy,vz:64)
+            for (int i = 0; i < nbodies; ++i) {
+                px[i] += vx[i] * DT;
+                py[i] += vy[i] * DT;
+                pz[i] += vz[i] * DT;
+            }
+        }
+    }
+
+    float *out = (float *)malloc(count * sizeof(float));
+    if (!out) { perror("malloc"); exit(EXIT_FAILURE); }
+    for (int i = 0; i < nbodies; ++i) {
+        out[6*i]   = px[i];
+        out[6*i+1] = py[i];
+        out[6*i+2] = pz[i];
+        out[6*i+3] = vx[i];
+        out[6*i+4] = vy[i];
+        out[6*i+5] = vz[i];
+    }
+    if (fwrite(out, count * sizeof(float), 1, stdout) != 1) {
+        fprintf(stderr, "\nError writing to output\n");
+        exit(EXIT_FAILURE);
+    }
+
+    free(px); free(py); free(pz); free(vx); free(vy); free(vz); free(out);
+    return EXIT_SUCCESS;
+}

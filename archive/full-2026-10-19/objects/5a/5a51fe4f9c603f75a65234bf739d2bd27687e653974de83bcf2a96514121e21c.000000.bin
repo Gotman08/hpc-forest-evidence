@@ -1,0 +1,98 @@
+"""Static G cold-reader review: hashes, AST and existing XML only; no source imports/tests."""
+import ast
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+OWN = Path(__file__).resolve().parent
+HERE = OWN.parent
+BASE = HERE.parents[2]
+OLD = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2f/reception-premier-batch-r1'
+FACTORY = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2g/revision-r1'
+SEEN = {}
+def sha(b): return hashlib.sha256(b).hexdigest()
+def read(p, pin=None):
+    p = Path(p)
+    assert p.is_file() and not p.is_symlink() and not p.is_junction()
+    b = p.read_bytes(); h = sha(b)
+    assert pin is None or pin == h, (str(p), h, pin)
+    assert SEEN.setdefault(p, h) == h
+    return b
+def js(p, pin=None): return json.loads(read(p, pin))
+def ref(r): return read(r['path'], r['sha256'])
+def tree(b): return ast.parse(b.decode('utf-8-sig'))
+def dump(t): return ast.dump(t, include_attributes=False)
+def functions(t): return {n.name: n for n in t.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+def literals(t):
+    return {n.targets[0].id: ast.literal_eval(n.value) for n in t.body if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and isinstance(n.value, (ast.Constant, ast.Dict, ast.List, ast.Set, ast.Tuple))}
+
+delivery_pin = '796dfa2b192196decb5c001791e87e1747b7978e696be17f9e9d1bcb46a7f54d'
+delivery = js(HERE / 'LIVRAISON-LECTEUR-FROID-POUR-REVUE.json', delivery_pin)
+manifest = json.loads(ref(delivery['manifest']))
+delta = json.loads(ref(manifest['closed_delta']))
+assert delivery['manifest']['sha256'] == 'a3857fcc32351b945b8b19ae09cd794dba6bb227d4793ddfec150335ae32267e'
+expected = {'reception_bornee.py': 'ded2fdc49f14186df714b3dc11f74f4c99abe801701a55cf59508e7ea04a7ab4', 'audit_prive.py': '147f28242753c81065048613fd9e1c79e00f3d4aadb9e8deec4bab8398be0b1c', 'controler-reception-bornee.py': '33ff0b40c29e28fdfea4d2457b373e6b11b4e44ee1df3ad7649ec4f21e10552f', 'collecter-frontiere.py': '7bc7e3a8f604ecf3b18fac8d1fd858a2cf00685fd5cafb37afad0b83e0c65c23', 'preparer-contexte.py': '7afa93fe03058af522e7286b482ab481c2de30044726786c6da0ffc483b80ffe'}
+assert manifest['components'] == delta['components'] == expected and set(delivery['components']) == set(expected)
+original, actual, rebuilt = {}, {}, {}
+for name, h in expected.items():
+    assert delivery['components'][name]['sha256'] == h
+    actual[name] = ref(delivery['components'][name]).decode('utf8')
+    original[name] = read(OLD / name, delta['ancestor_F_pins'][name]).decode('utf8')
+    text = original[name]
+    for before, after in delta['replacements'].items(): text = text.replace(before, after)
+    rebuilt[name] = text
+anchor = '    for key, value in overrides.items():'
+assert rebuilt['audit_prive.py'].count(anchor) == 1
+rebuilt['audit_prive.py'] = rebuilt['audit_prive.py'].replace(anchor, "    # G admits only this infrastructure host scalar; policy loader proves the closed22 bool map.\n    overrides['features.code_mode_host'] = True\n" + anchor)
+for name in ('audit_prive.py', 'reception_bornee.py'):
+    rebuilt['controler-reception-bornee.py'] = rebuilt['controler-reception-bornee.py'].replace(delta['ancestor_F_pins'][name], expected[name])
+rebuilt['preparer-contexte.py'] = rebuilt['preparer-contexte.py'].replace(delta['ancestor_F_pins']['collecter-frontiere.py'], expected['collecter-frontiere.py'])
+assert rebuilt == actual
+trees = {name: tree(text.encode()) for name, text in actual.items()}
+for name in ('reception_bornee.py', 'collecter-frontiere.py', 'preparer-contexte.py'):
+    assert {k: dump(v) for k,v in functions(tree(original[name].encode())).items()} == {k: dump(v) for k,v in functions(trees[name]).items()}
+private_before, private_after = functions(tree(original['audit_prive.py'].encode())), functions(trees['audit_prive.py'])
+assert set(private_before) == set(private_after) and [n for n in private_before if dump(private_before[n]) != dump(private_after[n])] == ['expected_argv']
+# Remove the unique scalar assignment and prove the rest of the private constructor AST unchanged.
+argv = private_after['expected_argv']; updates = [n for n in argv.body if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "overrides['features.code_mode_host']"]
+assert len(updates) == 1 and ast.literal_eval(updates[0].value) is True
+argv.body.remove(updates[0]); assert dump(argv) == dump(private_before['expected_argv'])
+controller = trees['controler-reception-bornee.py']; cf = functions(controller)
+assert dump(cf['verify_frozen_authorizations']) == dump(functions(tree(original['controler-reception-bornee.py'].encode()))['verify_frozen_authorizations'])
+assert 'm.need' in ast.unparse(cf['verify_frozen_authorizations']) and 'm.SCOPE' in ast.unparse(cf['verify_frozen_authorizations']) and 'finally:' in ast.unparse(cf['verify_frozen_authorizations'])
+assert "HERE / 'reception_bornee.py'" in actual['controler-reception-bornee.py'] and 'm = importlib.util.module_from_spec(SPEC)' in actual['controler-reception-bornee.py'] and 'm = factory.m' not in actual['controler-reception-bornee.py']
+cl = literals(controller); helper = literals(trees['reception_bornee.py']); context = literals(trees['preparer-contexte.py'])
+assert cl['HELPER_SHA'] == expected['reception_bornee.py'] and cl['PRIVATE_SHA'] == expected['audit_prive.py'] and context['COLLECTOR_SHA'] == expected['collecter-frontiere.py']
+assert helper['SCOPE'] == 'hpc-forest-primes-native-max-r2g' and helper['SOURCE'] == 'f8c2104bad52e3c298de596fd365415fbdfbbb12fbdc41b47b06a94ad68273fe'
+assert helper['PLAN'] == '5af07859f99192e169f2475fb2c863c9d4a05a4a8dba07845b3fcc54451e7dba'
+assert helper['CELLS'] == {'gpt-6-astra': '110cefccf16b439eb226e475c875c8df', 'gpt-5.6-terra': '5d8811082a1842f5836a2bdda982500f', 'gpt-6.1-sol': '13eaca4e39cf4147a3f677a32fb5a52d'}
+factory_raw = read(FACTORY / 'preparer-cellule-max.py', cl['FACTORY_SHA']); read(FACTORY / 'publication-locale.py', cl['PUBLICATION_SHA'])
+factory_functions = functions(tree(factory_raw)); policy_loader = ast.unparse(factory_functions['checked_task_cli_policy'])
+assert policy_loader.index('native()') < policy_loader.index("importlib.import_module('hpc_forest.codex_process')") < policy_loader.index('client.load_task_cli_policy(')
+source = read(BASE / 'work/hpc-forest-primes-natif-relance-r2g/project/src/hpc_forest/codex_process.py', 'efe23b4c69a769e58f620e3938a3f6549fc9d6b93960abf4e19f66a3e7254868')
+source_tree = tree(source); source_functions = functions(source_tree)
+assert 'any((features.get(name) is not enabled for name, enabled in TASK_CLI_FEATURES.items()))' in ast.unparse(source_functions['load_task_cli_policy'])
+assert 'set(features) != set(TASK_CLI_FEATURES)' in ast.unparse(source_functions['load_task_cli_policy'])
+assert 'code_mode_host_executable_sha256' in ast.unparse(source_functions['load_task_cli_policy'])
+collector = trees['collecter-frontiere.py']
+methods = {n.func.attr for n in ast.walk(collector) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+assert not methods & {'glob', 'rglob', 'iterdir', 'walk', 'listdir', 'system', 'popen', 'execv', 'startfile'}
+imports = {n.name for node in ast.walk(collector) if isinstance(node, (ast.Import, ast.ImportFrom)) for n in node.names}
+assert not imports & {'subprocess', 'socket', 'requests', 'httpx'}
+read(HERE / 'deriver-lecteur-froid.py'); read(HERE / 'sceller-livraison.py')
+test_raw = ref(manifest['tests']); junit_raw = ref(manifest['junit'])
+suite = ET.fromstring(junit_raw); cases = suite.findall('.//testcase')
+assert len(cases) == len({(c.get('classname'), c.get('name')) for c in cases}) == 24
+assert all(not list(c) for c in cases) and all(int(s.get(k, '0')) == 0 for s in suite.findall('.//testsuite') for k in ('errors', 'failures', 'skipped'))
+readme = read(HERE / 'REPRISE.md').decode('utf8')
+assert '--job JOB' in readme
+for flag in ('--launch-input', '--launch-input-sha256', '--initial-installation', '--initial-installation-sha256', '--initial-ready', '--initial-ready-sha256', '--parent-oauth', '--parent-oauth-sha256', '--output-name', '--collection-sha256', '--installation-context-sha256', '--input-sha256'):
+    assert flag in readme
+assert all(sha(p.read_bytes()) == h for p,h in SEEN.items())
+report = {'schema': 'hpc-forest-r2g-cold-first-batch-reader-independent-static-review-v1', 'verified': True, 'blocking_findings': [], 'decision': 'GO_SEALED_COLD_READER_MECHANICS_ONLY', 'reviewed_at_utc': datetime.now(timezone.utc).isoformat(), 'delivery_sha256': delivery_pin, 'manifest_sha256': delivery['manifest']['sha256'], 'component_sha256': expected, 'source_zip_sha256': helper['SOURCE'], 'plan_sha256': helper['PLAN'], 'scope_id': helper['SCOPE'], 'cells': helper['CELLS'], 'closed_F_to_G_byte_reconstruction_exact': True, 'all_scientific_helper_collector_context_function_ASTs_unchanged': True, 'private_only_changed_function': 'expected_argv', 'private_constructor_only_host_scalar_true_preserves_order': True, 'source_policy_loader_schema_G_closed22_exact_bool_and_host_SHA_required': True, 'factory_source_inventory_rehashed_before_policy_import': True, 'factory_private_helper_and_collector_pins_checked_before_import': True, 'cold_namespace_m_is_helper_need_SCOPE_not_factory_m': True, 'frozen_authorization_validator_AST_identical_and_resolver_restored_finally': True, 'initial_receipt_r4_is_distinct_not_invoked_or_qualified_here': True, 'collector_only_explicit_received_named_files_no_enumeration_or_effect_entrypoints': True, 'lock_database_ADS_UNC_alias_link_guards_preserved': True, 'canonical_transfer_path_proposals_and_no_MCP_refusal_bypass_preserved': True, 'README_arguments_match_four_public_interfaces_including_job': True, 'existing_XML_distinct_passed': 24, 'existing_XML_sha256': manifest['junit']['sha256'], 'reviewer_tests_replayed': 0, 'author_reports_Ruff_passed': delivery['ruff_passed'], 'checkpoint_private_digest_and_exact_source_gate_release_proposals_preserved': True, 'real_release_or_actual_private_receipt_created_by_this_review': False, 'actual_first_batch_private_argv_or_NORMAL_or_evaluation_received': False, 'runtime_host_or_no_tools_effectivity_proved': False, 'native_research_admitted': False, 'code_imports_source_tests_CLI_process_auth_network_MCP_cache_or_remote_actions': 0, 'production_files_edited': False, 'input_inventory_before_after_equal': True, 'limits': 'Static five-component mechanics and existing inert XML only. Application still requires actual frozen installation, OAuth/identity/transfers, named raw private records and checkpoint; parent alone publishes the real digest audit/readback and exact release last. No actual initial r4, NORMAL, host runtime, scientific result or extension is admitted.'}
+target = OWN / 'REVUE-LECTEUR-FROID-R2G-SCELLEE.json'
+with target.open('x', encoding='utf-8', newline='\n') as h: json.dump(report, h, ensure_ascii=False, sort_keys=True, indent=2); h.write('\n')
+assert all(sha(p.read_bytes()) == h for p,h in SEEN.items())
+print(json.dumps({'verified': True, 'blocking_findings': [], 'report': str(target), 'sha256': sha(target.read_bytes()), 'existing_neutral_XML_passed': 24, 'reviewer_test_runs': 0, 'native_admitted': False}))

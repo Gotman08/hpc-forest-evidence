@@ -1,0 +1,399 @@
+"""Export only the received Terra xhigh cohort; never alter an experimental source."""
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import json
+import sqlite3
+import statistics
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+ROOT = HERE / "restauration-neuve/results-750909"
+WORKER = STUDY / "runs/coverage-gpt-5.6-terra-xhigh/worker"
+GROUP = {"job_id": "750909", "session_id": "bb34f01e2e114cf4a59ae51b02823166",
+         "model": "gpt-5.6-terra", "effort": "xhigh"}
+KINDS = {"mother": "mère", "children": "enfant", "G": "intégration"}
+EXPORTS = {
+    "results": STUDY / "resultats-couverture-terra-xhigh.json",
+    "missions": STUDY / "details-missions-couverture-terra-xhigh.json",
+    "trees": STUDY / "arbres-couverture-terra-xhigh.json",
+    "comparability": STUDY / "comparabilite-couverture-terra-xhigh-max.json",
+    "calls": HERE / "appels-natifs-figes.json",
+    "csv": STUDY / "jetons-par-appel-couverture-terra-xhigh.csv",
+    "report": STUDY / "BILAN-COUVERTURE-TERRA-XHIGH.md",
+}
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def table(headers, rows):
+    return "\n".join(["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers),
+                      *["| " + " | ".join(str(x).replace("|", "/").replace("\n", " ")
+                                          for x in row) + " |" for row in rows]])
+
+
+def known_sum(values):
+    return sum(value for value in values if type(value) is int)
+
+
+def call_state(record):
+    if record["status"] == "interrupted_claim_unknown":
+        require(not record["delivery_verified"] and not record["usage_measured"]
+                and record["known_exact_tokens"] is None, "Interrupted claim lost its unknown accounting")
+        return "interrupted_claim_unknown"
+    if record["status"] == "expired_unanswered_no_local_invocation_evidence":
+        require(not record["native_invocation_observed"] and not record["delivery_verified"]
+                and not record["invocation_absence_proven"] and record["known_exact_tokens"] is None,
+                "Absence of evidence was converted into zero consumption")
+        return "expired_unanswered_no_local_invocation_evidence"
+    if record.get("not_called_before_expiry", False):
+        require(record["invocation_absence_proven"] and record["usage_measured"]
+                and record["known_exact_tokens"] == 0 and not record["native_invocation_observed"],
+                "Unproved pre-invocation expiry")
+        return "expired_before_invocation_proven"
+    if record["usage_measured"]:
+        require(type(record["known_exact_tokens"]) is int, "Missing measured exact counter")
+        return "exact"
+    require(record["known_exact_tokens"] is None, "Unknown consumption has a numeric exact total")
+    return "unmetered" if record["native_invocation_observed"] else "unknown_consumption_no_invocation_evidence"
+
+
+def summarize(calls):
+    return {
+        "requests": len(calls),
+        "calls": sum(c["native_invocation_observed"] for c in calls),
+        "known_exact_tokens": known_sum(c["exact_total"] for c in calls),
+        "unmetered_calls": sum(c["native_invocation_observed"] and not c["usage_measured"] for c in calls),
+        "unmetered_delivered_calls": sum(c["native_invocation_observed"] and not c["usage_measured"]
+                                        and c["delivery_verified"] for c in calls),
+        "unknown_consumption_requests": sum(c["exact_total"] is None for c in calls),
+        "verified_deliveries": sum(c["delivery_verified"] for c in calls),
+        "interrupted_claims_unknown": sum(c["state"] == "interrupted_claim_unknown" for c in calls),
+        "expired_before_invocation_proven": sum(c["state"] == "expired_before_invocation_proven" for c in calls),
+        "expired_unanswered_no_local_invocation_evidence": sum(
+            c["state"] == "expired_unanswered_no_local_invocation_evidence" for c in calls),
+    }
+
+
+def comparable(contract):
+    result = copy.deepcopy(contract)
+    result["benchmark"].pop("reference_seconds", None)
+    return result
+
+
+def confirmation_data(campaign, subject):
+    database = campaign / "registry.sqlite3"
+    before = sha(database)
+    with sqlite3.connect(database.resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+        rows = [{"experiment_id": exp, "outcome": json.loads(raw)} for exp, raw in db.execute(
+            "SELECT experiment_id,payload FROM evaluations WHERE phase='confirmation' ORDER BY id")]
+    require(sha(database) == before, "Registry changed during reporting")
+    for row in rows:
+        outcome = row["outcome"]
+        if outcome["correct"]:
+            require(len(outcome["times"]) == 5 and
+                    abs(statistics.mean(outcome["times"]) - outcome["mean_seconds"]) < 1e-12,
+                    "Final confirmation timings changed")
+        else:
+            require(not outcome["times"] and outcome["mean_seconds"] is None and outcome["score"] == 0,
+                    "Rejected confirmation has timings or reward")
+    winner = subject["best_confirmed"]
+    chosen = next(row["outcome"] for row in rows if row["experiment_id"] == winner["experiment_id"])
+    baseline = next(row["outcome"] for row in rows if row["experiment_id"] == "baseline-e1")
+    require(chosen["commit"] == winner["commit"] and chosen["correct"] and baseline["correct"],
+            "Final confirmation identity changed")
+    return {"registry_sha256": before, "all_finalists": rows,
+            "reference_times": baseline["times"], "chosen_times": chosen["times"],
+            "reference_stdev": statistics.stdev(baseline["times"]),
+            "chosen_stdev": statistics.stdev(chosen["times"])}
+
+
+def verify_receipt_artifacts(receipt):
+    require(receipt.get("verified") is True and str(receipt.get("job_id")) == GROUP["job_id"],
+            "Verified Terra reception is required")
+    if "session_id" in receipt:
+        require(receipt["session_id"] == GROUP["session_id"], "Wrong receipt session")
+    bindings = {}
+
+    def visit(value):
+        if isinstance(value, dict):
+            if "path" in value and "sha256" in value:
+                path = Path(value["path"])
+                require(path.is_file() and not path.is_symlink()
+                        and sha(path) == value["sha256"], "Receipt-bound artifact changed")
+                bindings[path.resolve()] = value["sha256"]
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(receipt)
+    for name in ("audit-initial.json", "audit-complementaire.json", "reconciliation-livraisons.json"):
+        require((HERE / name).resolve() in bindings, "Required audit not bound by reception receipt")
+    return bindings
+
+
+def self_test():
+    common = {"status": "delivered", "delivery_verified": True, "usage_measured": False,
+              "known_exact_tokens": None, "native_invocation_observed": True,
+              "invocation_absence_proven": False}
+    fixtures = [
+        ({**common, "status": "interrupted_claim_unknown", "delivery_verified": False},
+         "interrupted_claim_unknown"),
+        ({**common, "status": "expired_unanswered_no_local_invocation_evidence",
+          "delivery_verified": False, "native_invocation_observed": False},
+         "expired_unanswered_no_local_invocation_evidence"),
+        ({**common, "usage_measured": True, "known_exact_tokens": 0,
+          "native_invocation_observed": False, "invocation_absence_proven": True,
+          "not_called_before_expiry": True}, "expired_before_invocation_proven"),
+        ({**common, "usage_measured": True, "known_exact_tokens": 14}, "exact"),
+        (common, "unmetered"),
+    ]
+    for record, expected in fixtures:
+        require(call_state(record) == expected, "Neutral state classification failed")
+    for bad in ({**fixtures[0][0], "known_exact_tokens": 0},
+                {**fixtures[1][0], "invocation_absence_proven": True},
+                {**fixtures[2][0], "native_invocation_observed": True}):
+        try:
+            call_state(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("False zero/proof accepted")
+    require(known_sum([None, 0, 14, None, 5]) == 19, "Null-safe sum failed")
+    require(comparable({"benchmark": {"reference_seconds": 1, "other": 2}})
+            == comparable({"benchmark": {"reference_seconds": 9, "other": 2}}),
+            "Excluded calibration field differs")
+    require(comparable({"benchmark": {"reference_seconds": 1, "other": 2}})
+            != comparable({"benchmark": {"reference_seconds": 1, "other": 3}}),
+            "A second contract field was excluded")
+    return 11
+
+
+def main():
+    require(__debug__, "Never consolidate evidence under Python -O")
+    self_test()
+    require(not any(path.exists() for path in EXPORTS.values()), "A Terra export already exists")
+    receipt = read(HERE / "reception-verifiee.json")
+    bindings = verify_receipt_artifacts(receipt)
+    absence = read(Path(receipt["absence"]["path"]))
+    require(absence.get("verified") is True and absence.get("all_owned_process_identities_absent") is True
+            and absence.get("stop_performed") is False and absence.get("processes_stopped") == 0,
+            "Already-absent interfaces were incorrectly reported as stopped")
+    audit = read(HERE / "audit-initial.json")
+    supplement = read(HERE / "audit-complementaire.json")
+    reconciliation = read(HERE / "reconciliation-livraisons.json")
+    require(reconciliation["all_published_requests_accounted_for"]
+            and not reconciliation["all_published_requests_delivered"]
+            and all(reconciliation[key] == value for key, value in GROUP.items()),
+            "Wrong or unreconciled cohort")
+    references = {name: {row["subject"]: row for row in read(
+        STUDY / f"resultats-couverture-{name}-max.json")["rows"]}
+        for name in ("luna", "astra", "terra", "sol")}
+    pin = read(STUDY.parent / "HPC-Forest-Harnais-Comparaison-r1/cli-figee.json")
+    rows, missions, trees, comparisons, calls = [], [], [], [], []
+    for subject in audit["subjects"]:
+        slug = subject["subject"]
+        campaign = ROOT / slug
+        contract = read(campaign / "trusted/contract.json")
+        config = read(campaign / "trusted/config.json")
+        normalized = comparable(contract)
+        previous_contracts = {}
+        for name, previous in references.items():
+            previous_path = Path(previous[slug]["campaign_root"]) / "trusted/contract.json"
+            previous_contract = read(previous_path)
+            require(normalized == comparable(previous_contract), "Comparable contract changed: " + slug + "/" + name)
+            previous_contracts[name] = {"contract_sha256": sha(previous_path), "same_comparable_contract": True}
+        comparisons.append({
+            "subject": slug, "terra_xhigh_contract_sha256": sha(campaign / "trusted/contract.json"),
+            "common_contract_sha256": hashlib.sha256(json.dumps(
+                normalized, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "references": previous_contracts, "only_excluded_field": "benchmark.reference_seconds",
+            "timings_pooled": False, "causal_model_or_harness_ranking_proved": False})
+        selected = [record for record in reconciliation["records"] if record["subject"] == slug]
+        subject_calls = []
+        for record in selected:
+            state = call_state(record)
+            exact = record["known_exact_tokens"] if record["usage_measured"] else None
+            if record["native_invocation_observed"]:
+                invocation = read(WORKER / record["nonce"] / "invocation.json")
+                require(Path(invocation["argv"][0]).resolve() == Path(pin["executable"]["path"]).resolve(),
+                        "Cohort contains a different historical CLI path")
+            call = {
+                "session_id": record["session_id"], "nonce": record["nonce"], "subject": slug,
+                "model": GROUP["model"], "effort": GROUP["effort"], "job_id": GROUP["job_id"],
+                "campaign": "grille-r1/coverage-gpt-5.6-terra-xhigh", "kind": KINDS[record["category"]],
+                "role": record["role"], "native_invocation_observed": record["native_invocation_observed"],
+                "usage_measured": record["usage_measured"], "exact_total": exact,
+                "consumption": record["consumption"], "delivery_verified": record["delivery_verified"],
+                "state": state, "request_sha256": record["request_sha256"], "status": record["status"]}
+            calls.append(call)
+            subject_calls.append(call)
+        accounting = summarize(subject_calls)
+        rows.append({
+            "subject": slug, **GROUP, "campaign_root": str(campaign),
+            "confirmation": subject["best_confirmed"], "gain_fraction": subject["confirmed_gain_fraction"],
+            "statuses": subject["statuses"], "topology": subject["topology"],
+            "native_calls": accounting["calls"], "known_exact_tokens": accounting["known_exact_tokens"],
+            "unmetered_calls": accounting["unmetered_calls"], "unknown_consumption_requests": accounting["unknown_consumption_requests"],
+            "accounting": accounting, "trials": subject["trials"],
+            "mother_requests": subject["published_mother_requests"],
+            "harness_repaired_proposals": subject["automatically_repaired_proposals"],
+            "samples": confirmation_data(campaign, subject), "contract": contract,
+            "contract_sha256": sha(campaign / "trusted/contract.json"), "budget": config["budget"],
+            "operator_algorithm_hints": 0})
+        trees.append({"subject": slug, "topology": read(ROOT / (slug + "-progress.json")),
+                      "trials": subject["detailed_trials"]})
+        missions.extend({"subject": slug, **trial} for trial in subject["detailed_trials"])
+    require(len({(call["session_id"], call["nonce"]) for call in calls}) == len(calls),
+            "Duplicated session/nonce")
+    counts = summarize(calls)
+    require(counts["requests"] == reconciliation["published_requests"]
+            and counts["calls"] == reconciliation["native_invocations_observed"]
+            and counts["known_exact_tokens"] == reconciliation["known_exact_tokens"]
+            and counts["unmetered_calls"] == reconciliation["unmeasured_native_invocations"]
+            and counts["unknown_consumption_requests"] == reconciliation["requests_with_unknown_consumption"]
+            and counts["verified_deliveries"] == reconciliation["verified_deliveries"],
+            "Export counters differ from audited reconciliation")
+    require(counts["requests"] == receipt["published_requests"]
+            and counts["verified_deliveries"] == receipt["delivered_requests"]
+            and counts["calls"] == receipt["native_invocations_observed"]
+            and counts["known_exact_tokens"] == receipt["known_exact_tokens"]
+            and counts["unmetered_calls"] == receipt["unmeasured_native_invocations"]
+            and counts["unknown_consumption_requests"] == receipt["requests_with_unknown_consumption"],
+            "Export counters differ from the reception receipt")
+    statuses = Counter()
+    for row in rows:
+        statuses.update(row["statuses"])
+    require(sum(statuses.values()) == len(missions) == supplement["trials"], "Mission accounting changed")
+    role_totals = {kind: summarize([call for call in calls if call["kind"] == kind])
+                   for kind in KINDS.values()}
+    retained = [row["subject"] for row in rows if row["confirmation"]["is_baseline"]]
+    require(len(rows) == supplement["received_subjects"]
+            and len(retained) == supplement["references_retained"], "Confirmed coverage changed")
+    now = datetime.now(UTC).isoformat()
+    cohort = {
+        "schema": "hpc-forest-received-fourteen-subject-terra-xhigh-v1", "observed_utc": now, **GROUP,
+        "archive_sha256": supplement["archive_sha256"], "rows": rows,
+        "received_subjects": len(rows), "native_calls": counts["calls"],
+        "known_exact_tokens": counts["known_exact_tokens"], "unmetered_calls": counts["unmetered_calls"],
+        "published_requests": counts["requests"], "verified_deliveries": counts["verified_deliveries"],
+        "expired_before_invocation": counts["expired_before_invocation_proven"],
+        "interrupted_claims_unknown": counts["interrupted_claims_unknown"],
+        "expired_unanswered_no_local_invocation_evidence": counts["expired_unanswered_no_local_invocation_evidence"],
+        "requests_with_unknown_consumption": counts["unknown_consumption_requests"],
+        "all_published_requests_reconciled": True, "all_published_requests_delivered": False,
+        "statuses": dict(statuses), "trials": len(missions),
+        "scored_nodes": sum(row["topology"]["scored_nodes"] for row in rows),
+        "retained_baselines": len(retained), "retained_baseline_subjects": retained,
+        "modified_programs_confirmed": len(rows) - len(retained),
+        "tokens_by_role": role_totals, "accounting": counts,
+        "restored_files_unchanged": supplement["restored_file_count_including_manifest"],
+        "preserved_cache_files_unchanged": reconciliation["preserved_worker_files_verified"],
+        "frozen_source_files_verified": supplement["frozen_source_files_verified"],
+        "historical_cli_pin": pin, "new_cli_used_for_this_cohort": False,
+        "reception_receipt_sha256": sha(HERE / "reception-verifiee.json"),
+        "reconciliation_sha256": sha(HERE / "reconciliation-livraisons.json"),
+        "model_input": False, "total_exact_consumption_available": False,
+        "reservations_are_not_consumption": True, "universal_correctness_or_model_ranking_proved": False}
+    efficiency = read(HERE / "efficiency.json")
+    terminal = read(HERE / "statut-terminal.json")
+    end_utc = datetime.fromisoformat(terminal["end"] + "+02:00").astimezone(UTC).isoformat()
+    missing = [call for call in calls if not call["delivery_verified"]]
+    body = [
+        "# Couverture R1 Terra xhigh : quatorze sujets reçus et audités", "",
+        (f"{GROUP['job_id']} est clos, reçu et réconcilié. Archive annoncée/distante/locale : "
+        f"\x60{cohort['archive_sha256']}\x60. Les {cohort['restored_files_unchanged']} fichiers restaurés, "
+        f"{cohort['preserved_cache_files_unchanged']} fichiers du cache et {cohort['frozen_source_files_verified']} sources R1 sont identiques."), "",
+        (f"{cohort['received_subjects']} sujets, {cohort['modified_programs_confirmed']} programmes modifiés confirmés et "
+        f"{cohort['retained_baselines']} références conservées : {', '.join(retained)}. "
+        f"Les {len(missions)} missions sont comptabilisées par statut ci-dessous. Les {cohort['scored_nodes']} sommets notés "
+        "ne constituent pas autant de programmes valides chronométrés. Tous les négatifs restent conservés sans réparation ni rejeu."), "",
+        table(["Statut", "Missions"], sorted(statuses.items())), "",
+        table(["Sujet", "Référence (s)", "Retenu (s)", "Réduction confirmée"], [
+            [row["subject"], f"{row['confirmation']['reference_seconds']:.9f}",
+             f"{row['confirmation']['mean_seconds']:.9f}", f"{100 * row['gain_fraction']:.4f} %"] for row in rows]), "",
+        ("Les contrats sont égaux aux couvertures MAX Luna, Astra, Terra et Sol après exclusion du seul "
+        "benchmark.reference_seconds. Aucun temps n'est fusionné entre allocations. Une graine, l'ordre temporel et "
+        "les interruptions ne permettent ni rang causal de modèle/effort ni avantage causal général du harnais."), "",
+        (f"Les {counts['requests']} demandes sont réconciliées ; {counts['verified_deliveries']} sont livrées. "
+        f"Les {len(missing)} demandes non livrées ne sont pas présentées comme des livraisons. "
+        f"{counts['calls']} invocations sont observées, avec {counts['known_exact_tokens']} jetons exacts connus et "
+        f"{counts['unmetered_calls']} invocations non mesurées, dont le claim interrompu non livré. "
+        f"{counts['expired_before_invocation_proven']} expirations avant invocation sont prouvées par une réponse canonique zéro-appel ; "
+        f"{counts['expired_unanswered_no_local_invocation_evidence']} demandes expirées sans preuve locale d'invocation restent inconnues. "
+        f"La consommation de {counts['unknown_consumption_requests']} demandes reste inconnue au total. "
+        "Aucun total exact global de consommation. Les valeurs inconnues sont null dans les JSON et vides dans le CSV ; "
+        "cache et raisonnement sont déjà inclus dans les compteurs exacts. Les réservations ne sont jamais ajoutées aux jetons connus."), "",
+        table(["Rôle", "Invocations", "Jetons exacts connus", "Invocations non mesurées", "Demandes à consommation inconnue"], [
+            [kind, values["calls"], values["known_exact_tokens"], values["unmetered_calls"],
+             values["unknown_consumption_requests"]] for kind, values in role_totals.items()]), "",
+        table(["Nonce non livré", "Rôle", "Statut", "Consommation"], [
+            [call["nonce"], call["role"], call["state"], "inconnue"] for call in missing]), "",
+        (f"Slurm {efficiency['state']} {efficiency['exit_code']} ; fin {end_utc}. "
+        f"{efficiency['elapsed']} écoulées, {efficiency['alloc_cpus']} CPU ARM64 alloués, "
+        f"{efficiency['req_mem_mb']} Mio demandés, {efficiency['alloc_gpus']} GPU ; "
+        f"{efficiency['cpu_seconds_used']} secondes CPU et {efficiency['max_rss_mb']} Mio RSS. "
+        "Ces compteurs ne décrivent ni le CPU d'inférence hébergée ni un nombre exact de threads."), "",
+        ("La disparition des interfaces autour de 20:00 UTC est conservée, sans cause basse couche établie ni lien causal "
+        "démontré avec une mise à jour MCP. Le claim 870b02bda45245d39c5f8f0b3a4f3840 conserve son statut "
+        "interrupted_claim_unknown : aucune réponse synthétisée, livraison false, consommation inconnue et exact_total null. "
+        "Les deux autres demandes non livrées restent distinctes d'une expiration prouvée avant invocation. "
+        "Aucun processus possédé arrêté : les interfaces étaient déjà absentes."), "",
+        ("Toutes les invocations de cette cohorte sont liées au chemin historique du CLI 0.162 épinglé ; aucune nouvelle "
+        "génération R1 n'a utilisé le CLI 0.163. L'autorisation humaine ultérieure de qualification et de recherche du "
+        "CLI 0.163 concerne les prochains groupes après audit et ne transforme pas cette cohorte en essai du nouveau CLI."), "",
+        ("Après admission de cette cohorte, le suivi parent porte R1 à 27 groupes et 118 cellules reçues. "
+        "Source-only reste à 30/300 issues reçues/auditées ; son groupe Terra terminé attend sa propre réception. "
+        "Le véritable Codex attend les 300 et son admission propre. La voie R1 et les priorités restent réservées selon le guide vivant."), "",
+        ("Ces exports doivent être revus avant admission dans l'article, après préservation de l'édition puis construction "
+        "canonique et inspection visuelle. Aucun article actualisé n'est revendiqué ici. Dépôt public et kit privé inchangés."), ""]
+    for path, expected in bindings.items():
+        require(sha(path) == expected, "A bound input changed while reporting")
+    for kind in ("results", "missions", "trees", "comparability", "calls"):
+        value = {"results": cohort, "missions": missions, "trees": trees,
+                 "comparability": {"observed_utc": now, "rows": comparisons, "timings_pooled": False},
+                 "calls": {"calls": calls, "tokens_by_role": role_totals, "accounting": counts,
+                           "total_exact_consumption_available": False}}[kind]
+        with EXPORTS[kind].open("x", encoding="utf8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    with EXPORTS["csv"].open("x", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(calls[0]))
+        writer.writeheader()
+        writer.writerows(calls)
+    with EXPORTS["report"].open("x", encoding="utf8") as stream:
+        stream.write("\n".join(body))
+    print(json.dumps({"subjects": len(rows), "missions": len(missions), "scored_nodes": cohort["scored_nodes"],
+                      "accounting": counts, "roles": role_totals,
+                      "outputs": {key: {"path": str(path), "sha256": sha(path)} for key, path in EXPORTS.items()}},
+                     ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true", help="Run only fictitious classification checks")
+    arguments = parser.parse_args()
+    if arguments.self_test:
+        print(json.dumps({"neutral_reporting_checks_passed": self_test(), "model_calls": 0}))
+    else:
+        main()

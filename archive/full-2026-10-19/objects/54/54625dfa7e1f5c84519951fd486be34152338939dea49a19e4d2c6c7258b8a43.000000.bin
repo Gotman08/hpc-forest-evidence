@@ -1,0 +1,51 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stddef.h>\n#include <stdint.h>\n\n/* Maximum size (in char) for neighbors and compute lists */\n#define MAX 100\n\ntypedef struct {\n  int id;\n  float value;\n  char neighbors[MAX];\n} Node;\n\ntypedef struct {\n  int *keys;\n  int *indices;\n  size_t capacity;\n} IdIndex;\n\ntypedef struct {\n  float value;\n  unsigned char ready;\n} CostEntry;\n\ntypedef struct {\n  int node;\n  int successor;\n} PathEntry;\n\n/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */\nNode* read_input(char* fname, int *n, char* list) {\n  Node* data = NULL;\n  FILE *fl = NULL;\n\n  if (fname == NULL)\n    fl = stdin;\n  else\n    fl = fopen(fname, \"r\");\n\n  if (fl == NULL) {\n    fprintf(stderr, \"Error!\\n\");\n    exit(1);\n  }\n\n  /* Keep the scanset on the current line; its leading space belongs to the list. */\n  list[0] = '\\0';\n  fscanf(fl, \"%d%99[^\\n]\", n, list);\n\n  if (*n > 0) {\n    size_t count = (size_t)*n;\n    if (count > (size_t)-1 / sizeof(Node)) {\n      fprintf(stderr, \"Error!\\n\");\n      exit(1);\n    }\n    data = (Node*)malloc(count * sizeof(Node));\n    if (data == NULL) {\n      fprintf(stderr, \"Error!\\n\");\n      exit(1);\n    }\n  }\n\n  for (int i = 0; i < *n; i++) {\n    data[i].neighbors[0] = '\\0';\n    fscanf(fl, \"%d %f%99[^\\n]\", &data[i].id, &data[i].value,\n           data[i].neighbors);\n  }\n\n  fclose(fl);\n  return data;\n}\n\n/* Mix an integer ID before masking it into the power-of-two table. */\nstatic size_t hash_id(int id) {\n  uint32_t x = (uint32_t)id;\n  x ^= x >> 16;\n  x *= UINT32_C(0x7feb352d);\n  x ^= x >> 15;\n  x *= UINT32_C(0x846ca68b);\n  x ^= x >> 16;\n  return (size_t)x;\n}\n\n/* Build an open-addressed index; retaining the first occurrence matches the old scan. */\nstatic void build_id_index(IdIndex *index, const Node *g, int size) {\n  index->keys = NULL;\n  index->indices = NULL;\n  index->capacity = 0;\n\n  if (size <= 0)\n    return;\n\n  size_t max_size = (size_t)-1;\n  size_t count = (size_t)size;\n  if (count > max_size / 2) {\n    fprintf(stderr, \"Error!\\n\");\n    exit(1);\n  }\n\n  size_t needed = count * 2;\n  size_t capacity = 1;\n  while (capacity < needed) {\n    if (capacity > max_size / 2) {\n      fprintf(stderr, \"Error!\\n\");\n      exit(1);\n    }\n    capacity *= 2;\n  }\n  if (capacity > max_size / sizeof(int)) {\n    fprintf(stderr, \"Error!\\n\");\n    exit(1);\n  }\n\n  index->keys = (int*)malloc(capacity * sizeof(int));\n  index->indices = (int*)malloc(capacity * sizeof(int));\n  if (index->keys == NULL || index->indices == NULL) {\n    fprintf(stderr, \"Error!\\n\");\n    free(index->keys);\n    free(index->indices);\n    exit(1);\n  }\n  index->capacity = capacity;\n\n  for (size_t i = 0; i < capacity; i++) {\n    index->keys[i] = 0;\n    index->indices[i] = -1;\n  }\n\n  size_t mask = capacity - 1;\n  for (int i = 0; i < size; i++) {\n    size_t slot = hash_id(g[i].id) & mask;\n    while (index->indices[slot] != -1 && index->keys[slot] != g[i].id)\n      slot = (slot + 1) & mask;\n    if (index->indices[slot] == -1) {\n      index->keys[slot] = g[i].id;\n      index->indices[slot] = i;\n    }\n  }\n}\n\n/* Returns the first index of the node with the given ID, or -1 if absent. */\nstatic int find_by_id(const IdIndex *index, int id) {\n  if (index->capacity == 0)\n    return -1;\n\n  size_t mask = index->capacity - 1;\n  size_t slot = hash_id(id) & mask;\n  int found = index->indices[slot];\n  if (found == -1)\n    return -1;\n  if (index->keys[slot] == id)\n    return found;\n\n  slot = (slot + 1) & mask;\n  for (;;) {\n    int first_event = 4;\n#ifdef _OPENMP\n#pragma omp simd reduction(min:first_event)\n#endif\n    for (int lane = 0; lane < 4; lane++) {\n      size_t candidate = (slot + (size_t)lane) & mask;\n      int candidate_index = index->indices[candidate];\n      int event = (candidate_index == -1 || index->keys[candidate] == id) ? lane : 4;\n      first_event = event < first_event ? event : first_event;\n    }\n\n    if (first_event < 4) {\n      size_t candidate = (slot + (size_t)first_event) & mask;\n      int candidate_index = index->indices[candidate];\n      return candidate_index == -1 ? -1 : candidate_index;\n    }\n    slot = (slot + 4) & mask;\n  }\n}\n\n/* Computes and memoizes the sum for the node with the given ID. */\nstatic float get_costly(Node *g, int id, const IdIndex *index, int size,\n                        CostEntry *cache, PathEntry *path) {\n  int root = find_by_id(index, id);\n  if (root < 0)\n    return 0.0f;\n  if (cache[root].ready)\n    return cache[root].value;\n\n  /* Walk the selected-successor path, then evaluate it tail-first as recursion did. */\n  int depth = 0;\n  int current = root;\n  while (!cache[current].ready) {\n    if (depth >= size)\n      return 0.0f; /* A cycle would violate the input DAG contract. */\n\n    PathEntry *entry = &path[depth++];\n    entry->node = current;\n\n    int selected_id = -1;\n    int selected_index = -1;\n    float max = 0.0f;\n    char aux[MAX];\n    char *saveptr = NULL;\n    strcpy(aux, g[current].neighbors);\n    char *token = strtok_r(aux, \" \", &saveptr);\n\n    while (token != NULL) {\n      int neighbor_id = atoi(token);\n      int neighbor = find_by_id(index, neighbor_id);\n      if (neighbor >= 0 && max < g[neighbor].value) {\n        max = g[neighbor].value;\n        selected_id = neighbor_id;\n        selected_index = neighbor;\n      }\n      token = strtok_r(NULL, \" \", &saveptr);\n    }\n\n    /* Preserve the original -1 no-successor sentinel behavior. */\n    entry->successor = selected_id != -1 ? selected_index : -1;\n    if (entry->successor < 0)\n      break;\n    current = entry->successor;\n  }\n\n  while (depth > 0) {\n    PathEntry *entry = &path[--depth];\n    float result = g[entry->node].value;\n    if (entry->successor >= 0)\n      result += cache[entry->successor].value;\n    cache[entry->node].value = result;\n    cache[entry->node].ready = 1;\n  }\n\n  return cache[root].value;\n}\n\n/* Main program - calls read input, computes the requested sums, and prints output. */\nint main(void) {\n  char *fileN = NULL;\n  char computelist[MAX];\n  int n = -1;\n  Node* input = read_input(fileN, &n, computelist);\n\n  IdIndex index;\n  build_id_index(&index, input, n);\n\n  size_t count = n > 0 ? (size_t)n : 1;\n  if (count > (size_t)-1 / sizeof(CostEntry) ||\n      count > (size_t)-1 / sizeof(PathEntry)) {\n    fprintf(stderr, \"Error!\\n\");\n    free(index.keys);\n    free(index.indices);\n    free(input);\n    return 1;\n  }\n\n  CostEntry *cache = (CostEntry*)calloc(count, sizeof(CostEntry));\n  PathEntry *path = (PathEntry*)malloc(count * sizeof(PathEntry));\n  if (cache == NULL || path == NULL) {\n    fprintf(stderr, \"Error!\\n\");\n    free(cache);\n    free(path);\n    free(index.keys);\n    free(index.indices);\n    free(input);\n    return 1;\n  }\n\n  for (char *c = strtok(computelist, \" \"); c != NULL; c = strtok(NULL, \" \"))\n    printf(\"%s: %f\\n\", c,\n           get_costly(input, atoi(c), &index, n, cache, path));\n\n  free(path);\n  free(cache);\n  free(index.keys);\n  free(index.indices);\n  free(input);\n  return 0;\n}\n",
+        "path": "src/graph.c"
+      }
+    ],
+    "hypothesis": "Combining the fastest archived open-addressed ID lookup with per-node cost memoization should reduce repeated scans across neighbor IDs and shared query paths while preserving first-match lookup and recursive float accumulation behavior.",
+    "notes": "The memoized path is evaluated iteratively from tail to head to retain the original addition order without adding recursive stack growth. The complete program combination remains unmeasured; correctness and performance are for the controller to evaluate.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [
+      "948ce3b3705c4fab",
+      "32e6b14ccf2d4d11"
+    ],
+    "transformations": [
+      "Split hash-table keys and node indices into contiguous arrays; check the home bucket first, then probe collision candidates in groups of four while selecting the earliest match or empty slot.",
+      "Memoize computed per-node costs and reuse them for later queries; evaluate each unresolved selected-successor path tail-first to preserve float accumulation order."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-luna",
+  "nonce": "7c2d845bad814821843e68e9f19a1de7",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "xhigh",
+  "request_sha256": "2eba85587c17093d525fe55a324b6065e1bc8f0ffbbfffce7990b69cfabdf664",
+  "session_id": "fb704484f3a5459ca3a4a358d2208a0b",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "7b5ed62f0e6aaba2ee24221efbef0a5ef20417f95f4df10831537c75924508dc",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 25986,
+        "output_tokens": 12992,
+        "reasoning_output_tokens": 10358
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-luna",
+    "reasoning_effort_requested": "xhigh",
+    "token_accounting": "exact",
+    "tokens": 38978,
+    "tool_events": []
+  }
+}

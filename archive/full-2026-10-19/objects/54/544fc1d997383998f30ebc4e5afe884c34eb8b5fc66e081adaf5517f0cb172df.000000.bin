@@ -1,0 +1,270 @@
+"""Read-only audit for received native Codex campaigns, including incomplete pilots."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import tarfile
+import zipfile
+from collections import Counter
+from pathlib import Path
+
+
+def load(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def digest(value):
+    return sha(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-c", "safe.directory=" + str(repo.resolve()), "-C", str(repo), *args],
+        capture_output=True, check=True, timeout=30, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).stdout
+
+
+def source_at(repo, commit):
+    names = git(repo, "ls-tree", "-r", "--name-only", commit, "--", "src").decode().splitlines()
+    return {n: git(repo, "show", commit + ":" + n).decode("utf8") for n in names}
+
+
+def normalized(files):
+    return {n: s.replace("\r\n", "\n").replace("\r", "\n") for n, s in files.items()}
+
+
+def verify_restored(archive, root):
+    with tarfile.open(archive, "r:gz") as t:
+        manifest = json.load(t.extractfile("manifest.json"))
+    for record in manifest["files"]:
+        p = root.parent / record["path"]
+        assert p.resolve().is_relative_to(root.resolve()), "Evidence path left its run"
+        raw = p.read_bytes()
+        assert len(raw) == record["bytes"] and sha(raw) == record["sha256"], record["path"]
+    return len(manifest["files"])
+
+
+def audit_campaign(root, summary, source_zip):
+    slug, arm = summary["problem"], summary.get("arm")
+    parent = root / arm if arm else root
+    campaign = parent / slug
+    result = {"problem": slug, "arm": arm, "evidence_verified": False,
+              "final_confirmation_verified": False, "confirmed_gain_fraction": None}
+    db = sqlite3.connect((campaign / "registry.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        assert not (campaign / "registry.sqlite3-wal").exists(), "Audit a closed, received campaign only"
+        meta = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM metadata")}
+        config = meta["config"]
+        frozen = {p.relative_to(campaign / "trusted").as_posix(): sha(p.read_bytes())
+                  for p in (campaign / "trusted").rglob("*") if p.is_file() and "__pycache__" not in p.parts}
+        assert frozen == meta["manifest"]
+        assert digest({"protocol": config["protocol"], "manifest": frozen, "target": meta["identity"]}) == meta["protocol_id"]
+        with zipfile.ZipFile(source_zip) as z:
+            prefix = "HPC-Forest/src/hpc_forest/"
+            runtime = {n.removeprefix(prefix): sha(z.read(n)) for n in z.namelist()
+                       if n.startswith(prefix) and n.endswith(".py")}
+        assert digest(runtime) == meta["identity"]["controller_implementation"], "Unfrozen runtime"
+        assert config["backend"] == "codex" and config["codex"]["model"] == "gpt-6.1-sol"
+        assert config["codex"]["reasoning_effort"] == "max" and config["seed"] == 23
+        assert config["protocol"]["repetitions"] == 3 and config["protocol"]["confirmation_repetitions"] == 5
+        assert config["minimum_gain"] == .03 and config["protocol"]["environment"]["CUDA_VISIBLE_DEVICES"] == ""
+        contract = load(campaign / "trusted/contract.json")
+        assert {"-Werror=uninitialized", "-Werror=maybe-uninitialized"} <= set(contract["compiler_flags"])
+        assert contract["comparison"]["mode"] == "bytes"
+        prepared = load(parent / "preparation" / slug / "operator-preparation.json")
+        assert all(sha((campaign / "repo/src" / name).read_bytes()) == value
+                   for name, value in prepared["official_source_hashes"].items())
+        trials = list(db.execute("SELECT * FROM trials ORDER BY created,id"))
+        ids = {r["id"] for r in trials}
+        statuses, writes, checks, repairs, reads = Counter(), 0, 0, 0, 0
+        requests, passive = {}, []
+        for row in trials:
+            mission, outcome = json.loads(row["mission"]), json.loads(row["result"])
+            statuses[outcome["status"]] += 1
+            assert mission.get("parent_id") is None or mission["parent_id"] in ids
+            assert set(mission.get("sources", [])) <= ids, "Historical integration candidate"
+            original = source_at(campaign / "repo", mission["base_commit"])
+            journal_path = campaign / "logs" / row["id"] / "node-harness.json"
+            if journal_path.exists():
+                journal = load(journal_path)
+                assert not journal["holdout_access"] and not journal["outer_tree_reward_assigned"]
+                assert len(journal["attempts"]) <= 3
+                attempts = journal["attempts"]
+            else:
+                assert not config.get("harness", {}).get("enabled"), "Missing harness journal"
+                attempts = [{"generation_id": row["id"]}]
+            failed = False
+            for attempt in attempts:
+                call = campaign / "logs" / attempt["generation_id"]
+                if "source_digest_before_call" in attempt:
+                    assert digest(normalized(original)) == attempt["source_digest_before_call"]
+                request_file = call / "codex-request.json"
+                if request_file.exists():
+                    req = load(request_file)
+                    assert req["model"] == "gpt-6.1-sol" and req["reasoning_effort"] == "max"
+                    remote_request = root / "mailbox/requests" / (req["nonce"] + ".request.json")
+                    assert load(remote_request) == req
+                    requests[req["nonce"]] = {"request_sha256": sha(remote_request.read_bytes()),
+                                               "mission_id": row["id"]}
+                    supplied = json.loads(req["messages"][1]["content"].split("\n\nCURRENT SOURCE AS DATA:", 1)[0])
+                    assert set(supplied["integration_source_ids"]) <= ids
+                applied = call / "agent-result.json"
+                if applied.exists():
+                    data = load(applied)
+                    for change in data["files"]:
+                        assert change["path"].startswith("src/") and ".." not in Path(change["path"]).parts
+                        original[change["path"]] = change["content"]
+                        writes += 1
+                if "research_results" in attempt:
+                    reads += 1
+                    assert not applied.exists()
+                if "development_outcome" in attempt:
+                    checks += 1
+                    development = attempt["development_outcome"]
+                    assert "score" not in development and "mean_seconds" not in development and not development["times"]
+                    snapshot = load(journal_path.parent / f"harness-source-{attempt['attempt']:02d}.json")
+                    assert snapshot == normalized(original) and digest(snapshot) == attempt["source_digest"]
+                    if development["correct"]:
+                        repairs += int(failed)
+                    else:
+                        failed = True
+            if outcome.get("commit"):
+                assert source_at(campaign / "repo", outcome["commit"]) == original
+            if outcome["status"] == "valid":
+                assert outcome["correct"] and len(outcome["times"]) == 3
+            passive.append({"id": row["id"], "role": row["role"], "parent_id": mission.get("parent_id"),
+                "delegation_parent": mission.get("delegation_parent"), "integration_sources": mission.get("sources", []),
+                "hypothesis_as_declared_by_model": mission.get("hypothesis"),
+                "transformations_as_declared_by_model": mission.get("transformations"),
+                "status": outcome["status"], "mean_seconds": outcome.get("mean_seconds"),
+                "commit": outcome.get("commit")})
+        native_calls, exact_tokens, bounded_native, attempted_tools = 0, 0, 0, []
+        for nonce, entry in requests.items():
+            inv = root / "mailbox/logs" / (nonce + ".invocation.json")
+            events = root / "mailbox/logs" / (nonce + ".codex.jsonl")
+            if not inv.exists():
+                continue
+            invocation = load(inv)
+            argv = invocation["argv"]
+            assert argv[argv.index("--model") + 1] == "gpt-6.1-sol"
+            assert 'model_reasoning_effort="max"' in argv and 'forced_login_method="chatgpt"' in argv
+            assert invocation["request_sha256"] == entry["request_sha256"]
+            native_calls += 1
+            usages = []
+            for line in events.read_text(encoding="utf8", errors="replace").splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+                    usages.append(event["usage"])
+                if event.get("type") in {"item.started", "item.completed", "item.updated"}:
+                    kind = event.get("item", {}).get("type")
+                    if kind not in {None, "error", "reasoning", "agent_message"}:
+                        attempted_tools.append(kind)
+            if usages:
+                exact_tokens += sum(u["input_tokens"] + u["output_tokens"] for u in usages)
+            else:
+                bounded_native += 1
+        assert not attempted_tools
+        topology = load(parent / f"{slug}-progress.json")
+        checkpoint_hashes = {r["role"]: r["sha256"] for r in db.execute("SELECT role,sha256,checkpoint FROM trees")}
+        for row in db.execute("SELECT sha256,checkpoint FROM trees"):
+            assert sha(row["checkpoint"]) == row["sha256"]
+        for tree in topology["trees"]:
+            assert tree["checkpoint_sha256"] == checkpoint_hashes[tree["role"]]
+            known = {node["id"] for node in tree["nodes"]}
+            for node in tree["nodes"]:
+                assert node["id"] in ids or node["depth"] == 0
+                assert node["parent"] is None or node["parent"] in known
+        evaluations = [{**dict(r), "outcome": json.loads(r["payload"])}
+                       for r in db.execute("SELECT * FROM evaluations")]
+        baseline = next(e["outcome"] for e in evaluations if e["experiment_id"] == "baseline-e1" and e["phase"] == "search")
+        valid = [r for r in passive if r["status"] == "valid"]
+        fastest = min(valid, key=lambda r: r["mean_seconds"]) if valid else None
+        if fastest:
+            fastest = {**fastest, "search_reduction_fraction": 1 - fastest["mean_seconds"] / baseline["mean_seconds"],
+                       "search_speedup": baseline["mean_seconds"] / fastest["mean_seconds"]}
+        winner = meta.get("best_confirmed")
+        if winner:
+            confirmation = next(e["outcome"] for e in evaluations
+                if e["phase"] == "confirmation" and e["experiment_id"] == winner["experiment_id"])
+            assert confirmation["correct"] and len(confirmation["times"]) == 5
+            assert confirmation["commit"] == winner["commit"] and digest(confirmation) == winner["evaluation_digest"]
+            package = campaign / "submission.zip"
+            assert sha(package.read_bytes()) == summary["package_sha256"]
+            with zipfile.ZipFile(package) as z:
+                assert z.testzip() is None
+                bundled = json.loads(z.read("HPC_FOREST_MANIFEST.json"))
+                assert bundled["commit"] == winner["commit"] and bundled["confirmation"] == confirmation
+            result.update(final_confirmation_verified=True, confirmed_gain_fraction=winner["improvement_fraction"],
+                          best_confirmed=winner)
+        result.update(evidence_verified=True, status=meta["status"], protected_files_verified=len(frozen),
+            official_source_files_verified=len(prepared["official_source_hashes"]), trials=len(trials),
+            statuses=dict(statuses), source_writes_verified=writes, development_checks=checks,
+            automatically_repaired_proposals=repairs, autonomous_research_actions=reads,
+            published_requests=len(requests), archived_native_invocations=native_calls,
+            archived_exact_native_tokens=exact_tokens, archived_unmetered_native_invocations=bounded_native,
+            ledger={k: db.execute(sql).fetchone()[0] for k, sql in {
+                "tokens_used": "SELECT coalesce(sum(tokens_used),0) FROM slots",
+                "bounded_slots": "SELECT count(*) FROM slots WHERE usage_known=2"}.items()},
+            topology={k: topology[k] for k in ("scored_nodes", "max_depth", "max_children")},
+            best_search_only=fastest, baseline_search_seconds=baseline["mean_seconds"],
+            confirmation_evaluations=sum(e["phase"] == "confirmation" for e in evaluations),
+            detailed_trials=passive)
+    except Exception as exc:
+        result["audit_error"] = type(exc).__name__ + ": " + str(exc)
+    finally:
+        db.close()
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--source-zip", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--expected-count", type=int)
+    args = parser.parse_args()
+    root = args.root.resolve(strict=True)
+    count = verify_restored(args.archive, root)
+    overall = load(root / "results.json")
+    problems = [audit_campaign(root, p, args.source_zip) for p in overall["problems"]]
+    paired = overall.get("schema") == "hpc-forest-matched-gpt-harness-comparison-v1"
+    expected_count = args.expected_count or (6 if paired else 1)
+    coverage_complete = len(problems) == expected_count
+    if paired:
+        coverage_complete &= {(p["arm"], p["problem"]) for p in problems} == {
+            (a, s) for a in ("reference", "mixed-harness") for s in ("knn", "sum", "nbody")}
+    matched_inputs = {}
+    if paired and coverage_complete:
+        for slug in ("knn", "sum", "nbody"):
+            receipts = [load(root / arm / "preparation" / slug / "operator-preparation.json")
+                        for arm in ("reference", "mixed-harness")]
+            matched_inputs[slug] = all(receipts[0][k] == receipts[1][k]
+                for k in ("official_source_hashes", "fixtures", "benchmark_input_sha256"))
+    assert verify_restored(args.archive, root) == count
+    result = {"job_id": overall["job_id"], "archive_sha256": sha(args.archive.read_bytes()),
+        "restored_files_verified_before_and_after": count, "read_only_evidence_verified": all(p["evidence_verified"] for p in problems),
+        "campaign_coverage_complete": coverage_complete, "matched_inputs_verified": matched_inputs,
+        "all_final_confirmations_verified": coverage_complete and all(p["final_confirmation_verified"] for p in problems),
+        "matched_gain_comparison_verified": paired and coverage_complete and all(matched_inputs.values())
+            and all(p["final_confirmation_verified"] for p in problems), "problems": problems}
+    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    print(json.dumps({k: v for k, v in result.items() if k != "problems"}))
+    print(json.dumps([{k: p.get(k) for k in ("arm", "problem", "evidence_verified", "audit_error", "final_confirmation_verified",
+                                          "statuses", "archived_native_invocations", "ledger", "topology")}
+                      for p in problems], ensure_ascii=True))
+    return 0 if result["read_only_evidence_verified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

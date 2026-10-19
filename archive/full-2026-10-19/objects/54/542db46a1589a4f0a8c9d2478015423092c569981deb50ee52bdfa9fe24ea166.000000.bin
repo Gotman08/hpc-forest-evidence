@@ -1,0 +1,243 @@
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <numeric>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+struct adjacency_matrix {
+    int vertices;
+    size_t words_per_row;
+    vector<uint64_t> words;
+
+    explicit adjacency_matrix(int n)
+        : vertices(n), words_per_row((size_t(n) + 63) / 64),
+          words(size_t(n) * words_per_row, 0) {}
+
+    const uint64_t *row(int vertex) const {
+        return words.data() + size_t(vertex) * words_per_row;
+    }
+
+    bool edge(int source, int destination) const {
+        return (row(source)[size_t(destination) / 64] &
+                (uint64_t(1) << (destination & 63))) != 0;
+    }
+
+    void addEdge(int source, int destination) {
+        words[size_t(source) * words_per_row + size_t(destination) / 64] |=
+            uint64_t(1) << (destination & 63);
+        words[size_t(destination) * words_per_row + size_t(source) / 64] |=
+            uint64_t(1) << (source & 63);
+    }
+
+    int degree(int vertex) const {
+        int result = 0;
+        const uint64_t *values = row(vertex);
+        for (size_t word = 0; word < words_per_row; ++word)
+            result += __builtin_popcountll(values[word]);
+        return result;
+    }
+};
+
+adjacency_matrix readGraph() {
+    int vertices, edges, source, destination;
+    cin >> vertices;
+    adjacency_matrix graph(vertices);
+    cin >> edges;
+    for (int i = 0; i < edges; ++i) {
+        cin >> source >> destination;
+        graph.addEdge(source, destination);
+    }
+    return graph;
+}
+
+inline void printPermutation(const vector<int> &equivalence) {
+    for (int vertex : equivalence)
+        cout << vertex << " ";
+    cout << endl;
+}
+
+class HeapSearch {
+    const adjacency_matrix &g1;
+    const adjacency_matrix &g2;
+    int n;
+    size_t width;
+    vector<int> equivalence;
+    vector<size_t> domain_offsets;
+    vector<uint64_t> domains;
+    vector<uint64_t> relation_masks;
+    vector<int> terminal_map;
+    vector<int> scratch;
+    bool found;
+
+    static size_t terminalOffset(int count) {
+        return size_t(count) * size_t(count - 1) / 2;
+    }
+
+    void prepareTerminals() {
+        terminal_map.resize(terminalOffset(n));
+        for (int count = 1; count < n; ++count) {
+            int *current = terminal_map.data() + terminalOffset(count);
+            iota(current, current + count, 0);
+            const int *previous = count > 1
+                ? terminal_map.data() + terminalOffset(count - 1)
+                : nullptr;
+            for (int pass = 0; pass < count; ++pass) {
+                for (int j = 0; j < count - 1; ++j)
+                    scratch[j] = current[previous[j]];
+                for (int j = 0; j < count - 1; ++j)
+                    current[j] = scratch[j];
+                if (pass + 1 < count)
+                    swap(current[(count & 1) ? 0 : pass], current[count - 1]);
+            }
+        }
+    }
+
+    void skipBlock(int count) {
+        if (count < 2)
+            return;
+        const int *terminal = terminal_map.data() + terminalOffset(count);
+        for (int j = 0; j < count; ++j)
+            scratch[j] = equivalence[terminal[j]];
+        copy(scratch.begin(), scratch.begin() + count, equivalence.begin());
+    }
+
+    void prepareRelationMasks() {
+        relation_masks.resize(size_t(n) * 2 * width);
+        for (int target = 0; target < n; ++target) {
+            const uint64_t *adjacency = g2.row(target);
+            uint64_t *masks = relation_masks.data() + size_t(target) * 2 * width;
+            const size_t occupied_word = size_t(target) / 64;
+            const uint64_t occupied_bit = uint64_t(1) << (target & 63);
+            for (size_t word = 0; word < width; ++word) {
+                const uint64_t available =
+                    ~(word == occupied_word ? occupied_bit : uint64_t(0));
+                masks[word] = ~adjacency[word] & available;
+                masks[width + word] = adjacency[word] & available;
+            }
+        }
+    }
+
+    bool prepareChild(int count, int target) {
+        const int fixed = count - 1;
+        const uint64_t *source_row = g1.row(fixed);
+        const uint64_t *masks =
+            relation_masks.data() + size_t(target) * 2 * width;
+        const uint64_t *parent = domains.data() + domain_offsets[count];
+        uint64_t *child = domains.data() + domain_offsets[count - 1];
+
+        // Stream candidate rows into the next suffix-block state.
+        for (int vertex = 0; vertex < fixed; ++vertex) {
+            const bool adjacent =
+                (source_row[size_t(vertex) / 64] &
+                 (uint64_t(1) << (vertex & 63))) != 0;
+            const uint64_t *allowed = masks + (adjacent ? width : 0);
+            uint64_t any = 0;
+            for (size_t word = 0; word < width; ++word) {
+                const uint64_t candidates = parent[word] & allowed[word];
+                child[word] = candidates;
+                any |= candidates;
+            }
+            if (any == 0)
+                return false;
+            parent += width;
+            child += width;
+        }
+        return true;
+    }
+
+    void enumerate(int count) {
+        const int fixed = count - 1;
+        const uint64_t *fixed_domain =
+            domains.data() + domain_offsets[count] + size_t(fixed) * width;
+        for (int pass = 0; pass < count; ++pass) {
+            const int target = equivalence[fixed];
+            const bool compatible =
+                (fixed_domain[size_t(target) / 64] &
+                 (uint64_t(1) << (target & 63))) != 0;
+            if (compatible && (count == 1 || prepareChild(count, target))) {
+                if (count == 1) {
+                    printPermutation(equivalence);
+                    found = true;
+                } else {
+                    enumerate(count - 1);
+                }
+            } else {
+                // Preserve the exact terminal ordering of a rejected Heap block.
+                skipBlock(count - 1);
+            }
+            if (pass + 1 < count)
+                swap(equivalence[(count & 1) ? 0 : pass], equivalence[fixed]);
+        }
+    }
+
+public:
+    HeapSearch(const adjacency_matrix &first, const adjacency_matrix &second)
+        : g1(first), g2(second), n(first.vertices), width(first.words_per_row),
+          equivalence(n), domain_offsets(n + 1, 0), scratch(n), found(false) {}
+
+    bool run() {
+        iota(equivalence.begin(), equivalence.end(), 0);
+        found = false;
+        vector<int> key1(n), key2(n);
+        vector<int> balance(2 * (n + 1), 0);
+        for (int vertex = 0; vertex < n; ++vertex) {
+            // Degrees come from Boolean rows, not raw input edge counts.
+            key1[vertex] = 2 * g1.degree(vertex) + int(g1.edge(vertex, vertex));
+            key2[vertex] = 2 * g2.degree(vertex) + int(g2.edge(vertex, vertex));
+            ++balance[key1[vertex]];
+            --balance[key2[vertex]];
+        }
+        for (int value : balance)
+            if (value != 0)
+                return false;
+
+        // State k owns k contiguous domain rows for its free prefix.
+        size_t total = 0;
+        for (int count = 1; count <= n; ++count) {
+            domain_offsets[count] = total;
+            total += size_t(count) * width;
+        }
+        domains.assign(total, 0);
+        uint64_t *initial = domains.data() + domain_offsets[n];
+        for (int source = 0; source < n; ++source) {
+            for (int target = 0; target < n; ++target) {
+                if (key1[source] == key2[target])
+                    initial[size_t(source) * width + size_t(target) / 64] |=
+                        uint64_t(1) << (target & 63);
+            }
+        }
+
+        prepareRelationMasks();
+        prepareTerminals();
+        enumerate(n);
+        return found;
+    }
+};
+
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2) {
+    if (g1.vertices != g2.vertices)
+        return false;
+
+    // Both matrices are symmetric and have zeroed padding bits.
+    if (g1.words == g2.words) {
+        vector<int> equivalence(g1.vertices);
+        iota(equivalence.begin(), equivalence.end(), 0);
+        printPermutation(equivalence);
+        return true;
+    }
+
+    HeapSearch search(g1, g2);
+    return search.run();
+}
+
+int main() {
+    adjacency_matrix g1 = readGraph();
+    adjacency_matrix g2 = readGraph();
+    if (!testIsomorphism(g1, g2))
+        cout << "The graphs are not isomorphic" << endl;
+    return 0;
+}

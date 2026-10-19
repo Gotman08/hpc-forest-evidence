@@ -4,6 +4,12 @@ _Protocole public et observations vérifiables sur l’optimisation de programme
 
 [English](README.md) · [Protocole](docs/PROTOCOLE.fr.md) · [Résultats](docs/RESULTS.md) · [Vérification](docs/REPRODUCIBILITY.md)
 
+## Publication intégrale des sources et des données
+
+La publication intégrale demandée le 19 octobre ajoute les [codes R1/R2 séparés](code/README.md), les outils d'orchestration et leurs tests, les archives de résultats reçues, les journaux et les documents historiques. Le [guide de sauvegarde et de restauration](reproducibility/README.md) décrit le catalogue complet, la déduplication SHA-256 et les exclusions d'authentification, dépendances installées et caches. Les anciens documents marqués privés sont conservés dans leur état historique ; cette nouvelle publication en étend ensuite l'accès. Les PDF et chiffres scientifiques déjà figés restent inchangés.
+
+**Les expériences restent en pause.** Publier ou restaurer les fichiers ne relance aucun modèle, worker ou job et n'autorise pas le rejeu d'une ancienne session. La sauvegarde comprend aussi les échecs et préparations ; elle ne crée aucun résultat scientifique supplémentaire.
+
 ## Données reçues et article · 19 octobre 2026
 
 L’édition r5 courante de l’[article de recherche](docs/article/ARTICLE.pdf) et des [annexes techniques](docs/article/ANNEXES-TECHNIQUES.pdf) intègre les observations R2 reçues dans le résumé, la section 3.9 et l’annexe L, avec trois nouvelles figures R1/R2. L’[article en HTML](docs/article/ARTICLE.html), les [annexes en HTML](docs/article/ANNEXES-TECHNIQUES.html) et les [données numériques](docs/article/donnees-r1-r2/comparison.json) sont disponibles, avec un arrêté des sources au 19 octobre 2026 à 11:40:35,931 UTC. Le jeu couvre 60 cellules R1 historiques et une cellule R2 dont les temps finaux sont confirmés par les sources ; 59 cellules R2 n’ont pas de mesure scientifique. Il contient **zéro gain R2 scientifiquement admis et zéro paire R1/R2 admise**. Les comparaisons de temps et de coûts sont descriptives : les recherches diffèrent et la pause d’audit a consommé le budget de temps existant.
@@ -22,7 +28,7 @@ Le [supplément d’incidents techniques](evidence/native-incidents-2026-10-19/R
 
 HPC Forest étudie une question concrète : **un système peut-il produire des programmes corrects et plus rapides dans un budget fixé ?** L’évaluation repose sur un programme de départ figé, un contrôle externe des sorties, des temps bruts et une confirmation finale séparée. Un autre système peut suivre ce contrat sans exposer son fonctionnement interne.
 
-Ce dépôt rassemble le protocole, une sélection explicite de données auditées et des vérificateurs publics. Le moteur interne et les entrées réservées à l’évaluateur restent hors de ce dépôt.
+Ce dépôt rassemble le protocole, les projections scientifiques auditées, les vérificateurs publics et, depuis la publication intégrale, les sources et matériaux historiques disponibles. Les anciens instantanés restent des ensembles datés distincts du catalogue de sauvegarde.
 
 ## Résultats disponibles
 
@@ -46,7 +52,7 @@ python -m tools.verify
 python -m unittest discover -s tests -v
 ```
 
-Le vérificateur contrôle les empreintes, les liens locaux, la couverture et les calculs de **144 séries / 2 400 cycles mesurés** du contrôleur et **200 temps CPU / 40 configurations**, ainsi que les **60 cellules et 26 temps** de la comparaison courante. Il ne lance aucun modèle ou programme mesuré. Le recalcul public ne reproduit pas l’exécution d’origine, dont les binaires et les entrées protégées ne sont pas distribués. Les [limites de reproduction](docs/REPRODUCIBILITY.md) sont explicites.
+Le vérificateur contrôle les empreintes, les liens actuels, la couverture et les calculs de **144 séries / 2 400 cycles mesurés** du contrôleur et **200 temps CPU / 40 configurations**, ainsi que les **60 cellules et 26 temps** de la comparaison courante. Il ne lance aucun modèle ou programme mesuré. Le catalogue intégral permet également de vérifier et restaurer les matériaux archivés ; cette opération ne reproduit pas les mesures ni leur environnement historique. Les [limites de reproduction](docs/REPRODUCIBILITY.md) sont explicites.
 
 ## Comparer un autre système
 
@@ -61,4 +67,4 @@ Le [protocole français](docs/PROTOCOLE.fr.md) décrit les budgets, la compilati
 - [Travaux restant à réaliser](docs/ROADMAP.md)
 - [Contribuer](CONTRIBUTING.md)
 
-Première version **0.1.0**, 16 octobre 2026 ; les données reçues et l’article r5 du 19 octobre s’y ajoutent dans la révision courante. La suite porte sur quinze sujets et quatre modèles, tous en MAX, après le pilote nombres premiers et la qualification des références terminés. L’article courant distingue une cellule R2 confirmée par les sources des 59 cellules sans mesure et des comparaisons scientifiquement admises, dont le nombre reste zéro. Auteurs : **Nicolas Marano et Romain Despoullain**. La [licence MIT](LICENSE) couvre les fichiers originaux de cette publication ; les programmes et énoncés tiers ne sont pas redistribués. Pour citer les observations, utiliser [CITATION.cff](CITATION.cff) avec la révision exacte.
+Première version **0.1.0**, 16 octobre 2026 ; les données reçues, l’article r5 et la sauvegarde intégrale du 19 octobre s’y ajoutent. La campagne quinze sujets × quatre modèles MAX reste en pause. L’article courant distingue une cellule R2 confirmée par les sources des 59 cellules sans mesure et des comparaisons scientifiquement admises, dont le nombre reste zéro. Auteurs : **Nicolas Marano et Romain Despoullain**. La [licence MIT](LICENSE) couvre les fichiers originaux ; les matériaux tiers archivés conservent leurs notices et conditions, décrites dans [NOTICE](NOTICE.md). Pour citer les observations, utiliser [CITATION.cff](CITATION.cff) avec la révision exacte.

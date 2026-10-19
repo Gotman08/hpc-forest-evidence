@@ -26,7 +26,7 @@ Process launch, program I/O and resource-counter granularity matter, especially 
 
 The original audit compares exact outputs on archived finite cases. That does not certify all legal inputs, strict fidelity to a required algorithm, MPI/multi-node/GPU behavior or official contest compliance. The adapted target is not an official competition ranking.
 
-Internal engine code, original evaluated executables and protected inputs are not distributed. The public verifier therefore checks data integrity and calculations rather than independently re-executing correctness or the original timings. SHA-256 hashes identify bytes; without a trusted source or retained commit they do not authenticate an experiment.
+The complete snapshot now distributes available historical engine code, received artifacts and benchmark materials alongside the earlier scientific projections. Availability and successful restoration do not establish correctness or independently reproduce the timings. The public verifier checks integrity and calculations without executing those programs. SHA-256 hashes identify bytes; without a trusted source or retained commit they do not authenticate an experiment. Cases disclosed in this archive are no longer unseen confirmation cases for a future evaluated system.
 
 ## Unexecuted work
 

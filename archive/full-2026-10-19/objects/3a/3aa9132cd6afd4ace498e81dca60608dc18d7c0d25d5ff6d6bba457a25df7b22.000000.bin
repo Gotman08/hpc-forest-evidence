@@ -1,0 +1,182 @@
+#include "knn.h"
+#include <arm_neon.h>
+#include <omp.h>
+#include <float.h>
+
+// Max-heap node (1-indexed)
+typedef struct {
+    float dist;
+    char label;
+} HeapNode;
+
+static inline void heap_swap(HeapNode *a, HeapNode *b) {
+    HeapNode t = *a; *a = *b; *b = t;
+}
+
+// Sift down from index idx in a max-heap of size heap_size (1-indexed)
+static inline void sift_down(HeapNode *heap, int heap_size, int idx) {
+    while (1) {
+        int largest = idx;
+        int left = 2 * idx;
+        int right = 2 * idx + 1;
+        if (left <= heap_size && heap[left].dist > heap[largest].dist)
+            largest = left;
+        if (right <= heap_size && heap[right].dist > heap[largest].dist)
+            largest = right;
+        if (largest == idx) break;
+        heap_swap(&heap[idx], &heap[largest]);
+        idx = largest;
+    }
+}
+
+// Insert or replace in a max-heap of capacity k.
+static inline void heap_insert_or_replace(float d, char label,
+                                          HeapNode *heap, int *heap_size_ptr, int k) {
+    int hs = *heap_size_ptr;
+    if (hs < k) {
+        // Insert at end and bubble up
+        hs++;
+        int idx = hs;
+        heap[idx].dist = d;
+        heap[idx].label = label;
+        while (idx > 1 && heap[idx / 2].dist < heap[idx].dist) {
+            heap_swap(&heap[idx], &heap[idx / 2]);
+            idx /= 2;
+        }
+    } else if (d < heap[1].dist) {
+        // Replace root
+        heap[1].dist = d;
+        heap[1].label = label;
+        sift_down(heap, k, 1);
+    }
+    *heap_size_ptr = hs;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    // Determine number of threads once (outside parallel region)
+    int max_threads = omp_get_max_threads();
+    if (max_threads < 1) max_threads = 1;
+
+    // Per-thread heaps: each thread gets a heap array of size k+1 and its current size.
+    HeapNode **thread_heaps = (HeapNode**) malloc(max_threads * sizeof(HeapNode*));
+    int *thread_sizes = (int*) calloc(max_threads, sizeof(int));  // persistent per-thread sizes
+
+    for (int t = 0; t < max_threads; t++) {
+        thread_heaps[t] = (HeapNode*) malloc((k + 1) * sizeof(HeapNode));
+        // No need to initialize entries; they are set by insertion and only accessed up to size.
+    }
+
+    const float tx = to_evaluate.x;
+    const float ty = to_evaluate.y;
+
+    #pragma omp parallel for schedule(static)
+    for (int gi = 0; gi < n_groups; gi++) {
+        int tid = omp_get_thread_num();
+        HeapNode *local_heap = thread_heaps[tid];
+        // Use persistent per-thread size pointer so that multiple groups accumulate correctly
+        int *local_size_ptr = &thread_sizes[tid];
+
+        Group g = groups[gi];
+        float *xs = (float *)__builtin_assume_aligned(g.xs, 16);
+        float *ys = (float *)__builtin_assume_aligned(g.ys, 16);
+        int len = g.length;
+        char label = g.label;
+
+        // Process points in batches of 4 using NEON SIMD with prefetching
+        int j = 0;
+        for (; j + 3 < len; j += 4) {
+            __builtin_prefetch(xs + j + 16);
+            __builtin_prefetch(ys + j + 16);
+
+            float32x4_t x_vec = vld1q_f32(xs + j);
+            float32x4_t y_vec = vld1q_f32(ys + j);
+
+            float32x4_t dx = vsubq_f32(x_vec, vdupq_n_f32(tx));
+            float32x4_t dy = vsubq_f32(y_vec, vdupq_n_f32(ty));
+            // dist_sq = dx*dx + dy*dy
+            float32x4_t dist_sq = vmlaq_f32(vmulq_f32(dx, dx), dy, dy);
+
+            float d[4];
+            vst1q_f32(d, dist_sq);
+
+            for (int t = 0; t < 4; t++) {
+                heap_insert_or_replace(d[t], label, local_heap, local_size_ptr, k);
+            }
+        }
+
+        // Scalar remainder
+        for (; j < len; j++) {
+            float dx = xs[j] - tx;
+            float dy = ys[j] - ty;
+            float d = dx * dx + dy * dy;
+            heap_insert_or_replace(d, label, local_heap, local_size_ptr, k);
+        }
+    }
+
+    // Global max-heap to merge per-thread results (no initialization needed)
+    HeapNode *global_heap = (HeapNode*) malloc((k + 1) * sizeof(HeapNode));
+    int global_size = 0;
+
+    // Merge all per-thread heaps into the global heap
+    for (int t = 0; t < max_threads; t++) {
+        HeapNode *local = thread_heaps[t];
+        int sz = thread_sizes[t];
+        if (sz > k) sz = k;
+        for (int i = 1; i <= sz; i++) {
+            heap_insert_or_replace(local[i].dist, local[i].label,
+                                   global_heap, &global_size, k);
+        }
+    }
+
+    // Extract labels from the final global heap into a plain array for frequency counting.
+    char *labels = (char*) malloc(k * sizeof(char));
+    int actual_k = (global_size < k) ? global_size : k;
+    for (int i = 0; i < actual_k; i++) {
+        labels[i] = global_heap[i + 1].label;
+    }
+    // Fill remaining with -1 if not enough points
+    for (int i = actual_k; i < k; i++) {
+        labels[i] = -1;
+    }
+
+    free(global_heap);
+    for (int t = 0; t < max_threads; t++) {
+        free(thread_heaps[t]);
+    }
+    free(thread_heaps);
+    free(thread_sizes);
+
+    // Find most frequent label using frequency array (O(k + 256))
+    int freq[256] = {0};
+    for (int i = 0; i < k; i++) {
+        if (labels[i] >= 0)
+            freq[(unsigned char)labels[i]]++;
+    }
+
+    char best_label = labels[0];
+    int best_count = freq[(unsigned char)best_label];
+    for (int c = 1; c < 256; c++) {
+        if (freq[c] > best_count) {
+            best_count = freq[c];
+            best_label = (char)c;
+        }
+    }
+
+    free(labels);
+    return best_label;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+
+    Group *groups = (Group *)malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; ++i) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

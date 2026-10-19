@@ -1,0 +1,275 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/* Original traversal, also used when temporary storage is unavailable. */
+static void body_force_direct(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; j++) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+/*
+ * Cache-blocked force traversal. Each target still accumulates sources
+ * in increasing index order, using the original arithmetic expressions.
+ */
+void body_force(Body *p, float dt, int n) {
+  enum { TARGET_BLOCK = 64, SOURCE_BLOCK = 256 };
+
+  if (n <= 0) {
+    return;
+  }
+
+  float *positions = (float *)malloc((size_t)n * 3 * sizeof(float));
+  if (positions == NULL) {
+    body_force_direct(p, dt, n);
+    return;
+  }
+
+  float *restrict x = positions;
+  float *restrict y = positions + (size_t)n;
+  float *restrict z = positions + (size_t)n * 2;
+
+  for (int i = 0; i < n; ++i) {
+    x[i] = p[i].x;
+    y[i] = p[i].y;
+    z[i] = p[i].z;
+  }
+
+  for (int ib = 0; ib < n; ) {
+    int ni = n - ib;
+    if (ni > TARGET_BLOCK) {
+      ni = TARGET_BLOCK;
+    }
+
+    float fx[TARGET_BLOCK] = {0.0f};
+    float fy[TARGET_BLOCK] = {0.0f};
+    float fz[TARGET_BLOCK] = {0.0f};
+
+    for (int jb = 0; jb < n; ) {
+      int nj = n - jb;
+      if (nj > SOURCE_BLOCK) {
+        nj = SOURCE_BLOCK;
+      }
+      const int je = jb + nj;
+      int k = 0;
+
+      for (; k + 3 < ni; k += 4) {
+        const int i = ib + k;
+        const float x0 = x[i];
+        const float y0 = y[i];
+        const float z0 = z[i];
+        const float x1 = x[i + 1];
+        const float y1 = y[i + 1];
+        const float z1 = z[i + 1];
+        const float x2 = x[i + 2];
+        const float y2 = y[i + 2];
+        const float z2 = z[i + 2];
+        const float x3 = x[i + 3];
+        const float y3 = y[i + 3];
+        const float z3 = z[i + 3];
+
+        float fx0 = fx[k];
+        float fy0 = fy[k];
+        float fz0 = fz[k];
+        float fx1 = fx[k + 1];
+        float fy1 = fy[k + 1];
+        float fz1 = fz[k + 1];
+        float fx2 = fx[k + 2];
+        float fy2 = fy[k + 2];
+        float fz2 = fz[k + 2];
+        float fx3 = fx[k + 3];
+        float fy3 = fy[k + 3];
+        float fz3 = fz[k + 3];
+
+        for (int j = jb; j < je; ++j) {
+          const float jx = x[j];
+          const float jy = y[j];
+          const float jz = z[j];
+
+          {
+            float dx = jx - x0;
+            float dy = jy - y0;
+            float dz = jz - z0;
+            float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+            float inv_dist = 1 / sqrt(sqrd_dist);
+            float inv_dist3 = inv_dist * inv_dist * inv_dist;
+            fx0 += dx * inv_dist3;
+            fy0 += dy * inv_dist3;
+            fz0 += dz * inv_dist3;
+          }
+          {
+            float dx = jx - x1;
+            float dy = jy - y1;
+            float dz = jz - z1;
+            float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+            float inv_dist = 1 / sqrt(sqrd_dist);
+            float inv_dist3 = inv_dist * inv_dist * inv_dist;
+            fx1 += dx * inv_dist3;
+            fy1 += dy * inv_dist3;
+            fz1 += dz * inv_dist3;
+          }
+          {
+            float dx = jx - x2;
+            float dy = jy - y2;
+            float dz = jz - z2;
+            float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+            float inv_dist = 1 / sqrt(sqrd_dist);
+            float inv_dist3 = inv_dist * inv_dist * inv_dist;
+            fx2 += dx * inv_dist3;
+            fy2 += dy * inv_dist3;
+            fz2 += dz * inv_dist3;
+          }
+          {
+            float dx = jx - x3;
+            float dy = jy - y3;
+            float dz = jz - z3;
+            float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+            float inv_dist = 1 / sqrt(sqrd_dist);
+            float inv_dist3 = inv_dist * inv_dist * inv_dist;
+            fx3 += dx * inv_dist3;
+            fy3 += dy * inv_dist3;
+            fz3 += dz * inv_dist3;
+          }
+        }
+
+        fx[k] = fx0;
+        fy[k] = fy0;
+        fz[k] = fz0;
+        fx[k + 1] = fx1;
+        fy[k + 1] = fy1;
+        fz[k + 1] = fz1;
+        fx[k + 2] = fx2;
+        fy[k + 2] = fy2;
+        fz[k + 2] = fz2;
+        fx[k + 3] = fx3;
+        fy[k + 3] = fy3;
+        fz[k + 3] = fz3;
+      }
+
+      for (; k < ni; ++k) {
+        const int i = ib + k;
+        const float xi = x[i];
+        const float yi = y[i];
+        const float zi = z[i];
+        float fxi = fx[k];
+        float fyi = fy[k];
+        float fzi = fz[k];
+
+        for (int j = jb; j < je; ++j) {
+          float dx = x[j] - xi;
+          float dy = y[j] - yi;
+          float dz = z[j] - zi;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+          fxi += dx * inv_dist3;
+          fyi += dy * inv_dist3;
+          fzi += dz * inv_dist3;
+        }
+
+        fx[k] = fxi;
+        fy[k] = fyi;
+        fz[k] = fzi;
+      }
+
+      jb = je;
+    }
+
+    for (int k = 0; k < ni; ++k) {
+      p[ib + k].vx += dt*fx[k];
+      p[ib + k].vy += dt*fy[k];
+      p[ib + k].vz += dt*fz[k];
+    }
+
+    ib += ni;
+  }
+
+  free(positions);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

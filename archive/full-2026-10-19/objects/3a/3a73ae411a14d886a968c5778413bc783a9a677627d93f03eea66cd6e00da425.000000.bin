@@ -1,0 +1,127 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <immintrin.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system using SIMD intrinsics.
+ */
+void body_force(Body *p, float dt, int n) {
+  __m128 dt_vec = _mm_set1_ps(dt);
+  __m128 softening_vec = _mm_set1_ps(SOFTENING);
+
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    __m128 fx_vec = _mm_setzero_ps();
+    __m128 fy_vec = _mm_setzero_ps();
+    __m128 fz_vec = _mm_setzero_ps();
+
+    for (int j = 0; j < n - 3; j += 4) {
+      __m128 dx_vec = _mm_sub_ps(_mm_load_ps(&p[j].x), _mm_set1_ps(p[i].x));
+      __m128 dy_vec = _mm_sub_ps(_mm_load_ps(&p[j].y), _mm_set1_ps(p[i].y));
+      __m128 dz_vec = _mm_sub_ps(_mm_load_ps(&p[j].z), _mm_set1_ps(p[i].z));
+
+      __m128 sqrd_dist_vec = _mm_add_ps(_mm_add_ps(_mm_mul_ps(dx_vec, dx_vec), _mm_mul_ps(dy_vec, dy_vec)), _mm_add_ps(_mm_mul_ps(dz_vec, dz_vec), softening_vec));
+      __m128 inv_dist_vec = _mm_rsqrt_ps(sqrd_dist_vec);
+      __m128 inv_dist3_vec = _mm_mul_ps(inv_dist_vec, _mm_mul_ps(inv_dist_vec, inv_dist_vec));
+
+      fx_vec = _mm_add_ps(fx_vec, _mm_mul_ps(dx_vec, inv_dist3_vec));
+      fy_vec = _mm_add_ps(fy_vec, _mm_mul_ps(dy_vec, inv_dist3_vec));
+      fz_vec = _mm_add_ps(fz_vec, _mm_mul_ps(dz_vec, inv_dist3_vec));
+    }
+
+    // Handle the remaining elements if n is not a multiple of 4
+    for (int j = n - (n % 4); j < n; ++j) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+
+      float sqrd_dist = dx * dx + dy * dy + dz * dz + SOFTENING;
+      float inv_dist = 1.0f / sqrtf(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    fx += fx_vec[0] + fx_vec[1] + fx_vec[2] + fx_vec[3];
+    fy += fy_vec[0] + fy_vec[1] + fy_vec[2] + fy_vec[3];
+    fz += fz_vec[0] + fz_vec[1] + fz_vec[2] + fz_vec[3];
+
+    p[i].vx = _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(p[i].vx), _mm_mul_ss(dt_vec, _mm_set_ss(fx))));
+    p[i].vy = _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(p[i].vy), _mm_mul_ss(dt_vec, _mm_set_ss(fy))));
+    p[i].vz = _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(p[i].vz), _mm_mul_ss(dt_vec, _mm_set_ss(fz))));
+  }
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+  
+  exit(EXIT_SUCCESS);
+}

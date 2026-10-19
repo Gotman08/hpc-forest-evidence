@@ -1,0 +1,90 @@
+"""Resume R1 observation under its existing lock; defer reception to the audited path."""
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+spec = importlib.util.spec_from_file_location("original_r1_coordinator", ROOT / "coordonner-matrice.py")
+legacy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(legacy)
+
+JOB = "748782"
+SESSION = "16cc609c0eae4b378c00819505095c0f"
+KEY = "coverage-gpt-5.6-terra-max"
+
+
+def verify_cell(state, identity):
+    matches = [cell for cell in state["queue"] if cell["key"] == KEY]
+    if len(matches) != 1:
+        raise RuntimeError("Expected exactly the existing Terra group")
+    cell = matches[0]
+    if (cell.get("job_id") != JOB or cell.get("session_id") != SESSION
+            or cell.get("state") != "working"
+            or cell.get("model") != "gpt-5.6-terra" or cell.get("effort") != "max"
+            or "reprendre-relais-r1.py" not in identity.get("CommandLine", "")
+            or "--resume" not in identity["CommandLine"]
+            or SESSION not in identity["CommandLine"]
+            or cell["channel"] not in identity["CommandLine"]):
+        raise RuntimeError("Recovery identity differs from the existing group")
+    return cell
+
+
+async def watch():
+    launch = json.loads((HERE / "lancement-relais.json").read_text(encoding="utf-8-sig"))
+    identity = legacy.process_identity(launch["pid"])
+    if identity is None:
+        raise RuntimeError("The recovered relay is not running")
+    with legacy.FileLock(ROOT / "coordinator.lock"):
+        async with legacy.module.ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+            coordinator = legacy.Coordinator(rpc)
+            cell = verify_cell(coordinator.state, identity)
+            legacy.atomic_json(HERE / "identite-relais-verifiee.json", identity)
+            coordinator.state["recovery_incident"] = {
+                "path": str(HERE), "job_id": JOB, "session_id": SESSION,
+                "original_submission_replayed": False,
+                "scope": "current group only; audited reception must precede any relay stop or next group",
+            }
+            cell["previous_worker_identity"] = cell.get("worker_identity")
+            cell["worker_identity"] = identity
+            cell["recovery_worker_started_at"] = time.time()
+            coordinator.state.pop("error", None)
+            coordinator.state["stage"] = "running_current_group_recovered"
+            coordinator.save()
+            failures = 0
+            while True:
+                try:
+                    status = await coordinator.scheduler(JOB)
+                    if str(status.get("job_id")) != JOB:
+                        raise RuntimeError("Scheduler returned another job")
+                    failures = 0
+                    cell["scheduler"] = status
+                    coordinator.save()
+                    if status.get("finished"):
+                        coordinator.state["stage"] = "awaiting_audited_reception_after_interface_recovery"
+                        coordinator.state["recovery_next_action"] = (
+                            "Receive all deliveries, archive and efficiency; restore and audit read-only; "
+                            "reconcile then stop the owned relay; only then advance this same R1 queue.")
+                        coordinator.save()
+                        return
+                    if not legacy.same_process(identity):
+                        raise RuntimeError("The recovered relay stopped; no blind restart")
+                except Exception as exc:
+                    failures += 1
+                    legacy.atomic_json(HERE / "derniere-erreur-observation.json", {
+                        "utc_epoch": time.time(), "failures": failures,
+                        "error": str(exc)[:2400], "submission_retried": False})
+                    if failures >= 3 or "relay stopped" in str(exc):
+                        coordinator.state["stage"] = "attention_required"
+                        coordinator.state["error"] = str(exc)[:2400]
+                        coordinator.save()
+                        raise
+                await asyncio.sleep(30)
+
+
+if __name__ == "__main__":
+    asyncio.run(watch())

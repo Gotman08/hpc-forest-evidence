@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Genere par romeo-mcp - ne pas editer a la main.
+#SBATCH --job-name=forest-ds4-v4flash0731-v11c
+#SBATCH --account=r250127
+#SBATCH --qos=normal
+#SBATCH --partition=short
+#SBATCH --constraint=armgpu
+#SBATCH --time=20:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --gpus-per-node=2
+#SBATCH --mem=512G
+#SBATCH --chdir=/scratch_p/nimarano
+#SBATCH --output=/scratch_p/nimarano/%x-%j.out
+#SBATCH --error=/scratch_p/nimarano/%x-%j.err
+
+set -euo pipefail
+
+# Sans cette fonction, un job ROMEO 2025 n'a acces a aucun logiciel,
+# pas meme a la commande spack. Elle est propre a l'architecture :
+# charger celle de l'autre donnerait des binaires inutilisables.
+romeo_load_armgpu_env
+spack load /zrtbeqke25s2vbqo4yrhsowjz7mg3pjf
+
+# Provenance du premier demarrage : environnement, commit et fichiers choisis.
+if command -v python3 >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+  if timeout 20s python3 -I -S - '{"roots": ["/scratch_p/nimarano", "/project"], "include_home": true, "code_dir": "/scratch_p/nimarano", "data_files": [], "max_bytes": 67108864}' <<'ROMEO_REPRO_CAPTURE'
+
+import hashlib, json, os, pathlib, re, stat, subprocess, sys
+params = json.loads(sys.argv[1])
+roots = [pathlib.Path(p).resolve() for p in params['roots']]
+if params.get('include_home'):
+    roots.append(pathlib.Path.home().resolve())
+def allowed(value):
+    path = pathlib.Path(value).resolve()
+    if not any(path == root or root in path.parents for root in roots):
+        raise ValueError('outside_roots')
+    if any(p.lower().startswith(('.env', 'id_rsa', 'id_ed25519', 'id_ecdsa')) or p.lower() in ('.ssh', '.aws', '.azure', '.kube', 'hosts.yml')
+           or p.lower().endswith(('.pem', '.key', '.p12', '.pfx'))
+           or re.search(r'password|passwd|passphrase|secret|token|credential|authorization|cookie|api[_-]?key|access[_-]?key|private[_-]?key', p, re.I)
+           for p in path.parts):
+        raise ValueError('sensitive_path')
+    return path
+out = {'git': {'status': 'unavailable'}, 'data': []}
+try:
+    code = allowed(params['code_dir'])
+    result = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(code),
+                             'rev-parse', '--verify', 'HEAD'],
+                            capture_output=True, text=True, timeout=5,
+                            env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'})
+    sha = result.stdout.strip()
+    if result.returncode == 0 and len(sha) in (40, 64) and all(c in '0123456789abcdef' for c in sha):
+        out['git'] = {'status': 'observed', 'commit': sha, 'working_tree_verified': False}
+except (OSError, ValueError, subprocess.TimeoutExpired):
+    pass
+remaining = params['max_bytes']
+for name in params['data_files']:
+    item = {'path': name}
+    try:
+        path = allowed(name)
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            item['status'] = 'not_regular_file'
+        elif info.st_size > remaining:
+            item.update(status='size_limit', bytes=info.st_size)
+        else:
+            h = hashlib.sha256()
+            consumed = 0
+            with path.open('rb') as stream:
+                while True:
+                    block = stream.read(min(1048576, remaining - consumed + 1))
+                    if not block:
+                        break
+                    consumed += len(block)
+                    if consumed > remaining:
+                        break
+                    h.update(block)
+            after = path.stat()
+            remaining = max(0, remaining - consumed)
+            if consumed != info.st_size or (info.st_size, info.st_mtime_ns, info.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+                item['status'] = 'changed_during_read'
+            else:
+                item.update(status='hashed', sha256=h.hexdigest(), bytes=consumed)
+    except (OSError, ValueError):
+        item['status'] = 'unreadable_or_outside_roots'
+    out['data'].append(item)
+
+
+import datetime, platform
+out['observed_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+out['phase'] = 'before_workload'
+out['environment'] = {
+    'source': 'compute_node_before_command', 'architecture': platform.machine(),
+    'python_version': platform.python_version(),
+    'loaded_modules': [v for v in os.environ.get('LOADEDMODULES', '').split(':') if v][:128],
+    'spack_loaded_hashes': [v for v in os.environ.get('SPACK_LOADED_HASHES', '').split(':') if v][:128],
+}
+jid = os.environ.get('SLURM_JOB_ID', '')
+if os.environ.get('SLURM_ARRAY_JOB_ID') and os.environ.get('SLURM_ARRAY_TASK_ID'):
+    jid = os.environ['SLURM_ARRAY_JOB_ID'] + '_' + os.environ['SLURM_ARRAY_TASK_ID']
+if not re.fullmatch(r'[0-9]+(?:_[0-9]+)?', jid):
+    raise ValueError('missing_job_id')
+out['job_id'] = jid
+folder = pathlib.Path('.romeo-provenance')
+folder.mkdir(mode=0o700, exist_ok=True)
+if folder.is_symlink():
+    raise ValueError('symlink_capture_directory')
+out['restart_count'] = os.environ.get('SLURM_RESTART_COUNT', '0')
+try:
+    fd = os.open(folder / (jid + '.json'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+except FileExistsError:
+    pass
+else:
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(out, stream)
+        stream.write('\n')
+ROMEO_REPRO_CAPTURE
+  then :; else
+    printf '%s\n' '[romeo-mcp] provenance indisponible ; le calcul continue.' >&2
+  fi
+fi
+
+
+# Trace d'execution : sert a diagnostiquer les erreurs d'architecture.
+echo "[romeo-mcp] noeud=$(hostname) arch=$(uname -m) job=${SLURM_JOB_ID:-?}"
+echo "[romeo-mcp] debut $(date -Is)"
+
+bash -c 'set -euo pipefail
+archive=/scratch_p/nimarano/marathon22-deepseek-v11c-20261015.tar.gz
+root=/scratch_p/nimarano/hpc-forest-marathon22-deepseek-20261015-v11c-v4flash0731
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+test ! -e "$root"
+printf '"'"'%s  %s\n'"'"' '"'"'f3599d6f3510f735fd080a5221064dda99ed28205be9d92fce5a80b34bc670e6'"'"' "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" --strip-components=1 -C "$root"
+"$py" - "$root" <<'"'"'PY'"'"'
+import hashlib,json,shutil,sys,zipfile
+from pathlib import Path
+root=Path(sys.argv[1])
+old=Path('"'"'/scratch_p/nimarano/hpc-forest-marathon22-20261015-r1'"'"')
+shutil.copytree(old/'"'"'sources-officielles'"'"',root/'"'"'sources-officielles'"'"')
+manifest=json.loads((root/'"'"'payload-manifest.json'"'"').read_text())
+for name,expected in manifest.items():
+    p=root/name
+    assert p.resolve().is_relative_to(root.resolve()) and hashlib.sha256(p.read_bytes()).hexdigest()==expected, name
+wheel=next((root/'"'"'payload-r4'"'"').glob('"'"'*.whl'"'"'))
+with zipfile.ZipFile(wheel) as z:
+    for name in z.namelist():
+        assert (root/'"'"'runtime'"'"'/name).resolve().is_relative_to((root/'"'"'runtime'"'"').resolve())
+    z.extractall(root/'"'"'runtime'"'"')
+print('"'"'Execution payload verified:'"'"',len(manifest),'"'"'files'"'"',flush=True)
+PY
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$root/runtime:$root/qa-deps" flock -w 120 /tmp/hpc-forest-preflight-nimarano.lock "$py" -m pytest "$root/tests" -q -p no:cacheprovider > "$root/preflight-tests.log" 2>&1
+cat "$root/preflight-tests.log"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$root/runtime" "$py" "$root/timer_probe.py" "$root/timer-probe.json"
+export PYTHONPATH="$root/runtime"
+export PYTHONDONTWRITEBYTECODE=1
+exec "$py" "$root/romeo_marathon.py" --problems knn sum nbody --model hpcforest-deepseek-v4flash0731:mxfp4 --local-model-spec "$root/v4flash0731.json" --cycles 4 --trials-per-role 6 --integrations 6 --wall-seconds 21600 --tokens 4000000 --generation-seconds 600 --context-tokens 65536 --max-output-tokens 32768 --temperature 0.2 --repeat-penalty 1.1 --repeat-last-n 64 --root "$root" --ollama /scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/tools/ollama-0.40.4/bin/ollama --detector "$root/detect_resources.py"
+'
+
+echo "[romeo-mcp] fin $(date -Is)"
+

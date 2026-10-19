@@ -1,0 +1,146 @@
+"""Bounded read-only adapter for a received closed R2 r1b archive and cache snapshot.
+
+Exit 1: incomplete/refused. Exit 2: archived checker protocol inspected with the
+explicit raw-attribution limit. This prototype never issues full admission/exit 0.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import tarfile
+import zipfile
+from pathlib import Path
+
+from audit_campaign import campaign_evidence
+from audit_common import (
+    FLAGS,
+    JOB,
+    MODEL,
+    PLAN_SHA,
+    PREPARATION_SHA,
+    SCOPE,
+    SESSION,
+    SOURCE_SHA,
+    finite_contract,
+    inventory,
+    need,
+    read_json,
+    sha,
+    validate_admissions,
+    verify_archive,
+)
+from audit_transport import mailbox_and_cache
+
+LIMITS = [
+    "No independent raw stdout-to-candidate/binary attribution: execution.json lacks a strong candidate binding.",
+    "Typed checker results, Git lineage and recorded samples are inspected without executing or recompiling candidates.",
+    "No hardware/process isolation proof, causal model comparison, population generalization or replay.",
+    "Only a terminal archive freshly restored and a separately preserved complete stable local cache are admitted as inputs.",
+    "Loose Git SHA-1 objects only; required packed objects block this bounded prototype.",
+    "Operator receipt authenticity is outside this local parser; real transfer receipts and their hashes must be reviewed separately.",
+]
+
+
+def raw_evidence(root):
+    records = list(root.rglob("private-audit/executions/*/execution.json"))
+    need(records, "Archived private execution receipts missing")
+    for path in records:
+        record = read_json(path)
+        need(record.get("never_model_input") is True and isinstance(record.get("case"), str)
+             and type(record.get("returncode")) is int and type(record.get("timed_out")) is bool,
+             "Malformed private execution record")
+        need((path.parent / "stdout.bin").is_file() and (path.parent / "stderr.bin").is_file(), "Raw private streams missing")
+        need(record.get("independent_raw_stdout_per_candidate_verified") is not True,
+             "Unsupported claim of independently attributed raw streams")
+    return {"preserved_private_execution_records": len(records), "independent_raw_stdout_per_candidate_verified": False,
+            "attribution_reason": "No experiment ID, executable SHA or input SHA in frozen execution.json; timestamps are insufficient."}
+
+
+def audit(root, cache, reception_path, cache_receipt_path, source_zip, plan, certified):
+    result = {"schema": "hpc-forest-primes-r2max-readonly-audit-v1", "scope_id": SCOPE,
+              "session_id": SESSION, "job_id": JOB, "model": MODEL, "effort": "max",
+              "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+              "preparation_manifest_sha256": PREPARATION_SHA, "verified": False,
+              "native_research_admitted": False, "independent_performance_audit_verified": False,
+              "independent_raw_stdout_per_candidate_verified": False,
+              "received_cohort_audited_with_explicit_raw_attribution_limit": False,
+              "hardware_or_process_isolation_proved": False, "limits": LIMITS}
+    before = {}
+    try:
+        need(root.resolve() != cache.resolve() and not root.resolve().is_relative_to(cache.resolve())
+             and not cache.resolve().is_relative_to(root.resolve()), "Restoration/cache snapshots must be separate")
+        before = {"restoration": inventory(root), "cache": inventory(cache)}
+        need(sha(source_zip.read_bytes()) == SOURCE_SHA and sha(plan.read_bytes()) == PLAN_SHA, "Unrelated immutable R2 source/plan")
+        reception, receipt = read_json(reception_path), read_json(cache_receipt_path)
+        archive = Path(reception["archive"]["path"])
+        validate_admissions(reception, receipt, root, cache, archive)
+        verify_archive(archive, root)
+        output = root / ("results-" + JOB)
+        outer = read_json(output / "results.json")
+        need(outer.get("schema") == "hpc-forest-primes-r2max-native-single-cell-v1" and outer.get("scope_id") == SCOPE
+             and outer.get("model") == outer.get("mother_model") == MODEL and outer.get("effort") == outer.get("mother_effort") == "max"
+             and outer.get("session_id") == SESSION and outer.get("allocation", {}).get("job_id") == JOB
+             and outer.get("source_zip_sha256") == SOURCE_SHA and outer.get("plan_sha256") == PLAN_SHA
+             and outer.get("automatic_extension") is False and outer.get("other_cells_started") == 0,
+             "Unrelated/multiple-cell native result")
+        result["recorded_first_start_control"] = outer.get("first_start_control")
+        need(outer.get("pipeline_complete") is True and not outer.get("error"), "Terminal native pipeline incomplete; negatives retained, no replay")
+        origin = read_json(output / "runtime-reference-origin.json")
+        need(origin.get("schema") == "hpc-forest-primes-r2max-runtime-reference-v1" and origin.get("verified") is True
+             and origin.get("job_id") == JOB and origin.get("allocation") == outer["allocation"]
+             and origin.get("source_zip_sha256") == SOURCE_SHA and origin.get("plan_sha256") == PLAN_SHA
+             and origin.get("preparation_manifest_sha256") == PREPARATION_SHA
+             and origin.get("reference_origin_is_current_allocation") is True and origin.get("qualification_timings_imported") is False
+             and origin.get("native_model_calls") == origin.get("new_inputs_or_candidates") == 0 and origin.get("compiler_flags") == FLAGS,
+             "Reference timings do not originate in the native allocation")
+        finite_contract(root / "runtime-preparation-private-audit/validation", certified)
+        worker = read_json(output / "worker-identity.json")
+        need(worker == read_json(output / "mailbox/worker-ready.json") == read_json(cache / "worker-ready.json")
+             and worker.get("scope_id") == SCOPE and worker.get("model") == MODEL and worker.get("reasoning_effort") == "max"
+             and worker.get("session_id") == SESSION and worker.get("source_zip_sha256") == SOURCE_SHA
+             and worker.get("plan_sha256") == PLAN_SHA, "Worker cache/remote identity differs")
+        calls = mailbox_and_cache(output / "mailbox", cache)
+        result["transport_cost_reconciliation"] = calls
+        need(calls["unique_session_nonce_pairs"] > 0 and not calls["unresolved_nonces"]
+             and calls["unknown_native_invocations"] == 0, "Unknown/unresolved invocations block complete cohort audit")
+        result["campaign"] = campaign_evidence(root, certified, source_zip, calls)
+        need(result["campaign"]["selected_reported_by_frozen_checker"] == outer.get("best_confirmed"), "Outer/registry winner differs")
+        result["raw_evidence"] = raw_evidence(root)
+        result["received_cohort_audited_with_explicit_raw_attribution_limit"] = True
+    except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, sqlite3.DatabaseError, tarfile.TarError, zipfile.BadZipFile) as exc:
+        result["audit_error"] = type(exc).__name__ + ": " + str(exc)
+    finally:
+        if before:
+            try:
+                preserved = before == {"restoration": inventory(root), "cache": inventory(cache)}
+                result["evidence_inventory_before_after_identical"] = preserved
+                result["inventory_sha256"] = {key: sha(json.dumps(value, sort_keys=True).encode()) for key, value in before.items()}
+                if not preserved:
+                    result["audit_error"] = "Evidence changed during read-only inspection"
+                    result["received_cohort_audited_with_explicit_raw_attribution_limit"] = False
+            except (OSError, ValueError) as exc:
+                result["audit_error"] = "Final inventory failed: " + str(exc)
+                result["received_cohort_audited_with_explicit_raw_attribution_limit"] = False
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("root", "cache", "reception", "cache-receipt", "source-zip", "plan", "certified", "output"):
+        parser.add_argument("--" + name, required=True, type=Path)
+    args = parser.parse_args(argv)
+    own = Path(__file__).resolve().parent
+    output = args.output.resolve()
+    need(output.is_relative_to(own) and output.parent.is_dir() and not output.exists(), "New report must be inside this auditor directory")
+    for evidence in (args.root, args.cache, args.certified):
+        need(not output.is_relative_to(evidence.resolve()), "Report must never be written inside evidence")
+    result = audit(args.root, args.cache, args.reception, args.cache_receipt, args.source_zip, args.plan, args.certified)
+    with output.open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(result, stream, indent=2, ensure_ascii=True)
+        stream.write("\n")
+    return 1 if result.get("audit_error") else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

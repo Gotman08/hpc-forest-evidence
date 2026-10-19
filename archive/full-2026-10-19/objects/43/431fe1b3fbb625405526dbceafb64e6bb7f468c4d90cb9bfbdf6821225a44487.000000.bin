@@ -1,0 +1,42 @@
+"""Audit real bounded inference failures and ensure their source trees were untouched."""
+import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+root=Path(sys.argv[1]).resolve()
+campaign=root/sys.argv[3]
+db=sqlite3.connect(f"file:{(campaign/'registry.sqlite3').as_posix()}?mode=ro",uri=True)
+db.row_factory=sqlite3.Row
+rows=db.execute("SELECT t.id,t.mission,t.result,s.tokens_used,s.usage_known FROM trials t JOIN slots s ON t.slot_id=s.id WHERE s.usage_known=2").fetchall()
+records=[]
+for row in rows:
+    mission=json.loads(row["mission"])
+    outcome=json.loads(row["result"])
+    logs=campaign/"logs"/row["id"]
+    request=json.loads((logs/"ollama-request.json").read_text(encoding="utf-8"))
+    error=json.loads((logs/"ollama-error.json").read_text(encoding="utf-8"))
+    ceiling=request["options"]["num_ctx"]+request["options"]["num_predict"]
+    assert row["tokens_used"]==ceiling==error["token_ceiling"]
+    assert error["exact_tokens"] is None and error["token_accounting"]=="upper_bound"
+    assert outcome["status"]=="infrastructure_error" and outcome["score"] is None and outcome["correct"] is None
+    assert not (logs/"agent-result.json").exists()
+    arguments=["git","--git-dir="+str(campaign/"repo/.git")]
+    paths=subprocess.run([*arguments,"ls-tree","-r","--name-only",mission["base_commit"],"src"],capture_output=True,check=True).stdout.decode().splitlines()
+    for path in paths:
+        original=subprocess.run([*arguments,"show",mission["base_commit"]+":"+path],capture_output=True,check=True).stdout
+        assert (campaign/"worktrees"/row["id"]/path).read_bytes()==original,(row["id"],path)
+    records.append({"experiment_id":row["id"],"token_ceiling":ceiling,"score":None,"source_files_unchanged":len(paths)})
+report=json.loads((campaign/"report/experiments.json").read_text(encoding="utf-8"))
+costs=report["costs"]
+assert len(records)==costs["bounded_usage_calls"]
+if report.get("status")=="search_complete":
+    assert costs["unknown_usage_calls"]==0
+assert costs["tokens_used"]==costs["exact_tokens_used"]+sum(r["token_ceiling"] for r in records)
+assert costs["tokens_used"]<=report["config"]["budget"]["tokens"]
+db.close()
+result={"verified":True,"bounded_aborts":records,"costs":costs,"no_implicit_replay":True,
+        "note":"Each aborted request has one trial and one charge; subsequent trial ids represent new missions."}
+Path(sys.argv[2]).write_text(json.dumps(result,indent=2)+"\n",encoding="utf-8")
+print(json.dumps(result))

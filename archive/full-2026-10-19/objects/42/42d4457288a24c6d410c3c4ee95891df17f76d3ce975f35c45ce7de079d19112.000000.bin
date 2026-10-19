@@ -1,0 +1,185 @@
+#include <algorithm>
+#include <cassert>
+#include <climits>
+#include <cstddef>
+#include <cstdio>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+class FastInput {
+    unsigned char buffer_[1 << 16];
+    std::size_t position_;
+    std::size_t length_;
+
+    int next_byte() {
+        if (position_ == length_) {
+            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (length_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    FastInput() : position_(0), length_(0) {}
+
+    bool read_int(int& result) {
+        int c = next_byte();
+        while (c != EOF && c <= ' ') c = next_byte();
+        if (c == EOF) return false;
+
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = next_byte();
+        if (c < '0' || c > '9') return false;
+
+        long long value = 0;
+        do {
+            value = value * 10 + (c - '0');
+            c = next_byte();
+        } while (c >= '0' && c <= '9');
+        result = static_cast<int>(negative ? -value : value);
+        return true;
+    }
+};
+
+static void initialize_columns(const int* matrix, int n, int s, int top,
+                               long long* columns) {
+    for (int r = top; r < top + s; ++r) {
+        const int* row = matrix + static_cast<std::size_t>(r) * n;
+        for (int c = 0; c < n; ++c) {
+            columns[c] += static_cast<long long>(row[c]);
+        }
+    }
+}
+
+static long long scan_band(const int* matrix, int n, int s,
+                           int first, int last, long long* columns) {
+    long long best = LLONG_MIN;
+    for (int top = first; top < last; ++top) {
+        if (top != first) {
+            const int* leaving = matrix + static_cast<std::size_t>(top - 1) * n;
+            const int* entering = matrix + static_cast<std::size_t>(top + s - 1) * n;
+            for (int c = 0; c < n; ++c) {
+                columns[c] += static_cast<long long>(entering[c])
+                            - static_cast<long long>(leaving[c]);
+            }
+        }
+
+        long long sum = 0;
+        for (int c = 0; c < s; ++c) sum += columns[c];
+        best = std::max(best, sum);
+        for (int c = s; c < n; ++c) {
+            sum += columns[c] - columns[c - s];
+            best = std::max(best, sum);
+        }
+    }
+    return best;
+}
+
+#ifdef _OPENMP
+// Each worker owns a column stripe while constructing every band's seed.
+static void initialize_bands_by_prefix(const int* matrix, int n, int s,
+                                      int windows, int worker, int workers,
+                                      long long* seeds) {
+    const int column_first = n * worker / workers;
+    const int column_last = n * (worker + 1) / workers;
+    const int count = column_last - column_first;
+    std::vector<long long> prefix(count, 0);
+    int starts = 0;
+    int ends = 0;
+    int row_index = 0;
+
+    while (ends < workers) {
+        const int next_start = starts < workers
+                             ? windows * starts / workers : n + 1;
+        const int next_end = windows * ends / workers + s;
+        const int event = std::min(next_start, next_end);
+
+        for (; row_index < event; ++row_index) {
+            const int* row = matrix + static_cast<std::size_t>(row_index) * n
+                                   + column_first;
+            for (int c = 0; c < count; ++c) {
+                prefix[c] += static_cast<long long>(row[c]);
+            }
+        }
+
+        while (starts < workers && windows * starts / workers == event) {
+            long long* destination = seeds + static_cast<std::size_t>(starts) * n
+                                           + column_first;
+            for (int c = 0; c < count; ++c) destination[c] = -prefix[c];
+            ++starts;
+        }
+        while (ends < workers && windows * ends / workers + s == event) {
+            long long* destination = seeds + static_cast<std::size_t>(ends) * n
+                                           + column_first;
+            for (int c = 0; c < count; ++c) destination[c] += prefix[c];
+            ++ends;
+        }
+    }
+}
+#endif
+
+static long long maximum_sum(const int* matrix, int n, int s) {
+    const int windows = n - s + 1;
+
+#ifdef _OPENMP
+    const std::size_t elements = static_cast<std::size_t>(n) * n;
+    const std::size_t minimum_elements_per_thread = 131072;
+    const int requested = std::min(
+        omp_get_max_threads(),
+        std::max(1, static_cast<int>(elements / minimum_elements_per_thread)));
+
+    if (requested > 1) {
+        std::vector<long long> seeds(static_cast<std::size_t>(requested) * n, 0);
+        long long maximum = LLONG_MIN;
+
+        #pragma omp parallel num_threads(requested) reduction(max: maximum)
+        {
+            const int worker = omp_get_thread_num();
+            const int workers = omp_get_num_threads();
+            const int first = windows * worker / workers;
+            const int last = windows * (worker + 1) / workers;
+            long long* columns = seeds.data() + static_cast<std::size_t>(worker) * n;
+            const int prefix_rows = s + windows * (workers - 1) / workers;
+
+            // Choose the initialization requiring fewer total matrix reads.
+            if (static_cast<long long>(workers) * s <= prefix_rows) {
+                initialize_columns(matrix, n, s, first, columns);
+            } else {
+                initialize_bands_by_prefix(matrix, n, s, windows,
+                                           worker, workers, seeds.data());
+                #pragma omp barrier
+            }
+
+            maximum = scan_band(matrix, n, s, first, last, columns);
+        }
+        return maximum;
+    }
+#endif
+
+    std::vector<long long> columns(n, 0);
+    initialize_columns(matrix, n, s, 0, columns.data());
+    return scan_band(matrix, n, s, 0, windows, columns.data());
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.read_int(n) || !input.read_int(s)) return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::vector<int> matrix(static_cast<std::size_t>(n) * n);
+    for (std::size_t i = 0; i < matrix.size(); ++i) {
+        if (!input.read_int(matrix[i])) return 0;
+    }
+
+    std::printf("%lld\n", maximum_sum(matrix.data(), n, s));
+    return 0;
+}

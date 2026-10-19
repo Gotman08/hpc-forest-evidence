@@ -1,0 +1,207 @@
+"""Bounded evidence primitives: no external commands and no writable database."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import sqlite3
+import tarfile
+from pathlib import Path, PurePosixPath
+
+SCOPE = "hpc-forest-primes-native-max-r1"
+SESSION = "c8044062692149138d826d3f388a08ef"
+JOB = "751992"
+MODEL = "gpt-6-luna"
+SOURCE_SHA = "3e290f835570a8746be3c52144932b8c6866564980fd858cf4c0495a7b1e68c5"
+PLAN_SHA = "54ffd49f4dc868085d22208f773c4b4883590b25251b5992232509a1dc197024"
+PREPARATION_SHA = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+OFFICIAL_SHA = "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d"
+REMOTE = PurePosixPath("/scratch_p/nimarano/" + SCOPE + "-" + SESSION)
+REMOTE_ROOTS = (REMOTE, PurePosixPath("/gpfs/scratch/nimarano/" + SCOPE + "-" + SESSION))
+CAMPAIGN = "primes-max-gpt-6-luna"
+FLAGS = ["-O2", "-std=c11", "-Werror=uninitialized", "-Werror=maybe-uninitialized", "-lm"]
+MAX_FILE = 128 * 1024 * 1024
+
+
+class AuditError(ValueError):
+    pass
+
+
+def need(value, message):
+    if not value:
+        raise AuditError(message)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def digest(value):
+    return sha(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def read_json(path):
+    need(path.is_file() and not path.is_symlink() and path.stat().st_size <= 8 * 1024 * 1024,
+         "Missing/linked/oversized JSON evidence: " + path.name)
+    return json.loads(path.read_bytes())
+
+
+def relative(name):
+    need(isinstance(name, str) and name, "Missing evidence member name")
+    path = PurePosixPath(name)
+    need(not path.is_absolute() and str(path) == name and ".." not in path.parts
+         and "\\" not in name and ":" not in name, "Unsafe evidence member path")
+    return name
+
+
+def inventory(root):
+    need(root.is_dir() and not root.is_symlink(), "Evidence must be a restored directory")
+    result = {}
+    for path in sorted(root.rglob("*")):
+        need(not path.is_symlink() and path.resolve().is_relative_to(root.resolve()), "Linked/escaping evidence is not admitted")
+        if path.is_file():
+            need(path.stat().st_size <= MAX_FILE, "Oversized evidence file")
+            result[path.relative_to(root).as_posix()] = {"sha256": sha(path.read_bytes()), "bytes": path.stat().st_size}
+            need(len(result) <= 100000, "Evidence inventory exceeds bounded prototype")
+    return result
+
+
+def artifact(value):
+    need(isinstance(value, dict) and set(value) == {"path", "sha256"}, "Exact artifact path/SHA required")
+    path = Path(value["path"])
+    need(path.is_absolute() and path.is_file() and not path.is_symlink()
+         and sha(path.read_bytes()) == value["sha256"], "Missing or changed admission artifact")
+    return path
+
+
+def verify_archive(archive, root):
+    expected, seen, total = {}, set(), 0
+    with tarfile.open(archive, "r:gz") as stream:
+        for member in stream:
+            name = relative(member.name.rstrip("/"))
+            need(name not in seen, "Duplicate archive member")
+            seen.add(name)
+            need(len(seen) <= 100000, "Archive member count exceeds bounded prototype")
+            need(PurePosixPath(name).parts[0] in {"results-" + JOB, "runtime-preparation-private-audit"},
+                 "Unexpected R2 native archive root")
+            need(member.isfile() or member.isdir(), "Archive links/devices are not admitted")
+            if member.isdir():
+                continue
+            total += member.size
+            need(0 <= member.size <= MAX_FILE and total <= 2 * 1024**3, "Oversized native archive")
+            raw = stream.extractfile(member).read(MAX_FILE + 1)
+            need(len(raw) == member.size, "Archive size mismatch")
+            expected[name] = {"sha256": sha(raw), "bytes": len(raw)}
+    need(expected and inventory(root) == expected, "Restoration differs from the actual received archive")
+    return expected
+
+
+def validate_admissions(reception, receipt, root, cache, archive):
+    for data, schema in ((reception, "hpc-forest-primes-r2max-reception-for-audit-v1"),
+                         (receipt, "hpc-forest-primes-r2max-cache-preservation-for-audit-v1")):
+        need(isinstance(data, dict) and data.get("schema") == schema,
+             "Real received/restored/cache audit receipts required")
+        pending_lock = data is receipt and data.get("preservation_phase") == "pre_stop_owned_lock_pending"
+        if pending_lock:
+            need(data.get("verified") is False and data.get("source_cache_complete") is False
+                 and data.get("readable_data_preservation_verified") is True,
+                 "Pre-stop receipt must stay globally unverified/incomplete, with only readable artifacts verified")
+        else:
+            need(data.get("verified") is True, "Complete reception/cache receipt must be verified")
+        need(data.get("scope_id") == SCOPE and data.get("session_id") == SESSION
+             and data.get("job_id") == JOB and data.get("model") == MODEL and data.get("effort") == "max"
+             and data.get("source_zip_sha256") == SOURCE_SHA and data.get("plan_sha256") == PLAN_SHA
+             and data.get("preparation_manifest_sha256") == PREPARATION_SHA,
+             "Unrelated R2 receipt identity")
+        need(data.get("synthetic_fixture") is not True and data.get("stub") is not True,
+             "Synthetic/stub receipt cannot become a production audit")
+    need(reception.get("fresh_restore") is True and reception.get("live_controller") is False
+         and Path(reception.get("restored_root", "")).resolve() == root.resolve()
+         and artifact(reception.get("archive")).resolve() == archive.resolve(), "Fresh closed restoration binding missing")
+    need(receipt.get("source_cache_stable") is True and receipt.get("snapshot_is_live") is False
+         and Path(receipt.get("snapshot_root", "")).resolve() == cache.resolve(), "Separately preserved stable cache snapshot required")
+    from audit_cache_preservation_r2 import cache_preservation
+    cache_status = cache_preservation(receipt, cache)
+    need(reception.get("files") == inventory(root), "Restoration receipt inventory incomplete")
+    need(reception.get("transfer_receipts"), "Real archive transfer receipt(s) required")
+    for item in reception["transfer_receipts"]:
+        artifact(item)
+    return cache_status
+
+
+def open_closed_database(path):
+    need(path.is_file() and not path.is_symlink(), "Received SQLite database missing")
+    for suffix in ("-wal", "-shm", "-journal"):
+        need(not Path(str(path) + suffix).exists(), "Nonconsolidated SQLite sidecar; never checkpoint or open live controller")
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        need(db.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "Received SQLite integrity failed")
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+def original_root(path):
+    need(isinstance(path, str) and "\\" not in path and "\0" not in path, "Malformed original native path")
+    original = PurePosixPath(path)
+    need(original.is_absolute() and str(original) == path and ".." not in original.parts, "Noncanonical/traversing original native path")
+    matches = [candidate for candidate in REMOTE_ROOTS if original.is_relative_to(candidate)]
+    need(len(matches) == 1, "Evidence path leaves the two exact received 751992 roots")
+    return matches[0]
+
+
+def rebased(path, root):
+    original = PurePosixPath(path)
+    parts = original.relative_to(original_root(path)).parts
+    need(parts, "Empty original native member path")
+    if parts[0] == "prepared":
+        result = root / "runtime-preparation-private-audit" / Path(*parts[1:])
+    else:
+        need(parts[0] == "results-" + JOB, "Unrecognized original evidence job/path")
+        result = root / Path(*parts)
+    need(result.resolve().is_relative_to(root.resolve()), "Restored evidence path escaped")
+    return result
+
+
+def finite_contract(trusted, certified):
+    manifest_path = certified / "prototype-manifest.json"
+    need(sha(manifest_path.read_bytes()) == PREPARATION_SHA, "Unreviewed certified manifest")
+    expected = read_json(manifest_path)
+    need(inventory(certified) == {**expected, "prototype-manifest.json": {"sha256": PREPARATION_SHA, "bytes": manifest_path.stat().st_size}}, "Frozen certified preparation changed")
+    c = read_json(trusted / "contract.json")
+    need(c.get("language") == "c" and c.get("source_files") == ["model-view/primetest.c"]
+         and c.get("compiler_flags") == FLAGS and c.get("comparison") == {"mode": "bytes"}, "Protected source/compiler/byte contract changed")
+    rows = []
+    for phase, variant in (("search", 0), ("confirmation", 1)):
+        cases = c.get(phase, [])
+        names = [case.get("name") for case in cases]
+        need(len(cases) == len(set(names)) == 6 and set(names) == {f"{phase}-case-{n}" for n in range(1, 7)}, "Exact six unique cases per phase required")
+        rows.extend((case, f"p{(1,2,4,8,16,30)[int(case['name'].rsplit('-',1)[1])-1]:02d}-v{variant}") for case in cases)
+    benchmark = c.get("benchmark", {})
+    need(benchmark.get("name") == "benchmark-case-1", "Fixed explicit benchmark missing")
+    rows.append((benchmark, "p30-v0"))
+    for case, origin in rows:
+        data = certified / "data/private-audit-fixtures" / origin
+        need(case.get("argv") == [] and case.get("files") == [] and case.get("capture_files") == []
+             and set(case.get("expected", {})) == {"stdout"}, "Changed certified case I/O channels")
+        need((trusted / relative(case["stdin"])).read_bytes() == (data / "input.txt").read_bytes(), "Changed private certified input")
+        blob = case["expected"]["stdout"]
+        raw = base64.b64decode(blob["base64"], validate=True)
+        need(len(raw) == blob["bytes"] and sha(raw) == blob["sha256"] and raw == (data / "expected.txt").read_bytes(), "Certified expected bytes differ")
+    return c
+
+
+def slot_costs(rows):
+    out = {"exact_known_tokens": 0, "unknown_usage_charged_tokens": 0, "upper_bound_charged_tokens": 0,
+           "reserved_tokens": 0, "unknown_usage_slots": 0, "upper_bound_slots": 0, "slots": len(rows)}
+    for row in rows:
+        need(type(row["usage_known"]) is int and row["usage_known"] in {0, 1, 2}, "Unknown slot accounting state")
+        need(all(type(row[k]) is int and row[k] >= 0 for k in ("tokens_used", "tokens_reserved")), "Invalid ledger tokens")
+        out["reserved_tokens"] += row["tokens_reserved"]
+        key = {0: "unknown_usage_charged_tokens", 1: "exact_known_tokens", 2: "upper_bound_charged_tokens"}[row["usage_known"]]
+        out[key] += row["tokens_used"]
+        out["unknown_usage_slots"] += row["usage_known"] == 0
+        out["upper_bound_slots"] += row["usage_known"] == 2
+    return out

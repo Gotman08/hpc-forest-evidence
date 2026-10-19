@@ -1,0 +1,266 @@
+"""Allocated Python-neutral qualification only. Never invoke C, CLI or a model."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import tarfile
+import time
+import traceback
+import xml.etree.ElementTree as ET
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE = "60db53fb69e014133a9c77ebaea9ae09ae7891c1433070a9af4eae30b0d05e6d"
+PLAN = "b1b39b999cb89374a17191c5b3aef2b4eee255287a4cdbb80ed9c8b5d2ac1e1c"
+RUNTIME = "890b20a1ac050fc3952f1409eb884a9013b9c01ddde5f8a79304485187f523ac"
+BUNDLE = "f1ff59777d4c2a0b09038bc32f2cead5e327badd865a9a1a904fdc9b4f72adb6"
+OLD_SOURCE = "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3"
+OLD_PLAN = "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b"
+DEADLINE = datetime(2026, 10, 31, 23, tzinfo=UTC).timestamp()
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+
+
+def need(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read(path):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, "Duplicate JSON member")
+            result[key] = value
+        return result
+    return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=pairs)
+
+
+def save(path, value):
+    with Path(path).open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def allocation_guard(*, now=None):
+    now = time.time() if now is None else now
+    need(now + 600 + 10800 < DEADLINE, "10min maximum plus 3h audit must precede exclusive deadline")
+    need(platform.machine().lower() == "aarch64", "ARM64 allocation required")
+    values = {"SLURM_CPUS_PER_TASK": "4", "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
+              "SLURM_MEM_PER_NODE": "16384"}
+    need(all(os.environ.get(key) == value for key, value in values.items()), "Exact 1node/1task/4CPU/16GiB allocation required")
+    job = os.environ.get("SLURM_JOB_ID", "")
+    need(re.fullmatch(r"[0-9]+", job) is not None, "Actual SLURM job required")
+    need(not os.environ.get("SLURM_JOB_GPUS", "") and not os.environ.get("SLURM_STEP_GPUS", "")
+         and os.environ.get("SLURM_GPUS", "0") == "0"
+         and os.environ.get("SLURM_GPUS_ON_NODE", "0") == "0", "Zero GPU allocation required")
+    affinity = sorted(os.sched_getaffinity(0))
+    need(len(affinity) == 4, "The unique srun step must bind exactly four CPUs")
+    return {"architecture": "ARM64", "cpu_cores": 4, "tasks": 1, "nodes": 1,
+            "allocated_memory_mib": 16384, "allocated_gpus": 0, "slurm_job_id": job,
+            "affinity_cpu_ids": affinity, "affinity_cpu_count": len(affinity)}
+
+
+def safe_members(archive, *, expected_count=None):
+    members = archive.getmembers()
+    need(bool(members) and (expected_count is None or len(members) == expected_count), "Exact archive member count required")
+    names, total = set(), 0
+    for member in members:
+        name = member.name
+        rel = PurePosixPath(name)
+        need(member.isfile() and not member.issym() and not member.islnk()
+             and name and "\\" not in name and "\0" not in name and not rel.is_absolute()
+             and rel.as_posix() == name and all(part not in {".", "..", ""} for part in rel.parts)
+             and not re.match(r"^[A-Za-z]:", name) and name not in names,
+             "Regular unique safe relative archive members required")
+        need(0 <= member.size <= 32 * 1024 * 1024, "Archive member exceeds neutral packet bound")
+        total += member.size
+        need(total <= 128 * 1024 * 1024, "Neutral packet expanded size exceeds bound")
+        names.add(name)
+    return members
+
+
+def extract_new(path, root, *, expected_count=None):
+    root.mkdir(parents=False, exist_ok=False)
+    with tarfile.open(path, "r:gz") as archive:
+        members = safe_members(archive, expected_count=expected_count)
+        for member in members:
+            target = root.joinpath(*PurePosixPath(member.name).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            need(target.resolve().is_relative_to(root.resolve()) and not target.exists(), "Extraction target escaped or repeated")
+            data = archive.extractfile(member).read()
+            need(len(data) == member.size, "Short archive member")
+            with target.open("xb") as stream:
+                stream.write(data)
+    return {member.name for member in members}
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        need(not path.is_symlink(), "Symlinks are not admissible evidence")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = sha(path)
+    return result
+
+
+def verify_source(root):
+    need(sha(root / "project.zip") == SOURCE and sha(root / "dynamic-plan.json") == PLAN
+         and sha(root / "runtime-manifest.json") == RUNTIME, "Derived source/plan/runtime changed")
+    expected = read(root / "runtime-manifest.json")
+    actual = inventory(root / "project")
+    need(isinstance(expected, dict) and len(expected) == 105 and actual == expected, "Exact 105 source files required")
+    with zipfile.ZipFile(root / "project.zip") as archive:
+        entries = archive.infolist()
+        need(len(entries) == 105 and len({i.filename for i in entries}) == 105, "Exact unique source ZIP inventory required")
+        for info in entries:
+            need(not info.is_dir() and info.filename.startswith("HPC-Forest/"), "Unexpected source ZIP member")
+            rel = info.filename.removeprefix("HPC-Forest/")
+            need(rel in expected and hashlib.sha256(archive.read(info)).hexdigest() == expected[rel], "Source ZIP differs from runtime")
+    need(sha(root / "predecessor/project.zip") == OLD_SOURCE
+         and sha(root / "predecessor/plan.json") == OLD_PLAN, "Predecessor data for refusal test changed")
+    plan = read(root / "dynamic-plan.json")
+    need(plan["scope_id"] == SCOPE and plan["source_zip_sha256"] == SOURCE, "Exact derived scope/source plan required")
+    return actual
+
+
+def junit_counts(path):
+    tree = ET.parse(path)
+    cases = list(tree.iter("testcase"))
+    need(bool(cases), "JUnit must contain actual test cases")
+    failed = sum(case.find("failure") is not None or case.find("error") is not None for case in cases)
+    skipped = sum(case.find("skipped") is not None for case in cases)
+    return {"passed": len(cases) - failed - skipped, "failed": failed}, {
+        "testcases": len(cases), "skipped": skipped, "junit_sha256": sha(path)}
+
+
+def run_suite(label, test, cutoff, output, root, started):
+    junit = output / f"{label}-junit.xml"
+    argv = [sys.executable, "-B", "-m", "pytest", str(test), "--confcutdir", str(cutoff),
+            "-q", "-p", "no:cacheprovider", "--basetemp", str(output / f"{label}-NEUTRAL-fixtures"),
+            "--junitxml", str(junit)]
+    timeout = min(180, int(600 - (time.monotonic() - started) - 60))
+    need(timeout > 0, "No reserved time remains for the one permitted suite run")
+    environment = os.environ.copy()
+    environment.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", CUDA_VISIBLE_DEVICES="",
+                       OMP_NUM_THREADS="4", OPENBLAS_NUM_THREADS="1")
+    save(output / f"{label}-intention.json", {"argv": argv, "timeout_seconds": timeout,
+         "maximum_run_count": 1, "model_calls": 0})
+    # These are two explicit Python pytest runs, each at most once. No model,
+    # Codex CLI, compiler, C candidate, installation or transport is invoked.
+    with (output / f"{label}-stdout.log").open("xb") as stdout, (output / f"{label}-stderr.log").open("xb") as stderr:
+        result = subprocess.run(argv, cwd=root, env=environment, stdout=stdout, stderr=stderr,
+                                timeout=timeout, check=False)
+    counts, details = junit_counts(junit)
+    save(output / f"{label}-execution.json", {"argv": argv, "returncode": result.returncode,
+         "timeout_seconds": timeout, "run_count": 1, "model_calls": 0, **details})
+    return result.returncode, counts, details
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path)
+    args = parser.parse_args()
+    started = time.monotonic()
+    # This guard precedes extraction, test imports and all scientific work.
+    allocation = allocation_guard()
+    root = args.root.resolve(strict=True)
+    need(Path(sys.executable).resolve(strict=True) == Path(PYTHON).resolve(strict=True), "Existing allocated Python only")
+    bindings = read(root / "bindings.json")
+    need(bindings["scope_id"] == SCOPE and bindings["source_zip_sha256"] == SOURCE
+         and bindings["plan_sha256"] == PLAN and bindings["source_bundle_sha256"] == BUNDLE,
+         "Exact derivative bindings required")
+    output = root / "qualification-output"
+    output.mkdir(exist_ok=False)
+    record = {"schema": "hpc-forest-lane-r2-zero-model-allocated-qualification-v1", "verified": False,
+              "scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+              "adapter_revision": "lane-r2-integration", "native_model_calls": 0,
+              "source_file_count": None, "allocation": allocation,
+              "allocated_contract_tests_returncode": None,
+              "source_lane_contract_tests": None, "adapter_portable_tests": None,
+              "adapter_components_manifest_sha256": None, "native_generation_admitted": False,
+              "normal_first_start_verified": False, "independent_performance_audit_verified": False,
+              "started_at_utc": datetime.now(UTC).isoformat(), "qualification_attempt": 1}
+    save(output / "qualification-started.json", record)
+    source_before = adapter_before = None
+    exitcode = 1
+    try:
+        need(sha(root / "source-bundle.tar.gz") == BUNDLE
+             and sha(root / "adapter-bundle.tar.gz") == bindings["adapter_bundle_sha256"], "Exact source/adapter bundle required")
+        names = extract_new(root / "source-bundle.tar.gz", root / "source", expected_count=111)
+        expected_names = {"project/" + name for name in read(root / "source/runtime-manifest.json")}
+        expected_names |= {"project.zip", "dynamic-plan.json", "runtime-manifest.json", "DESIGN-INTERFACE.json",
+                           "predecessor/project.zip", "predecessor/plan.json"}
+        need(names == expected_names, "Exact 111 source bundle members required")
+        source_before = verify_source(root / "source")
+        record["source_file_count"] = len(source_before)
+        save(output / "source-before.json", source_before)
+        extract_new(root / "adapter-bundle.tar.gz", root / "adapters",
+                    expected_count=bindings["adapter_bundle_member_count"])
+        components = root / "adapters/COMPONENTS.json"
+        need(sha(components) == bindings["adapter_components_manifest_sha256"], "Exact integration components required")
+        record["adapter_components_manifest_sha256"] = sha(components)
+        code_pins = read(components)["code_pins"]
+        need(isinstance(code_pins, dict) and code_pins, "Closed adapter code inventory required")
+        for name, expected in code_pins.items():
+            rel = PurePosixPath(name)
+            need(not rel.is_absolute() and ".." not in rel.parts and "\\" not in name
+                 and sha(root / "adapters" / name) == expected, "Adapter component changed")
+        adapter_before = inventory(root / "adapters")
+        save(output / "adapter-before.json", adapter_before)
+        first, source_counts, source_details = run_suite("source-lane", root / "source/project/tests/test_lane_contract.py",
+                                                         root / "source/project/tests", output, root, started)
+        second, adapter_counts, adapter_details = run_suite("adapter-portable", root / "adapters/test_portable_chain.py",
+                                                            root / "adapters", output, root, started)
+        record.update(source_lane_contract_tests=source_counts, adapter_portable_tests=adapter_counts,
+                      source_suite_details=source_details, adapter_suite_details=adapter_details,
+                      allocated_contract_tests_returncode=first if first else second)
+        source_after = verify_source(root / "source")
+        adapter_after = inventory(root / "adapters")
+        save(output / "source-after.json", source_after)
+        save(output / "adapter-after.json", adapter_after)
+        need(source_after == source_before and adapter_after == adapter_before, "Source/adapter bytes changed during neutral tests")
+        need(first == second == 0 and source_counts == {"passed": 26, "failed": 0}
+             and adapter_counts["passed"] >= 1 and adapter_counts["failed"] == 0
+             and source_details["skipped"] == adapter_details["skipped"] == 0,
+             "Both actual exact-source and portable suites must pass without skips")
+        record.update(verified=True, source_files_before_after_identical=True, adapter_files_before_after_identical=True)
+        exitcode = 0
+    except Exception as exc:  # noqa: BLE001 -- preserve every first qualifier failure; never retry it.
+        record.update(failure_type=type(exc).__name__, failure_reason=str(exc))
+        with (output / "first-failure.txt").open("x", encoding="utf-8") as stream:
+            traceback.print_exc(file=stream)
+    finally:
+        record.update(finished_at_utc=datetime.now(UTC).isoformat(), elapsed_seconds=time.monotonic() - started)
+        save(output / "qualification.json", record)
+        archive = root / f"qualification-results-{allocation['slurm_job_id']}.tar.gz"
+        with tarfile.open(archive, "w:gz") as packed:
+            for directory in (output, root / "source", root / "adapters"):
+                if directory.is_dir():
+                    for path in sorted(directory.rglob("*")):
+                        need(not path.is_symlink(), "Never follow result archive links")
+                        if path.is_file():
+                            packed.add(path, arcname=path.relative_to(root).as_posix(), recursive=False)
+            for name in ("qualification-wrapper.py", "bindings.json", "packet-manifest.json"):
+                packed.add(root / name, arcname=name, recursive=False)
+        envelope = {"schema": "hpc-forest-lane-r2-zero-model-envelope-v1", "verified": exitcode == 0,
+                    "native_model_calls": 0, "slurm_job_id": allocation["slurm_job_id"],
+                    "archive": {"path": str(archive), "sha256": sha(archive), "bytes": archive.stat().st_size},
+                    "qualification": {"path": str(output / "qualification.json"), "sha256": sha(output / "qualification.json")}}
+        save(root / "qualification-envelope.json", envelope)
+        print(json.dumps(envelope), flush=True)
+    return exitcode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

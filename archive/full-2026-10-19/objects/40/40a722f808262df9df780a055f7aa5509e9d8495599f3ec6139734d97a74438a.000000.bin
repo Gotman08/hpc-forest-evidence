@@ -1,0 +1,154 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define TILE 4   // bodies processed together per tile
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+void body_force(float * restrict x, float * restrict y, float * restrict z,
+                float * restrict vx, float * restrict vy, float * restrict vz,
+                float dt, int n) {
+  // Process full tiles of TILE bodies in parallel.
+  #pragma omp parallel for schedule(static)
+  for (int i0 = 0; i0 < n - (n % TILE); i0 += TILE) {
+    float fx[TILE] = {0.0f};
+    float fy[TILE] = {0.0f};
+    float fz[TILE] = {0.0f};
+
+    // Sequential scan over all bodies j; each body in the tile accumulates
+    // its force contributions in exactly the same order as the original code.
+    for (int j = 0; j < n; ++j) {
+      float xj = x[j];
+      float yj = y[j];
+      float zj = z[j];
+
+      #pragma omp simd
+      for (int t = 0; t < TILE; ++t) {
+        int idx = i0 + t;
+        float dx = xj - x[idx];
+        float dy = yj - y[idx];
+        float dz = zj - z[idx];
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1 / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx[t] += dx * inv_dist3;
+        fy[t] += dy * inv_dist3;
+        fz[t] += dz * inv_dist3;
+      }
+    }
+
+    for (int t = 0; t < TILE; ++t) {
+      int idx = i0 + t;
+      vx[idx] += dt*fx[t];
+      vy[idx] += dt*fy[t];
+      vz[idx] += dt*fz[t];
+    }
+  }
+
+  // Handle the remaining bodies (at most TILE-1) with the original scalar loop.
+  for (int i = n - (n % TILE); i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; ++j) {
+      float dx = x[j] - x[i];
+      float dy = y[j] - y[i];
+      float dz = z[j] - z[i];
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    vx[i] += dt*fx;
+    vy[i] += dt*fy;
+    vz[i] += dt*fz;
+  }
+}
+
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  // Convert to Structure-of-Arrays for better cache locality and SIMD.
+  float *x, *y, *z, *vx, *vy, *vz;
+  posix_memalign((void**)&x, 64, nbodies*sizeof(float));
+  posix_memalign((void**)&y, 64, nbodies*sizeof(float));
+  posix_memalign((void**)&z, 64, nbodies*sizeof(float));
+  posix_memalign((void**)&vx, 64, nbodies*sizeof(float));
+  posix_memalign((void**)&vy, 64, nbodies*sizeof(float));
+  posix_memalign((void**)&vz, 64, nbodies*sizeof(float));
+
+  for (int i = 0; i < nbodies; ++i) {
+    x[i] = bodies[i].x;
+    y[i] = bodies[i].y;
+    z[i] = bodies[i].z;
+    vx[i] = bodies[i].vx;
+    vy[i] = bodies[i].vy;
+    vz[i] = bodies[i].vz;
+  }
+
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(x, y, z, vx, vy, vz, DT, nbodies);
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < nbodies; ++i) {
+      x[i] += vx[i]*DT;
+      y[i] += vy[i]*DT;
+      z[i] += vz[i]*DT;
+    }
+  }
+
+  // Copy results back to the original Body array for output.
+  for (int i = 0; i < nbodies; ++i) {
+    bodies[i].x = x[i];
+    bodies[i].y = y[i];
+    bodies[i].z = z[i];
+    bodies[i].vx = vx[i];
+    bodies[i].vy = vy[i];
+    bodies[i].vz = vz[i];
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(x); free(y); free(z); free(vx); free(vy); free(vz);
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

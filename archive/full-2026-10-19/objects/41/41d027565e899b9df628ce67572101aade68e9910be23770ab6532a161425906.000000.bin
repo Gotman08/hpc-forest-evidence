@@ -1,0 +1,204 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<stdint.h>
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+typedef struct {
+  int id;
+  int node_plus_one;
+} IdEntry;
+
+typedef struct {
+  IdEntry *entries;
+  size_t mask;
+} IdIndex;
+
+/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  
+  Node* data = NULL;
+  FILE *fl = NULL;
+  
+  if (fname == NULL) 
+    fl = stdin;
+  else 
+    fl = fopen(fname, "r");
+  
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+  
+  // header 
+  fscanf(fl, "%d %[^\n]", n, list);
+  
+  if (*n > 1) {
+    data = (Node*) malloc ((*n)*sizeof(Node));
+    if(data == NULL){
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }    
+  }
+  
+  for(int i = 0; i < *n; i++)
+    fscanf(fl, "%d %f %[^\n]", &data[i].id, &data[i].value, data[i].neighbors);
+  
+  fclose(fl);
+
+  return data;
+  
+}
+
+/* Returns the index of the node with the given id or -1 if not found */
+int find_by_id(Node g[], int id, int size){
+
+  int i = 0;
+
+  while((i < size) && g[i].id != id)
+    i++;
+
+  if(i < size)
+    return i;
+
+  return -1;
+
+}
+
+static uint32_t hash_id(int id) {
+  uint32_t x = (uint32_t)id;
+  x ^= x >> 16;
+  x *= UINT32_C(0x7feb352d);
+  x ^= x >> 15;
+  x *= UINT32_C(0x846ca68b);
+  x ^= x >> 16;
+  return x;
+}
+
+/* Keep lookup keys together instead of scanning full Node records. */
+static IdIndex build_id_index(const Node *g, int size) {
+  IdIndex index = {NULL, 0};
+  size_t capacity = 1;
+  size_t target;
+
+  /* Small inputs avoid index construction; allocation failure also falls back. */
+  if (size <= 16)
+    return index;
+  if ((size_t)size > SIZE_MAX / 2)
+    return index;
+
+  target = (size_t)size * 2;
+  while (capacity < target) {
+    if (capacity > SIZE_MAX / 2)
+      return index;
+    capacity *= 2;
+  }
+  if (capacity > SIZE_MAX / sizeof(IdEntry))
+    return index;
+
+  index.entries = (IdEntry*)calloc(capacity, sizeof(IdEntry));
+  if (index.entries == NULL)
+    return index;
+  index.mask = capacity - 1;
+
+  for (int i = 0; i < size; ++i) {
+    int id = g[i].id;
+    size_t pos = (size_t)hash_id(id) & index.mask;
+    while (index.entries[pos].node_plus_one != 0 &&
+           index.entries[pos].id != id)
+      pos = (pos + 1) & index.mask;
+
+    /* Duplicate IDs retain the first record, as in the linear search. */
+    if (index.entries[pos].node_plus_one == 0) {
+      index.entries[pos].id = id;
+      index.entries[pos].node_plus_one = i + 1;
+    }
+  }
+
+  return index;
+}
+
+static int find_by_id_indexed(Node g[], int id, int size,
+                              const IdIndex *index) {
+  if (index->entries == NULL)
+    return find_by_id(g, id, size);
+
+  const IdEntry *entries = index->entries;
+  size_t pos = (size_t)hash_id(id) & index->mask;
+  while (entries[pos].node_plus_one != 0) {
+    if (entries[pos].id == id)
+      return entries[pos].node_plus_one - 1;
+    pos = (pos + 1) & index->mask;
+  }
+  return -1;
+}
+
+/* Computes the sum using an index owned by the current evaluation. */
+static float get_costly_indexed(Node *g, int id, int size,
+                                const IdIndex *index) {
+
+  char *t;
+  int idmax = -1;
+  float max = 0;
+  char *auxptr;
+  
+  int nd = find_by_id_indexed(g, id, size, index);
+  if(nd < 0)
+    return max;
+
+  char aux[MAX];
+  strcpy(aux, g[nd].neighbors);
+  t = strtok_r(aux, " ", &auxptr);
+
+  do {
+    int d = find_by_id_indexed(g, atoi(t), size, index);
+    if (d >= 0 && max < g[d].value) {
+      max = g[d].value;
+      idmax = atoi(t);
+    }    
+  } while ((t = strtok_r(NULL, " ", &auxptr)));
+
+  float r = g[nd].value;
+
+  if(idmax != -1)
+    r += get_costly_indexed(g, idmax, size, index);
+  
+  return (r);
+
+}
+
+/* Preserve the standalone entry point without persistent cached state. */
+float get_costly(Node *g, int id, int size) {
+  IdIndex index = build_id_index(g, size);
+  float result = get_costly_indexed(g, id, size, &index);
+  free(index.entries);
+  return result;
+}
+
+/* Main program - calls read input, computes sum for each node in the list, prints output */
+int main() {
+  char *fileN = NULL;
+  char computelist[MAX];
+  int n = -1;
+  Node* input = NULL;
+
+  input = read_input(fileN, &n, computelist);
+  IdIndex index = build_id_index(input, n);
+  
+  // process
+  for(char *c = strtok(computelist, " "); c != NULL; c = strtok(NULL, " "))
+    printf("%s: %f\n", c, get_costly_indexed(input, atoi(c), n, &index));
+  
+  free(index.entries);
+  free(input);
+
+  return 0;
+}

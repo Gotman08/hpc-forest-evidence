@@ -1,0 +1,42 @@
+"""Assemble the measured report data and confirmed packages, without rerunning search."""
+import hashlib
+import json
+import shutil
+from pathlib import Path
+
+workspace=Path(__file__).resolve().parents[2]
+output=workspace/"outputs/Marathon22-interface-v3"
+read=lambda p:json.loads(p.read_text(encoding="utf-8"))
+a,b=read(output/"analyse-v3.json"),read(output/"analyse-v4.json")
+problems={p["problem"]:p for p in a["problems"]}
+problems.update({p["problem"]:p for p in b["problems"]})
+assert len(problems)==4 and all(p["complete"] and p["search_complete"] for p in problems.values())
+assert all(p["search_trials"]==24 for p in problems.values())
+assert all(s["identical"] for p in problems.values() for s in p["source_identity"])
+labels={"knn":"k-NN","sum":"Somme · reprise complète","nbody":"N-body","bucketsort":"Tri par seaux"}
+data=[{"name":labels[p["problem"]],"problem":p["problem"],"trees":p["trees"],
+       "events":[{k:e[k] for k in ["id","label","state","score"]} for e in p["events"]]}
+      for p in problems.values()]
+template=(workspace/"work/marathon-v3/forest-template.html").read_text(encoding="utf-8")
+visual=Path("C:/Users/nicol/.codex/visualizations/2026/10/15/01a13e1b-d868-7240-8a3c-454bc296b43e/forest-marathon.html")
+visual.write_text(template.replace("__OBSERVED_DATA__",json.dumps(data,ensure_ascii=False).replace("<","\\u003c")),encoding="utf-8")
+assert visual.stat().st_size<1000000
+packages=[]
+for slug,p in problems.items():
+    job="746998" if slug=="sum" else "746984"
+    proof=output/("preuves-v4" if slug=="sum" else "preuves-v3")/("results-"+job)/slug
+    name=slug+("-reference" if p["best_confirmed"]["is_baseline"] else "-optimise")+".zip"
+    dest=output/"programmes-retenus"/name
+    shutil.copyfile(proof/"submission.zip",dest)
+    packages.append({"problem":slug,"file":name,"sha256":hashlib.sha256(dest.read_bytes()).hexdigest(),"job_id":job,"best_confirmed":p["best_confirmed"]})
+(output/"programmes-retenus/manifest.json").write_text(json.dumps(packages,indent=2)+"\n",encoding="utf-8")
+summary={"all_four_searches_complete":True,"primary_trials":sum(p["search_trials"] for p in problems.values()),
+         "primary_llm_calls":sum(p["llm_calls"] for p in problems.values()),
+         "preserved_interrupted_trials":next(p for p in a["problems"] if p["problem"]=="sum")["search_trials"],
+         "full_restored_files":2567+750,"manual_candidate_repairs":0,
+         "results":[{k:p[k] for k in ["problem","outcomes","tree_nodes","max_depth","max_children","best_confirmed"]} for p in problems.values()],
+         "cleanup_verified":all(x["cleanup"]["owned_server_stopped"] and x["cleanup"]["owned_cache_removed"] for x in [a,b])}
+(output/"bilan-verifie.json").write_text(json.dumps(summary,indent=2)+"\n",encoding="utf-8")
+for src,dest in [("analyse_results.py","analyse_results.py"),("verify_results.py","verifier-preuves.py"),("build_report.py","construire-rapport.py")]:
+    shutil.copyfile(workspace/"work/marathon-v3"/src,output/"cadre-execution"/dest)
+print(json.dumps({"visual":str(visual),"primary_trials":summary["primary_trials"],"llm_calls":summary["primary_llm_calls"],"packages":len(packages),"cleanup":summary["cleanup_verified"]}))

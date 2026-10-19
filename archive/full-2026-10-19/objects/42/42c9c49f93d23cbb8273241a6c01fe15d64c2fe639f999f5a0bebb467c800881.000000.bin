@@ -1,0 +1,25 @@
+$ErrorActionPreference='Stop'
+$taskDir=$PSScriptRoot
+$taskBeforePath=Join-Path $taskDir 'cim-avant-observateur.json'
+$taskBefore=Get-Content -LiteralPath $taskBeforePath -Raw|ConvertFrom-Json
+$taskFields=@('ProcessId','ParentProcessId','ExecutablePath','CommandLine','CreationDate')
+function Task-Current($taskPid){$taskRow=Get-CimInstance Win32_Process -Filter "ProcessId=$taskPid";if($null -eq $taskRow){return $null};return [pscustomobject]@{ProcessId=[int]$taskRow.ProcessId;ParentProcessId=[int]$taskRow.ParentProcessId;ExecutablePath=$taskRow.ExecutablePath;CommandLine=$taskRow.CommandLine;CreationDate=$taskRow.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')}}
+function Task-Same($taskA,$taskB){if($null -eq $taskA -or $null -eq $taskB){return $false};foreach($taskField in $taskFields){if($taskA.$taskField -cne $taskB.$taskField){return $false}};return $true}
+function Task-Ref($taskPath){return @{path=[IO.Path]::GetFullPath($taskPath);sha256=(Get-FileHash -LiteralPath $taskPath -Algorithm SHA256).Hash.ToLowerInvariant()}}
+$taskTarget=@($taskBefore.rows|Where-Object ProcessId -eq 37484)[0]
+$taskPrevious=@($taskBefore.rows|Where-Object {$_.ProcessId -in @(40208,37484)})
+$taskSourceOnly=@($taskBefore.rows|Where-Object {$_.ProcessId -in @(37900,37848)})
+if($taskTarget.CommandLine -notlike '*observateur-r3*observer-source-only-max-r3.py*' -or $taskTarget.CreationDate -ne '2026-10-17T22:12:26.4606350Z' -or $taskTarget.ExecutablePath -ne 'C:\Users\nicol\AppData\Local\Programs\Python\Python313\python.exe'){throw 'Wrong readonly reader target'}
+foreach($taskRow in $taskSourceOnly){if(-not(Task-Same $taskRow (Task-Current $taskRow.ProcessId))){throw 'Source-only changed; refuse observer intervention'}}
+if(-not(Task-Same $taskTarget (Task-Current $taskTarget.ProcessId))){throw 'Readonly reader full identity mismatch'}
+$taskIntentPath=Join-Path $taskDir 'old-reader-only-stop-intent.json';if(Test-Path -LiteralPath $taskIntentPath){throw 'Intent exists; reconcile before any action'}
+$taskIntent=@{target=$taskTarget;scope='Single readonly observer main; MCP and SSH processes excluded from stop';recursive_stop=$false;source_only_preserved=$taskSourceOnly;observed_at=[DateTime]::UtcNow.ToString('o')}
+[IO.File]::WriteAllText($taskIntentPath,($taskIntent|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+$taskProcess=[Diagnostics.Process]::GetProcessById($taskTarget.ProcessId)
+try{$null=$taskProcess.Handle;if(-not(Task-Same $taskTarget (Task-Current $taskTarget.ProcessId))){throw 'Identity changed after stable handle'};$taskDelta=[Math]::Abs(($taskProcess.StartTime.ToUniversalTime()-[DateTime]::Parse($taskTarget.CreationDate).ToUniversalTime()).Ticks);if($taskDelta -gt 10000){throw 'Stable handle creation mismatch'};$taskProcess.Kill();if(-not $taskProcess.WaitForExit(5000)){throw 'Readonly reader did not exit'}}finally{$taskProcess.Dispose()}
+Start-Sleep -Seconds 2
+foreach($taskRow in $taskPrevious){if(Task-Same $taskRow (Task-Current $taskRow.ProcessId)){throw 'Previous readonly observer pair not yet absent; preserve and reconcile'}}
+foreach($taskRow in $taskSourceOnly){if(-not(Task-Same $taskRow (Task-Current $taskRow.ProcessId))){throw 'Source-only preservation failed'}}
+$taskAfterPath=Join-Path $taskDir 'cim-apres-reader-only-stop.json';& (Join-Path $taskDir 'capturer-cim-parent.ps1') -Destination $taskAfterPath
+$taskReceipt=@{schema='hpc-forest-passive-observer-owned-stop-v1';verified=$true;observed_at=[DateTime]::UtcNow.ToString('o');owned_observer_stop_verified=$true;previous_observer_identities=$taskPrevious;source_only_relay_preserved=$true;model_workers_stopped=$false;recursive_stop=$false;stopped_process_identities=@($taskTarget);mcp_and_ssh_stops_performed=$false;wrapper_exited_naturally=$true;evidence_refs=@((Task-Ref $taskBeforePath),(Task-Ref $taskIntentPath),(Task-Ref $taskAfterPath))}
+$taskReceiptPath=Join-Path $taskDir 'old-reader-only-owned-stop.json';[IO.File]::WriteAllText($taskReceiptPath,($taskReceipt|ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false));Write-Output ('Single readonly reader stopped; source-only preserved; '+$taskReceiptPath)

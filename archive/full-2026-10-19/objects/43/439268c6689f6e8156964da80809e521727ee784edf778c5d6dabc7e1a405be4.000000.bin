@@ -1,0 +1,101 @@
+"""Seal the local r2c envelope and observed parent upload; never operate ROMEO."""
+from __future__ import annotations
+
+import hashlib
+import json
+import zipfile
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+BASE = OUT.parents[1]
+SOURCE = BASE / "outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2c"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def save(name, value):
+    path = OUT / name
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    return ref(path)
+
+
+before = json.loads((OUT / "preservation-avant.json").read_text(encoding="utf8"))["original_files"]
+if any(sha(Path(name)) != expected for name, expected in before.items()):
+    raise RuntimeError("A source or closed wrapper byte changed")
+review = SOURCE / "REVUE-INDEPENDANTE-CAP4.json"
+if sha(review) != "22ba707765abdc4764b771c4c620ae2648ff15f3052a55e8dcde17066f0a728d":
+    raise RuntimeError("The actual independent source review changed")
+upload_path = SOURCE / "upload-verifie-parent.json"
+upload = json.loads(upload_path.read_text(encoding="utf8"))["structuredContent"]
+payload_sha = "b64b297c0d1550c7b906f601c924fe36a7fe3bf71a9b111c8678450f0082697a"
+if (upload.get("ok") is not True or upload.get("verifie") is not True or upload.get("bytes") != 477198
+        or upload.get("to") != "/scratch_p/nimarano/hpc-forest-primes-native-max-r2c-b64b297c0d1550c7.tar.gz"
+        or any(upload.get(key) != payload_sha for key in ("remote_sha256", "empreinte_locale", "empreinte_distante"))):
+    raise RuntimeError("The observed parent upload differs from the proposed input")
+if "36 passed" not in (OUT / "tests-final.log").read_text(encoding="utf8"):
+    raise RuntimeError("Complete neutral wrapper tests are missing")
+if any("All checks passed!" not in (OUT / name).read_text(encoding="utf8")
+       for name in ("ruff-final.log", "ruff-scellement.log")):
+    raise RuntimeError("Ruff validation is missing")
+wrapper = (OUT / "qualification-wrapper.py").read_text(encoding="utf8")
+body = wrapper.split('\nif __name__ == "__main__":', 1)[0]
+command = (OUT / "commande-allouee-proposee.sh").read_text(encoding="utf8")
+if body not in command or sum(line.startswith("srun ") for line in command.splitlines()) != 1:
+    raise RuntimeError("Final command does not embed the checked wrapper with exactly one srun")
+active = {name: ref(OUT / name) for name in ("qualification-wrapper.py", "bindings-proposees.json",
+    "commande-allouee-proposee.sh", "demande-allocation-proposee.json")}
+if (active["qualification-wrapper.py"]["sha256"] != "55f85123d62fa242db999a63852028c16ff22496747b4fbbcc08f25b229f0af1"
+        or active["commande-allouee-proposee.sh"]["sha256"] != "42dfbfb9ca6f1fe6ad643993a858595d9d3b48c3c353a5fa5d1ed5068fb200d6"
+        or active["bindings-proposees.json"]["sha256"] != "dc5bedc73f9f0dec3d8e8ea63f364b4cd1d6b2152c3678eb9f9d3a85e77fc813"):
+    raise RuntimeError("Active wrapper inputs changed after delivery to the reviewer")
+save("preservation-apres.json", {"schema": "hpc-forest-qualification-r2c-input-preservation-after-v1",
+    "verified": True, "original_file_count": len(before), "original_files": before,
+    "source_review": ref(review), "parent_upload_observed": ref(upload_path),
+    "source_and_previous_wrapper_unchanged": True})
+save("validation-locale.json", {"schema": "hpc-forest-qualification-r2c-local-validation-v1",
+    "verified_local_only": True, "mechanical_tests_passed": 36, "neutral_subtests_passed": 22,
+    "tests": ref(OUT / "tests-final.log"), "ruff": "passed", "ruff_log": ref(OUT / "ruff-final.log"),
+    "ruff_seal_log": ref(OUT / "ruff-scellement.log"),
+    "first_expected_refusal": ref(OUT / "premier-refus-revue-absente.log"),
+    "source_review": ref(review), "active": active,
+    "one_srun_without_nested_srun_required": True, "flat_payload_members_verified": 162,
+    "exact_source_zip_members_verified": 103, "complete_resolved_alias_identity_retained": True,
+    "original_qualification_and_prepared_root_bytes_preserved": True,
+    "official_evaluator_trace_in_original_inner_archive_required": True, "summary_only_trace_not_admitted": True,
+    "new_cap4_and_single_cell_plan_required": True,
+    "wrapper_review_required_before_plan_and_submission": True, "wrapper_review_verified": False,
+    "parent_source_bundle_upload_observed": ref(upload_path),
+    "romeo_calls_by_this_preparation": 0, "uploads_by_this_preparation": 0, "plans_prepared": 0,
+    "jobs_submitted": 0, "c_compiler_model_cli_socket_executions": 0, "native_research_admitted": False})
+files = {path.name: sha(path) for path in sorted(OUT.iterdir()) if path.is_file()}
+save("manifeste-local.json", {"schema": "hpc-forest-qualification-r2c-local-manifest-v1",
+    "files": files, "active": active, "status": "local_sealed_proposal_wrapper_review_required",
+    "native_research_admitted": False})
+archive = OUT / "WRAPPER-QUALIFICATION-R2C.zip"
+with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as output:
+    for name in [*files, "manifeste-local.json"]:
+        entry = zipfile.ZipInfo(name, (2026, 10, 18, 0, 0, 0))
+        entry.external_attr = 0o100644 << 16
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        output.writestr(entry, (OUT / name).read_bytes())
+with zipfile.ZipFile(archive) as received:
+    if (len(received.namelist()) != len(files) + 1
+            or any(hashlib.sha256(received.read(name)).hexdigest() != sha(OUT / name) for name in received.namelist())):
+        raise RuntimeError("The sealed wrapper archive bytes differ")
+delivery = save("LIVRAISON-LOCALE.json", {"schema": "hpc-forest-qualification-r2c-local-delivery-v1",
+    "status": "sealed_local_only_wrapper_review_required", "active": active, "archive": ref(archive),
+    "manifest": ref(OUT / "manifeste-local.json"), "validation": ref(OUT / "validation-locale.json"),
+    "source_review": ref(review), "source_and_previous_wrapper_preserved": ref(OUT / "preservation-apres.json"),
+    "mechanical_tests_passed": 36, "neutral_subtests_passed": 22, "ruff": "passed",
+    "romeo_operations_by_this_preparation": 0, "parent_source_bundle_upload_observed": ref(upload_path),
+    "plans_prepared": 0, "jobs_submitted": 0, "native_model_calls": 0, "native_research_admitted": False,
+    "wrapper_review_required_before_plan_and_submission": True})
+print(json.dumps({"delivery": delivery, "active": active, "archive": ref(archive),
+    "preserved_original_files": len(before)}, indent=2))

@@ -1,0 +1,148 @@
+"""R4b identity/policy adapter; inherited claim and byte retransmission stay intact."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from .core import InfrastructureError, atomic_json, file_digest
+from .dynamic_admission import policy_cell_binding, verify_local_cli, verify_task_cli_policy
+from .dynamic_runtime_gate import check_worker_hold, preserve_delivered_hold, read_json
+from .native_matrix import SCOPE, install_identity, validate_receipt
+
+
+class LocalCliProjectionTransfers:
+    """Only two private argv records are projected; diagnostics remain byte-exact."""
+    def __init__(self, transfer, channel, policy_sha256):
+        self.transfer, self.channel, self.policy_sha256 = transfer, channel, policy_sha256
+
+    def __getattr__(self, name):
+        return getattr(self.transfer, name)
+
+    async def upload(self, local, remote):
+        kinds = {"invocation.json": "invocation", "codex.jsonl.json": "process"}
+        if local.name in kinds:
+            nonce = local.parent.name
+            if (not re.fullmatch(r"[0-9a-f]{32}", nonce)
+                    or remote != self.channel + "/logs/" + nonce + "." + local.name):
+                raise InfrastructureError("Private CLI metadata has an unexpected destination")
+            from .codex_process import cli_metadata_projection
+            projection = cli_metadata_projection(local, self.policy_sha256, kinds[local.name])
+            projected = local.with_name(local.name + ".arm-projection.json")
+            if projected.exists():
+                if read_json(projected) != projection:
+                    raise InfrastructureError("Existing private metadata projection changed")
+            else:
+                atomic_json(projected, projection)
+            return await self.transfer.upload(projected, remote)
+        return await self.transfer.upload(local, remote)
+
+
+def main():
+    private = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    private.add_argument("--cli-policy", required=True)
+    private.add_argument("--cli-policy-sha256", required=True)
+    _, inherited = private.parse_known_args()
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--dependency-receipt", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--channel", required=True)
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--required-jobs", nargs="+", required=True)
+    parser.add_argument("--executable", required=True)
+    parser.add_argument("--transport-smoke", action="store_true")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--cli-policy", type=Path, required=True)
+    parser.add_argument("--cli-policy-sha256", required=True)
+    args, _ = parser.parse_known_args()
+    authorization = validate_receipt(args.dependency_receipt, {SCOPE})
+    if (args.session_id != authorization["session_id"] or set(args.required_jobs) != {SCOPE}
+            or args.transport_smoke
+            or (authorization["purpose"] == "technical-contract" and not args.once)):
+        raise InfrastructureError("Only the exact admitted normal R4b phase worker is allowed")
+    # Rehash the policy and all four CLI files before creating a cache or transport.
+    policy = verify_task_cli_policy(authorization, args.cli_policy, args.cli_policy_sha256, args.executable)
+    cli = verify_local_cli(authorization, args.executable)
+    install_identity(authorization["model"], authorization["effort"], args.dependency_receipt)
+    from . import codex_process
+    from . import codex_worker as worker
+    worker.validate_remote_channel(args.channel)
+    old_policy, old_reference = codex_process.CLI_POLICY, codex_process.CLI_POLICY_REFERENCE
+    old_worker = worker.Worker
+    original_argv = sys.argv
+    codex_process.CLI_POLICY = policy
+    codex_process.CLI_POLICY_REFERENCE = {"path": str(args.cli_policy), "sha256": args.cli_policy_sha256}
+    try:
+        args.output.mkdir(parents=True, exist_ok=False)
+        atomic_json(args.output / "CLI-IDENTITY-VERIFIED.json", cli)
+        atomic_json(args.output / "CELL-BINDING.json", authorization)
+
+        class R4bWorker(old_worker):
+            def __init__(self, *positional, **keywords):
+                super().__init__(*positional, **keywords)
+                self.transfer = LocalCliProjectionTransfers(self.transfer, self.channel, args.cli_policy_sha256)
+
+            async def hello(self):
+                worker.check_dependencies(self.dependency_receipt, self.required_jobs)
+                verify_task_cli_policy(authorization, args.cli_policy, args.cli_policy_sha256, args.executable)
+                self.executable = cli["executable_path"]
+                version = await asyncio.to_thread(subprocess.run, [self.executable, "--version"],
+                    capture_output=True, text=True, timeout=30, check=True)
+                auth = await asyncio.to_thread(subprocess.run, [self.executable, "login", "status"],
+                    capture_output=True, text=True, timeout=30, check=True)
+                if "Logged in using ChatGPT" not in auth.stdout + auth.stderr:
+                    raise InfrastructureError("Existing local ChatGPT authentication required")
+                await self.transfer.download(self.channel + "/OWNER.json", self.output / "OWNER.json")
+                marker = worker.bounded_json(self.output / "OWNER.json", 4096)
+                expected = {"protocol": worker.PROTOCOL, "session_id": self.session_id,
+                            "model": authorization["model"], "reasoning_effort": authorization["effort"],
+                            "owner": authorization["job_id"]}
+                if any(marker.get(k) != v for k, v in expected.items()):
+                    raise InfrastructureError("R4b OWNER differs from the admitted phase")
+                ready = {**expected, **policy_cell_binding(authorization), "mode": "codex",
+                    "pid": os.getpid(), "started_at": time.time(), "local_python": sys.executable,
+                    "model_weights_on_romeo": False, "codex_executable": self.executable,
+                    "codex_cli_version": version.stdout.strip(), "codex_executable_sha256": file_digest(self.executable),
+                    "authentication": "existing-local-ChatGPT", "weight_digest_available": False,
+                    "task_cli_policy_sha256": args.cli_policy_sha256,
+                    "task_cli_policy_candidate_count": len(policy["skill_candidate_directories"]),
+                    "local_skill_paths_exported": False}
+                atomic_json(self.output / "worker-ready.json", ready)
+                await self.transfer.upload(self.output / "worker-ready.json", self.channel + "/worker-ready.json")
+
+            async def handle(self, filename):
+                check_worker_hold(self.output, filename, authorization)
+                worker.check_dependencies(self.dependency_receipt, self.required_jobs)
+                current = verify_task_cli_policy(authorization, args.cli_policy, args.cli_policy_sha256, args.executable)
+                if current != policy:
+                    raise InfrastructureError("Task CLI policy changed within the owned phase")
+                done = await super().handle(filename)
+                if done:
+                    nonce = filename.split(".")[0]
+                    local = self.output / nonce
+                    delivered = read_json(local / "delivered.json")
+                    delivered.update(policy_cell_binding(authorization))
+                    atomic_json(local / "delivered.json", delivered)
+                    # Latch before the next transfer await, even if its sidecar upload fails.
+                    preserve_delivered_hold(self.output, local, authorization)
+                    for name in ("codex.jsonl.json", "delivered.json"):
+                        if (local / name).is_file():
+                            await self.transfer.upload(local / name, self.channel + f"/logs/{nonce}.{name}")
+                return done
+
+        worker.Worker = R4bWorker
+        sys.argv = [original_argv[0], *inherited]
+        return worker.main()
+    finally:
+        sys.argv = original_argv
+        worker.Worker = old_worker
+        codex_process.CLI_POLICY, codex_process.CLI_POLICY_REFERENCE = old_policy, old_reference
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

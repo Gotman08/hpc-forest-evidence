@@ -1,0 +1,185 @@
+"""Dispatch one next R1 group, then observe; receipt and stopping require a later audit."""
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+WORKSPACE = ROOT.parents[1]
+KEY = "coverage-gpt-6-luna-xhigh"
+SESSION = "fb704484f3a5459ca3a4a358d2208a0b"
+OTHER_SESSION = "bb7a58941e74486ba24267f2f526de8f"
+SOURCE = "cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18"
+DEADLINE = datetime(2026, 10, 31, 23, tzinfo=UTC).timestamp()
+MAXIMUM = 11 * 3600
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def deadline_guard(now):
+    if now + MAXIMUM + 3 * 3600 >= DEADLINE:
+        raise RuntimeError("Insufficient time for the maximum plus three hours of reception/audit")
+
+
+def choose_next(state):
+    if state.get("source_zip_sha256") != SOURCE:
+        raise RuntimeError("Frozen R1 source differs")
+    pending = [g for g in state["queue"] if g["state"] != "received_and_audited"]
+    if not pending or pending[0]["key"] != KEY or pending[0]["session_id"] != SESSION:
+        raise RuntimeError("The expected next group is not the head of the same R1 queue")
+    if pending[0]["state"] != "not_started" or any(g["state"] != "not_started" for g in pending):
+        raise RuntimeError("Reconcile existing submissions or workers before any dispatch")
+    if pending[0]["model"] != "gpt-6-luna" or pending[0]["effort"] != "xhigh":
+        raise RuntimeError("The recorded model or effort differs")
+    return pending[0]
+
+
+def census():
+    command = "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{n='CreationDate';e={$_.CreationDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Depth 4 -Compress"
+    p = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True,
+                       text=True, check=True, timeout=30, creationflags=NO_WINDOW)
+    return json.loads(p.stdout)
+
+
+def worker_guard(rows, own_allowed=False):
+    sessions = {}
+    for p in rows:
+        command = p.get("CommandLine") or ""
+        if not (p.get("ExecutablePath") or "").lower().endswith("python.exe"):
+            continue
+        if not re.search(r"(?:-m hpc_forest\.[a-z0-9_]*worker|reprendre-relais-r1\.py)", command):
+            continue
+        match = re.search(r"--session-id ([0-9a-f]{32})(?:\s|$)", command)
+        if match is None:
+            raise RuntimeError("Unknown native worker session")
+        sessions.setdefault(match[1], []).append(p)
+    allowed = {OTHER_SESSION, SESSION} if own_allowed else {OTHER_SESSION}
+    if not set(sessions) <= allowed or OTHER_SESSION not in sessions or len(sessions) > 2:
+        raise RuntimeError("Native worker capacity or identity is not reconciled")
+    if not own_allowed and SESSION in sessions:
+        raise RuntimeError("A relay for this group is already present")
+    return sessions
+
+
+def load_legacy():
+    spec = importlib.util.spec_from_file_location("next_r1_legacy", ROOT / "coordonner-matrice.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class GuardedRpc:
+    def __init__(self, rpc):
+        self.rpc = rpc
+
+    async def call(self, name, **args):
+        if name in {"job_prepare", "job_submit"}:
+            deadline_guard(time.time())
+            worker_guard(census())
+        return await self.rpc.call(name, **args)
+
+
+async def run():
+    legacy = load_legacy()
+    with legacy.FileLock(ROOT / "coordinator.lock"):
+        coordinator = legacy.Coordinator(None)
+        assert not (ROOT / "STOP-AFTER-CURRENT").exists(), "A requested stop marker is present"
+        cell = choose_next(coordinator.state)
+        deadline_guard(time.time())
+        assert legacy.file_digest(ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip") == SOURCE
+        frozen_spec = importlib.util.spec_from_file_location("next_r1_source_reader",
+            ROOT / "reprises/incident-liaison-20261016T1656/reprendre-relais-r1.py")
+        frozen = importlib.util.module_from_spec(frozen_spec)
+        frozen_spec.loader.exec_module(frozen)
+        assert frozen.frozen_source(ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip", legacy.PROJECT, SOURCE) == 90
+        receipt_closed = json.loads((HERE / "reception-verifiee.json").read_text(encoding="utf-8"))
+        assert receipt_closed["verified"] and receipt_closed["r1_lane_remains_reserved"]
+        assert json.loads((HERE / "owned-worker-stopped.json").read_text())["all_owned_process_identities_absent_after_stop"]
+        folder = ROOT / "runs" / KEY
+        assert not folder.exists(), "An existing next-group folder requires reconciliation, never a blind restart"
+        slots = worker_guard(census())
+        pin = json.loads((ROOT.parent / "HPC-Forest-Harnais-Comparaison-r1/cli-figee.json").read_text())
+        executable = Path(pin["executable"]["path"])
+        assert legacy.file_digest(executable) == pin["executable"]["sha256"]
+        folder.mkdir()
+        legacy.atomic_json(HERE / "preparation-prochain-verifiee.json", {
+            "key": KEY, "session_id": SESSION, "source_sha256": SOURCE,
+            "existing_native_sessions": sorted(slots), "new_groups_per_dispatch": 1,
+            "pinned_cli": pin, "maximum_seconds": MAXIMUM, "reserved_reception_seconds": 10800,
+            "deadline_exclusive_utc": DEADLINE, "no_reception_or_stop_in_this_dispatcher": True})
+        authorization = coordinator.authorization(cell, folder)
+        coordinator.state.update(current_key=KEY, stage="dispatching_next_r1_group_after_audit", error=None,
+            strict_coordinator_identity=legacy.process_identity(os.getpid()),
+            strict_dispatcher=str(Path(__file__).resolve()))
+        coordinator.save()
+        try:
+            async with legacy.module.ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+                coordinator.rpc = GuardedRpc(rpc)
+                await coordinator.submit(cell, folder)
+                failures = 0
+                while True:
+                    try:
+                        status = await coordinator.scheduler(cell["job_id"])
+                        cell["scheduler"] = status
+                        if status.get("finished"):
+                            coordinator.state.update(stage="awaiting_audited_reception_after_strict_dispatch",
+                                recovery_next_action="Receive efficiency/archive/SHA; restore fresh; native audit and delivery reconciliation before any fully identified owned relay stop; then continue the same R1 queue")
+                            coordinator.save()
+                            return
+                        if status["state"] == "RUNNING" and cell["state"] == "submitted":
+                            deadline_guard(time.time())
+                            worker_guard(census())
+                            data = await rpc.call("read_remote_file", path=cell["remote_root"] + f"/results-{cell['job_id']}/channel.json", offset=1, limit=40, max_chars=6000)
+                            channel = json.loads(data["content"])["channel"]
+                            output = folder / "worker"
+                            assert not output.exists(), "An existing cache requires reconciliation"
+                            output.mkdir()
+                            argv = [str(WORKSPACE / "work/.venv/Scripts/python.exe"), "-B", "-u", "-m", "hpc_forest.matrix_worker",
+                                "--channel", channel, "--session-id", SESSION, "--output", str(output),
+                                "--codex-config", "C:/Users/nicol/.codex/config.toml", "--dependency-receipt", str(authorization),
+                                "--required-jobs", legacy.SCOPE, "--max-seconds", "43200", "--executable", str(executable)]
+                            legacy.atomic_json(folder / "worker-start-intent.json", {"argv": argv, "observed_at": time.time(),
+                                "retry_without_reconciliation_forbidden": True})
+                            cell["state"] = "worker_starting"
+                            coordinator.save()
+                            with (output / "stdout.log").open("ab") as stdout, (output / "stderr.log").open("ab") as stderr:
+                                process = await asyncio.to_thread(subprocess.Popen, argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                    env={**os.environ, "PYTHONPATH": str(legacy.PROJECT / "src"), "PYTHONDONTWRITEBYTECODE": "1"},
+                                    creationflags=NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+                            identity = legacy.process_identity(process.pid)
+                            assert identity and SESSION in identity["CommandLine"]
+                            legacy.atomic_json(folder / "worker-lancement.json", {"argv": argv, "identity": identity, "session_id": SESSION})
+                            cell.update(state="working", worker_identity=identity, channel=channel, worker_started_at=time.time())
+                            coordinator.state["stage"] = "running_next_r1_group_strict_observation"
+                        elif cell["state"] == "working":
+                            assert legacy.same_process(cell["worker_identity"]), "The existing relay exited; preserve and reconcile its cache"
+                            worker_guard(census(), own_allowed=True)
+                        coordinator.save()
+                        failures = 0
+                    except Exception as exc:
+                        failures += 1
+                        with (HERE / "erreurs-prochain.jsonl").open("a", encoding="utf-8") as f:
+                            f.write(json.dumps({"observed_at": time.time(), "error": str(exc), "consecutive": failures,
+                                "submission_replayed": False, "worker_restarted": False}) + "\n")
+                            f.flush()
+                            os.fsync(f.fileno())
+                        if failures >= 3 or cell["state"] == "worker_starting":
+                            raise
+                    await asyncio.sleep(30)
+        except Exception as exc:
+            coordinator.state.update(stage="attention_required", error=str(exc))
+            coordinator.save()
+            raise
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

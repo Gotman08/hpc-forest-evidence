@@ -1,0 +1,1426 @@
+--- R2d/examples/marathon22/primes_native_max.py
++++ R2e/examples/marathon22/primes_native_max.py
+@@ -3,6 +3,7 @@
+ 
+ import argparse
+ import importlib.metadata
++import re
+ import socket
+ import sys
+ import tarfile
+@@ -53,6 +54,120 @@
+     if receipt.get("technical_errors_found") is True:
+         raise InfrastructureError("Technical/unknown invocation after this batch; stop immediately and never replay")
+     return first_verified or receipt["verified"], receipt
++
++
++def bound_ref(path):
++    return {"path": str(path.resolve()), "sha256": file_digest(path)}
++
++
++def private_call_bindings(first):
++    result = {}
++    for call in first["all_started_calls_reconciled"]:
++        request = read_json(artifact(call["request"]))
++        nonce = request.get("nonce", "")
++        private = call.get("private_cli_records", {})
++        if (not re.fullmatch(r"[0-9a-f]{32}", nonce) or nonce in result
++                or set(private) != {"invocation_sha256", "process_sha256", "argv_sha256",
++                                    "skill_override_sha256", "task_cli_policy_sha256"}
++                or any(not re.fullmatch(r"[0-9a-f]{64}", str(value)) for value in private.values())
++                or call.get("private_cli_review_required") is not True or call.get("private_cli_argv_verified") is not False):
++            raise InfrastructureError("Every first-batch call needs exact pending private CLI bindings")
++        result[nonce] = {**private, "invocation_projection_sha256": call["invocation"]["sha256"],
++                         "process_projection_sha256": call["process"]["sha256"]}
++    if not result:
++        raise InfrastructureError("No real first-batch calls to review")
++    return result
++
++
++def validate_first_batch_release(release, snapshot, first, authorization):
++    """Only a root-produced actual audit may open the next unchanged batch."""
++    identity = cell_binding(authorization)
++    fields = {"schema", "verified", *identity, "paused_snapshot", "first_start_receipt",
++              "evaluation_snapshot", "private_cli_audit", "no_replay", "new_model_or_budget_authorized"}
++    if (set(release) != fields or release.get("schema") != "hpc-forest-r2e-first-batch-release-v1"
++            or release.get("verified") is not True or any(release.get(key) != value for key, value in identity.items())
++            or release.get("no_replay") is not True or release.get("new_model_or_budget_authorized") is not False
++            or release.get("paused_snapshot") != snapshot["self_ref"]
++            or release.get("first_start_receipt") != snapshot["first_start_receipt"]
++            or release.get("evaluation_snapshot") != snapshot["evaluation_snapshot"]):
++        raise InfrastructureError("Release does not bind this exact unchanged first-batch checkpoint")
++    artifact(release["paused_snapshot"])
++    artifact(release["first_start_receipt"])
++    if (first.get("verified") is not True or first.get("technical_errors_found") is not False
++            or first.get("invocation_unknown") is not False or not first.get("first_normal_delivered_call")
++            or first.get("first_real_evaluation", {}).get("status") not in {"valid", "incorrect", "build_failed", "runtime_failed"}
++            or first.get("private_cli_review_required") is not True or first.get("private_cli_argv_verified") is not False):
++        raise InfrastructureError("Actual normal delivery and recorded evaluation required before release")
++    evaluation = read_json(artifact(release["evaluation_snapshot"]))
++    if (evaluation.get("never_model_input") is not True
++            or evaluation.get("experiment_id") != first["first_real_evaluation"]["experiment_id"]
++            or evaluation.get("outcome", {}).get("status") != first["first_real_evaluation"]["status"]):
++        raise InfrastructureError("Release evaluation differs; algorithmic negatives must stay negative")
++    audit = read_json(artifact(release["private_cli_audit"]))
++    audit_fields = {"schema", "verified", *identity, "first_start_receipt_sha256", "paused_snapshot_sha256",
++                    "call_bindings", "all_private_raws_received_and_hashed", "argv_matches_projections_and_local_policy",
++                    "cli_diagnostics_clean", "raw_skill_paths_exported", "private_review_receipt_sha256"}
++    if (set(audit) != audit_fields or audit.get("schema") != "hpc-forest-r2e-private-cli-audit-digest-projection-v1"
++            or audit.get("verified") is not True or any(audit.get(key) != value for key, value in identity.items())
++            or audit.get("first_start_receipt_sha256") != snapshot["first_start_receipt"]["sha256"]
++            or audit.get("paused_snapshot_sha256") != snapshot["self_ref"]["sha256"]
++            or audit.get("call_bindings") != private_call_bindings(first)
++            or any(audit.get(key) is not True for key in ("all_private_raws_received_and_hashed",
++                   "argv_matches_projections_and_local_policy", "cli_diagnostics_clean"))
++            or audit.get("raw_skill_paths_exported") is not False
++            or not re.fullmatch(r"[0-9a-f]{64}", audit.get("private_review_receipt_sha256", ""))):
++        raise InfrastructureError("Actual hash-linked private CLI audit is required; ARM cannot certify private argv")
++    return audit
++
++
++def wait_first_batch_release(controller, authorization, output, first, *, now=time.time,
++                             monotonic=time.monotonic, sleep=time.sleep):
++    """Passive wait on the existing search deadline; never rerun or fabricate a response."""
++    deadline = controller.db.get("deadline") - controller.config["budget"]["confirmation_seconds"]
++    deadline = min(deadline, authorization["expires_at"])
++    first_ref = bound_ref(output / "premier-demarrage-verifie.json")
++    snapshot_path = output / "premier-batch-en-attente.json"
++    snapshot = {"schema": "hpc-forest-r2e-first-batch-paused-v1", **cell_binding(authorization),
++                "first_batch_completed": True, "first_start_receipt": first_ref,
++                "evaluation_snapshot": first.get("evaluation_snapshot"), "first_start_public_verified": first.get("verified") is True,
++                "existing_campaign_deadline": controller.db.get("deadline"), "existing_search_deadline": deadline,
++                "budget_or_chronology_reset": False, "new_requests_created": 0,
++                "private_cli_argv_verified_on_ARM": False, "waiting_for_external_root_audit": True}
++    if snapshot_path.exists():
++        raise InfrastructureError("First-batch checkpoint already exists; no overwrite or replay")
++    atomic_json(snapshot_path, snapshot)
++    snapshot["self_ref"] = bound_ref(snapshot_path)
++    remaining = max(0.0, deadline - now())
++    end = monotonic() + remaining
++    release_path = output / "autorisation-apres-premier-batch.json"
++    refused_hashes = set()
++    while now() < deadline and monotonic() < end:
++        if release_path.is_file():
++            checksum = file_digest(release_path)
++            if checksum not in refused_hashes:
++                try:
++                    release = read_json(release_path)
++                    audit = validate_first_batch_release(release, snapshot, first, authorization)
++                except (InfrastructureError, ValueError, OSError, KeyError, TypeError, IndexError) as exc:
++                    refused_hashes.add(checksum)
++                    atomic_json(output / ("refus-release-" + checksum + ".json"),
++                                {"verified": False, "release_sha256": checksum,
++                                 "reason": type(exc).__name__ + ": " + str(exc), "next_batch_started": False})
++                else:
++                    if now() >= deadline or monotonic() >= end:
++                        break
++                    atomic_json(output / "premier-batch-release-verifiee.json",
++                                {"verified": True, "release": bound_ref(release_path), "private_cli_audit": release["private_cli_audit"],
++                                 "private_review_receipt_sha256": audit["private_review_receipt_sha256"],
++                                 "budget_or_chronology_reset": False, "replayed_claims": 0})
++                    return True
++        sleep(min(2.0, max(0.0, deadline - now()), max(0.0, end - monotonic())))
++    atomic_json(output / "premier-batch-attente-expiree.json",
++                {"verified": False, "reason": "existing_search_budget_expired_while_waiting_for_actual_audit",
++                 "snapshot": snapshot["self_ref"], "existing_search_deadline": deadline,
++                 "next_batch_started": False, "budget_or_chronology_reset": False,
++                 "model_error_or_response_fabricated": False, "replayed_claims": 0})
++    return False
+ 
+ 
+ def main():
+@@ -135,14 +250,21 @@
+                 "certified_manifest": authorization["artifacts"]["preparation_manifest"]["sha256"],
+                 "operator_algorithm_advice": False, "old_candidates_imported": False})
+             first_checked = False
++            first_batch_released = False
+             while True:
+                 result["search"] = controller.run(max_batches=1)
+                 atomic_json(output / "results.json", result)
+-                first_checked, _ = reconcile_after_batch(controller, channel, authorization, allocation,
+-                                                          output, first_checked)
++                first_checked, first_receipt = reconcile_after_batch(controller, channel, authorization, allocation,
++                                                                      output, first_checked)
+                 result["first_start_control"] = "verified" if first_checked else "pending_first_real_evaluation"
+                 if result["search"]["status"] != "checkpointed":
+                     break
++                if not first_batch_released:
++                    if not wait_first_batch_release(controller, authorization, output, first_receipt):
++                        result.update(first_batch_release="closed_at_existing_search_deadline", extension_blocked=True,
++                                      model_negative_preserved=True, no_candidate_replay=True)
++                        return 1
++                    first_batch_released = True
+             final = first_start_receipt(controller, channel, authorization, allocation,
+                                         output / "reconciliation-finale-verifiee.json")
+             if final.get("technical_errors_found") is True:
+--- R2d/src/hpc_forest/codex_process.py
++++ R2e/src/hpc_forest/codex_process.py
+@@ -3,9 +3,12 @@
+ 
+ import copy
+ import json
++import re
+ import shutil
+ import time
++import tomllib
+ from pathlib import Path
++from subprocess import list2cmdline
+ 
+ from .codex_mailbox import (
+     EFFORT,
+@@ -16,6 +19,118 @@
+     sha256,
+ )
+ from .core import InfrastructureError, atomic_json, run_process
++
++CLI_POLICY = None  # Populated only by the exact per-task local policy in the admitted R2e worker.
++
++
++def load_task_cli_policy(path: Path, checksum: str, binding: dict, executable_sha256: str) -> dict:
++    """Read only a hash-bound local task policy, never discover or read skill bodies."""
++    if (not path.is_absolute() or path.name != "cli-policy-" + binding["session_id"] + ".json"
++            or ".." in path.parts or not path.is_file()
++            or any(p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents))
++            or not re.fullmatch(r"[0-9a-f]{64}", checksum)
++            or sha256(path.read_bytes()) != checksum):
++        raise InfrastructureError("Exact ordinary hash-bound local CLI policy required")
++    value = bounded_json(path, 262144)
++    expected_fields = {"schema", *binding, "cli_executable_sha256", "skill_candidate_directories",
++                       "filesystem_metadata_sha256", "is_actual_CLI_discovery_receipt",
++                       "instruction_or_SKILL_body_read"}
++    paths = value.get("skill_candidate_directories")
++    if (set(value) != expected_fields or value.get("schema") != "hpc-forest-r2e-local-cli-policy-v1"
++            or any(value.get(key) != expected for key, expected in binding.items())
++            or value.get("cli_executable_sha256") != executable_sha256
++            or value.get("is_actual_CLI_discovery_receipt") is not False
++            or value.get("instruction_or_SKILL_body_read") is not False
++            or not re.fullmatch(r"[0-9a-f]{64}", value.get("filesystem_metadata_sha256", ""))
++            or not isinstance(paths, list) or not 0 < len(paths) <= 512
++            or any(not isinstance(p, str) or not re.match(r"^[A-Za-z]:[/\\]", p)
++                   or ".." in p.replace("\\", "/").split("/")
++                   or any(char in p for char in ("\0", "\n", "\r")) for p in paths)
++            or len(set(paths)) != len(paths)):
++        raise InfrastructureError("Local CLI policy differs from the exact admitted R2e cell")
++    return value
++
++
++def toml_override_value(value):
++    """Serialize the closed per-task primitive/skill-selector types as TOML, not JSON maps."""
++    if type(value) in (bool, int, str):
++        return json.dumps(value, ensure_ascii=False)
++    if isinstance(value, list):
++        return "[" + ",".join(toml_override_value(item) for item in value) + "]"
++    if isinstance(value, dict) and set(value) == {"path", "enabled"}:
++        if not isinstance(value["path"], str) or value["enabled"] is not False:
++            raise InfrastructureError("Only explicit disabled skill path selectors are supported")
++        return "{path=" + toml_override_value(value["path"]) + ",enabled=false}"
++    raise InfrastructureError("Unsupported task CLI override type")
++
++
++def cli_metadata_projection(path: Path, policy_sha256: str, kind: str) -> dict:
++    """Keep actual argv locally; export an explicitly non-executable digest projection."""
++    record = bounded_json(path, 262144)
++    argv = record.get("argv")
++    if kind not in {"invocation", "process"} or not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
++        raise InfrastructureError("Exact private CLI record required for projection")
++    indices = [i for i, arg in enumerate(argv) if arg.startswith("skills.config=")]
++    expected = "skills.config=" + toml_override_value([
++        {"path": directory, "enabled": False} for directory in (CLI_POLICY or {}).get("skill_candidate_directories", [])])
++    if (not CLI_POLICY or len(indices) != 1 or indices[0] < 1 or argv[indices[0] - 1] != "--config"
++            or argv[indices[0]] != expected):
++        raise InfrastructureError("Only the exact hash-bound local skill selector may be omitted")
++    index = indices[0]
++    return {"schema": "hpc-forest-r2e-private-cli-metadata-projection-v1", "kind": kind,
++            "record_without_private_argv": {key: value for key, value in record.items() if key != "argv"},
++            "argv_public": argv[:index - 1] + argv[index + 1:],
++            "private_record_sha256": sha256(path.read_bytes()),
++            "private_argv_sha256": sha256(json.dumps(argv, ensure_ascii=False, sort_keys=True).encode("utf8")),
++            "private_skill_override_sha256": sha256(expected.encode("utf8")),
++            "task_cli_policy_sha256": policy_sha256,
++            "private_skill_path_count": len(CLI_POLICY["skill_candidate_directories"]),
++            "private_review_required": True, "private_argv_verified": False,
++            "projection_is_executable": False, "raw_record_exported": False}
++
++
++def check_cli_metadata_projection(value: dict, kind: str, cli: dict, model: str) -> tuple[dict, list[str]]:
++    fields = {"schema", "kind", "record_without_private_argv", "argv_public", "private_record_sha256",
++              "private_argv_sha256", "private_skill_override_sha256", "task_cli_policy_sha256",
++              "private_skill_path_count", "private_review_required", "private_argv_verified",
++              "projection_is_executable", "raw_record_exported"}
++    if (set(value) != fields or value.get("schema") != "hpc-forest-r2e-private-cli-metadata-projection-v1"
++            or value.get("kind") != kind or value.get("private_review_required") is not True
++            or any(value.get(key) is not False for key in ("private_argv_verified", "projection_is_executable", "raw_record_exported"))
++            or value.get("task_cli_policy_sha256") != cli.get("task_cli_policy_sha256")
++            or any(not isinstance(value.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", value[key])
++                   for key in ("private_record_sha256", "private_argv_sha256", "private_skill_override_sha256", "task_cli_policy_sha256"))
++            or type(value.get("private_skill_path_count")) is not int or not 0 < value["private_skill_path_count"] <= 512):
++        raise InfrastructureError("Exact non-executable private CLI projection required")
++    argv = value.get("argv_public")
++    record = value.get("record_without_private_argv")
++    if (not isinstance(argv, list) or not all(isinstance(arg, str) and arg and "\0" not in arg for arg in argv)
++            or not argv or argv[0] != cli["executable_path"] or argv[1:2] != ["exec"]
++            or argv.count("--model") != 1 or argv[argv.index("--model") + 1] != model
++            or argv.count("--strict-config") != 1 or argv.count("--ignore-user-config") != 1
++            or any(arg.startswith("skills.config=") for arg in argv) or not isinstance(record, dict) or "argv" in record):
++        raise InfrastructureError("CLI projection identity or public argv differs")
++    if (argv[:14] != [cli["executable_path"], "exec", "--ignore-user-config", "--strict-config", "--ephemeral",
++                      "--skip-git-repo-check", "--sandbox", "read-only", "--json", "--color", "never",
++                      "--model", model, "--output-schema"]
++            or len(argv) < 20 or argv[15] != "--output-last-message" or argv[17] != "-C" or argv[-1] != "-"
++            or len(argv[19:-1]) % 2 or any(argv[i] != "--config" for i in range(19, len(argv) - 1, 2))):
++        raise InfrastructureError("CLI public command layout differs from the frozen source-only constructor")
++    try:
++        config = tomllib.loads("\n".join(argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"))
++    except (IndexError, ValueError) as exc:
++        raise InfrastructureError("CLI public configuration projection is malformed") from exc
++    if (config.get("model_reasoning_effort") != "max" or config.get("forced_login_method") != "chatgpt"
++            or config.get("web_search") != "disabled" or not config.get("features")
++            or config.get("approval_policy") != "never" or config.get("project_doc_max_bytes") != 0
++            or config.get("model_context_window") != 65536
++            or any(setting is not False for setting in config["features"].values())
++            or any(config["features"].get(name) is not False for name in
++                   ("code_mode", "code_mode_only", "code_mode_host", "skip_host_skill_discovery"))
++            or config.get("skills") != {"max_context_tokens": 1, "include_instructions": False,
++                                         "bundled": {"enabled": False}}):
++        raise InfrastructureError("CLI public no-tools/MAX/OAuth/skills guards differ")
++    return record, argv
+ 
+ 
+ def check_dependencies(receipt: Path, required_jobs: set[str]) -> dict:
+@@ -105,48 +220,173 @@
+         "model_context_window": 65536,
+         "project_doc_max_bytes": 0,
+         "skills.max_context_tokens": 1,
++        "skills.config": [{"path": path, "enabled": False}
++                          for path in (CLI_POLICY or {}).get("skill_candidate_directories", [])],
++        "skills.include_instructions": False,
++        "skills.bundled.enabled": False,
+         "approval_policy": "never",
+         "forced_login_method": "chatgpt",
+         "web_search": "disabled",
+-        "features.skip_host_skill_discovery": True,
++        "features.skip_host_skill_discovery": False,
+         **{f"features.{name}": False for name in [
+             "shell_tool", "unified_exec", "apps", "plugins", "memories", "multi_agent",
+             "multi_agent_v2", "hooks", "skill_search", "browser_use", "computer_use",
+             "image_generation", "view_image", "workspace_dependencies", "code_mode_host",
++            "code_mode", "code_mode_only",
+             "sleep_tool", "unbounded_connection_retries", "shell_snapshot", "goals",
+         ]},
+     }
+     for key, value in overrides.items():
+-        args.extend(["--config", f"{key}={json.dumps(value, ensure_ascii=False)}"])
+-    return [*args, "-"]
++        args.extend(["--config", f"{key}={toml_override_value(value)}"])
++    command = [*args, "-"]
++    if len(list2cmdline(command).encode("utf-16-le")) // 2 + 1 > 32767:
++        raise InfrastructureError("Exact quoted command exceeds the Windows process argument limit")
++    return command
+ 
+ 
+ def usage_from_events(path: Path) -> tuple[dict, bool]:
+     usage_events, tool_events = [], []
+-    for line in path.read_text(encoding="utf8", errors="replace").splitlines():
++    ambiguous, completed = False, 0
++
++    def pairs(items):
++        result = {}
++        for key, value in items:
++            if key in result:
++                raise ValueError("Duplicate JSON member")
++            result[key] = value
++        return result
++
++    for raw_line in path.read_bytes().splitlines():
+         try:
+-            event = json.loads(line)
++            line = raw_line.decode("utf8", errors="strict")
++        except UnicodeDecodeError:
++            ambiguous = True
++            continue
++        try:
++            event = json.loads(line, object_pairs_hook=pairs,
++                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+         except ValueError:
++            if line.lstrip().startswith(("{", "[")):
++                ambiguous = True
+             continue
+-        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+-            usage_events.append(event["usage"])
++        if not isinstance(event, dict):
++            continue
++        if event.get("type") == "turn.completed":
++            completed += 1
++            if isinstance(event.get("usage"), dict):
++                usage_events.append(event["usage"])
+         item = event.get("item", {})
+         if event.get("type") in {"item.started", "item.completed", "item.updated"}:
+             if item.get("type") not in {"agent_message", "reasoning", "error", None}:
+                 tool_events.append(item.get("type"))
+-    known = bool(usage_events) and all(
+-        all(type(u.get(k)) is int and u[k] >= 0 for k in ["input_tokens", "output_tokens"])
+-        for u in usage_events
+-    )
++    required_usage = {"input_tokens", "output_tokens"}
++    optional_usage = {"cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens"}
++    known = not ambiguous and completed == len(usage_events) == 1 and all(
++        required_usage <= set(u) <= required_usage | optional_usage
++        and all(type(value) is int and value >= 0 for value in u.values())
++        and all(u.get(key, 0) <= u.get("input_tokens", -1) for key in ("cached_input_tokens", "cache_write_input_tokens"))
++        and u.get("reasoning_output_tokens", 0) <= u.get("output_tokens", -1)
++        for u in usage_events)
+     return {
+         "tokens": sum(u["input_tokens"] + u["output_tokens"] for u in usage_events)
+         if known else TOKEN_CEILING,
+         "token_accounting": "exact" if known else "upper_bound",
+         "events": usage_events, "llm_calls": max(1, len(usage_events)),
++        "usage_parse_ambiguity": ambiguous or completed != len(usage_events) or completed > 1,
+         "model_requested": MODEL, "reasoning_effort_requested": EFFORT,
+         "cached_tokens_included_in_input": True, "tool_events": tool_events,
+         "codex_jsonl_sha256": sha256(path.read_bytes()),
+     }, bool(tool_events)
++
++
++def diagnostics_from_events(path: Path) -> dict:
++    """Inspect completed raw output without accepting or filtering diagnostic text."""
++    raw = path.read_bytes()
++    findings = []
++    nonempty = 0
++    completed_count = 0
++
++    def closed_pairs(items):
++        result = {}
++        for key, value in items:
++            if key in result:
++                raise ValueError("Duplicate JSON member")
++            result[key] = value
++        return result
++
++    for number, line in enumerate(raw.splitlines(), 1):
++        if not line.strip():
++            continue
++        nonempty += 1
++        category = None
++        try:
++            text = line.decode("utf8", errors="strict")
++        except UnicodeDecodeError:
++            category = "invalid_utf8"
++        else:
++            try:
++                event = json.loads(text, object_pairs_hook=closed_pairs,
++                    parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
++            except ValueError:
++                category = "non_json_or_malformed_json"
++            else:
++                if not isinstance(event, dict):
++                    category = "non_object_event"
++                else:
++                    item = event.get("item")
++                    if event.get("type") == "turn.completed":
++                        completed_count += 1
++                    diagnostic_types = {"error", "warning", "warn", "fatal"}
++                    if str(event.get("type", "")).casefold() in diagnostic_types:
++                        category = "diagnostic_event"
++                    elif isinstance(item, dict) and str(item.get("type", "")).casefold() in diagnostic_types:
++                        category = "diagnostic_item"
++                    elif event.get("error") is not None:
++                        category = "event_error_field"
++                    elif any(str(event.get(key, "")).casefold() in diagnostic_types
++                             for key in ("level", "severity")):
++                        category = "diagnostic_severity"
++                    elif event.get("type") == "thread.started":
++                        if set(event) != {"type", "thread_id"} or not isinstance(event["thread_id"], str) or not event["thread_id"]:
++                            category = "unknown_thread_shape"
++                    elif event.get("type") == "turn.started":
++                        if set(event) != {"type"}:
++                            category = "unknown_turn_shape"
++                    elif event.get("type") in {"item.started", "item.updated", "item.completed"}:
++                        if (set(event) != {"type", "item"} or not isinstance(item, dict)
++                                or set(item) != {"id", "type", "text"}
++                                or item.get("type") not in {"reasoning", "agent_message"}
++                                or not isinstance(item.get("id"), str) or not item["id"]
++                                or not isinstance(item.get("text"), str)):
++                            category = "unknown_or_tool_item"
++                    elif event.get("type") == "turn.completed":
++                        usage = event.get("usage")
++                        required = {"input_tokens", "output_tokens"}
++                        optional = {"cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens"}
++                        if (set(event) != {"type", "usage"} or not isinstance(usage, dict)
++                                or not required <= set(usage) <= required | optional
++                                or any(type(value) is not int or value < 0 for value in usage.values())
++                                or any(usage.get(key, 0) > usage.get("input_tokens", -1)
++                                       for key in ("cached_input_tokens", "cache_write_input_tokens"))
++                                or usage.get("reasoning_output_tokens", 0) > usage.get("output_tokens", -1)):
++                            category = "unknown_or_invalid_usage"
++                    else:
++                        category = "unknown_event_type"
++        if category:
++            findings.append({"line": number, "category": category, "line_sha256": sha256(line)})
++    if not nonempty:
++        findings.append({"line": 0, "category": "empty_cli_log", "line_sha256": sha256(raw)})
++    if completed_count != 1:
++        findings.append({"line": 0, "category": "missing_or_ambiguous_completed_event", "line_sha256": sha256(raw)})
++    counts = {}
++    for finding in findings:
++        counts[finding["category"]] = counts.get(finding["category"], 0) + 1
++    return {"schema": "hpc-forest-completed-cli-diagnostics-v1",
++            "clean": not findings, "findings": findings, "counts": counts,
++            "nonempty_lines_examined": nonempty, "raw_bytes": len(raw),
++            "codex_jsonl_sha256": sha256(raw), "raw_log_preserved": True,
++            "diagnostic_allowlist_or_suppression": False,
++            "process_interrupted_by_this_check": False}
+ 
+ 
+ def run_codex(request: dict, request_sha: str, output: Path, dependency_receipt: Path,
+@@ -171,12 +411,18 @@
+     result = run_process(argv, output, output / "codex.jsonl", timeout,
+                          env={"OPENAI_API_KEY": "", "CODEX_API_KEY": ""},
+                          stdin=request["messages"][1]["content"])
++    diagnostics = diagnostics_from_events(Path(result.log))
++    atomic_json(output / "cli-diagnostics.json", diagnostics)
+     usage, tools = usage_from_events(Path(result.log))
++    usage["cli_diagnostics_sha256"] = sha256((output / "cli-diagnostics.json").read_bytes())
++    usage["cli_diagnostic_count"] = len(diagnostics["findings"])
+     error = None
+     infra = False
+     data = None
+     if result.returncode or result.timed_out:
+         error, infra = "Codex failed or exceeded the generation deadline; inspect its log", True
++    elif not diagnostics["clean"]:
++        error, infra = "Completed Codex output contains unaccepted diagnostics; inspect preserved raw log", True
+     elif tools:
+         error, infra = "Codex attempted a tool call in a source-only generation", True
+     else:
+--- R2d/src/hpc_forest/core.py
++++ R2e/src/hpc_forest/core.py
+@@ -105,20 +105,15 @@
+ def _kill_owned(process: subprocess.Popen) -> None:
+     if process.poll() is not None:
+         return
+-    # The still-running process belongs to this Popen handle, never a name match.
++    # On Windows Popen.kill uses the retained process handle. Do not reopen a
++    # numeric PID or terminate a process tree: descendants are not owned here.
+     if os.name == "nt":
+-        subprocess.run(
+-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+-            stdout=subprocess.DEVNULL,
+-            stderr=subprocess.DEVNULL,
+-            check=False,
+-            timeout=5,
+-        )
+-    else:
+-        try:
+-            os.killpg(process.pid, signal.SIGKILL)
+-        except ProcessLookupError:
+-            pass
++        process.kill()
++        return
++    try:
++        os.killpg(process.pid, signal.SIGKILL)
++    except ProcessLookupError:
++        pass
+     if process.poll() is None:
+         process.kill()
+ 
+--- R2d/src/hpc_forest/native_r2max.py
++++ R2e/src/hpc_forest/native_r2max.py
+@@ -22,12 +22,12 @@
+ )
+ from .primes_lane_contract import PLAN_CONTRACT, validate_lane_v2
+ 
+-SCOPE = "hpc-forest-primes-native-max-r2d"
++SCOPE = "hpc-forest-primes-native-max-r2e"
+ EFFORT = "max"
+ MAXIMUM_NATIVE_WORKERS = 4
+-CELLS = {"gpt-6-astra": "26d58fc2d88f423d9b5fd241ade3d185",
+-         "gpt-5.6-terra": "fee3bd8ba5fc4e6eafa1167ef279f9fa",
+-         "gpt-6.1-sol": "182500fef7c546af87f14498de353581"}
++CELLS = {"gpt-6-astra": "f81b76a9bc484f669a210c476ae6f9b0",
++         "gpt-5.6-terra": "e3678f243ba54a9fadb57440641c0599",
++         "gpt-6.1-sol": "515db6fd166e4b68875f34cf2fe733fa"}
+ LUNA_SOURCE = "3e290f835570a8746be3c52144932b8c6866564980fd858cf4c0495a7b1e68c5"
+ LUNA_PLAN = "54ffd49f4dc868085d22208f773c4b4883590b25251b5992232509a1dc197024"
+ LUNA_SESSION = "c8044062692149138d826d3f388a08ef"
+@@ -66,7 +66,7 @@
+         "normal_first_call_proved", "cli_tools_disabled", "neutral_tests_passed",
+         "cli_identity_sha256", "allocated_contract_qualification_sha256", "limits"},
+     "cli_identity": {"version", "executable_path", "executable_sha256", "source_execution_allowed",
+-        "authentication", "files", "observed_at"},
++        "authentication", "files", "observed_at", "task_cli_policy_sha256"},
+     "worker_lane_admission": {"active_native_workers_before_start", "maximum_native_workers",
+         "live_worker_identities", "observed_at", "job_reservation", "lane_v2"},
+     "integration_review": {"neutral_tests_passed", "blocking_findings", "reviewer", "reviewed_at",
+@@ -444,6 +444,7 @@
+             if (not isinstance(item.get("version"), str) or not item["version"]
+                     or not isinstance(item.get("executable_path"), str)
+                     or not re.fullmatch(r"[0-9a-f]{64}", item.get("executable_sha256", ""))
++                    or not re.fullmatch(r"[0-9a-f]{64}", item.get("task_cli_policy_sha256", ""))
+                     or item.get("source_execution_allowed") is not False):
+                 raise InfrastructureError("Immutable CLI identity metadata missing")
+         elif key == "worker_lane_admission":
+--- R2d/src/hpc_forest/r2max_first_start.py
++++ R2e/src/hpc_forest/r2max_first_start.py
+@@ -5,6 +5,7 @@
+ import time
+ from pathlib import Path
+ 
++from .codex_process import check_cli_metadata_projection
+ from .core import InfrastructureError, atomic_json, digest, file_digest
+ from .native_r2max import EFFORT, SCOPE, artifact, cell_binding, read_json, selected_identity
+ 
+@@ -89,7 +90,13 @@
+     while not delivery_path.is_file() and time.monotonic() < end:
+         time.sleep(0.1)
+     response, ready = read_json(response_path), read_json(ready_path)
+-    invocation, delivered, process = read_json(invocation_path), read_json(delivery_path), read_json(process_path)
++    invocation_projection, delivered, process_projection = read_json(invocation_path), read_json(delivery_path), read_json(process_path)
++    cli = read_json(artifact(authorization["artifacts"]["cli_identity"]))
++    invocation, argv = check_cli_metadata_projection(invocation_projection, "invocation", cli, model)
++    process, process_argv = check_cli_metadata_projection(process_projection, "process", cli, model)
++    if (argv != process_argv or any(invocation_projection[key] != process_projection[key] for key in
++            ("private_argv_sha256", "private_skill_override_sha256", "task_cli_policy_sha256", "private_skill_path_count"))):
++        raise ValueError("Private CLI metadata projections do not bind the same invocation")
+     request_sha, response_sha = file_digest(request_path), file_digest(response_path)
+     if not isinstance(request.get("mission_id"), str):
+         raise ValueError("Normal request has no mission identity")
+@@ -106,13 +113,10 @@
+             or delivered.get("source_zip_sha256") != authorization["artifacts"]["source_zip"]["sha256"]
+             or delivered.get("plan_sha256") != authorization["artifacts"]["plan"]["sha256"]
+             or process.get("returncode") != 0 or process.get("timed_out") is not False
+-            or process.get("argv") != invocation.get("argv")
+             or invocation.get("request_sha256") != request_sha
+             or invocation.get("model") != model or invocation.get("reasoning_effort") != EFFORT
+             or invocation.get("source_execution_allowed") is not False):
+         raise ValueError("Incomplete, failed or unrelated normal native call")
+-    cli = read_json(artifact(authorization["artifacts"]["cli_identity"]))
+-    argv = invocation.get("argv", [])
+     if (not argv or argv[0] != cli.get("executable_path") or "--model" not in argv
+             or argv[argv.index("--model") + 1] != model
+             or 'model_reasoning_effort="max"' not in argv):
+@@ -128,7 +132,14 @@
+             "process": ref(process_path), "error_and_usage_log": ref(log_path),
+             "mission_id": request.get("mission_id"), "mother_call": bool(request.get("meta_role")),
+             "normal_delivered": True, "usage_exact": True,
+-            "known_model_negative": response.get("error") is not None}
++            "known_model_negative": response.get("error") is not None,
++            "private_cli_review_required": True, "private_cli_argv_verified": False,
++            "private_cli_records": {
++                "invocation_sha256": invocation_projection["private_record_sha256"],
++                "process_sha256": process_projection["private_record_sha256"],
++                "argv_sha256": invocation_projection["private_argv_sha256"],
++                "skill_override_sha256": invocation_projection["private_skill_override_sha256"],
++                "task_cli_policy_sha256": invocation_projection["task_cli_policy_sha256"]}}
+ 
+ 
+ def first_start_receipt(controller, channel, authorization, allocation, output):
+@@ -143,6 +154,8 @@
+               "automatic_extension": False, "extension_to_other_models_allowed": False,
+               "hardware_or_process_isolation_proved": False, "blocking_reasons": [],
+               "pending_first_real_evaluation": False, "technical_errors_found": False,
++              "private_cli_review_required": True, "private_cli_argv_verified": False,
++              "verified_scope": "Public CLI projection/response linkage and actual evaluation only; private argv not audited on ARM",
+               "admission_artifacts": authorization["artifacts"]}
+     try:
+         if allocation["job_id"] != authorization["job_id"]:
+--- R2d/src/hpc_forest/r2max_worker.py
++++ R2e/src/hpc_forest/r2max_worker.py
+@@ -3,7 +3,9 @@
+ 
+ import argparse
+ import asyncio
++import json
+ import os
++import re
+ import subprocess
+ import sys
+ import time
+@@ -22,6 +24,73 @@
+ )
+ 
+ 
++def check_technical_hold(output: Path, filename: str):
++    """An existing technical hold permits only already-produced response retransmission."""
++    if not re.fullmatch(r"[0-9a-f]{32}\.request\.json", filename):
++        raise InfrastructureError("Unsafe request filename")
++    if (output / "cli-technical-hold.json").exists():
++        response = output / filename.split(".")[0] / "response.json"
++        if not response.is_file() or response.is_symlink():
++            raise InfrastructureError("Delivered technical failure holds all new R2e generations")
++
++
++def preserve_delivered_technical_hold(output: Path, local: Path):
++    """Latch only after delivery; never stop a process or reinterpret a model negative."""
++    response_path = local / "response.json"
++    response = read_json(response_path)
++    if response.get("infrastructure_error") is not True:
++        return
++    delivered = read_json(local / "delivered.json")
++    response_sha = file_digest(response_path)
++    if delivered.get("response_sha256") != response_sha:
++        raise InfrastructureError("Technical hold requires the fully delivered exact response")
++    hold = output / "cli-technical-hold.json"
++    if hold.exists():
++        return
++    value = {"schema": "hpc-forest-r2e-delivered-technical-hold-v1",
++             "scope_id": SCOPE, "nonce": local.name, "created_at": time.time(),
++             "response_sha256": response_sha,
++             "delivered_sha256": file_digest(local / "delivered.json"),
++             "new_generations_allowed": False, "byte_identical_retransmissions_only": True,
++             "process_stop_or_retry": False, "model_algorithmic_negative_repaired": False}
++    diagnostics = local / "cli-diagnostics.json"
++    if diagnostics.is_file():
++        value["cli_diagnostics_sha256"] = file_digest(diagnostics)
++    descriptor = os.open(hold, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++    with os.fdopen(descriptor, "w", encoding="utf8") as stream:
++        json.dump(value, stream, sort_keys=True, ensure_ascii=False)
++        stream.write("\n")
++        stream.flush()
++        os.fsync(stream.fileno())
++
++
++class LocalCliProjectionTransfers:
++    """Only two exact metadata records are projected; stderr and responses stay raw."""
++    def __init__(self, transfer, channel, policy_sha256):
++        self.transfer, self.channel, self.policy_sha256 = transfer, channel, policy_sha256
++
++    def __getattr__(self, name):
++        return getattr(self.transfer, name)
++
++    async def upload(self, local, remote):
++        kinds = {"invocation.json": "invocation", "codex.jsonl.json": "process"}
++        if local.name in kinds:
++            nonce = local.parent.name
++            if (not re.fullmatch(r"[0-9a-f]{32}", nonce)
++                    or remote != self.channel + "/logs/" + nonce + "." + local.name):
++                raise InfrastructureError("Private CLI metadata has an unexpected destination")
++            from .codex_process import cli_metadata_projection
++            projection = cli_metadata_projection(local, self.policy_sha256, kinds[local.name])
++            projected = local.with_name(local.name + ".arm-projection.json")
++            if projected.exists():
++                if read_json(projected) != projection:
++                    raise InfrastructureError("Existing CLI metadata projection differs; never overwrite it")
++            else:
++                atomic_json(projected, projection)
++            return await self.transfer.upload(projected, remote)
++        return await self.transfer.upload(local, remote)
++
++
+ def main():
+     parser = argparse.ArgumentParser(add_help=False)
+     parser.add_argument("--dependency-receipt", type=Path, required=True)
+@@ -31,6 +100,8 @@
+     parser.add_argument("--channel", required=True)
+     parser.add_argument("--output", type=Path, required=True)
+     parser.add_argument("--transport-smoke", action="store_true")
++    parser.add_argument("--cli-policy", type=Path, required=True)
++    parser.add_argument("--cli-policy-sha256", required=True)
+     args, _ = parser.parse_known_args()
+     authorization = install_identity(args.dependency_receipt, prepared=False)
+     model, session = selected_identity(authorization)
+@@ -42,6 +113,12 @@
+             or str(executable.resolve()) != str(Path(cli.get("executable_path", "")).resolve())
+             or file_digest(executable) != cli.get("executable_sha256")):
+         raise InfrastructureError("Explicit immutable CLI identity changed before invocation")
++    from . import codex_process
++    if args.cli_policy_sha256 != cli.get("task_cli_policy_sha256"):
++        raise InfrastructureError("Local CLI policy digest differs from the admitted identity")
++    policy = codex_process.load_task_cli_policy(args.cli_policy, args.cli_policy_sha256,
++                                               cell_binding(authorization), cli["executable_sha256"])
++    codex_process.CLI_POLICY = policy
+     expected_channel = (authorization["remote_root"] + "/results-" + authorization["job_id"] + "/mailbox")
+     if args.channel != expected_channel:
+         raise InfrastructureError("The R2 worker channel is not the exact owned job/session")
+@@ -59,6 +136,7 @@
+         def __init__(self, *positional, **keywords):
+             super().__init__(*positional, **keywords)
+             bind_worker_cache(self.output, authorization)
++            self.transfer = LocalCliProjectionTransfers(self.transfer, self.channel, args.cli_policy_sha256)
+ 
+         async def hello(self):
+             # Validate version/auth before publishing readiness; no race with a rejected CLI.
+@@ -86,11 +164,15 @@
+                      "model_weights_on_romeo": False,
+                      "source_zip_sha256": authorization["artifacts"]["source_zip"]["sha256"],
+                      "plan_sha256": authorization["artifacts"]["plan"]["sha256"]}
++            ready.update(task_cli_policy_sha256=args.cli_policy_sha256,
++                         task_cli_policy_candidate_count=len(policy["skill_candidate_directories"]),
++                         local_skill_paths_exported=False)
+             atomic_json(self.output / "worker-ready.json", ready)
+             await self.transfer.upload(self.output / "worker-ready.json", self.channel + "/worker-ready.json")
+ 
+         async def handle(self, filename):
+             # Every generation goes through the exact session gate, including cached delivery.
++            check_technical_hold(self.output, filename)
+             worker.check_dependencies(self.dependency_receipt, self.required_jobs)
+             bind_worker_cache(self.output, authorization)
+             if file_digest(executable) != cli["executable_sha256"]:
+@@ -105,6 +187,7 @@
+                                  source_zip_sha256=authorization["artifacts"]["source_zip"]["sha256"],
+                                  plan_sha256=authorization["artifacts"]["plan"]["sha256"])
+                 atomic_json(local / "delivered.json", delivered)
++                preserve_delivered_technical_hold(self.output, local)
+                 for name in ("codex.jsonl.json", "delivered.json"):
+                     if (local / name).is_file():
+                         await self.transfer.upload(local / name, self.channel + f"/logs/{nonce}.{name}")
+@@ -115,6 +198,8 @@
+     legacy_run = worker.run_codex
+ 
+     def generate(request, request_sha, output, receipt, jobs, executable="codex"):
++        if file_digest(args.cli_policy) != args.cli_policy_sha256:
++            raise InfrastructureError("Local task CLI policy changed before generation")
+         if (request.get("session_id") != session or request.get("kind") != "source-proposal"
+                 or request.get("model") != model or request.get("reasoning_effort") != EFFORT):
+             raise InfrastructureError("Unrelated or smoke request forbidden in R2 native search")
+--- R2d/tests/test_codex_cli_diagnostics_r2e.py
++++ R2e/tests/test_codex_cli_diagnostics_r2e.py
+@@ -0,0 +1,326 @@
++"""Pure CLI-event/hold regressions; never start a CLI, model, compiler or transport."""
++import json
++import time
++import tomllib
++from subprocess import list2cmdline
++from types import SimpleNamespace
++
++import pytest
++
++from hpc_forest import codex_process, native_r2max, r2max_worker
++from hpc_forest.codex_mailbox import EFFORT, MODEL, sha256
++from hpc_forest.core import InfrastructureError, atomic_json, file_digest
++
++
++def test_candidate_argv_is_real_TOML_MAX_OAuth_no_tools_and_under_Windows_limit(tmp_path, monkeypatch):
++    executable = "C:/NEUTRAL/pinned/codex.exe"
++    monkeypatch.setattr(codex_process.shutil, "which", lambda _: executable)
++    candidates = ["C:/NEUTRAL/skill-one", "C:/NEUTRAL/skill-two"]
++    monkeypatch.setattr(codex_process, "CLI_POLICY", {"skill_candidate_directories": candidates})
++    request = {"model": MODEL, "reasoning_effort": EFFORT,
++               "schema": {"type": "object", "properties": {"NEUTRAL": {"type": "boolean"}}},
++               "messages": [{"role": "system", "content": "NEUTRAL frozen instructions"},
++                            {"role": "user", "content": "NEUTRAL"}]}
++    output = tmp_path / "NEUTRAL-argv"
++    argv = codex_process.command_for(request, output, executable)
++    overrides = [argv[index + 1] for index, token in enumerate(argv) if token == "--config"]
++    values = tomllib.loads("\n".join(overrides))
++    assert values["model_reasoning_effort"] == "max"
++    assert values["forced_login_method"] == "chatgpt"
++    assert values["model_context_window"] == 65536
++    assert values["project_doc_max_bytes"] == 0 and values["web_search"] == "disabled"
++    assert all(value is False for value in values["features"].values())
++    for field in ("skip_host_skill_discovery", "code_mode", "code_mode_only", "code_mode_host"):
++        assert values["features"][field] is False
++    assert values["skills"]["include_instructions"] is False
++    assert values["skills"]["bundled"]["enabled"] is False
++    assert values["skills"]["max_context_tokens"] == 1
++    assert values["skills"]["config"] == [
++        {"path": path, "enabled": False} for path in candidates]
++    assert len(values["skills"]["config"]) == 2
++    assert "--ignore-user-config" in argv and "--strict-config" in argv
++    assert argv[argv.index("--sandbox") + 1] == "read-only"
++    assert argv[argv.index("--model") + 1] == MODEL
++    assert len(list2cmdline(argv).encode("utf-16-le")) // 2 + 1 < 32767
++    assert (output / "instructions.txt").read_text("utf8") == request["messages"][0]["content"]
++
++
++def test_oversized_quoted_command_refused_before_any_execution(tmp_path, monkeypatch):
++    monkeypatch.setattr(codex_process.shutil, "which", lambda _: "C:/NEUTRAL/codex.exe")
++    monkeypatch.setattr(codex_process, "CLI_POLICY", {"skill_candidate_directories": ["C:/NEUTRAL/" + "x" * 33000]})
++    request = {"model": MODEL, "reasoning_effort": EFFORT, "schema": {"type": "object"},
++               "messages": [{"role": "system", "content": "NEUTRAL"},
++                            {"role": "user", "content": "NEUTRAL"}]}
++    with pytest.raises(InfrastructureError, match="argument limit"):
++        codex_process.command_for(request, tmp_path / "NEUTRAL-oversized")
++
++
++@pytest.mark.parametrize("value", [{"path": "C:/NEUTRAL", "enabled": True}, {"name": "*", "enabled": False}, None])
++def test_TOML_serializer_rejects_enabled_or_guessed_selector(value):
++    with pytest.raises(InfrastructureError):
++        codex_process.toml_override_value(value)
++
++
++@pytest.mark.parametrize("raw,category", [
++    (b"WARN NEUTRAL loader diagnostic\n", "non_json_or_malformed_json"),
++    (b'{"type":"error","message":"NEUTRAL"}\n', "diagnostic_event"),
++    (b'{"type":"item.completed","item":{"type":"error","message":"NEUTRAL"}}\n', "diagnostic_item"),
++    (b'{"type":"warning"}\n', "diagnostic_event"),
++    (b'{"level":"WARN","message":"NEUTRAL"}\n', "diagnostic_severity"),
++    (b'{"error":{"message":"NEUTRAL"}}\n', "event_error_field"),
++    (b"\xff\n", "invalid_utf8"),
++    (b"[]\n", "non_object_event"),
++    (b'{"type":"item.completed","item":{}}\n', "unknown_or_tool_item"),
++    (b'{"type":"item.completed","item":null}\n', "unknown_or_tool_item"),
++    (b'{"type":"NEUTRAL-unknown-event"}\n', "unknown_event_type"),
++    (b'{"type":"turn.completed","type":"error"}\n', "non_json_or_malformed_json"),
++    (b'{"type":"turn.completed","duration":NaN}\n', "non_json_or_malformed_json"),
++    (b"\n \n", "empty_cli_log"),
++])
++def test_all_raw_diagnostics_refused_without_allowlist(tmp_path, raw, category):
++    path = tmp_path / "NEUTRAL.jsonl"
++    path.write_bytes(raw)
++    result = codex_process.diagnostics_from_events(path)
++    assert result["clean"] is False and result["counts"].get(category) == 1
++    assert result["codex_jsonl_sha256"] == sha256(raw)
++    assert path.read_bytes() == raw
++    assert result["diagnostic_allowlist_or_suppression"] is False
++    assert "message" not in result["findings"][0]
++
++
++def test_model_text_is_not_reclassified_as_system_diagnostic(tmp_path):
++    raw = (b'{"type":"item.completed","item":{"id":"NEUTRAL","type":"agent_message","text":"NEUTRAL WARN word"}}\n'
++           b'{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}\n')
++    path = tmp_path / "NEUTRAL.jsonl"
++    path.write_bytes(raw)
++    assert codex_process.diagnostics_from_events(path)["clean"] is True
++
++
++@pytest.mark.parametrize("raw", [b'{"type":"turn.started"}\n',
++                                 b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n' * 2])
++def test_missing_or_multiple_completed_events_never_promote_NORMAL(tmp_path, raw):
++    path = tmp_path / "NEUTRAL-incomplete.jsonl"
++    path.write_bytes(raw)
++    result = codex_process.diagnostics_from_events(path)
++    assert result["clean"] is False and result["counts"]["missing_or_ambiguous_completed_event"] == 1
++
++
++@pytest.mark.parametrize("with_diagnostic", [False, True])
++def test_result_is_checked_after_natural_process_completion(tmp_path, monkeypatch, with_diagnostic):
++    output = tmp_path / "NEUTRAL-generation"
++    output.mkdir()
++    request = {"model": MODEL, "reasoning_effort": EFFORT, "session_id": "2" * 32,
++               "nonce": "1" * 32, "expires_at": time.time() + 10,
++               "messages": [{"role": "system", "content": "NEUTRAL"},
++                            {"role": "user", "content": "NEUTRAL"}]}
++    order = []
++    monkeypatch.setattr(codex_process, "check_dependencies", lambda *args: {})
++    monkeypatch.setattr(codex_process, "command_for", lambda *args: ["NEUTRAL-DO-NOT-EXECUTE"])
++
++    def fake_process(argv, cwd, log, timeout, **kwargs):
++        assert argv == ["NEUTRAL-DO-NOT-EXECUTE"]
++        raw = b'{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}\n'
++        if with_diagnostic:
++            raw += b'{"type":"item.completed","item":{"type":"error","message":"NEUTRAL"}}\n'
++        log.write_bytes(raw)
++        atomic_json(output / "agent-result.json", {"NEUTRAL": True})
++        order.append("process_returned_naturally")
++        return SimpleNamespace(log=str(log), returncode=0, timed_out=False)
++
++    inspect = codex_process.diagnostics_from_events
++
++    def checked_after_completion(path):
++        assert order == ["process_returned_naturally"]
++        order.append("diagnostics_checked")
++        return inspect(path)
++
++    monkeypatch.setattr(codex_process, "run_process", fake_process)
++    monkeypatch.setattr(codex_process, "diagnostics_from_events", checked_after_completion)
++    response = codex_process.run_codex(request, "3" * 64, output, tmp_path / "NEUTRAL-gate.json", set())
++    assert order == ["process_returned_naturally", "diagnostics_checked"]
++    assert response["infrastructure_error"] is with_diagnostic
++    assert response["data"] == (None if with_diagnostic else {"NEUTRAL": True})
++    assert response["usage"]["tokens"] == 10
++    assert response["usage"]["cli_diagnostic_count"] == int(with_diagnostic)
++    assert (output / "agent-result.json").is_file()
++    assert (output / "cli-diagnostics.json").is_file()
++
++
++def delivered_fixture(tmp_path, *, technical=True):
++    output = tmp_path / "NEUTRAL-cache"
++    local = output / ("1" * 32)
++    local.mkdir(parents=True)
++    atomic_json(local / "response.json", {"infrastructure_error": technical})
++    atomic_json(local / "delivered.json", {"response_sha256": file_digest(local / "response.json")})
++    return output, local
++
++
++def test_delivered_technical_hold_blocks_new_claim_but_preserves_cached_response(tmp_path):
++    output, local = delivered_fixture(tmp_path)
++    response_raw = (local / "response.json").read_bytes()
++    r2max_worker.preserve_delivered_technical_hold(output, local)
++    hold_raw = (output / "cli-technical-hold.json").read_bytes()
++    assert json.loads(hold_raw)["new_generations_allowed"] is False
++    r2max_worker.check_technical_hold(output, "1" * 32 + ".request.json")
++    with pytest.raises(InfrastructureError, match="holds all new"):
++        r2max_worker.check_technical_hold(output, "2" * 32 + ".request.json")
++    assert not (output / ("2" * 32)).exists()
++    r2max_worker.preserve_delivered_technical_hold(output, local)
++    assert (local / "response.json").read_bytes() == response_raw
++    assert (output / "cli-technical-hold.json").read_bytes() == hold_raw
++
++
++def test_no_hold_for_algorithmic_negative(tmp_path):
++    output, local = delivered_fixture(tmp_path, technical=False)
++    (local / "delivered.json").unlink()
++    r2max_worker.preserve_delivered_technical_hold(output, local)
++    assert not (output / "cli-technical-hold.json").exists()
++
++
++def test_hold_requires_exact_completed_delivery(tmp_path):
++    output, local = delivered_fixture(tmp_path)
++    atomic_json(local / "delivered.json", {"response_sha256": "f" * 64})
++    with pytest.raises(InfrastructureError, match="fully delivered exact"):
++        r2max_worker.preserve_delivered_technical_hold(output, local)
++    assert not (output / "cli-technical-hold.json").exists()
++
++
++def test_opaque_existing_hold_refuses_new_generation_without_parsing_it(tmp_path):
++    output = tmp_path / "NEUTRAL-cache"
++    output.mkdir()
++    (output / "cli-technical-hold.json").write_bytes(b"NEUTRAL partial durable hold")
++    with pytest.raises(InfrastructureError, match="holds all new"):
++        r2max_worker.check_technical_hold(output, "3" * 32 + ".request.json")
++    with pytest.raises(InfrastructureError, match="Unsafe"):
++        r2max_worker.check_technical_hold(output, "../foreign.request.json")
++
++
++def test_R2e_scope_and_sessions_are_new_and_MAX_only():
++    assert native_r2max.SCOPE == "hpc-forest-primes-native-max-r2e"
++    assert native_r2max.EFFORT == "max"
++    assert native_r2max.CELLS == {"gpt-6-astra": "f81b76a9bc484f669a210c476ae6f9b0",
++                                 "gpt-5.6-terra": "e3678f243ba54a9fadb57440641c0599",
++                                 "gpt-6.1-sol": "515db6fd166e4b68875f34cf2fe733fa"}
++
++
++def policy_fixture(tmp_path):
++    binding = {"scope_id": native_r2max.SCOPE, "model": MODEL, "effort": "max",
++               "session_id": native_r2max.CELLS[MODEL], "job_id": "900000",
++               "remote_root": "/scratch_p/NEUTRAL", "source_zip_sha256": "1" * 64, "plan_sha256": "2" * 64}
++    value = {"schema": "hpc-forest-r2e-local-cli-policy-v1", **binding, "cli_executable_sha256": "3" * 64,
++             "skill_candidate_directories": ["C:/NEUTRAL/skill-one", "C:/NEUTRAL/skill-two"],
++             "filesystem_metadata_sha256": "4" * 64, "is_actual_CLI_discovery_receipt": False,
++             "instruction_or_SKILL_body_read": False}
++    path = tmp_path / ("cli-policy-" + binding["session_id"] + ".json")
++    atomic_json(path, value)
++    return path, value, binding
++
++
++def test_exact_local_policy_binds_cell_before_any_cli(tmp_path):
++    path, value, binding = policy_fixture(tmp_path)
++    assert codex_process.load_task_cli_policy(path, file_digest(path), binding, "3" * 64) == value
++    with pytest.raises(InfrastructureError):
++        codex_process.load_task_cli_policy(path, "f" * 64, binding, "3" * 64)
++    with pytest.raises(InfrastructureError):
++        codex_process.load_task_cli_policy(path, file_digest(path), {**binding, "model": "gpt-6-astra"}, "3" * 64)
++
++
++@pytest.mark.parametrize("field,value", [
++    ("instruction_or_SKILL_body_read", True), ("is_actual_CLI_discovery_receipt", True),
++    ("cli_executable_sha256", "f" * 64), ("skill_candidate_directories", ["C:/NEUTRAL/../foreign"]),
++    ("unknown_field", True),
++])
++def test_local_policy_mutation_refused(tmp_path, field, value):
++    path, policy, binding = policy_fixture(tmp_path)
++    policy[field] = value
++    atomic_json(path, policy)
++    with pytest.raises(InfrastructureError):
++        codex_process.load_task_cli_policy(path, file_digest(path), binding, "3" * 64)
++
++
++def projection_fixture(tmp_path, monkeypatch):
++    policy_path, policy, _ = policy_fixture(tmp_path)
++    monkeypatch.setattr(codex_process, "CLI_POLICY", policy)
++    monkeypatch.setattr(codex_process.shutil, "which", lambda _: "C:/NEUTRAL/codex.exe")
++    output = tmp_path / ("7" * 32)
++    request = {"model": MODEL, "reasoning_effort": EFFORT, "schema": {"type": "object"},
++               "messages": [{"role": "system", "content": "NEUTRAL"}, {"role": "user", "content": "NEUTRAL"}]}
++    argv = codex_process.command_for(request, output)
++    raw = output / "invocation.json"
++    atomic_json(raw, {"argv": argv, "model": MODEL, "reasoning_effort": EFFORT,
++                      "request_sha256": "8" * 64, "source_execution_allowed": False, "hosted_inference": True})
++    cli = {"executable_path": argv[0], "task_cli_policy_sha256": file_digest(policy_path)}
++    projection = codex_process.cli_metadata_projection(raw, cli["task_cli_policy_sha256"], "invocation")
++    return raw, projection, cli
++
++
++def test_projection_retains_actual_record_privately_and_never_exports_skill_paths(tmp_path, monkeypatch):
++    raw, projection, cli = projection_fixture(tmp_path, monkeypatch)
++    before = raw.read_bytes()
++    record, argv = codex_process.check_cli_metadata_projection(projection, "invocation", cli, MODEL)
++    assert record["model"] == MODEL and argv[0] == cli["executable_path"]
++    assert "C:/NEUTRAL/skill-one" not in json.dumps(projection)
++    assert projection["private_record_sha256"] == file_digest(raw)
++    assert projection["private_argv_verified"] is False and projection["private_review_required"] is True
++    assert raw.read_bytes() == before
++
++
++@pytest.mark.parametrize("change", ["policy", "hash", "model", "flag", "array", "claim"])
++def test_projection_mutations_refused(tmp_path, monkeypatch, change):
++    _, projection, cli = projection_fixture(tmp_path, monkeypatch)
++    if change == "policy":
++        projection["task_cli_policy_sha256"] = "f" * 64
++    elif change == "hash":
++        projection["private_record_sha256"] = "malformed"
++    elif change == "model":
++        projection["argv_public"][12] = "NEUTRAL-other-model"
++    elif change == "flag":
++        projection["argv_public"][7] = "danger-full-access"
++    elif change == "array":
++        projection["argv_public"].insert(-1, "skills.config=[]")
++    else:
++        projection["private_argv_verified"] = True
++    with pytest.raises((InfrastructureError, IndexError)):
++        codex_process.check_cli_metadata_projection(projection, "invocation", cli, MODEL)
++
++
++def test_two_metadata_uploads_are_projected_but_raw_stderr_is_not_filtered(tmp_path, monkeypatch):
++    raw, _, cli = projection_fixture(tmp_path, monkeypatch)
++    argv = json.loads(raw.read_bytes())["argv"]
++    sidecar = raw.with_name("codex.jsonl.json")
++    atomic_json(sidecar, {"argv": argv, "returncode": 0, "timed_out": False, "seconds": 1.0, "log": "NEUTRAL"})
++    stderr = raw.with_name("codex.jsonl")
++    stderr.write_bytes(b"WARN NEUTRAL remains raw\n")
++    transferred = []
++
++    class InertTransfer:
++        async def upload(self, local, remote):
++            transferred.append((local, remote, local.read_bytes()))
++            return {"NEUTRAL": True}
++
++    proxy = r2max_worker.LocalCliProjectionTransfers(InertTransfer(), "NEUTRAL-channel", cli["task_cli_policy_sha256"])
++    for local in (raw, sidecar, stderr):
++        before = local.read_bytes()
++        coroutine = proxy.upload(local, "NEUTRAL-channel/logs/" + local.parent.name + "." + local.name)
++        with pytest.raises(StopIteration):
++            coroutine.send(None)
++        assert local.read_bytes() == before
++    assert all(b"C:/NEUTRAL/skill-one" not in payload for _, _, payload in transferred[:2])
++    assert all(json.loads(payload)["projection_is_executable"] is False for _, _, payload in transferred[:2])
++    assert transferred[2][2] == b"WARN NEUTRAL remains raw\n"
++
++
++@pytest.mark.parametrize("prefix,exact", [
++    (b"WARN NEUTRAL retained\n", True),
++    (b"\xff\n", False),
++    (b'{"type":"turn.completed","usage":{"input_tokens":2,"input_tokens":9,"output_tokens":1}}\n', False),
++    (b'{"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":1}}\n', False),
++    (b'{"type":"turn.completed"}\n', False),
++])
++def test_diagnostic_refusal_keeps_exact_usage_only_when_unambiguous(tmp_path, prefix, exact):
++    path = tmp_path / "NEUTRAL-usage.jsonl"
++    path.write_bytes(prefix + b'{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}\n')
++    usage, _ = codex_process.usage_from_events(path)
++    assert usage["token_accounting"] == ("exact" if exact else "upper_bound")
++    assert usage["events"][-1] == {"input_tokens": 7, "output_tokens": 3}
++    assert usage["tokens"] == (10 if exact else codex_process.TOKEN_CEILING)
+--- R2d/tests/test_first_batch_gate_r2e.py
++++ R2e/tests/test_first_batch_gate_r2e.py
+@@ -0,0 +1,183 @@
++"""Pure first-batch checkpoint/release fixtures, never production admission receipts."""
++import copy
++import importlib.util
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hpc_forest import native_r2max
++from hpc_forest.core import InfrastructureError, atomic_json
++
++SPEC = importlib.util.spec_from_file_location(
++    "NEUTRAL_r2e_first_batch_runner", Path(__file__).parents[1] / "examples/marathon22/primes_native_max.py")
++runner = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(runner)
++
++
++def fixture(tmp_path, status="build_failed"):
++    output = tmp_path / "NEUTRAL-results"
++    output.mkdir()
++    authorization = {"model": "gpt-6-astra", "effort": "max", "session_id": native_r2max.CELLS["gpt-6-astra"],
++                     "job_id": "900000", "remote_root": "/scratch_p/NEUTRAL", "expires_at": 400,
++                     "artifacts": {"source_zip": {"sha256": "1" * 64}, "plan": {"sha256": "2" * 64}}}
++    evaluation = output / "NEUTRAL-evaluation.json"
++    atomic_json(evaluation, {"experiment_id": "NEUTRAL-trial", "outcome": {"status": status}, "never_model_input": True})
++    calls = []
++    for char, mother in (("3", True), ("4", False)):
++        request = output / ("NEUTRAL-request-" + char + ".json")
++        atomic_json(request, {"nonce": char * 32, "meta_role": "mother-preparation" if mother else None})
++        projection = output / ("NEUTRAL-projection-" + char + ".json")
++        atomic_json(projection, {"NEUTRAL": "fixture only, not production admission"})
++        calls.append({"request": runner.bound_ref(request), "invocation": runner.bound_ref(projection),
++                      "process": runner.bound_ref(projection), "private_cli_review_required": True,
++                      "private_cli_argv_verified": False,
++                      "private_cli_records": {key: char * 64 for key in ("invocation_sha256", "process_sha256", "argv_sha256",
++                                                                 "skill_override_sha256", "task_cli_policy_sha256")}})
++    first = {"verified": True, "technical_errors_found": False, "invocation_unknown": False,
++             "first_normal_delivered_call": calls[1], "first_real_evaluation": {"experiment_id": "NEUTRAL-trial", "status": status},
++             "evaluation_snapshot": runner.bound_ref(evaluation), "all_started_calls_reconciled": calls,
++             "private_cli_review_required": True, "private_cli_argv_verified": False}
++    atomic_json(output / "premier-demarrage-verifie.json", first)
++    snapshot = {"schema": "NEUTRAL-fixture-snapshot", "first_start_receipt": runner.bound_ref(output / "premier-demarrage-verifie.json"),
++                "evaluation_snapshot": runner.bound_ref(evaluation)}
++    path = output / "NEUTRAL-paused-snapshot.json"
++    atomic_json(path, snapshot)
++    snapshot["self_ref"] = runner.bound_ref(path)
++    return output, authorization, first, snapshot
++
++
++def make_release(output, authorization, first, snapshot):
++    identity = native_r2max.cell_binding(authorization)
++    audit = {"schema": "hpc-forest-r2e-private-cli-audit-digest-projection-v1", "verified": True, **identity,
++             "first_start_receipt_sha256": snapshot["first_start_receipt"]["sha256"],
++             "paused_snapshot_sha256": snapshot["self_ref"]["sha256"], "call_bindings": runner.private_call_bindings(first),
++             "all_private_raws_received_and_hashed": True, "argv_matches_projections_and_local_policy": True,
++             "cli_diagnostics_clean": True, "raw_skill_paths_exported": False,
++             "private_review_receipt_sha256": "f" * 64}
++    audit_path = output / "NEUTRAL-private-audit-digest-projection.json"
++    atomic_json(audit_path, audit)
++    return {"schema": "hpc-forest-r2e-first-batch-release-v1", "verified": True, **identity,
++            "paused_snapshot": snapshot["self_ref"], "first_start_receipt": snapshot["first_start_receipt"],
++            "evaluation_snapshot": snapshot["evaluation_snapshot"], "private_cli_audit": runner.bound_ref(audit_path),
++            "no_replay": True, "new_model_or_budget_authorized": False}
++
++
++@pytest.mark.parametrize("status", ["valid", "incorrect", "build_failed", "runtime_failed"])
++def test_exact_audited_release_does_not_require_a_gain_or_erase_negative(tmp_path, status):
++    output, authorization, first, snapshot = fixture(tmp_path, status)
++    release = make_release(output, authorization, first, snapshot)
++    runner.validate_first_batch_release(release, snapshot, first, authorization)
++    assert first["first_real_evaluation"]["status"] == status
++
++
++@pytest.mark.parametrize("field", ["model", "effort", "session_id", "job_id", "source_zip_sha256",
++                                   "plan_sha256", "paused_snapshot", "first_start_receipt", "evaluation_snapshot"])
++def test_any_unrelated_release_stays_closed(tmp_path, field):
++    output, authorization, first, snapshot = fixture(tmp_path)
++    release = make_release(output, authorization, first, snapshot)
++    release[field] = "NEUTRAL-mismatch"
++    with pytest.raises(InfrastructureError):
++        runner.validate_first_batch_release(release, snapshot, first, authorization)
++
++
++def test_no_private_actual_audit_cannot_release(tmp_path):
++    output, authorization, first, snapshot = fixture(tmp_path)
++    release = make_release(output, authorization, first, snapshot)
++    Path(release["private_cli_audit"]["path"]).unlink()
++    with pytest.raises(InfrastructureError):
++        runner.validate_first_batch_release(release, snapshot, first, authorization)
++
++
++def test_changed_private_call_digest_refused_even_with_new_audit_file_SHA(tmp_path):
++    output, authorization, first, snapshot = fixture(tmp_path)
++    release = make_release(output, authorization, first, snapshot)
++    audit_path = Path(release["private_cli_audit"]["path"])
++    audit = runner.read_json(audit_path)
++    audit["call_bindings"]["3" * 32]["argv_sha256"] = "a" * 64
++    atomic_json(audit_path, audit)
++    release["private_cli_audit"] = runner.bound_ref(audit_path)
++    with pytest.raises(InfrastructureError, match="Actual hash-linked"):
++        runner.validate_first_batch_release(release, snapshot, first, authorization)
++
++
++def controller_fixture():
++    return SimpleNamespace(db=SimpleNamespace(get=lambda key: 300), config={"budget": {"confirmation_seconds": 120}},
++                           run=lambda **kwargs: pytest.fail("No new batch during passive wait"))
++
++
++def test_absent_release_waits_only_remaining_search_budget_and_creates_no_error_response(tmp_path):
++    output, authorization, first, _ = fixture(tmp_path)
++    clock = [100.0]
++    sleeps = []
++    def sleep(seconds):
++        assert 0 <= seconds <= 2
++        sleeps.append(seconds)
++        clock[0] += seconds
++    assert runner.wait_first_batch_release(controller_fixture(), authorization, output, first,
++                                            now=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep) is False
++    assert sum(sleeps) == 80 and clock[0] == 180
++    expired = runner.read_json(output / "premier-batch-attente-expiree.json")
++    assert expired["next_batch_started"] is False and expired["budget_or_chronology_reset"] is False
++    assert expired["model_error_or_response_fabricated"] is False
++    assert not list(output.glob("*.response.json"))
++
++
++def test_valid_release_after_real_checkpoint_resumes_only_unchanged_remaining_budget(tmp_path):
++    output, authorization, first, _ = fixture(tmp_path)
++    clock = [100.0]
++    def sleep(seconds):
++        snapshot_path = output / "premier-batch-en-attente.json"
++        snapshot = runner.read_json(snapshot_path)
++        snapshot["self_ref"] = runner.bound_ref(snapshot_path)
++        release = make_release(output, authorization, first, snapshot)
++        atomic_json(output / "autorisation-apres-premier-batch.json", release)
++        clock[0] += seconds
++    assert runner.wait_first_batch_release(controller_fixture(), authorization, output, first,
++                                            now=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep) is True
++    assert clock[0] == 102
++    accepted = runner.read_json(output / "premier-batch-release-verifiee.json")
++    assert accepted["budget_or_chronology_reset"] is False and accepted["replayed_claims"] == 0
++
++
++def test_invalid_release_is_retained_and_budget_still_expires(tmp_path):
++    output, authorization, first, _ = fixture(tmp_path)
++    atomic_json(output / "autorisation-apres-premier-batch.json", {"NEUTRAL": "not an actual release"})
++    clock = [100.0]
++    assert runner.wait_first_batch_release(controller_fixture(), authorization, output, first,
++                                            now=lambda: clock[0], monotonic=lambda: clock[0],
++                                            sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)) is False
++    assert len(list(output.glob("refus-release-*.json"))) == 1
++    assert runner.read_json(output / "autorisation-apres-premier-batch.json") == {"NEUTRAL": "not an actual release"}
++
++
++def test_pending_or_unreconciled_first_start_cannot_release(tmp_path):
++    output, authorization, first, snapshot = fixture(tmp_path)
++    release = make_release(output, authorization, first, snapshot)
++    changed = copy.deepcopy(first)
++    changed["verified"] = False
++    with pytest.raises(InfrastructureError, match="Actual normal"):
++        runner.validate_first_batch_release(release, snapshot, changed, authorization)
++
++
++def test_budget_is_rechecked_after_validating_a_release(tmp_path, monkeypatch):
++    output, authorization, first, _ = fixture(tmp_path)
++    clock = [100.0]
++    original = runner.validate_first_batch_release
++
++    def slow_validation(*args):
++        result = original(*args)
++        clock[0] = 181.0
++        return result
++
++    def sleep(seconds):
++        path = output / "premier-batch-en-attente.json"
++        snapshot = runner.read_json(path)
++        snapshot["self_ref"] = runner.bound_ref(path)
++        atomic_json(output / "autorisation-apres-premier-batch.json", make_release(output, authorization, first, snapshot))
++        clock[0] += seconds
++
++    monkeypatch.setattr(runner, "validate_first_batch_release", slow_validation)
++    assert runner.wait_first_batch_release(controller_fixture(), authorization, output, first,
++                                            now=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep) is False
++    assert not (output / "premier-batch-release-verifiee.json").exists()
+--- R2d/tests/test_owned_timeout_r2e.py
++++ R2e/tests/test_owned_timeout_r2e.py
+@@ -0,0 +1,135 @@
++"""Owned watchdog tests; every process, timer and signal target is inert."""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++SPEC = importlib.util.spec_from_file_location(
++    "r2e_owned_timeout_core", Path(__file__).parents[1] / "src/hpc_forest/core.py"
++)
++core = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = core
++SPEC.loader.exec_module(core)
++
++
++class OwnedProcess:
++    def __init__(self, returncode=None):
++        self.returncode = returncode
++        self.kill_calls = 0
++        self.communications = []
++
++    @property
++    def pid(self):
++        raise AssertionError("Windows termination must not reopen or target a PID")
++
++    def poll(self):
++        return self.returncode
++
++    def kill(self):
++        self.kill_calls += 1
++        self.returncode = -9
++
++    def communicate(self, *args, **kwargs):
++        self.communications.append((args, kwargs))
++
++
++def windows(monkeypatch):
++    monkeypatch.setattr(core, "os", SimpleNamespace(name="nt", environ={}, replace=os.replace))
++
++
++def test_windows_uses_only_owned_popen_object(monkeypatch):
++    windows(monkeypatch)
++    monkeypatch.setattr(core.subprocess, "run", lambda *_a, **_k: pytest.fail("No taskkill"))
++    owned = OwnedProcess()
++    core._kill_owned(owned)
++    assert owned.kill_calls == 1
++    assert owned.returncode == -9
++
++
++def test_finished_process_is_untouched(monkeypatch):
++    windows(monkeypatch)
++    owned = OwnedProcess(returncode=0)
++    core._kill_owned(owned)
++    assert owned.kill_calls == 0
++
++
++def test_exception_cleanup_reaps_only_owned_process(monkeypatch):
++    windows(monkeypatch)
++    owned = OwnedProcess()
++    core._terminate_owned(owned)
++    assert owned.kill_calls == 1
++    assert owned.communications == [((), {"timeout": 5})]
++
++
++def test_posix_group_branch_is_unchanged_and_inert(monkeypatch):
++    signals = []
++    owned = OwnedProcess()
++    monkeypatch.setattr(
++        core,
++        "os",
++        SimpleNamespace(name="posix", killpg=lambda pid, sig: signals.append((pid, sig))),
++    )
++    monkeypatch.setattr(OwnedProcess, "pid", property(lambda self: 24680))
++    monkeypatch.setattr(core, "signal", SimpleNamespace(SIGKILL=9))
++    core._kill_owned(owned)
++    assert signals == [(24680, 9)]
++    assert owned.kill_calls == 1
++
++
++def test_windows_watchdog_keeps_deadline_and_timeout_metadata(monkeypatch, tmp_path):
++    windows(monkeypatch)
++    owned = OwnedProcess()
++    timers = []
++    launches = []
++
++    class InertTimer:
++        def __init__(self, seconds, callback):
++            self.seconds = seconds
++            self.callback = callback
++            self.cancelled = False
++            self.joined = False
++            timers.append(self)
++
++        def start(self):
++            self.callback()
++
++        def cancel(self):
++            self.cancelled = True
++
++        def join(self):
++            self.joined = True
++
++    def inert_popen(argv, **kwargs):
++        launches.append((argv, kwargs))
++        return owned
++
++    monkeypatch.setattr(core.threading, "Timer", InertTimer)
++    monkeypatch.setattr(core.subprocess, "Popen", inert_popen)
++    monkeypatch.setattr(core.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
++    log = tmp_path / "owned.log"
++    result = core.run_process(["inert-only"], tmp_path, log, 2.75, stdin="fixture")
++    assert len(launches) == 1
++    assert launches[0][1]["start_new_session"] is False
++    assert launches[0][1]["creationflags"] == core.subprocess.CREATE_NEW_PROCESS_GROUP
++    assert owned.kill_calls == 1
++    assert owned.communications == [((b"fixture",), {})]
++    assert timers[0].seconds == 2.75
++    assert timers[0].cancelled and timers[0].joined
++    assert result.timed_out is True
++    assert result.returncode == -9
++    metadata = json.loads(log.with_suffix(".log.json").read_text(encoding="utf-8"))
++    assert metadata["timed_out"] is True
++    assert metadata["returncode"] == -9
++
++
++def test_nonpositive_deadline_does_not_launch(monkeypatch, tmp_path):
++    monkeypatch.setattr(core.subprocess, "Popen", lambda *_a, **_k: pytest.fail("No process"))
++    with pytest.raises(core.BudgetExhausted, match="deadline"):
++        core.run_process(["inert-only"], tmp_path, tmp_path / "never.log", 0)

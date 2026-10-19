@@ -1,0 +1,103 @@
+"""Five new local metadata guards; no received Q data, archive or test replay."""
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+CODE = HERE / "restaurer-livraison-reguliere-froide-r3.py"
+PIN = "dd66073025da86e15461236b2b748ae1d6121c33e1d968842aca03e4ef4720dd"
+assert hashlib.sha256(CODE.read_bytes()).hexdigest() == PIN
+spec = importlib.util.spec_from_file_location("own_prepared_reader_r3", CODE)
+reader = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(reader)  # Trusted local definitions only; no main.
+proof_path = HERE / "PREUVE-NTFS-CPYTHON-CTIME-NEUTRE.json"
+assert hashlib.sha256(proof_path.read_bytes()).hexdigest() == "f6521b084ade5bfbb9476e4204473dbcc29c8ddf737c6877ea051042a070e3eb"
+proof = json.loads(proof_path.read_bytes())
+fixture = Path(proof["fixture"])
+assert fixture.is_relative_to(HERE)
+
+
+class DoubleBaseline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.other = HERE / "second-own-inert-object.bin"
+        with cls.other.open("xb") as out:
+            out.write(b"different own inert bytes\n")
+
+    def test_actual_distinct_creation_change_semantics_are_supported_exactly(self):
+        self.assertNotEqual(proof["path_lstat"]["st_ctime_ns"], proof["held_fd_fstat"]["st_ctime_ns"])
+        self.assertEqual(reader.raw(fixture), b"only own newly created inert bytes\n")
+
+    def test_path_API_ctime_change_is_still_rejected(self):
+        actual_metadata = reader.metadata
+        path_calls = 0
+        def altered(info):
+            nonlocal path_calls
+            value = actual_metadata(info)
+            if info.st_ctime_ns == proof["path_lstat"]["st_ctime_ns"]:
+                path_calls += 1
+                if path_calls >= 2:
+                    value = (*value[:6], value[6] + 1, *value[7:])
+            return value
+        with patch.object(reader, "metadata", side_effect=altered):
+            with self.assertRaisesRegex(ValueError, "Full input path baseline changed"):
+                reader.raw(fixture)
+
+    def test_fd_API_ctime_change_is_still_rejected(self):
+        actual_fstat = os.fstat
+        calls = 0
+        def altered(fd):
+            nonlocal calls
+            calls += 1
+            info = actual_fstat(fd)
+            if calls != 3:
+                return info
+            values = {k: getattr(info, k) for k in ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size",
+                       "st_mtime_ns", "st_ctime_ns", "st_file_attributes")}
+            values["st_ctime_ns"] += 1
+            return SimpleNamespace(**values)
+        with patch.object(reader.os, "fstat", side_effect=altered):
+            with self.assertRaisesRegex(ValueError, "Held full fd/native bytes or baseline changed"):
+                reader.raw(fixture)
+
+    def test_native_change_time_change_is_rejected_even_if_API_metadata_matches(self):
+        actual_native = reader.native_basic_info
+        calls = 0
+        def altered(fd):
+            nonlocal calls
+            calls += 1
+            value = actual_native(fd)
+            return (*value[:2], value[2] + 1, value[3]) if calls == 3 else value
+        with patch.object(reader, "native_basic_info", side_effect=altered):
+            with self.assertRaisesRegex(ValueError, "Held full fd/native bytes or baseline changed"):
+                reader.raw(fixture)
+
+    def test_different_fd_object_still_rejected_before_content(self):
+        with patch.object(reader, "open_nofollow_read", side_effect=lambda _: os.open(self.other, os.O_RDONLY)), \
+                patch.object(reader.os, "fdopen", side_effect=AssertionError("content read attempted")):
+            with self.assertRaisesRegex(ValueError, "Held input object differs BEFORE read"):
+                reader.raw(fixture)
+
+
+log = io.StringIO()
+result = unittest.TextTestRunner(stream=log, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(DoubleBaseline))
+assert hashlib.sha256(CODE.read_bytes()).hexdigest() == PIN
+receipt = {"schema": "hpc-forest-Q753709-reader-r3-double-baseline-neutral-tests-v1",
+    "tests_run": result.testsRun, "passed": result.wasSuccessful(), "failures": len(result.failures), "errors": len(result.errors),
+    "reader_sha256": PIN, "semantics_proof_sha256": "f6521b084ade5bfbb9476e4204473dbcc29c8ddf737c6877ea051042a070e3eb",
+    "own_new_local_fixture_only": True, "numeric_tolerance_used": False,
+    "path_and_fd_complete_ctime_baselines_both_preserved": True,
+    "reader_main_or_received_archive_executed": False, "project265_tests_replayed": False,
+    "model_CLI_MCP_network_job_or_process_effect": False, "log": log.getvalue()}
+out = HERE / "TESTS-NEUTRES-DOUBLES-BASELINES-R3.json"
+with out.open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(receipt, stream, indent=2, ensure_ascii=True); stream.write("\n")
+print(json.dumps({"tests_run": result.testsRun, "passed": result.wasSuccessful(),
+                  "receipt_sha256": hashlib.sha256(out.read_bytes()).hexdigest()}))
+raise SystemExit(0 if result.wasSuccessful() else 1)

@@ -1,0 +1,68 @@
+"""Summarize observed trials and frozen-protocol integrity, without changing them."""
+import argparse
+import hashlib
+import json
+from collections import Counter
+from pathlib import Path
+
+
+def read(path,default=None):
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else default
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def analyse(root):
+    overall=read(root/"results.json",{})
+    output={"job_id":overall.get("job_id"),"complete":overall.get("complete"),
+            "elapsed_seconds":overall.get("elapsed_seconds"),"cleanup":read(root/"cleanup.json"),"problems":[]}
+    for slug in [p["problem"] for p in overall.get("problems",[])] or ["knn","sum","nbody","bucketsort"]:
+        s=read(root/f"{slug}-summary.json",{})
+        p=read(root/f"{slug}-progress.json",{})
+        r=read(root/slug/"report/experiments.json",{})
+        trials=r.get("experiments",[])
+        operator=read(root/"preparation"/slug/"operator-preparation.json",{})
+        item={"problem":slug,"complete":s.get("complete",False),"error":s.get("error"),
+              "preparation_ready":operator.get("ready",False),"search_trials":len(trials),
+              "search_termination":s.get("search",{}).get("status"),
+              "search_complete":s.get("search",{}).get("status")=="search_complete",
+              "outcomes":dict(Counter(t["state"] for t in trials)),"roles":dict(Counter(t["role"] for t in trials)),
+              "costs":s.get("costs"),"best_confirmed":s.get("best_confirmed"),
+              "llm_calls":sum(u.get("llm_calls",0) for u in s.get("generation_usage",[])),
+              "tree_nodes":sum(len(t["nodes"]) for t in p.get("trees",[])),"scored_nodes":p.get("scored_nodes",0),
+              "max_depth":p.get("max_depth",0),"max_children":p.get("max_children",0),"trees":p.get("trees",[]),
+              "operator_preparation":operator,"elapsed_seconds":s.get("elapsed_seconds"),"source_identity":[],
+              "confirmation_evaluations":[{"experiment_id":e["experiment_id"],"outcome":e.get("outcome",json.loads(e.get("payload","{}")))} for e in r.get("evaluations",[]) if e.get("phase")=="confirmation"],
+              "minimum_gain":r.get("config",{}).get("minimum_gain"),
+              "search_reference":[e.get("outcome",json.loads(e.get("payload","{}"))) for e in r.get("evaluations",[]) if e.get("phase")=="search" and e["experiment_id"].startswith("baseline-")],
+              "events":[]}
+        trusted=root/slug/"trusted"
+        contract=read(trusted/"contract.json",{})
+        if contract:
+            item["coverage"]=contract["coverage"]
+            item["comparison"]=contract["comparison"]
+            item["cases"]=[{"phase":phase,"name":c["name"],"stdin_bytes":c["stdin_bytes"],"input_fingerprint":c["input_fingerprint"],
+                            "output_bytes":{key:value["bytes"] for key,value in c["expected"].items()}}
+                           for phase in ["search","confirmation","benchmark"] for c in (contract[phase] if phase!="benchmark" else [contract[phase]])]
+        for name,expected in operator.get("official_source_hashes",{}).items():
+            path=root/slug/"repo/src"/name
+            item["source_identity"].append({"path":name,"identical":path.is_file() and sha(path)==expected,"sha256":expected})
+        counts=Counter()
+        for t in trials:
+            counts[t["role"]]+=1
+            item["events"].append({"id":t["id"],"label":t["role"]+str(counts[t["role"]]),"role":t["role"],"parent":t["search_parent"],
+                "sources":t["sources"],"state":t["state"],"score":t["score"],"seconds":t["mean_seconds"],"hypothesis":t["hypothesis"],"reason":t["reason"]})
+        output["problems"].append(item)
+    return output
+
+
+if __name__=="__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument("root",type=Path)
+    parser.add_argument("destination",type=Path)
+    args=parser.parse_args()
+    result=analyse(args.root)
+    args.destination.write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+    print(json.dumps({"job_id":result["job_id"],"complete":result["complete"],"problems":[{k:p[k] for k in ["problem","complete","error","search_trials","outcomes","llm_calls","max_depth","max_children","best_confirmed"]} for p in result["problems"]]},ensure_ascii=False))

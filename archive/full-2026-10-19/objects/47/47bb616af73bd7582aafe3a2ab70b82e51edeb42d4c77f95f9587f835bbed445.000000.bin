@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <stdint.h>\n#include <string.h>\n#include <ctype.h>\n\ntypedef struct {\n    size_t offset;\n    uint64_t prefix;\n} record;\n\nstatic void fail(const char *message) {\n    fputs(message, stderr);\n    exit(EXIT_FAILURE);\n}\n\nstatic void *checked_malloc(size_t bytes) {\n    void *p = malloc(bytes);\n    if (p == NULL)\n        fail(\"ERROR memory\\n\");\n    return p;\n}\n\nstatic char *read_payload(size_t *length) {\n    size_t capacity = 65536;\n    size_t used = 0;\n    char *buffer = checked_malloc(capacity);\n\n    for (;;) {\n        if (used == capacity - 1) {\n            size_t next_capacity = capacity <= SIZE_MAX / 2\n                                 ? capacity * 2 : SIZE_MAX;\n            if (next_capacity <= capacity)\n                fail(\"ERROR input size\\n\");\n            char *next = realloc(buffer, next_capacity);\n            if (next == NULL)\n                fail(\"ERROR memory\\n\");\n            buffer = next;\n            capacity = next_capacity;\n        }\n        size_t got = fread(buffer + used, 1, capacity - used - 1, stdin);\n        used += got;\n        if (got == 0) {\n            if (ferror(stdin))\n                fail(\"ERROR input\\n\");\n            break;\n        }\n    }\n\n    buffer[used] = '\\0';\n    *length = used;\n    return buffer;\n}\n\n/* Numeric order of these keys is unsigned-byte lexicographic order. */\nstatic uint64_t read_prefix(const char *text) {\n    uint64_t key = 0;\n    for (unsigned int i = 0; i < 8; ++i) {\n        unsigned char c = (unsigned char)text[i];\n        if (c == 0)\n            break;\n        key |= (uint64_t)c << (56U - 8U * i);\n    }\n    return key;\n}\n\nstatic void insertion_sort(record *a, size_t n,\n                           const char *strings, size_t depth) {\n    for (size_t i = 1; i < n; ++i) {\n        record item = a[i];\n        size_t j = i;\n        while (j != 0) {\n            record previous = a[j - 1];\n            if (previous.prefix < item.prefix)\n                break;\n            if (previous.prefix == item.prefix) {\n                if ((item.prefix & UINT64_C(255)) == 0 ||\n                    strcmp(strings + previous.offset + depth + 8,\n                           strings + item.offset + depth + 8) <= 0)\n                    break;\n            }\n            a[j] = previous;\n            --j;\n        }\n        a[j] = item;\n    }\n}\n\nstatic void radix_sort(record *a, record *scratch, size_t n,\n                       const char *strings, size_t depth) {\n    while (n > 1) {\n        if (n <= 24) {\n            insertion_sort(a, n, strings, depth);\n            return;\n        }\n\n        uint64_t first = a[0].prefix;\n        uint64_t different = 0;\n        for (size_t i = 1; i < n; ++i)\n            different |= first ^ a[i].prefix;\n\n        if (different == 0) {\n            /* A zero final byte means this common key contains a terminator. */\n            if ((first & UINT64_C(255)) == 0)\n                return;\n            depth += 8;\n            for (size_t i = 0; i < n; ++i)\n                a[i].prefix = read_prefix(strings + a[i].offset + depth);\n            continue;\n        }\n\n        unsigned int shift = 56;\n        while ((different >> shift) == 0)\n            shift -= 8;\n\n        size_t count[256] = {0};\n        size_t begin[256];\n        size_t next[256];\n        for (size_t i = 0; i < n; ++i) {\n            unsigned int digit = (unsigned int)\n                ((a[i].prefix >> shift) & UINT64_C(255));\n            ++count[digit];\n        }\n\n        size_t total = 0;\n        for (unsigned int digit = 0; digit < 256; ++digit) {\n            begin[digit] = total;\n            next[digit] = total;\n            total += count[digit];\n        }\n        for (size_t i = 0; i < n; ++i) {\n            unsigned int digit = (unsigned int)\n                ((a[i].prefix >> shift) & UINT64_C(255));\n            scratch[next[digit]++] = a[i];\n        }\n        memcpy(a, scratch, n * sizeof(*a));\n\n        /* Bucket zero terminates here. Recurse only into smaller buckets. */\n        unsigned int largest = 0;\n        size_t largest_count = 0;\n        for (unsigned int digit = 1; digit < 256; ++digit) {\n            if (count[digit] > largest_count) {\n                largest = digit;\n                largest_count = count[digit];\n            }\n        }\n        for (unsigned int digit = 1; digit < 256; ++digit) {\n            if (digit != largest && count[digit] > 1)\n                radix_sort(a + begin[digit], scratch + begin[digit],\n                           count[digit], strings, depth);\n        }\n        if (largest_count < 2)\n            return;\n\n        /* Tail iteration bounds stack depth even for highly skewed inputs. */\n        a += begin[largest];\n        scratch += begin[largest];\n        n = largest_count;\n    }\n}\n\nint main(void) {\n    int declared_length, offset, nbuckets;\n    long int input_count;\n\n    if (fscanf(stdin, \"%d\", &declared_length) != 1) {\n        printf(\"ERROR len\\n\");\n        return EXIT_FAILURE;\n    }\n    if (fscanf(stdin, \"%ld\", &input_count) != 1) {\n        printf(\"ERROR n\\n\");\n        return EXIT_FAILURE;\n    }\n    if (fscanf(stdin, \"%d\", &offset) != 1) {\n        printf(\"ERROR offset\\n\");\n        return EXIT_FAILURE;\n    }\n    if (fscanf(stdin, \"%d\", &nbuckets) != 1) {\n        printf(\"ERROR nbucket\\n\");\n        return EXIT_FAILURE;\n    }\n    (void)declared_length;\n    (void)offset;\n    (void)nbuckets;\n\n    if (input_count < 0 ||\n        (uintmax_t)input_count > (uintmax_t)(SIZE_MAX / sizeof(record)))\n        fail(\"ERROR n\\n\");\n    size_t n = (size_t)input_count;\n    if (n == 0)\n        return EXIT_SUCCESS;\n\n    size_t input_length;\n    char *strings = read_payload(&input_length);\n    record *records = checked_malloc(n * sizeof(*records));\n    size_t position = 0;\n\n    /* Tokenize in place; offsets remain valid for arbitrary token lengths. */\n    for (size_t i = 0; i < n; ++i) {\n        while (position < input_length &&\n               isspace((unsigned char)strings[position]))\n            ++position;\n        if (position == input_length) {\n            printf(\"ERROR %zu\\n\", i);\n            free(records);\n            free(strings);\n            return EXIT_FAILURE;\n        }\n        size_t start = position;\n        while (position < input_length &&\n               !isspace((unsigned char)strings[position]))\n            ++position;\n        strings[position] = '\\0';\n        if (position < input_length)\n            ++position;\n        records[i].offset = start;\n        records[i].prefix = read_prefix(strings + start);\n    }\n\n    record *scratch = NULL;\n    if (n > 1) {\n        scratch = checked_malloc(n * sizeof(*scratch));\n        radix_sort(records, scratch, n, strings, 0);\n    }\n    for (size_t i = 0; i < n; ++i)\n        puts(strings + records[i].offset);\n\n    free(scratch);\n    free(records);\n    free(strings);\n    return EXIT_SUCCESS;\n}\n",
+        "path": "src/bucketsort.c"
+      }
+    ],
+    "hypothesis": "Caching eight lexicographic bytes beside each token offset should reduce scattered string reads during radix passes and small-partition comparisons while replacing quadratic bucket sorting.",
+    "notes": "Unmeasured; no commands executed. Preserves variable-length tokens, leading zeros, duplicates, unsigned-byte strcmp ordering and one-token-per-line output.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Tokenize a contiguous input buffer in place and store offsets with portable big-endian eight-byte prefix keys.",
+      "Use count/prefix/scatter MSD sorting with reusable scratch storage and actual bucket occupancies; compare cached keys first in small-partition insertion sorting.",
+      "Skip common prefix chunks iteratively and tail-process the largest partition to bound recursion depth."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "fae0e1019a1e457bb35aed80f80c9694",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "xhigh",
+  "request_sha256": "0082c6fababc156e44123e9028cf82f39221b07300e5eb33a5ff8b3ce1724d77",
+  "session_id": "2bd8b683b45b41c8b48ec38708f46bab",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "83a664c2a3bf57fd7b7de554ebdfad7800fdc0036c20d525cf8e78d2a86261a4",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 4224,
+        "input_tokens": 12416,
+        "output_tokens": 10135,
+        "reasoning_output_tokens": 7911
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "xhigh",
+    "token_accounting": "exact",
+    "tokens": 22551,
+    "tool_events": []
+  }
+}

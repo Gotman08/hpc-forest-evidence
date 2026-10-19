@@ -1,0 +1,125 @@
+"""Allocated read/hash of exactly three ORIGINAL terminal archives; never extract or write."""
+import hashlib
+import json
+import os
+from pathlib import PurePosixPath
+import platform
+import re
+import stat
+import time
+from datetime import UTC, datetime
+
+RECORDS = [{'job_id': '754549', 'session_id': '80d47d8d3f8f4e35bc26ceb54d06e870', 'model': 'gpt-6.1-sol', 'path': '/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-80d47d8d3f8f4e35bc26ceb54d06e870/contract-results-754549.tar.gz'}, {'job_id': '754550', 'session_id': '29583a77237e4777aa09209331ec7ecd', 'model': 'gpt-6-astra', 'path': '/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-29583a77237e4777aa09209331ec7ecd/contract-results-754550.tar.gz'}, {'job_id': '754552', 'session_id': '3ae8341d27784c1bbd830ac19e4b77bc', 'model': 'gpt-5.6-terra', 'path': '/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-3ae8341d27784c1bbd830ac19e4b77bc/contract-results-754552.tar.gz'}]
+MAX_BYTES_PER_ARCHIVE = 512 * 1024**2
+DEADLINE = datetime(2026, 10, 31, 23, 0, tzinfo=UTC).timestamp()
+
+
+def need(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def file_identity(facts):
+    return (facts.st_dev, facts.st_ino, facts.st_mode, facts.st_nlink,
+            facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns)
+
+
+def directory_identity(facts):
+    need(stat.S_ISDIR(facts.st_mode), "Only no-follow ordinary directory handles")
+    return (facts.st_dev, facts.st_ino, facts.st_mode)
+
+
+def infrastructure_alias_snapshot():
+    """Only /scratch_p is an allowed alias, solely to the exact canonical tree."""
+    literal, expected = '/scratch_p', '/gpfs/scratch'
+    before = os.lstat(literal)
+    need(stat.S_ISLNK(before.st_mode), 'Only the explicitly declared infrastructure symlink is permitted')
+    target = os.readlink(literal)
+    need(target in {expected, expected + '/'}, 'No other alias target or intermediate alias is allowed')
+    resolved = os.path.realpath(literal, strict=True)
+    need(resolved == expected, 'Infrastructure alias must resolve strictly to /gpfs/scratch')
+    after = os.lstat(literal)
+    need(file_identity(before) == file_identity(after) and os.readlink(literal) == target
+         and os.path.realpath(literal, strict=True) == expected, 'Infrastructure alias changed during metadata validation')
+    return {'literal_path': literal, 'readlink_target': target, 'observed_canonical_path': resolved,
+            'lstat_before': list(file_identity(before)), 'lstat_after': list(file_identity(after)),
+            'metadata_unchanged': True, 'only_this_infrastructure_alias_allowed': True}
+
+
+def hash_exact_archive(row):
+    literal = PurePosixPath(row['path'])
+    need(literal.is_absolute() and '..' not in literal.parts and literal.parts[:3] == ('/', 'scratch_p', 'nimarano'),
+         'Exact original scratch archive path')
+    need(literal.name == 'contract-results-' + row['job_id'] + '.tar.gz'
+         and literal.parent.name == 'hpc-forest-dynamic-r4b-max-' + row['session_id'], 'Exact closed job/session archive binding')
+    alias_before = infrastructure_alias_snapshot()
+    path = PurePosixPath('/gpfs/scratch').joinpath(*literal.parts[2:])
+    need(path.parts[:4] == ('/', 'gpfs', 'scratch', 'nimarano'), 'Only the derived exact canonical namespace')
+    need(all(hasattr(os, name) for name in ('O_DIRECTORY', 'O_NOFOLLOW', 'O_CLOEXEC', 'O_NONBLOCK')),
+         'POSIX held no-follow API required; no fallback')
+    directories = []
+    fd = None
+    try:
+        current = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        directories.append((current, None, None, directory_identity(os.fstat(current))))
+        for name in path.parts[1:-1]:
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current)
+            facts = directory_identity(os.fstat(child))
+            directories.append((child, current, name, facts))
+            current = child
+        before = os.stat(path.name, dir_fd=current, follow_symlinks=False)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and 0 < before.st_size <= MAX_BYTES_PER_ARCHIVE,
+             'Bounded single-link original regular archive required')
+        baseline = file_identity(before)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=current)
+        need(file_identity(os.fstat(fd)) == baseline, 'Archive path/held identity differs before read')
+        checksum = hashlib.sha256()
+        count = 0
+        while True:
+            block = os.read(fd, min(1024**2, MAX_BYTES_PER_ARCHIVE - count + 1))
+            if not block:
+                break
+            count += len(block)
+            need(count <= MAX_BYTES_PER_ARCHIVE, 'Archive exceeded its fixed read bound')
+            checksum.update(block)
+        need(count == before.st_size and file_identity(os.fstat(fd)) == baseline
+             and file_identity(os.stat(path.name, dir_fd=current, follow_symlinks=False)) == baseline,
+             'Original archive changed while hashing; no announcement promoted')
+        for child, parent, name, facts in directories:
+            need(directory_identity(os.fstat(child)) == facts, 'Held parent identity changed')
+            if parent is not None:
+                need(directory_identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == facts,
+                     'Original literal directory entry no longer matches its held parent chain')
+        alias_after = infrastructure_alias_snapshot()
+        need(alias_before == alias_after, 'Infrastructure alias changed while hashing original archive')
+        return {**row, 'canonical_path_observed': str(path), 'infrastructure_alias_proof': alias_after,
+                'literal_original_path_preserved': True, 'sha256': checksum.hexdigest(), 'bytes': count,
+                'original_bytes_unchanged': True, 'held_no_follow_file_and_parent_chain': True}
+    finally:
+        if fd is not None:
+            os.close(fd)
+        for child, _parent, _name, _facts in reversed(directories):
+            os.close(child)
+
+
+def main():
+    need(platform.machine().lower() in {'aarch64', 'arm64'}, 'Actual ARM allocation required')
+    job = os.environ.get('SLURM_JOB_ID', '')
+    need(re.fullmatch('[0-9]+', job) is not None and job not in {row['job_id'] for row in RECORDS} | {'754337', '754586'},
+         'New actual allocation job ID required, never a source root replay')
+    need(os.environ.get('SLURM_CPUS_PER_TASK') == '1', 'Exactly one requested CPU per task')
+    need(time.time() + 60 + 10800 < DEADLINE, 'One-minute maximum plus three-hour audit reserve must fit strictly before deadline')
+    alias_before = infrastructure_alias_snapshot()
+    records = [hash_exact_archive(row) for row in RECORDS]
+    alias_after = infrastructure_alias_snapshot()
+    need(alias_before == alias_after, 'Infrastructure alias changed across the complete three-archive observation')
+    print(json.dumps({'schema': 'hpc-forest-r7-original-terminal-archives-hash-announcement-v1',
+        'verified_readonly_hashes': True, 'observed_at': time.time(),
+        'observed_at_utc': datetime.now(UTC).isoformat(), 'allocation_job_id': job,
+        'native_model_calls_by_hash_workload': 0, 'tests_or_compilations_replayed': 0,
+        'source_roots_call_counts_not_inferred': True, 'archives_extracted_or_modified': False,
+        'new_archive_created': False, 'infrastructure_alias_observation': alias_after, 'records': records}), flush=True)
+
+
+if __name__ == '__main__':
+    main()

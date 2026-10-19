@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import json
+from unittest.mock import Mock
+
+import pytest
+
+from hpc_forest.cli import main, parser
+from hpc_forest.evolution.demo import run_demo, write_report
+
+
+@pytest.mark.parametrize("strategy", ["ab-mcts", "population"])
+def test_full_synthetic_demo_exercises_search_workflow_router_and_exports(tmp_path, strategy):
+    root = tmp_path / strategy
+    result = run_demo(root, strategy=strategy, trials=4)
+    assert result["demonstration_only"] is True
+    assert result["costs"]["missions"] == 7
+    assert result["costs"]["model_calls_known"] == 0
+    assert result["costs"]["exact_tokens"] == 0
+    assert len(result["programs"]) == 4
+    export = json.loads((root / "synthetic-training.jsonl.manifest.json").read_bytes())
+    assert export["synthetic_data"] is True and export["weights_trained"] is False
+    report = write_report(root, tmp_path / (strategy + ".md"))
+    assert "trial-000000" in report.read_text(encoding="utf-8")
+    with pytest.raises(Exception, match="new file"):
+        write_report(root, report)
+
+
+def test_new_cli_commands_do_not_construct_the_historical_controller(tmp_path, capsys, monkeypatch):
+    import hpc_forest.cli as cli
+
+    controller = Mock(side_effect=AssertionError("historical campaign was touched"))
+    monkeypatch.setattr(cli, "Controller", controller)
+    root = tmp_path / "demo"
+    assert main(["evolution-demo", str(root), "--trials", "2"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["costs"]["missions"] == 5
+    assert main(["evolution-status", str(root)]) == 0
+    assert json.loads(capsys.readouterr().out)["native_runtime_admitted"] is False
+    assert main(["evolution-report", str(root), str(tmp_path / "report.md")]) == 0
+    assert (tmp_path / "report.md").exists()
+    controller.assert_not_called()
+
+
+def test_historical_parser_defaults_remain_unchanged():
+    args = parser().parse_args(["run", "existing"])
+    assert args.max_batches is None and args.confirm is False
+    args = parser().parse_args(["init", "new"])
+    assert args.backend is None and args.method is None

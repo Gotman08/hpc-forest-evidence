@@ -1,0 +1,183 @@
+#include "knn.h"
+#include <arm_neon.h>
+#include <omp.h>
+
+static int is_worse(float da, long ia, float db, long ib) {
+    return (da > db) || (da == db && ia > ib);
+}
+
+static void swap3(float *hd, long *hi, char *hl, int a, int b) {
+    float td = hd[a]; hd[a] = hd[b]; hd[b] = td;
+    long ti = hi[a]; hi[a] = hi[b]; hi[b] = ti;
+    char tc = hl[a]; hl[a] = hl[b]; hl[b] = tc;
+}
+
+static void heap_push(float *hd, long *hi, char *hl, int *n,
+                      float d, long idx, char label) {
+    int i = (*n)++;
+    hd[i] = d; hi[i] = idx; hl[i] = label;
+
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (is_worse(hd[i], hi[i], hd[parent], hi[parent])) {
+            swap3(hd, hi, hl, i, parent);
+            i = parent;
+        } else {
+            break;
+        }
+    }
+}
+
+static void heap_replace_root(float *hd, long *hi, char *hl, int n,
+                              float d, long idx, char label) {
+    hd[0] = d; hi[0] = idx; hl[0] = label;
+    int i = 0;
+
+    for (;;) {
+        int left = 2 * i + 1;
+        if (left >= n) break;
+        int right = left + 1;
+        int worst = i;
+
+        if (is_worse(hd[left], hi[left], hd[worst], hi[worst])) {
+            worst = left;
+        }
+        if (right < n && is_worse(hd[right], hi[right], hd[worst], hi[worst])) {
+            worst = right;
+        }
+
+        if (worst == i) break;
+        swap3(hd, hi, hl, i, worst);
+        i = worst;
+    }
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    size_t total = 0;
+    for (int gi = 0; gi < n_groups; ++gi) {
+        total += (size_t)groups[gi].length;
+    }
+
+    float * restrict xs = NULL;
+    if (posix_memalign((void **)&xs, 64, total * sizeof(float)) != 0) {
+        xs = malloc(total * sizeof(float));
+    }
+    float * restrict ys = NULL;
+    if (posix_memalign((void **)&ys, 64, total * sizeof(float)) != 0) {
+        ys = malloc(total * sizeof(float));
+    }
+    char *plabels = (char *)malloc(total * sizeof(char));
+
+    size_t pos = 0;
+    for (int gi = 0; gi < n_groups; ++gi) {
+        Group g = groups[gi];
+        char lab = g.label;
+        for (int j = 0; j < g.length; ++j) {
+            xs[pos] = g.points[j].x;
+            ys[pos] = g.points[j].y;
+            plabels[pos] = lab;
+            ++pos;
+        }
+    }
+
+    float * restrict dists = NULL;
+    if (posix_memalign((void **)&dists, 64, total * sizeof(float)) != 0) {
+        dists = malloc(total * sizeof(float));
+    }
+    float tx = to_evaluate.x;
+    float ty = to_evaluate.y;
+
+#pragma omp parallel
+    {
+        size_t tid = (size_t)omp_get_thread_num();
+        size_t nthreads = (size_t)omp_get_num_threads();
+        size_t start = (total * tid) / nthreads;
+        size_t end = (total * (tid + 1)) / nthreads;
+
+        float32x4_t tvx = vdupq_n_f32(tx);
+        float32x4_t tvy = vdupq_n_f32(ty);
+
+        size_t p = start;
+        for (; p + 3 < end; p += 4) {
+            float32x4_t xv = vld1q_f32(&xs[p]);
+            float32x4_t yv = vld1q_f32(&ys[p]);
+            float32x4_t dx = vsubq_f32(xv, tvx);
+            float32x4_t dy = vsubq_f32(yv, tvy);
+            float32x4_t d = vfmaq_f32(vmulq_f32(dy, dy), dx, dx);
+            vst1q_f32(&dists[p], d);
+        }
+        for (; p < end; ++p) {
+            float dx = xs[p] - tx;
+            float dy = ys[p] - ty;
+            dists[p] = dx * dx + dy * dy;
+        }
+    }
+
+    float *heap_d = (float *)malloc(k * sizeof(float));
+    long *heap_idx = (long *)malloc(k * sizeof(long));
+    char *heap_lab = (char *)malloc(k * sizeof(char));
+    int heap_n = 0;
+
+    for (size_t p = 0; p < total; ++p) {
+        float d = dists[p];
+        if (heap_n < k) {
+            heap_push(heap_d, heap_idx, heap_lab, &heap_n,
+                      d, (long)p, plabels[p]);
+        } else if (is_worse(heap_d[0], heap_idx[0], d, (long)p)) {
+            heap_replace_root(heap_d, heap_idx, heap_lab, k,
+                              d, (long)p, plabels[p]);
+        }
+    }
+
+    char *labels = (char *)malloc(k * sizeof(char));
+    for (int i = 0; i < k; ++i) {
+        if (i < heap_n) labels[i] = heap_lab[i];
+        else labels[i] = -1;
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; ++i) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            ++current_frequency;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(xs); free(ys); free(plabels); free(dists);
+    free(heap_d); free(heap_idx); free(heap_lab); free(labels);
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; ++i) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+    return 0;
+}

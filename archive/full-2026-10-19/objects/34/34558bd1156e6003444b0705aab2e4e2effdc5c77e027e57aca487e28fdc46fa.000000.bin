@@ -1,0 +1,471 @@
+"""ROOT-only local R8 candidate copy/rebinding; prepared, not executed by author.
+
+No COMPONENTS.json, new PASS/XML/validation, Q or operational admission is made.
+The candidate deliberately lacks its two new local validation slots. Historical
+62 components remain byte-exact in ancestry. This module never invokes product
+code, tests, transport, a clock, a UUID generator, a compiler or a worker.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import gzip
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shlex
+import stat
+import tarfile
+
+CODE_HERE = Path(__file__).resolve().parent
+HERE = CODE_HERE.parent
+BASE = HERE.parents[3]
+PREP = BASE / "outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3"
+OP = PREP / "operations-parent-premier-roots-source110-r1"
+EXPECTED_HERE = OP / "preparation-derivee-R8-apres-raccord-r1"
+SELF = CODE_HERE / "preparer-composants-R8-phase2-parent-r2.py"
+PHASE1 = HERE / "preparer-plan-R8-phase1-parent.py"
+PHASE1_SHA = "83bc0810fca205d5548fbd78fb7f6ff86e81e3ca279a60e4d095a7b7bbb56efc"
+R7 = PREP / "adaptateurs-source110-r1/revision-r7-racines-techniques-neuves"
+DESTINATION = PREP / "adaptateurs-source110-r1/revision-r8-racines-techniques-neuves"
+PLAN = HERE / "plan-R8-proposition-root-01/dynamic-plan-r4b-lane-r3-max-r8-PROPOSITION-NON-ADMISE.json"
+PLAN_SHA = "f927d37098f3fd50cc4916195da3e300bd7c29597ba7ece4b9669abd715897fe"
+DELTA = HERE / "plan-R8-proposition-root-01/DELTA-PLAN-R8-NON-ADMIS.json"
+DELTA_SHA = "fc522b48de56da6ccd60440b4443e217c6baa6826a04dff1921f7970633a56fc"
+PLAN_REVIEW = HERE / "revue-source-plan-R8-reels-r1/REVUE-SOURCE110-PLAN-R8-PROPOSE-REEL.json"
+PLAN_REVIEW_SHA = "59f3e17c5fb0bc35bc94722cffb16ca92064e6dbaf83063de987e816bc98ad01"
+SOURCE_REVIEW = HERE / "revue-source-plan-R8-reels-r1/REVUE-SOURCE110-PLAN-R8-PREPARATION-COMPAT.json"
+SOURCE_REVIEW_SHA = "16d81068392789ad6b98c8ad358cb1e84d7630c33fd1a2b3ece69bbb145d3e20"
+OLD_SOURCE_REVIEW = R7 / "revue-source110-plan-r7/REVUE-INDEPENDANTE-SOURCE110-PLAN-R7.json"
+OLD_SOURCE_REVIEW_SHA = "33b05b6825f1eb340073a63c13bdc1e11696db14b3e9b33ce48b3dcfcb0c326a"
+PLAN_RELATIVE = "plan-technique-neuf/dynamic-plan-r4b-lane-r3-max-r8.json"
+OLD_SHARED = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-r7-5c3cc0082589"
+NEW_SHARED = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-r8-f927d37098f3"
+OLD_REMOTE_STAGE = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-native-interface-lane-r3-r7-5c3cc0082589.tar.gz"
+NEW_REMOTE_STAGE = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-native-interface-lane-r3-r8-f927d37098f3.tar.gz"
+STAGE = "launcher/native-interface-models-max-r3.tar.gz"
+MODELS = ("gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-terra")
+SLUGS = {"gpt-6.1-sol": "sol-max", "gpt-6-astra": "astra-max", "gpt-5.6-terra": "terra-max"}
+PHASES = ("roots", "advice", "harvest")
+NEW_ROOTS = {"gpt-6.1-sol": "277b1e33ea5e4af6af1c9144ce970ac4",
+             "gpt-6-astra": "5033baf5d38042efb8ab834a59437d19",
+             "gpt-5.6-terra": "d5007804188a4fc793582a26e47c556c"}
+PENDING_VALIDATION = {"observer/TESTS-OBS4-NEUTRES.xml", "observer/validation-locale.json"}
+IDENTICAL15 = {
+    "G-POST-CONTRAT-PRODUCTEUR.json", "LANE-SCHEMA-HISTORIQUE.json",
+    "NEGATIVE-HISTORIQUE-NON-EXECUTABLE.txt", "PROVENANCE-SOCLE-HISTORIQUE.json",
+    "launcher/bind_qualification.py", "launcher/native_worker_detection.py", "launcher/publication.py",
+    "observer/PROVENANCE-EXTRACTION-CINQ-CAS.json", "observer/TESTS-FACADES-ET-OBS4-ORIGINAL.xml",
+    "observer/test_obs4_neutre.py", "reader/normalisation_native.py", "reader/private_cli110.py",
+    "test_contrat_source110.py", "test_facades_closure110.py", "test_portable_chain110.py",
+}
+CHANGED18 = {
+    "READER-INTEGRATION-ABI.json", "assemble_admissions.py", "chain_contract.py", "contrat_source110.py",
+    "lane_projection.py", "launcher/COMMANDES-PROPOSEES.json", "launcher/bootstrap_worker.py",
+    "launcher/cell_selection.py", STAGE, "launcher/pins-source-plan.json", "launcher/remote_stage.py",
+    "launcher/render_launch.py", "observer/ABI.json", "observer/observer-mixte.py",
+    "reader/pins-source-plan.json", "reader/receipt_native.py", "reader/receive_phase.py", "reader_bridge.py",
+}
+COMMAND27 = {f"launcher/{slug}/{phase}/{name}" for slug in SLUGS.values() for phase in PHASES
+             for name in ("commande-allouee.sh", "job-prepare-propose.json", "factory-input-NON-ADMIS.json")}
+CHANGED45 = CHANGED18 | COMMAND27
+# Topological order is part of this closed preparation graph: observer must
+# consume the new bootstrap SHA BEFORE lane_projection consumes observer SHA.
+TRANSITIVE_SOURCE_EDGES = {
+    "observer/observer-mixte.py": ("launcher/bootstrap_worker.py",),
+    "lane_projection.py": ("launcher/cell_selection.py", "observer/observer-mixte.py"),
+    "reader/receive_phase.py": ("reader/receipt_native.py",),
+}
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def load_preparation_primitives():
+    """Only the pinned LOCAL phase1 module; no product module is imported."""
+    need(HERE == EXPECTED_HERE and CODE_HERE == HERE / "revision-r2-liaisons-transitives"
+         and os.name == "nt", "Exact Windows R2 preparation boundary required")
+    # Bootstrap is read-only; execution occurs only after the complete known SHA.
+    for path in (*reversed(PHASE1.parents), PHASE1):
+        info = path.lstat()
+        need(not stat.S_ISLNK(info.st_mode) and not (getattr(info, "st_file_attributes", 0) & 1024),
+             "Preparation primitive alias/reparse refused")
+    raw = PHASE1.read_bytes()
+    need(sha(raw) == PHASE1_SHA, "Exact reviewed phase1 preparation primitives required")
+    tree = ast.parse(raw, filename=str(PHASE1))
+    last = tree.body[-1]
+    need(isinstance(last, ast.If) and ast.unparse(last.test) == "__name__ == '__main__'"
+         and len(last.body) == 1 and ast.unparse(last.body[0]) == "main()" and not last.orelse,
+         "Exact inert module-entry exclusion required")
+    tree.body.pop()
+    ns = {"__file__": str(PHASE1), "__name__": "r8_local_phase1_preparation_primitives"}
+    exec(compile(tree, str(PHASE1), "exec"), ns)
+    need(ns["HERE"] == HERE and ns["SELF"] == PHASE1 and ns["BASE"] == BASE and ns["PREP"] == PREP,
+         "Preparation primitive anchor changed before held IO")
+    store = ns["ColdStore"]()
+    store.pinned(PHASE1, PHASE1_SHA)
+    return ns, store
+
+
+def verify_actual_plan(ns, store, parent):
+    """Actual two independent source/plan receipts, not a future code/Q review."""
+    plan = ns["strict_json"](store.pinned(PLAN, PLAN_SHA))
+    delta = ns["strict_json"](store.pinned(DELTA, DELTA_SHA))
+    review = ns["strict_json"](store.pinned(PLAN_REVIEW, PLAN_REVIEW_SHA))
+    compat = ns["strict_json"](store.pinned(SOURCE_REVIEW, SOURCE_REVIEW_SHA))
+    changed = ns["verify_three_root_delta"](parent, plan, NEW_ROOTS)
+    ref = ns["ref"]
+    need(delta.get("schema") == "hpc-forest-r8-three-root-local-plan-delta-NON-ADMIS-v1"
+         and delta.get("proposed_plan") == ref(PLAN, PLAN_SHA)
+         and delta.get("only_semantic_changed_paths") == changed
+         and delta.get("component62_copy_or_rebinding_performed") is False
+         and delta.get("native_generation_admitted") is False, "Actual local phase1 delta required")
+    need(review.get("schema") == "hpc-forest-r8-source110-proposed-plan-independent-review-v1"
+         and review.get("verified_source_and_plan_only") is True and review.get("blocking_findings") == []
+         and review.get("proposed_plan") == ref(PLAN, PLAN_SHA), "Actual independent R8 plan review required")
+    need(compat.get("schema") == "hpc-forest-r4b-r3-independent-source-preparation-review-v1"
+         and compat.get("verified_source_preparation_only") is True and compat.get("blocking_findings") == []
+         and compat.get("scope_id") == ns["SCOPE"]
+         and compat.get("source_zip") == ref(ns["SOURCE_ZIP"], ns["SOURCE_SHA"])
+         and compat.get("plan") == ref(PLAN, PLAN_SHA)
+         and compat.get("actual_source_and_proposed_plan_cold_review") == ref(PLAN_REVIEW, PLAN_REVIEW_SHA)
+         and compat.get("actual_local_delta") == ref(DELTA, DELTA_SHA)
+         and compat.get("native_generation_admitted") is False, "Actual compatible source/plan receipt required")
+    return plan
+
+
+def replace_text(text, substitutions):
+    """Pure closed literals only; no recursive R7-name or arbitrary SHA replacement."""
+    for old, new in substitutions:
+        need(isinstance(old, str) and old and isinstance(new, str), "Explicit text literals required")
+        text = text.replace(old, new)
+    return text
+
+
+def replace_value(value, substitutions):
+    if isinstance(value, dict):
+        return {key: replace_value(item, substitutions) for key, item in value.items()}
+    if isinstance(value, list):
+        return [replace_value(item, substitutions) for item in value]
+    return replace_text(value, substitutions) if isinstance(value, str) else value
+
+
+def string_erased_ast(raw):
+    """Pure check: no Python syntax/control/numeric/boolean change is allowed."""
+    class Strings(ast.NodeTransformer):
+        def visit_Constant(self, node):
+            return ast.copy_location(ast.Constant(value="<closed-string>"), node) if isinstance(node.value, str) else node
+    return ast.dump(Strings().visit(ast.parse(raw)), include_attributes=False)
+
+
+def deterministic_stage(data, json_bytes):
+    """Same regular three-member code archive recipe; no execution or test claim."""
+    runtime = {name: data["launcher/" + name] for name in ("remote_stage.py", "cell_selection.py")}
+    members = {**runtime, "stage-manifest.json": json_bytes({name: sha(raw) for name, raw in runtime.items()})}
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, filename="", mode="wb", mtime=0) as zipped, \
+            tarfile.open(fileobj=zipped, mode="w") as archive:
+        for name, raw in sorted(members.items()):
+            item = tarfile.TarInfo(name)
+            item.size, item.mode, item.mtime = len(raw), 0o600, 0
+            archive.addfile(item, io.BytesIO(raw))
+    packed = buffer.getvalue()
+    with tarfile.open(fileobj=io.BytesIO(packed), mode="r:gz") as archive:
+        headers = archive.getmembers()
+        need(len(headers) == 3 and {item.name for item in headers} == set(members)
+             and all(item.isfile() and not item.pax_headers for item in headers), "Closed regular stage archive required")
+        need(all(archive.extractfile(item).read() == members[item.name] for item in headers),
+             "Stage archive differs from actual candidate modules")
+    return packed
+
+
+def verify_command_binding(data, plan, ns):
+    """Pure command/job/template binding; no shell, source import or allocation."""
+    read = ns["strict_json"]
+    aggregate = read(data["launcher/COMMANDES-PROPOSEES.json"])
+    need(set(aggregate["commands"]) == {model + ":" + phase for model in MODELS for phase in PHASES}
+         and aggregate["verified"] is False and aggregate["automatic_loop"] is False
+         and aggregate["pilot_admitted"] is False and aggregate["native_model_calls"] == 0,
+         "Exactly nine proposed closed commands required")
+    for model in MODELS:
+        for phase in PHASES:
+            folder = f"launcher/{SLUGS[model]}/{phase}/"
+            command = data[folder + "commande-allouee.sh"].decode("utf-8", errors="strict")
+            job = read(data[folder + "job-prepare-propose.json"])
+            template = read(data[folder + "factory-input-NON-ADMIS.json"])
+            item = aggregate["commands"][model + ":" + phase]
+            session = plan["contract_cells"][model][phase]
+            need(job["command"] == "bash -lc " + shlex.quote(command)
+                 and shlex.split(job["command"]) == ["bash", "-lc", command], "Exact shell newlines and quoting required")
+            need(job["arch"] == "armgpu" and type(job["cpus_per_task"]) is int and job["cpus_per_task"] == 4
+                 and type(job["mem_gb"]) is int and job["mem_gb"] == 16
+                 and type(job["gpus_per_node"]) is int and job["gpus_per_node"] == 0
+                 and job["time_limit"] == "01:00:00", "Original ARM4/16GiB/0GPU/1h resource request required")
+            need(item["session_id"] == template["session_id"] == session
+                 and item["command_sha256"] == sha(data[folder + "commande-allouee.sh"])
+                 and item["job_request_sha256"] == sha(data[folder + "job-prepare-propose.json"])
+                 and item["verified"] is False and item["native_generation_admitted"] is False,
+                 "Actual proposed session/command/job bytes differ")
+            need(template["verified"] is False and template["job_id"] is None
+                 and template["real_qualification_reception"] is None
+                 and template["allocation_marker"] is None and template["request_prepared"] is None
+                 and template["submission_intent"] is None and template["submission_observed"] is None
+                 and template["native_contract_phase_receipts"] == []
+                 and template["plan_sha256"] == PLAN_SHA, "No future operational fact may enter a template")
+            need(f"native_root=/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-{session}\n" in command
+                 and f"admission_root=/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-{session}\n" in command
+                 and f"shared={NEW_SHARED}\n" in command and f"stage_archive={NEW_REMOTE_STAGE}\n" in command
+                 and f"printf '%s  %s\\n' {sha(data[STAGE])} \"$stage_archive\" | sha256sum -c -\n" in command
+                 and f"printf '%s  %s\\n' {PLAN_SHA} \"$shared/dynamic-plan.json\" | sha256sum -c -\n" in command,
+                 "Exact root/shared/stage/hash shell bindings required")
+
+
+def build_candidate(before, parent_plan, plan, destination, ns):
+    """Pure bytes-to-bytes candidate; does not create a directory, UUID or PASS."""
+    need(destination == DESTINATION, "Exact new R8 candidate destination required")
+    need(set(before) == IDENTICAL15 | CHANGED45 | PENDING_VALIDATION and len(before) == 62,
+         "Exact inherited62 list,15 byte-identical,45 changed and2 pending validation slots required")
+    ns["verify_three_root_delta"](parent_plan, plan, NEW_ROOTS)
+    need(deterministic_stage(before, ns["json_bytes"]) == before[STAGE],
+         "Inherited archive must exactly match the same closed three-member deterministic recipe")
+    substitutions = [
+        (str(ns["PLAN_R7"]), str(destination / PLAN_RELATIVE)),
+        (str(OLD_SOURCE_REVIEW), str(SOURCE_REVIEW)),
+        (str(R7), str(destination)),
+        (ns["PLAN_SHA"], PLAN_SHA), (OLD_SOURCE_REVIEW_SHA, SOURCE_REVIEW_SHA),
+        (OLD_SHARED, NEW_SHARED), (OLD_REMOTE_STAGE, NEW_REMOTE_STAGE),
+        *[(ns["ROOTS_R7"][model], NEW_ROOTS[model]) for model in MODELS],
+    ]
+    data = {name: raw for name, raw in before.items() if name not in PENDING_VALIDATION}
+    for name in sorted(CHANGED45 - {STAGE}):
+        if name.endswith(".json"):
+            data[name] = ns["json_bytes"](replace_value(ns["strict_json"](before[name]), substitutions))
+        else:
+            data[name] = replace_text(before[name].decode("utf-8", errors="strict"), substitutions).encode("utf-8")
+    # Transitive hashes are taken from these actual new candidate bytes only.
+    for name, dependencies in TRANSITIVE_SOURCE_EDGES.items():
+        for dependency in dependencies:
+            old, new = sha(before[dependency]), sha(data[dependency])
+            need(data[name].count(old.encode()) == 1, "Exact single transitive source-hash dependency required")
+            data[name] = data[name].replace(old.encode(), new.encode())
+    abi = ns["strict_json"](data["observer/ABI.json"])
+    need(abi["bootstrap"]["sha256"] == sha(before["launcher/bootstrap_worker.py"]), "Old exact bootstrap binding required")
+    abi["bootstrap"] = ns["ref"](destination / "launcher/bootstrap_worker.py", sha(data["launcher/bootstrap_worker.py"]))
+    data["observer/ABI.json"] = ns["json_bytes"](abi)
+    data[STAGE] = deterministic_stage(data, ns["json_bytes"])
+    old_stage, new_stage = sha(before[STAGE]), sha(data[STAGE])
+    for model in MODELS:
+        for phase in PHASES:
+            folder = f"launcher/{SLUGS[model]}/{phase}/"
+            command_name = folder + "commande-allouee.sh"
+            need(data[command_name].count(old_stage.encode()) == 1, "Original stage SHA exactly once in each shell command required")
+            data[command_name] = data[command_name].replace(old_stage.encode(), new_stage.encode())
+            job_name = folder + "job-prepare-propose.json"
+            job = ns["strict_json"](data[job_name])
+            job["command"] = "bash -lc " + shlex.quote(data[command_name].decode("utf-8", errors="strict"))
+            data[job_name] = ns["json_bytes"](job)
+    aggregate = ns["strict_json"](data["launcher/COMMANDES-PROPOSEES.json"])
+    need(aggregate["stage_archive"]["sha256"] == old_stage, "Original stage manifest SHA required")
+    aggregate["stage_archive"] = {"local_path": str(destination / STAGE), "sha256": new_stage, "remote_path": NEW_REMOTE_STAGE}
+    for model in MODELS:
+        for phase in PHASES:
+            folder = f"launcher/{SLUGS[model]}/{phase}/"
+            record = aggregate["commands"][model + ":" + phase]
+            record["command_sha256"] = sha(data[folder + "commande-allouee.sh"])
+            record["job_request_sha256"] = sha(data[folder + "job-prepare-propose.json"])
+    data["launcher/COMMANDES-PROPOSEES.json"] = ns["json_bytes"](aggregate)
+    verify_candidate_delta(before, data, plan, ns)
+    return data
+
+
+def verify_candidate_delta(before, after, plan, ns):
+    """Pure fail-closed delta checks, including inherited controls and missing PASS."""
+    need(set(after) == set(before) - PENDING_VALIDATION and len(after) == 60,
+         "Only60 active candidate files; the two new test-result slots must remain absent")
+    need({name for name in after if before[name] != after[name]} == CHANGED45,
+         "Unexpected changed/unchanged candidate surface")
+    need(all(before[name] == after[name] for name in IDENTICAL15), "Protected15 byte identity required")
+    forbidden = (ns["PLAN_SHA"], OLD_SOURCE_REVIEW_SHA, OLD_SHARED, OLD_REMOTE_STAGE,
+                 str(R7), *ns["ROOTS_R7"].values())
+    for name in sorted(CHANGED45 - {STAGE}):
+        text = after[name].decode("utf-8", errors="strict")
+        decoded = json.dumps(ns["strict_json"](after[name]), ensure_ascii=False) if name.endswith(".json") else text
+        need(not any(token in decoded or token.replace("\\", "\\\\") in decoded for token in forbidden),
+             "Old active R7 binding remains in " + name)
+        if name.endswith(".py"):
+            need(string_erased_ast(before[name]) == string_erased_ast(after[name]),
+                 "Python control structure, numbers or booleans changed in " + name)
+    for name in ("launcher/pins-source-plan.json", "reader/pins-source-plan.json"):
+        pins = ns["strict_json"](after[name])
+        old = ns["strict_json"](before[name])
+        need(pins["source_zip"] == old["source_zip"] and pins["source_manifest"] == old["source_manifest"]
+             and pins["latest_native_generation_closure"] == old["latest_native_generation_closure"]
+             and pins["source_project"] == old["source_project"] and pins["copied_cli_executable"] == old["copied_cli_executable"]
+             and pins["cli_sha256"] == old["cli_sha256"] and pins["contract_cells"] == plan["contract_cells"]
+             and pins["supported_contract_sessions"] == plan["contract_cells"]
+             and pins["plan"] == ns["ref"](DESTINATION / PLAN_RELATIVE, PLAN_SHA)
+             and pins["independent_source_review"] == ns["ref"](SOURCE_REVIEW, SOURCE_REVIEW_SHA)
+             and pins["qualification_reception"] is None and pins["verified"] is False
+             and pins["native_generation_admitted"] is False and pins["pilot_admitted"] is False
+             and pins["allocated_qualification_received"] is False, "Protected source/G/CLI or closed future admission differs")
+    for consumer, dependencies in TRANSITIVE_SOURCE_EDGES.items():
+        for dependency in dependencies:
+            old, actual = sha(before[dependency]).encode(), sha(after[dependency]).encode()
+            need(after[consumer].count(actual) == 1 and old not in after[consumer],
+                 "Transitive consumer does not bind the actual new dependency: " + consumer)
+    abi = ns["strict_json"](after["observer/ABI.json"])
+    need(abi["bootstrap"] == ns["ref"](DESTINATION / "launcher/bootstrap_worker.py",
+                                      sha(after["launcher/bootstrap_worker.py"])),
+         "Observer ABI must bind the same actual new bootstrap as observer code")
+    verify_command_binding(after, plan, ns)
+
+
+def source_metadata(store):
+    """Same full path-API baseline before/after; read-time handle checks are additional."""
+    return {path: list(store.api["metadata"](Path(path).lstat())) for path in sorted(store.pins)}
+
+
+def write_tree(destination, payloads, final_record, metadata_before, ns, store):
+    """CreateNew only, held ordinary directory ancestry; preserve partial failures."""
+    for name in payloads:
+        parts = name.split("/")
+        need(parts and all(part and part not in {".", ".."} and ":" not in part and "\\" not in part
+                           and part == part.rstrip(" .") for part in parts), "Closed relative output names required")
+    need(len({name.rstrip(" .").casefold() for name in payloads}) == len(payloads), "Windows output aliases refused")
+    with ns["DirectoryLeases"]() as leases:
+        for parent in (*reversed(destination.parent.parents), destination.parent):
+            leases.hold(parent)
+        ns["ordinary_path"](destination, beneath=destination.parent, missing_leaf=True)
+        ns["require_missing"](destination)
+        destination.mkdir()
+        leases.hold(destination)
+        made = {destination}
+        for name, raw in sorted(payloads.items()):
+            target = destination / name
+            for parent in reversed(target.parents):
+                if parent == destination or parent.is_relative_to(destination):
+                    if parent not in made:
+                        ns["ordinary_path"](parent, beneath=destination, missing_leaf=True)
+                        ns["require_missing"](parent)
+                        parent.mkdir()
+                        leases.hold(parent)
+                        made.add(parent)
+            ns["ordinary_path"](target, beneath=destination, missing_leaf=True)
+            ns["require_missing"](target)
+            ns["write_new"](target, raw)
+            need(store.api["raw"](target) == raw, "New ordinary output changed after exclusive write")
+        for name, raw in payloads.items():
+            need(store.api["raw"](destination / name) == raw, "Candidate/ancestry bytes changed before completion")
+        for name in (*PENDING_VALIDATION, "COMPONENTS.json", "COMPONENTS.pre-validation.json"):
+            ns["require_missing"](destination / name)
+        store.unchanged()
+        metadata_after = source_metadata(store)
+        need(metadata_after == metadata_before, "Full source path metadata changed during copy")
+        final_record["input_metadata_before"] = metadata_before
+        final_record["input_metadata_after"] = metadata_after
+        final_record["input_sha256_after"] = dict(store.pins)
+        final_record["new_ordinary_payload_inventory_excluding_this_delta"] = {
+            name: {"bytes": len(raw), "sha256": sha(raw)} for name, raw in sorted(payloads.items())}
+        final_path = destination / "DELTA-COPIE-RELIAGE-R8-NON-ADMIS.json"
+        ns["ordinary_path"](final_path, beneath=destination, missing_leaf=True)
+        ns["require_missing"](final_path)
+        final_raw = ns["json_bytes"](final_record)
+        ns["write_new"](final_path, final_raw)
+        need(store.api["raw"](final_path) == final_raw, "Final NON_ADMIS delta changed after exclusive write")
+        for name, raw in payloads.items():
+            need(store.api["raw"](destination / name) == raw, "Output bytes changed after delta creation")
+        store.unchanged()
+        need(source_metadata(store) == metadata_before, "Full input metadata changed after final delta creation")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--generator-review", type=Path, required=True)
+    parser.add_argument("--generator-review-sha256", required=True)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--run-local-components-phase2", action="store_true")
+    args = parser.parse_args()
+    need(args.run_local_components_phase2, "Explicit ROOT local-candidate-only action required")
+    ns, store = load_preparation_primitives()
+    output = ns["ordinary_path"](args.output_directory, beneath=DESTINATION.parent, missing_leaf=True)
+    need(output == DESTINATION, "Only the exact new isolated R8 destination is permitted")
+    ns["require_missing"](output)
+    parent = ns["verify_ancestors"](store)
+    plan = verify_actual_plan(ns, store, parent)
+    generator_review_path = ns["ordinary_path"](args.generator_review, beneath=CODE_HERE / "revue-generateur-phase2-independante-r1")
+    generator_ref = ns["ref"](generator_review_path, args.generator_review_sha256)
+    review = store.reference(generator_ref)
+    need(review.get("schema") == "hpc-forest-r8-components-phase2-generator-independent-preparation-review-v1"
+         and review.get("verified_source_preparation_only") is True and review.get("blocking_findings") == []
+         and review.get("reviewed_files", {}).get(SELF.name) == sha(store.raw(SELF))
+         and review.get("native_generation_admitted") is False,
+         "Actual independent review of this exact phase2 generator required")
+    manifest_raw = store.pinned(ns["COMPONENTS"], ns["COMPONENTS_SHA"])
+    manifest = ns["strict_json"](manifest_raw)
+    before = {name: store.pinned(R7 / name, digest) for name, digest in manifest["code_pins"].items()}
+    candidate = build_candidate(before, parent, plan, output, ns)
+    store.unchanged()
+    input_before = dict(store.pins)
+    inventory = {name: {"bytes": len(raw), "sha256": sha(raw)} for name, raw in sorted(candidate.items())}
+    payloads = dict(candidate)
+    payloads[PLAN_RELATIVE] = store.pinned(PLAN, PLAN_SHA)
+    payloads.update({"ascendance-R7/components/" + name: raw for name, raw in before.items()})
+    payloads["ascendance-R7/COMPONENTS-R7.json"] = manifest_raw
+    payloads["ascendance-R7/PLAN-R7.json"] = store.pinned(ns["PLAN_R7"], ns["PLAN_SHA"])
+    payloads["ascendance-R7/REVUE-SOURCE-PLAN-R8-59f3.json"] = store.pinned(PLAN_REVIEW, PLAN_REVIEW_SHA)
+    payloads["ascendance-R7/REVUE-SOURCE-PLAN-R8-COMPAT-16d8.json"] = store.pinned(SOURCE_REVIEW, SOURCE_REVIEW_SHA)
+    non_admis = {
+        "schema": "hpc-forest-r8-unsealed-component-candidate-NON-ADMIS-v1", "verified": False,
+        "prepared_candidate_bytes_only": True, "source_zip_sha256": ns["SOURCE_SHA"], "plan_sha256": PLAN_SHA,
+        "source_plan_review": ns["ref"](SOURCE_REVIEW, SOURCE_REVIEW_SHA),
+        "actual_local_plan_review": ns["ref"](PLAN_REVIEW, PLAN_REVIEW_SHA),
+        "parent_components": ns["ref"](ns["COMPONENTS"], ns["COMPONENTS_SHA"]),
+        "present60_candidate_inventory": inventory, "required_new_result_slots_absent": sorted(PENDING_VALIDATION),
+        "future_final_COMPONENTS": None, "actual_new_local_validation_receipt": None,
+        "actual_independent_R8_integration_review": None, "actual_R8_allocated_Q_reception": None,
+        "historical_R7_validation_XMLs_are_R8_results": False, "inherited62_preserved_byte_exact_in_ancestry": True,
+        "native_generation_admitted": False, "staging_or_publication_or_worker_admitted": False,
+        "phase_after_copy": "Run and receive actual local adapter/OBS4/portable/policy guards on these exact bytes; create NEW result XML/validation only. Then seal all62 actual components, obtain fresh independent code/command review, build exact packet, receive new allocated Q and inheritance. Never rebadge the ancestor tests.",
+        "sequence_after_local_qualification": "Only after required local composition, new Q and reviews may ROOT allocate staging. Actual R8 routes/state/CIM/SO/policies/index are acquired AFTER allocation and BEFORE publication/worker/inference within the one original600s; no existing R7 timer is renewed.",
+    }
+    payloads["COMPOSANTS-NON-SCELLES.json"] = ns["json_bytes"](non_admis)
+    final_record = {
+        "schema": "hpc-forest-r8-local-component-copy-rebinding-delta-NON-ADMIS-v1",
+        "verified": False, "candidate_copy_only": True, "generator_independent_review": generator_ref,
+        "parent_components": ns["ref"](ns["COMPONENTS"], ns["COMPONENTS_SHA"]),
+        "plan": ns["ref"](output / PLAN_RELATIVE, PLAN_SHA),
+        "actual_plan_byte_exact_alias_of": ns["ref"](PLAN, PLAN_SHA),
+        "source_plan_review": ns["ref"](SOURCE_REVIEW, SOURCE_REVIEW_SHA),
+        "pure_structural_changed_plan_paths": ns["verify_three_root_delta"](parent, plan, NEW_ROOTS),
+        "changed45_active_files": sorted(CHANGED45), "byte_identical15_active_files": sorted(IDENTICAL15),
+        "withheld2_new_validation_slots": sorted(PENDING_VALIDATION),
+        "all62_ancestor_files_preserved": manifest["code_pins"], "candidate_inventory": inventory,
+        "input_sha256_before": input_before,
+        "historical_R7_closures_rehashed_as_cold_receipts_not_result_archives": True,
+        "three_root_values_already_created_by_ROOT_not_generated_here": NEW_ROOTS,
+        "new_local_tests_executed_by_generator": False, "source110_bytes_copied_or_changed": False,
+        "final_manifest_or_Q_or_integration_review_produced": False,
+        "whole_composition_Q_or_live_proofs_admitted": False, "native_generation_admitted": False,
+        "failure_policy": "Preserve partial new candidate; no cleanup, resume or overwrite. Existing destination refuses all retries.",
+    }
+    need(store.pins == input_before, "Input set changed before output creation")
+    metadata_before = source_metadata(store)
+    store.unchanged()
+    need(source_metadata(store) == metadata_before, "Input metadata changed before output creation")
+    write_tree(output, payloads, final_record, metadata_before, ns, store)
+    need(store.pins == input_before, "Input bytes changed after output creation")
+    print(json.dumps({"candidate_directory": str(output), "active_candidate_files": 60,
+                      "ancestor_component_files": 62, "missing_new_validation_slots": sorted(PENDING_VALIDATION),
+                      "final_COMPONENTS_created": False, "native_generation_admitted": False}))
+
+
+if __name__ == "__main__":
+    main()

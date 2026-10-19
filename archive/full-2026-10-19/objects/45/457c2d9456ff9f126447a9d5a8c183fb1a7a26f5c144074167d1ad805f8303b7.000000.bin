@@ -1,0 +1,271 @@
+"""Independent metadata-only audit of captured SO/OBS3 closure; no live APIs."""
+import hashlib
+import json
+import math
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OP = HERE.parent
+PREP = OP.parent
+COLD = OP / "reception-sortie-naturelle"
+R3 = PREP / "integration-factory-lecteur-r4-r2-so-clos/revision-r3-command-identity"
+CURRENT_DIR = R3 / "current-20261018T070500Z"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+SESSION = "665743a02b824021a697b6a4884a667c"
+READ = {}
+
+
+def file_ref(path):
+    path = Path(path)
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    old = READ.setdefault(str(path), {"sha256": digest, "bytes": len(data)})
+    assert old == {"sha256": digest, "bytes": len(data)}, "Input changed during audit"
+    return {"path": str(path), **old}
+
+
+def bound(value):
+    assert isinstance(value, dict) and set(value) == {"path", "sha256"}
+    path = Path(value["path"])
+    assert path.is_absolute() and ".." not in path.parts and path.is_file()
+    assert not any(p.is_symlink() or p.is_junction() for p in (path, *path.parents))
+    text = str(path).replace("\\", "/").casefold()
+    assert "/runs/" not in text and not text.endswith(("worker.lock", "registry.sqlite3", "-wal", "-shm"))
+    assert file_ref(path)["sha256"] == value["sha256"]
+    return path
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        assert key not in result, "Duplicate JSON field"
+        result[key] = value
+    return result
+
+
+def read(path):
+    file_ref(path)
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"), object_pairs_hook=unique)
+
+
+def birth(text):
+    assert isinstance(text, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z", text)
+    datetime.fromisoformat(text)
+    whole, _, fraction = text[:-1].partition(".")
+    return whole + "." + fraction.ljust(7, "0")
+
+
+def identity(row):
+    assert all(k in row for k in FIELDS)
+    assert all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+    assert all(isinstance(row[k], str) and row[k] for k in FIELDS[2:])
+    return tuple(row[k] for k in FIELDS[:-1]) + (birth(row["CreationDate"]),)
+
+
+def census(value):
+    assert value["schema"] == "hpc-forest-dynamic-r4b-full-cim-v1"
+    assert value["complete_census"] is True and value["strict_utf8_decoding"] is True
+    rows = value["rows"]
+    assert isinstance(rows, list) and rows and type(value["rows_count"]) is int and len(rows) == value["rows_count"]
+    assert len({r["ProcessId"] for r in rows}) == len(rows)
+    when = birth(value["captured_at_utc"])
+    for row in rows:
+        assert all(k in row for k in FIELDS)
+        assert all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+        assert all(row[k] is None or isinstance(row[k], str) for k in FIELDS[2:])
+        if row["CreationDate"] is not None:
+            assert birth(row["CreationDate"]) <= when
+    return rows, when
+
+
+def check_tree(pair, tree, prior_by_pid):
+    assert len(pair) == 2 and len(tree) == 7
+    assert pair[0]["CommandLine"] == pair[1]["CommandLine"]
+    assert pair[0]["ParentProcessId"] == pair[1]["ProcessId"] or pair[1]["ParentProcessId"] == pair[0]["ProcessId"]
+    known = {identity(r) for r in pair}
+    assert known <= {identity(r) for r in tree}
+    remaining = [r for r in tree if identity(r) not in known]
+    while remaining:
+        progress = False
+        for child in list(remaining):
+            parents = [r for r in tree if identity(r) in known and r["ProcessId"] == child["ParentProcessId"]]
+            if not parents:
+                continue
+            assert birth(parents[0]["CreationDate"]) <= birth(child["CreationDate"])
+            known.add(identity(child))
+            remaining.remove(child)
+            progress = True
+        assert progress, "Disconnected ownership tree"
+    for row in tree:
+        assert identity(prior_by_pid[row["ProcessId"]]) == identity(row)
+
+
+def possibilities(owned, snapshots):
+    known = {identity(r) for r in owned}
+    pool = {tuple(r[k] for k in FIELDS): r for rows in snapshots for r in rows}
+    pending, walked, unresolved = list(owned), set(), set()
+    while pending:
+        parent = pending.pop()
+        key = identity(parent)
+        if key in walked:
+            continue
+        walked.add(key)
+        for candidate in pool.values():
+            if candidate["ParentProcessId"] != parent["ProcessId"]:
+                continue
+            if candidate["CreationDate"] is not None and birth(candidate["CreationDate"]) < birth(parent["CreationDate"]):
+                continue
+            value = identity(candidate)  # An opaque possible child cannot prove absence.
+            if value == key:
+                continue
+            if value not in known:
+                unresolved.add(value)
+            if value not in walked:
+                pending.append(candidate)
+    assert not unresolved, "Unresolved possible owned descendants"
+
+
+def main():
+    out = HERE / "RECEPTION-FERMETURE-INDEPENDANTE.json"
+    assert not out.exists()
+    cold_path = COLD / "RECEPTION-COLD-METADONNEES.json"
+    assert file_ref(cold_path)["sha256"] == "6a0b0c2e9e2562daeb6837f517d75fc360fa5f3696bab6bf0274dc0c02d67838"
+    report = read(cold_path)
+    current_report_path = CURRENT_DIR / "VERIFICATION-CURRENT.json"
+    assert file_ref(current_report_path)["sha256"] == "4582b84146068073bcb26f9914734298ccc8abac1a1250821f1e33e7aef0571d"
+    current_report = read(current_report_path)
+    assert current_report["verified"] is True and current_report["failure_reasons"] == {}
+    assert current_report["cold_metadata_reception"]["sha256"] == file_ref(cold_path)["sha256"]
+    assert current_report["current_census"]["sha256"] == "ab09e3c88bcf32ce06cfd117b7cf75c691d7294941d45e217357c0425241f693"
+    before, t0 = census(read(bound(report["prior_full_cim"])))
+    cold, t1 = census(read(bound(report["cold_full_cim"])))
+    current, t2 = census(read(bound(current_report["current_census"])))
+    assert t0 <= t1 <= t2 and len(current) == 463 and len(cold) == 433
+    # Bind the recorded timestamp explicitly; filenames are not temporal evidence.
+    current_doc = read(bound(current_report["current_census"]))
+    assert current_doc["captured_at_utc"] == current_report["current_captured_at_utc"]
+    age = current_report["current_age_seconds_at_validation"]
+    assert type(age) in (int, float) and math.isfinite(age) and 0 <= age <= 120
+    assert current_report["source_only_reader"]["sha256"] == "d00b785664d67f968dd54101b3ec2f1903662855f47c1ae411f4a6a4467f10fc"
+    assert current_report["obs4_reader"]["sha256"] == "a8903b386a2d53cb663e75d719a50c2c8c39931e91d9c3e664f0d41bd29d54a8"
+    bound(current_report["source_only_reader"])
+    bound(current_report["obs4_reader"])
+    review_path = R3 / "revue-independante/REVUE-LECTEUR-R3.json"
+    assert file_ref(review_path)["sha256"] == "5ea7c7bc9b8e25120ad840e528eb300383c4f531f12b7b2e8bd9e57673aa58cd"
+    reader_review = read(review_path)
+    assert reader_review["verified"] is True and reader_review["blocking_findings"] == []
+    assert reader_review["source_state_reader_sha256"] == current_report["source_only_reader"]["sha256"]
+    assert file_ref(R3 / "verifier-current.py")["sha256"] == "fdf7757d98e18e2205da1ef2835297b9bd23e46c9efad598cdb23931ef89d827"
+    owned = report["ownership_inventory"]
+    assert len(owned) == len({identity(r) for r in owned}) == len({r["ProcessId"] for r in owned}) == 14
+    prior_by_pid = {r["ProcessId"]: r for r in before}
+    check_tree(report["source_only_pair"], report["source_only_owned_tree"], prior_by_pid)
+    check_tree(report["observer3_pair"], report["observer3_owned_tree"], prior_by_pid)
+    assert {identity(r) for r in owned} == {identity(r) for r in report["source_only_owned_tree"] + report["observer3_owned_tree"]}
+    possibilities(owned, (before, cold, current))
+    statuses = []
+    for row in owned:
+        record = {"pid": row["ProcessId"], "creation_utc": row["CreationDate"],
+                  "five_field_identity_sha256": hashlib.sha256(json.dumps({k: row[k] for k in FIELDS}, sort_keys=True).encode()).hexdigest()}
+        for label, rows in (("cold", cold), ("captured_current", current)):
+            matched = [r for r in rows if r["ProcessId"] == row["ProcessId"]]
+            if not matched:
+                record[label] = "pid_absent"
+            else:
+                actual = matched[0]
+                assert identity(actual) != identity(row) and birth(actual["CreationDate"]) > birth(row["CreationDate"])
+                record[label] = "different_complete_later_identity"
+        statuses.append(record)
+    old_observer_command = report["observer3_pair"][0]["CommandLine"]
+    for rows in (cold, current):
+        assert not any(SESSION in (r.get("CommandLine") or "") for r in rows)
+        assert not any(r.get("CommandLine") == old_observer_command for r in rows)
+        assert not any("observateur-mixte-r4b-r3/observer-mixte.py" in (r.get("CommandLine") or "").replace("\\", "/").casefold() for r in rows)
+    proof_refs = []
+    for subject, pair in (("source-only", report["source_only_pair"]), ("observer3", report["observer3_pair"])):
+        path = CURRENT_DIR / f"INPUT-{subject}-CURRENT.json"
+        proof = read(path)
+        assert proof["schema"] == "hpc-forest-passive-owned-pair-absence-v1" and proof["subject"] == subject
+        assert proof["verified"] is True and proof["no_stop_or_replay"] is True
+        assert {identity(r) for r in proof["owned_full_identities"]} == {identity(r) for r in pair}
+        assert proof["prior_full_cim"] == report["prior_full_cim"]
+        assert proof["fresh_full_cim"] == current_report["current_census"] and proof["historical_cold_cim"] == report["cold_full_cim"]
+        assert proof["fresh_full_cim"] in proof["evidence_refs"]
+        for value in proof["evidence_refs"]:
+            bound(value)
+        expected_tree = report["source_only_owned_tree" if subject == "source-only" else "observer3_owned_tree"]
+        assert len(proof["owned_descendants"]) == 5
+        for item in proof["owned_descendants"]:
+            fact = read(bound(item["ownership_evidence"]))
+            assert fact["verified"] is True and identity(fact["identity"]) == identity(item["identity"])
+            assert identity(fact["identity"]) in {identity(r) for r in expected_tree}
+            assert identity(fact["parent_identity"]) in {identity(r) for r in expected_tree}
+        proof_refs.append(file_ref(path))
+    copies = {}
+    for row in report["preserved_lifecycle_metadata"]:
+        path = bound(row["copy"])
+        assert file_ref(path)["bytes"] == row["bytes"]
+        assert row["copy"]["sha256"] == row["original"]["sha256"]
+        copies[path.name] = path
+    event_data = copies["worker-resume-events.jsonl"].read_text(encoding="utf-8-sig").splitlines()
+    events = [json.loads(line, object_pairs_hook=unique) for line in event_data if line.strip()]
+    assert len(events) == report["worker_event_count"] == 128
+    terminal = events[-1]
+    assert terminal == report["worker_last_event_metadata"] and terminal["event"] == "relay_maximum_reached"
+    refusals = sorted([read(path) for name, path in copies.items() if name.startswith("obs3-refus-")], key=lambda v: v["at"])
+    assert [r["consecutive"] for r in refusals] == [1, 2, 3]
+    assert all(r["error"] == "Source-only relay exited or complete identity changed" and r["no_repair_replay_or_stop"] is True for r in refusals)
+    attention = read(copies["obs3-attention-required.json"])
+    state = read(copies["obs3-observer-state.json"])
+    assert attention == refusals[-1] and state["stage"] == "attention_required"
+    assert terminal["utc_epoch"] < refusals[0]["at"] < refusals[1]["at"] < refusals[2]["at"] <= state["updated_at"]
+    assert datetime.fromtimestamp(state["updated_at"], UTC).isoformat().replace("+00:00", "Z")[:19] <= t1[:19]
+    interpretation = read(COLD / "INTERPRETATION-LIFECYCLE.json")
+    for key in ("worker_source", "observer3_source"):
+        bound(interpretation[key])
+    assert report["worker_os_exit_code_observed"] is None and report["observer3_os_exit_code_observed"] is None
+    assert file_ref(copies["worker-stdout.log"])["bytes"] == file_ref(copies["worker-stderr.log"])["bytes"] == 0
+    bound(report["scientific_reception"])
+    bound(report["reconciliation"])
+    assert report["scientific_reception"]["sha256"] == "6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7"
+    assert report["reconciliation"]["sha256"] == "0ed5c437d3737ec9a970a4183b3e80ce996e87a7f655e5fba9965a979682def8"
+    for path, expected in list(READ.items()):
+        assert file_ref(path)["sha256"] == expected["sha256"]
+    inputs = dict(READ)
+    (HERE / "INVENTAIRE-LECTURES-AVANT-APRES.json").write_text(json.dumps({"unchanged": True, "files": inputs}, indent=2) + "\n", encoding="utf-8")
+    result = {
+        "schema": "hpc-forest-so-obs3-natural-closure-independent-reception-v1", "verified": True,
+        "verification_scope": "Historical captured absence and lifecycle metadata only; no native admission",
+        "observed_utc": datetime.now(UTC).isoformat(), "blocking_findings": [],
+        "source_only_job_id": "751592", "source_only_session_id": SESSION,
+        "cold_reception": file_ref(cold_path), "current_verification": file_ref(current_report_path),
+        "prior_cim": report["prior_full_cim"], "cold_cim": report["cold_full_cim"], "captured_current_cim": current_report["current_census"],
+        "capture_times": {"prior": t0, "cold": t1, "captured_current": t2},
+        "captured_current_age_at_parent_validation_seconds": age,
+        "capture_name_was_not_used_as_timestamp": True,
+        "fresh_current_capture_or_freshness_claim_at_this_audit": False,
+        "all14_full_identities_verified_prior": True, "all14_absent_in_cold_and_captured_current": True,
+        "source_only_owned_count": 7, "observer3_owned_count": 7,
+        "identity_dispositions": statuses, "unresolved_possible_descendants": [],
+        "source_only_and_observer3_proofs": proof_refs,
+        "recorded_worker_terminal": {**terminal, "utc": datetime.fromtimestamp(terminal["utc_epoch"], UTC).isoformat()},
+        "observer3_refusals": refusals,
+        "observer3_final_state": {"stage": state["stage"], "updated_at": state["updated_at"]},
+        "lifecycle_interpretation": file_ref(COLD / "INTERPRETATION-LIFECYCLE.json"),
+        "scientific_reception": report["scientific_reception"], "reconciliation": report["reconciliation"],
+        "input_inventory": file_ref(HERE / "INVENTAIRE-LECTURES-AVANT-APRES.json"),
+        "no_replay_in_received_lifecycle_evidence": True,
+        "worker_os_exitcode_observed": None, "observer3_os_exitcode_observed": None,
+        "precise_OS_termination_events_observed": False,
+        "native_generation_admitted": False, "observer_transition_or_start_admitted": False,
+        "processes_stopped_or_launched": False, "RPC_CLI_model_CIM_live_cache_DB_lock_calls": 0,
+        "limitations": ["Absence certifiée seulement aux captures liées, pas à l'heure de cette revue; toute action ultérieure nécessite sa propre observation fraîche.", "Sorties autonomes cohérentes avec relay_maximum_reached et les trois refus/attention_required, mais codes de sortie OS et événement exact de terminaison non capturés.", "Les étrangers opaques sans lien ne sont pas adoptés et aucune absence globale de processus ininspectables n'est affirmée.", "La revue ne décode aucun payload candidat, ne rejoue aucun appel et n'accorde ni génération, ni transition, ni ouverture de transport/verrou."],
+    }
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"path": str(out), "sha256": hashlib.sha256(out.read_bytes()).hexdigest(), "owned": 14, "captured_current_rows": len(current)}))
+
+
+if __name__ == "__main__":
+    main()

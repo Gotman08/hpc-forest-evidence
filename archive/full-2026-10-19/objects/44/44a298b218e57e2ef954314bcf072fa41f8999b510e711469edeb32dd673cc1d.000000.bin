@@ -1,0 +1,51 @@
+set -euo pipefail
+[[ ${SLURM_JOB_ID:-} =~ ^[0-9]+$ ]]
+test "$(uname -m)" = aarch64
+test "${SLURM_CPUS_PER_TASK:-}" = 4
+test "${SLURM_NTASKS:-1}" = 1
+test "${SLURM_JOB_NUM_NODES:-1}" = 1
+test "${SLURM_MEM_PER_NODE:-}" = 16384
+test -z "${SLURM_JOB_GPUS:-}${SLURM_STEP_GPUS:-}"
+test "${SLURM_GPUS:-0}" = 0
+test "${SLURM_GPUS_ON_NODE:-0}" = 0
+archive=/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-qualification-20261018-r1-ed2cc913cd5e.tar.gz
+shared=/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-qualification-20261018-r1-ed2cc913cd5e
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+test ! -e "$shared"
+test -x "$py"
+printf '%s  %s\n' f58dbb52fdec031bd6b84838db67e14eafb08c39308d07198aae3156d0cc5bf5 "$archive" | sha256sum -c -
+"$py" -I -B - "$archive" "$shared" <<'EXTRACT'
+import hashlib,json,shutil,stat,sys,tarfile,zipfile
+from pathlib import Path
+archive,root=Path(sys.argv[1]),Path(sys.argv[2])
+root.mkdir(parents=True,exist_ok=False)
+with tarfile.open(archive) as t:
+ for info in t.getmembers():
+  if info.isdir():continue
+  assert info.isfile() and info.name.startswith('payload/')
+  rel=Path(info.name.removeprefix('payload/'));assert not rel.is_absolute() and '..' not in rel.parts
+  target=root/rel;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(t.extractfile(info).read())
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+for name,expected in json.loads((root/'payload-manifest.json').read_text()).items():
+ p=root/name;assert p.resolve().is_relative_to(root.resolve()) and sha(p)==expected,name
+for item in json.loads((root/'existing-official-dependencies.json').read_text()):
+ source=Path(item['source']);target=root/item['destination'];assert sha(source)==item['sha256']
+ target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(source,target);assert sha(target)==item['sha256']
+with zipfile.ZipFile(root/'project.zip') as z:
+ for info in z.infolist():
+  assert info.filename.startswith('HPC-Forest/') and not stat.S_ISLNK(info.external_attr>>16)
+  rel=Path(info.filename.removeprefix('HPC-Forest/'));assert not rel.is_absolute() and '..' not in rel.parts
+  target=root/'project'/rel
+  if info.is_dir():target.mkdir(parents=True,exist_ok=True)
+  else:target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(z.read(info))
+expected=json.loads((root/'runtime-manifest.json').read_text())
+actual={p.relative_to(root/'project').as_posix():sha(p) for p in (root/'project').rglob('*') if p.is_file()}
+assert actual==expected
+plan=json.loads((root/'dynamic-plan.json').read_text());assert sha(root/'project.zip')==plan['source_zip_sha256']
+print(json.dumps({'source_files':len(actual),'source_zip_sha256':sha(root/'project.zip'),'plan_sha256':sha(root/'dynamic-plan.json'),'native_model_calls':0}),flush=True)
+EXTRACT
+romeo_load_armgpu_env
+spack load /zrtbeqke25s2vbqo4yrhsowjz7mg3pjf
+export PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=TRUE CUDA_VISIBLE_DEVICES=
+ulimit -s unlimited
+exec srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores "$py" -I -B -u "$shared/qualifier-r4b.py" --root "$shared"

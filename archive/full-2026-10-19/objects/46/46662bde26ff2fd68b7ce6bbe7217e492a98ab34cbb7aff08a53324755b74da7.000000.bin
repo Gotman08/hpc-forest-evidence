@@ -1,0 +1,280 @@
+"""Pure, deliberately partial checks proposed for a future isolated receipt reader.
+
+No file/process/network/model operation and no admission or receipt writer exists here.
+These checks never replace the frozen actor, CLI, event-lifecycle, response, closed
+mother-contract, reconciliation, exit or archive guards. All SHA inputs must come
+from immutable, independently bound received evidence, not from a new authorization.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+from pathlib import PurePosixPath, PureWindowsPath
+
+PROTOCOL = "hpc-forest-codex-mailbox-v1"
+REQUEST_NAMES = frozenset({
+    "protocol", "kind", "meta_role", "owner_key", "nonce", "session_id", "model",
+    "reasoning_effort", "mission_id", "integration_source_ids", "token_ceiling",
+    "expires_at", "schema", "messages",
+})
+TOP_FILES = frozenset({
+    "OWNER.json", "worker-ready.json", "CLI-IDENTITY-VERIFIED.json", "CELL-BINDING.json", "worker.lock",
+})
+NONCE_FILES = frozenset({
+    "downloaded-request.json", "download-receipt.json", "generation-claimed.json",
+    "instructions.txt", "output-schema.json", "invocation.json", "request.json",
+    "codex.jsonl", "codex.jsonl.json", "process.json", "response.json",
+    "response-ready.json", "delivered.json", "agent-result.json",
+})
+USAGE_REQUIRED = frozenset({"input_tokens", "output_tokens"})
+USAGE_OPTIONAL = frozenset({"cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens"})
+
+
+class EvidenceError(ValueError):
+    """Unbound, unknown, altered, duplicate or non-normal evidence."""
+
+
+def need(condition, code):
+    if not condition:
+        raise EvidenceError(code)
+
+
+def sha(raw):
+    need(type(raw) is bytes, "bytes_required")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def hex_digest(value, length=64):
+    return isinstance(value, str) and re.fullmatch("[0-9a-f]{" + str(length) + "}", value) is not None
+
+
+def _pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result, "duplicate_json_member")
+        result[key] = value
+    return result
+
+
+def _finite(value):
+    raise EvidenceError("nonfinite_json_constant")
+
+
+def decode_object(raw):
+    """Reject duplicate keys at every object depth, nonfinite numbers and nonobjects."""
+    need(type(raw) is bytes, "bytes_required")
+    try:
+        value = json.loads(raw.decode("utf8", errors="strict"), object_pairs_hook=_pairs, parse_constant=_finite)
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise EvidenceError("invalid_or_duplicate_json") from exc
+    need(isinstance(value, dict), "json_object_required")
+    # json.loads can also produce inf from a syntactically ordinary huge exponent.
+    try:
+        json.dumps(value, allow_nan=False)
+    except (ValueError, RecursionError) as exc:
+        raise EvidenceError("nonfinite_or_deep_json") from exc
+    return value
+
+
+def canonical(value):
+    """Same finite JSON serialization as core.canonical; preserves bool/int/float types."""
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise EvidenceError("invalid_canonical_json") from exc
+
+
+def same(left, right):
+    return canonical(left) == canonical(right)
+
+
+def _number(value):
+    return (type(value) is int and value >= 0) or (type(value) is float and math.isfinite(value) and value >= 0)
+
+
+def request_pair(downloaded_raw, native_raw, *, downloaded_sha256, native_sha256,
+                 canonical_sha256, session_id, nonce, model, phase, token_ceiling=196608):
+    """Compare entire JSON values, retaining two distinct raw SHA and one canonical SHA.
+
+    canonical_sha256 is the existing authorization's allowed_request_sha256, with
+    its complete actor/source/plan/job/CLI binding still checked by the outer reader.
+    downloaded_sha256 remains the hash used by claim/invocation/process/response;
+    native_sha256 only authenticates the received worker serialization.
+    """
+    need(all(hex_digest(value) for value in (downloaded_sha256, native_sha256, canonical_sha256)), "request_sha_pins_required")
+    need(sha(downloaded_raw) == downloaded_sha256 and sha(native_raw) == native_sha256, "request_raw_sha_differs")
+    downloaded, native = decode_object(downloaded_raw), decode_object(native_raw)
+    need(set(downloaded) == set(native) == REQUEST_NAMES, "unknown_or_missing_request_field")
+    need(same(downloaded, native), "request_semantics_differ")
+    need(sha(canonical(downloaded)) == canonical_sha256, "authorized_canonical_request_differs")
+    need(hex_digest(session_id, 32) and hex_digest(nonce, 32) and phase in {"roots", "advice", "harvest"}
+         and isinstance(model, str) and bool(model.strip()), "invalid_expected_request_identity")
+    need(type(token_ceiling) is int and token_ceiling == 196608, "historical_request_budget_required")
+    need(native["protocol"] == PROTOCOL and native["kind"] == "source-proposal"
+         and native["meta_role"] == "mother-dynamic-" + phase and native["session_id"] == session_id
+         and native["nonce"] == nonce and native["model"] == model and native["reasoning_effort"] == "max"
+         and type(native["token_ceiling"]) is int and native["token_ceiling"] == token_ceiling,
+         "request_identity_effort_or_budget_differs")
+    need(all(isinstance(native[key], str) and bool(native[key].strip()) for key in ("owner_key", "mission_id"))
+         and native["integration_source_ids"] == [] and _number(native["expires_at"]) and native["expires_at"] > 0
+         and isinstance(native["schema"], dict) and bool(native["schema"]), "request_metadata_shape_differs")
+    messages = native["messages"]
+    need(isinstance(messages, list) and len(messages) == 2
+         and all(isinstance(item, dict) and set(item) == {"role", "content"}
+                 and isinstance(item["content"], str) and bool(item["content"].strip()) for item in messages)
+         and [item["role"] for item in messages] == ["system", "user"], "request_message_shape_differs")
+    return {"downloaded_raw_sha256": downloaded_sha256, "native_raw_sha256": native_sha256,
+            "raw_bytes_identical": downloaded_raw == native_raw, "canonical_sha256": canonical_sha256,
+            "semantic_json_equal": True, "scope": "request serialization only; no native admission"}
+
+
+def closed_inventory(before, after, nonce):
+    """Check caller-measured inventories; this pure function does not measure files.
+
+    The outer cold receiver must rehash all regular files, reject aliases/junctions
+    and establish natural exit before invoking this subset check. A supplied dict
+    alone is never proof of a snapshot or proof that a live lock may be read.
+    """
+    need(hex_digest(nonce, 32), "invalid_nonce")
+    expected = TOP_FILES | {nonce + "/" + name for name in NONCE_FILES}
+    for inventory in (before, after):
+        need(isinstance(inventory, dict) and set(inventory) == expected
+             and all(hex_digest(value) for value in inventory.values()), "unlisted_missing_or_arbitrary_snapshot_file")
+    need(before == after, "snapshot_inventory_changed")
+    return len(expected)
+
+
+def known_sidecar(sidecar_raw, invocation_raw, process_raw, *, before, after, nonce,
+                  sidecar_relative, jsonl_sha256, downloaded_sha256, model, original_nonce_dir):
+    """Bind exactly codex.jsonl.json to the original invocation/process/opaque stream.
+
+    No alias rewriting, alternate filename or additional sidecar is accepted. The
+    unchanged outer CLI argv gate remains required; this only cross-checks records.
+    """
+    need(isinstance(model, str) and bool(model.strip()), "expected_model_required")
+    closed_inventory(before, after, nonce)
+    need(sidecar_relative == nonce + "/codex.jsonl.json", "arbitrary_sidecar_refused")
+    need(sha(sidecar_raw) == before[sidecar_relative]
+         and sha(invocation_raw) == before[nonce + "/invocation.json"]
+         and sha(process_raw) == before[nonce + "/process.json"]
+         and hex_digest(jsonl_sha256) and jsonl_sha256 == before[nonce + "/codex.jsonl"]
+         and hex_digest(downloaded_sha256) and downloaded_sha256 == before[nonce + "/downloaded-request.json"],
+         "sidecar_or_linked_raw_sha_differs")
+    sidecar, invocation, process = map(decode_object, (sidecar_raw, invocation_raw, process_raw))
+    need(set(sidecar) == {"argv", "returncode", "seconds", "timed_out", "log"}, "unknown_sidecar_field")
+    need(set(invocation) == {"argv", "model", "reasoning_effort", "request_sha256", "hosted_inference", "source_execution_allowed"}
+         and invocation["model"] == model and invocation["reasoning_effort"] == "max"
+         and invocation["request_sha256"] == downloaded_sha256 and invocation["hosted_inference"] is True
+         and invocation["source_execution_allowed"] is False, "sidecar_invocation_binding_differs")
+    need(set(process) == {"returncode", "timed_out", "seconds", "log_sha256", "request_sha256", "never_model_input"}
+         and type(process["returncode"]) is int and process["returncode"] == 0 and process["timed_out"] is False
+         and _number(process["seconds"]) and process["log_sha256"] == jsonl_sha256
+         and process["request_sha256"] == downloaded_sha256 and process["never_model_input"] is True,
+         "sidecar_process_binding_differs")
+    need(same(sidecar["argv"], invocation["argv"])
+         and all(same(sidecar[key], process[key]) for key in ("returncode", "timed_out", "seconds")),
+         "sidecar_execution_differs")
+    argv = invocation["argv"]
+    need(isinstance(argv, list) and all(isinstance(arg, str) and arg and "\0" not in arg for arg in argv)
+         and argv.count("-C") == 1 and argv.index("-C") + 1 < len(argv)
+         and argv[argv.index("-C") + 1] == original_nonce_dir, "sidecar_original_cwd_differs")
+    need(isinstance(original_nonce_dir, str) and "\0" not in original_nonce_dir, "original_cwd_required")
+    path = PureWindowsPath(original_nonce_dir)
+    if not path.is_absolute():
+        path = PurePosixPath(original_nonce_dir)
+    need(path.is_absolute() and ".." not in path.parts and path.name == nonce, "original_cwd_not_exact_nonce")
+    need(sidecar["log"] == str(path / "codex.jsonl"), "sidecar_original_stream_path_differs")
+    return {"sidecar_relative": sidecar_relative, "sidecar_sha256": sha(sidecar_raw),
+            "invocation_sha256": sha(invocation_raw), "process_sha256": sha(process_raw),
+            "jsonl_sha256": jsonl_sha256, "scope": "historical run_process record linkage only; no NORMAL verdict"}
+
+
+def usage_events(completed_event_raws):
+    """One closed turn.completed, totals=input+output; subdivisions are never added.
+
+    Reasoning is already part of output. Cached/cache-write counters are retained as
+    reported input subdivisions; no disjointness, backend billing or extra charge is
+    inferred. Absence stays absence, rather than an invented exact zero.
+    """
+    need(isinstance(completed_event_raws, (list, tuple)) and len(completed_event_raws) == 1,
+         "exactly_one_completed_usage_event_required")
+    event = decode_object(completed_event_raws[0])
+    need(set(event) == {"type", "usage"} and event["type"] == "turn.completed", "closed_completed_event_required")
+    usage = event["usage"]
+    need(isinstance(usage, dict) and USAGE_REQUIRED <= set(usage) <= USAGE_REQUIRED | USAGE_OPTIONAL,
+         "unknown_or_missing_usage_field")
+    need(all(type(value) is int and value >= 0 for value in usage.values()), "noninteger_or_negative_usage")
+    for key in ("cached_input_tokens", "cache_write_input_tokens"):
+        need(key not in usage or usage[key] <= usage["input_tokens"], "input_subdivision_exceeds_reported_input")
+    need("reasoning_output_tokens" not in usage or usage["reasoning_output_tokens"] <= usage["output_tokens"],
+         "reasoning_exceeds_reported_output")
+    return {"tokens": usage["input_tokens"] + usage["output_tokens"], "reported_usage": dict(usage),
+            "completed_event_raw_sha256": sha(completed_event_raws[0]),
+            "reasoning_and_cache_added_again": False, "scope": "reported single CLI turn usage; no backend billing attestation"}
+
+
+def normal_stream_blockers(raw):
+    """Return only positions/kinds/SHA, never message bodies or reasoning.
+
+    This is an additional refusal gate, not a replacement event-lifecycle audit.
+    Every WARN/non-JSON/error/unknown event is a blocker, including previously known
+    WARNs. No allowlist can turn the actual diagnostic-bearing stream into NORMAL.
+    """
+    need(type(raw) is bytes, "bytes_required")
+    try:
+        lines = raw.decode("utf8", errors="strict").splitlines()
+    except UnicodeError as exc:
+        raise EvidenceError("non_utf8_stream") from exc
+    blockers = []
+    for number, line in enumerate(lines, 1):
+        line_raw = line.encode("utf8")
+        kind = None
+        try:
+            event = decode_object(line_raw)
+        except EvidenceError:
+            kind = "warn_or_non_json_line" if "WARN" in line else "blank_or_invalid_json_line"
+        else:
+            event_type = event.get("type")
+            if not isinstance(event_type, str):
+                kind = "unknown_event_type"
+            elif event_type == "thread.started":
+                if set(event) != {"type", "thread_id"} or not isinstance(event["thread_id"], str) or not event["thread_id"]:
+                    kind = "unknown_thread_shape"
+            elif event_type == "turn.started":
+                if set(event) != {"type"}:
+                    kind = "unknown_turn_shape"
+            elif event_type in {"item.started", "item.updated", "item.completed"}:
+                item = event.get("item")
+                if not isinstance(item, dict) or set(event) != {"type", "item"}:
+                    kind = "unknown_item_shape"
+                elif item.get("type") == "error":
+                    kind = "native_item_error"
+                elif set(item) != {"id", "type", "text"} or item.get("type") not in {"reasoning", "agent_message"}:
+                    kind = "unknown_or_tool_item"
+                elif not isinstance(item["id"], str) or not item["id"] or not isinstance(item["text"], str):
+                    kind = "unknown_item_value"
+            elif event_type == "turn.completed":
+                try:
+                    usage_events([line_raw])
+                except EvidenceError:
+                    kind = "unknown_or_invalid_usage"
+            else:
+                kind = "unknown_or_error_event"
+        if kind:
+            blockers.append({"line": number, "kind": kind, "line_sha256": sha(line_raw)})
+    need(bool(lines), "empty_stream")
+    return blockers
+
+
+def refuse_stream_diagnostics(raw):
+    blockers = normal_stream_blockers(raw)
+    need(not blockers, "normal_refused_diagnostics_or_unknown_stream")
+
+
+def require_nonempty_roots(data):
+    """A refusal floor only; full mother.validate_directions MUST still run unchanged."""
+    need(isinstance(data, dict) and set(data) == {"analysis", "directions"}
+         and isinstance(data["analysis"], str) and isinstance(data["directions"], list)
+         and 1 <= len(data["directions"]) <= 8, "normal_refused_empty_or_invalid_roots")

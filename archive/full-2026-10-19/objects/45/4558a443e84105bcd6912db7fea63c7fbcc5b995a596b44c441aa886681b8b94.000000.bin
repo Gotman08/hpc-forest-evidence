@@ -1,0 +1,296 @@
+"""Pure versioned host-policy regressions; no CLI, host, model or transport starts."""
+import json
+import time
+import tomllib
+from subprocess import list2cmdline
+from types import SimpleNamespace
+
+import pytest
+
+from hpc_forest import codex_process, native_matrix
+from hpc_forest.codex_mailbox import EFFORT, MODEL, sha256
+from hpc_forest.core import InfrastructureError, atomic_json, file_digest
+
+FEATURE_NAMES = [
+    "skip_host_skill_discovery", "shell_tool", "unified_exec", "apps", "plugins", "memories",
+    "multi_agent", "multi_agent_v2", "hooks", "skill_search", "browser_use", "computer_use",
+    "image_generation", "view_image", "workspace_dependencies", "code_mode_host", "code_mode",
+    "code_mode_only", "sleep_tool", "unbounded_connection_retries", "shell_snapshot", "goals",
+]
+
+
+def policy_fixture(tmp_path):
+    binding = {"scope_id": native_matrix.SCOPE, "model": MODEL, "effort": EFFORT,
+               "session_id": "3b1de5658e4641149b15a3bea4850239", "job_id": "900000",
+               "remote_root": "/scratch_p/NEUTRAL", "source_zip_sha256": "1" * 64,
+               "plan_sha256": "2" * 64}
+    policy = {"schema": codex_process.TASK_CLI_POLICY_SCHEMA, **binding,
+              "cli_executable_sha256": "3" * 64,
+              "skill_candidate_directories": ["C:/NEUTRAL/skill-one"],
+              "filesystem_metadata_sha256": "4" * 64,
+              "is_actual_CLI_discovery_receipt": False, "instruction_or_SKILL_body_read": False,
+              "cli_feature_overrides": dict(codex_process.TASK_CLI_FEATURES),
+              "code_mode_host_executable_sha256": codex_process.CODE_MODE_HOST_SHA256}
+    path = tmp_path / ("cli-policy-" + binding["session_id"] + ".json")
+    atomic_json(path, policy)
+    return path, policy, binding
+
+
+def request_fixture():
+    return {"model": MODEL, "reasoning_effort": EFFORT, "schema": {"type": "object"},
+            "messages": [{"role": "system", "content": "NEUTRAL"},
+                         {"role": "user", "content": "NEUTRAL"}]}
+
+
+@pytest.mark.parametrize("feature", FEATURE_NAMES)
+def test_any_feature_boolean_change_is_refused_before_generation(tmp_path, feature):
+    path, policy, binding = policy_fixture(tmp_path)
+    policy["cli_feature_overrides"][feature] = not policy["cli_feature_overrides"][feature]
+    atomic_json(path, policy)
+    with pytest.raises(InfrastructureError):
+        codex_process.load_task_cli_policy(path, file_digest(path), binding, "3" * 64)
+
+
+@pytest.mark.parametrize("mutation", ["old_schema", "missing_host_pin", "wrong_host_pin",
+                                     "missing_feature", "extra_feature", "numeric_host", "numeric_tool"])
+def test_host_contract_schema_pin_and_closed_typed_map_are_required(tmp_path, mutation):
+    path, policy, binding = policy_fixture(tmp_path)
+    if mutation == "old_schema":
+        policy["schema"] = "hpc-forest-r2e-local-cli-policy-v1"
+    elif mutation == "missing_host_pin":
+        del policy["code_mode_host_executable_sha256"]
+    elif mutation == "wrong_host_pin":
+        policy["code_mode_host_executable_sha256"] = "f" * 64
+    elif mutation == "missing_feature":
+        del policy["cli_feature_overrides"]["shell_tool"]
+    elif mutation == "extra_feature":
+        policy["cli_feature_overrides"]["NEUTRAL_unknown"] = False
+    else:
+        policy["cli_feature_overrides"]["code_mode_host" if mutation == "numeric_host" else "shell_tool"] = (
+            1 if mutation == "numeric_host" else 0)
+    atomic_json(path, policy)
+    with pytest.raises(InfrastructureError):
+        codex_process.load_task_cli_policy(path, file_digest(path), binding, "3" * 64)
+
+
+@pytest.mark.parametrize("policy", [None, {}, {"schema": "hpc-forest-r2e-local-cli-policy-v1"}])
+def test_unversioned_command_is_refused_before_cli_lookup_or_output(tmp_path, monkeypatch, policy):
+    monkeypatch.setattr(codex_process, "CLI_POLICY", policy)
+
+    def forbidden_lookup(_):
+        raise AssertionError("No CLI lookup is allowed before the versioned policy")
+
+    monkeypatch.setattr(codex_process.shutil, "which", forbidden_lookup)
+    output = tmp_path / "NEUTRAL-not-created"
+    with pytest.raises(InfrastructureError, match="versioned R2g"):
+        codex_process.command_for(request_fixture(), output)
+    assert not output.exists()
+
+
+def projection_fixture(tmp_path, monkeypatch):
+    path, policy, binding = policy_fixture(tmp_path)
+    assert codex_process.load_task_cli_policy(path, file_digest(path), binding, "3" * 64) == policy
+    monkeypatch.setattr(codex_process, "CLI_POLICY", policy)
+    monkeypatch.setattr(codex_process.shutil, "which", lambda _: "C:/NEUTRAL/codex.exe")
+    output = tmp_path / ("7" * 32)
+    argv = codex_process.command_for(request_fixture(), output)
+    raw = output / "invocation.json"
+    atomic_json(raw, {"argv": argv, "model": MODEL, "reasoning_effort": EFFORT,
+                      "source_execution_allowed": False, "hosted_inference": True})
+    cli = {"executable_path": argv[0], "task_cli_policy_sha256": file_digest(path)}
+    return policy, codex_process.cli_metadata_projection(raw, file_digest(path), "invocation"), cli
+
+
+def test_canonical_feature_order_is_independent_of_private_JSON_order(tmp_path, monkeypatch):
+    policy, projection, cli = projection_fixture(tmp_path, monkeypatch)
+    canonical = list(projection["argv_public"])
+    policy["cli_feature_overrides"] = dict(reversed(list(policy["cli_feature_overrides"].items())))
+    monkeypatch.setattr(codex_process, "CLI_POLICY", policy)
+    argv = codex_process.command_for(request_fixture(), tmp_path / ("7" * 32))
+    assert [arg.split("=", 1)[0][9:] for arg in argv if arg.startswith("features.")] == FEATURE_NAMES
+    assert sum(arg == "features.code_mode_host=true" for arg in argv) == 1
+    assert all(arg.endswith("=false") for arg in argv
+               if arg.startswith("features.") and not arg.startswith("features.code_mode_host="))
+    raw = tmp_path / ("7" * 32) / "invocation.json"
+    atomic_json(raw, {"argv": argv, "model": MODEL, "reasoning_effort": EFFORT})
+    shuffled = codex_process.cli_metadata_projection(raw, cli["task_cli_policy_sha256"], "invocation")
+    assert shuffled["argv_public"] == canonical
+    codex_process.check_cli_metadata_projection(shuffled, "invocation", cli, MODEL)
+
+
+@pytest.mark.parametrize("mutation", ["host_false", "tool_true", "numeric_host", "extra_feature", "missing_feature"])
+def test_public_projection_does_not_reintroduce_tool_or_old_host_policy(tmp_path, monkeypatch, mutation):
+    _, projection, cli = projection_fixture(tmp_path, monkeypatch)
+    argv = projection["argv_public"]
+    index = argv.index("features.code_mode_host=true")
+    if mutation == "host_false":
+        argv[index] = "features.code_mode_host=false"
+    elif mutation == "tool_true":
+        argv[argv.index("features.shell_tool=false")] = "features.shell_tool=true"
+    elif mutation == "numeric_host":
+        argv[index] = "features.code_mode_host=1"
+    elif mutation == "extra_feature":
+        argv[-1:-1] = ["--config", "features.NEUTRAL_unknown=false"]
+    else:
+        del argv[index - 1:index + 1]
+    with pytest.raises(InfrastructureError):
+        codex_process.check_cli_metadata_projection(projection, "invocation", cli, MODEL)
+
+
+@pytest.mark.parametrize("item_type", ["command_execution", "mcp_tool_call", "web_search"])
+def test_host_candidate_never_admits_tool_events(tmp_path, item_type):
+    raw = (json.dumps({"type": "item.completed", "item": {"type": item_type}}) + "\n" +
+           json.dumps({"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 3}}) + "\n").encode()
+    path = tmp_path / "NEUTRAL-tool-event.jsonl"
+    path.write_bytes(raw)
+    assert codex_process.diagnostics_from_events(path)["clean"] is False
+    usage, tools = codex_process.usage_from_events(path)
+    assert tools is True and usage["tool_events"] == [item_type]
+    assert path.read_bytes() == raw
+
+
+def command_policy(candidates):
+    return {"schema": codex_process.TASK_CLI_POLICY_SCHEMA,
+            "cli_feature_overrides": dict(codex_process.TASK_CLI_FEATURES),
+            "code_mode_host_executable_sha256": codex_process.CODE_MODE_HOST_SHA256,
+            "skill_candidate_directories": candidates}
+
+
+def test_candidate_argv_is_real_TOML_MAX_OAuth_no_tools_and_under_Windows_limit(tmp_path, monkeypatch):
+    executable = "C:/NEUTRAL/pinned/codex.exe"
+    monkeypatch.setattr(codex_process.shutil, "which", lambda _: executable)
+    candidates = ["C:/NEUTRAL/skill-one", "C:/NEUTRAL/skill-two"]
+    monkeypatch.setattr(codex_process, "CLI_POLICY", command_policy(candidates))
+    request = {"model": MODEL, "reasoning_effort": EFFORT,
+               "schema": {"type": "object", "properties": {"NEUTRAL": {"type": "boolean"}}},
+               "messages": [{"role": "system", "content": "NEUTRAL frozen instructions"},
+                            {"role": "user", "content": "NEUTRAL"}]}
+    output = tmp_path / "NEUTRAL-argv"
+    argv = codex_process.command_for(request, output, executable)
+    overrides = [argv[index + 1] for index, token in enumerate(argv) if token == "--config"]
+    values = tomllib.loads("\n".join(overrides))
+    assert values["model_reasoning_effort"] == "max"
+    assert values["forced_login_method"] == "chatgpt"
+    assert values["model_context_window"] == 65536
+    assert values["project_doc_max_bytes"] == 0 and values["web_search"] == "disabled"
+    assert values["features"] == codex_process.TASK_CLI_FEATURES
+    assert values["features"]["code_mode_host"] is True
+    for field in ("skip_host_skill_discovery", "code_mode", "code_mode_only"):
+        assert values["features"][field] is False
+    assert values["skills"]["include_instructions"] is False
+    assert values["skills"]["bundled"]["enabled"] is False
+    assert values["skills"]["max_context_tokens"] == 1
+    assert values["skills"]["config"] == [
+        {"path": path, "enabled": False} for path in candidates]
+    assert len(values["skills"]["config"]) == 2
+    assert "--ignore-user-config" in argv and "--strict-config" in argv
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert argv[argv.index("--model") + 1] == MODEL
+    assert len(list2cmdline(argv).encode("utf-16-le")) // 2 + 1 < 32767
+    assert (output / "instructions.txt").read_text("utf8") == request["messages"][0]["content"]
+
+
+def test_oversized_quoted_command_refused_before_any_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(codex_process.shutil, "which", lambda _: "C:/NEUTRAL/codex.exe")
+    monkeypatch.setattr(codex_process, "CLI_POLICY", command_policy(["C:/NEUTRAL/" + "x" * 33000]))
+    request = {"model": MODEL, "reasoning_effort": EFFORT, "schema": {"type": "object"},
+               "messages": [{"role": "system", "content": "NEUTRAL"},
+                            {"role": "user", "content": "NEUTRAL"}]}
+    with pytest.raises(InfrastructureError, match="argument limit"):
+        codex_process.command_for(request, tmp_path / "NEUTRAL-oversized")
+
+
+@pytest.mark.parametrize("value", [{"path": "C:/NEUTRAL", "enabled": True}, {"name": "*", "enabled": False}, None])
+def test_TOML_serializer_rejects_enabled_or_guessed_selector(value):
+    with pytest.raises(InfrastructureError):
+        codex_process.toml_override_value(value)
+
+
+@pytest.mark.parametrize("raw,category", [
+    (b"WARN NEUTRAL loader diagnostic\n", "non_json_or_malformed_json"),
+    (b'{"type":"error","message":"NEUTRAL"}\n', "diagnostic_event"),
+    (b'{"type":"item.completed","item":{"type":"error","message":"NEUTRAL"}}\n', "diagnostic_item"),
+    (b'{"type":"warning"}\n', "diagnostic_event"),
+    (b'{"level":"WARN","message":"NEUTRAL"}\n', "diagnostic_severity"),
+    (b'{"error":{"message":"NEUTRAL"}}\n', "event_error_field"),
+    (b"\xff\n", "invalid_utf8"),
+    (b"[]\n", "non_object_event"),
+    (b'{"type":"item.completed","item":{}}\n', "unknown_or_tool_item"),
+    (b'{"type":"item.completed","item":null}\n', "unknown_or_tool_item"),
+    (b'{"type":"NEUTRAL-unknown-event"}\n', "unknown_event_type"),
+    (b'{"type":"turn.completed","type":"error"}\n', "non_json_or_malformed_json"),
+    (b'{"type":"turn.completed","duration":NaN}\n', "non_json_or_malformed_json"),
+    (b"\n \n", "empty_cli_log"),
+])
+def test_all_raw_diagnostics_refused_without_allowlist(tmp_path, raw, category):
+    path = tmp_path / "NEUTRAL.jsonl"
+    path.write_bytes(raw)
+    result = codex_process.diagnostics_from_events(path)
+    assert result["clean"] is False and result["counts"].get(category) == 1
+    assert result["codex_jsonl_sha256"] == sha256(raw)
+    assert path.read_bytes() == raw
+    assert result["diagnostic_allowlist_or_suppression"] is False
+    assert "message" not in result["findings"][0]
+
+
+def test_model_text_is_not_reclassified_as_system_diagnostic(tmp_path):
+    raw = (b'{"type":"item.completed","item":{"id":"NEUTRAL","type":"agent_message","text":"NEUTRAL WARN word"}}\n'
+           b'{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}\n')
+    path = tmp_path / "NEUTRAL.jsonl"
+    path.write_bytes(raw)
+    assert codex_process.diagnostics_from_events(path)["clean"] is True
+
+
+@pytest.mark.parametrize("raw", [b'{"type":"turn.started"}\n',
+                                 b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n' * 2])
+def test_missing_or_multiple_completed_events_never_promote_NORMAL(tmp_path, raw):
+    path = tmp_path / "NEUTRAL-incomplete.jsonl"
+    path.write_bytes(raw)
+    result = codex_process.diagnostics_from_events(path)
+    assert result["clean"] is False and result["counts"]["missing_or_ambiguous_completed_event"] == 1
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_R4b_phase_policy_and_exact_digest_guard_before_inert_process(tmp_path, monkeypatch, diagnostic):
+    from hpc_forest import dynamic_admission as admission
+    from hpc_forest.core import digest
+    request = {"model": MODEL, "reasoning_effort": EFFORT, "session_id": "a" * 32,
+               "nonce": "b" * 32, "meta_role": "mother-dynamic-roots", "expires_at": time.time() + 60,
+               "messages": [{"role": "system", "content": "NEUTRAL"}, {"role": "user", "content": "NEUTRAL"}]}
+    auth = {"scope_id": native_matrix.SCOPE, "purpose": "technical-contract", "technical_phase": "roots",
+            "allowed_request_sha256": digest(request), "model": MODEL, "session_id": "a" * 32}
+    order = []
+    monkeypatch.setattr(codex_process, "check_dependencies", lambda *_: auth)
+    monkeypatch.setattr(admission, "verify_local_cli", lambda *_: order.append("CLI4"))
+    monkeypatch.setattr(admission, "verify_task_cli_policy", lambda *_: order.append("policy") or {"NEUTRAL": True})
+    monkeypatch.setattr(codex_process, "CLI_POLICY", {"NEUTRAL": True})
+    monkeypatch.setattr(codex_process, "CLI_POLICY_REFERENCE", {"path": str(tmp_path / "NEUTRAL-policy"), "sha256": "f" * 64})
+    monkeypatch.setattr(codex_process, "command_for", lambda *_: ["NEUTRAL-never-executable"])
+    def inert_process(argv, cwd, log, seconds, **kwargs):
+        assert order == ["CLI4", "policy"] and argv == ["NEUTRAL-never-executable"]
+        assert kwargs["env"] == {"OPENAI_API_KEY": "", "CODEX_API_KEY": ""}
+        order.append("inert_process")
+        log.write_bytes(b'{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}\n'
+                        + (b'WARN NEUTRAL preserved\n' if diagnostic else b''))
+        atomic_json(tmp_path / "agent-result.json", {"NEUTRAL": True})
+        return SimpleNamespace(log=str(log), seconds=0.125, returncode=0, timed_out=False)
+    monkeypatch.setattr(codex_process, "run_process", inert_process)
+    response = codex_process.run_codex(request, "c" * 64, tmp_path, tmp_path / "NEUTRAL-auth", {native_matrix.SCOPE})
+    assert response["usage"]["tokens"] == 10 and response["infrastructure_error"] is diagnostic
+    assert json.loads((tmp_path / "process.json").read_text("utf8"))["seconds"] == 0.125
+    assert order == ["CLI4", "policy", "inert_process"]
+    request["meta_role"] = "mother-dynamic-advice"
+    with pytest.raises(InfrastructureError, match="another request"):
+        codex_process.run_codex(request, "c" * 64, tmp_path, tmp_path / "NEUTRAL-auth", {native_matrix.SCOPE})
+    assert order == ["CLI4", "policy", "inert_process"]
+
+
+@pytest.mark.parametrize("field", ["scope_id", "model", "effort", "session_id", "job_id", "remote_root", "source_zip_sha256", "plan_sha256"])
+def test_all_eight_policy_bindings_are_required(tmp_path, field):
+    path, _, binding = policy_fixture(tmp_path)
+    expected = dict(binding)
+    expected[field] = "NEUTRAL-other-binding"
+    with pytest.raises(InfrastructureError):
+        codex_process.load_task_cli_policy(path, file_digest(path), expected, "3" * 64)
+
+

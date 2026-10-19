@@ -1,0 +1,198 @@
+"""Cold byte audit; imports only sealed local pure readers, never received code."""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import sys
+import tarfile
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path, PurePosixPath
+
+BASE = Path('C:\\Users\\nicol\\Documents\\Codex\\2026-10-15\\cr')
+ROOT = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g/reception-Q753463"
+SEALED = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g/qualification-zero-modele-r1/paquet-source-lie-r1"
+DELIVERY_PATH = SEALED / "LIVRAISON-LOCALE-FINALE.json"
+BINDINGS_PATH = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g/qualification-zero-modele-r1/rendu-source-liee/bindings-proposees.json"
+SOURCE_MEMBERS = 110
+DELTA_CASES = 163
+JOB_ID = "753463"
+EXPECTED_BYTES = 864081
+PROJECT = BASE / "work/hpc-forest-primes-natif-relance-r2g/project"
+EXPECTED_ARCHIVE = "5eddf37563593547f61174a6bf7f1d9c571420a161908120dbac504b2ae23c80"
+SCOPE = "hpc-forest-primes-native-max-r2g"
+
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": digest(path.read_bytes())}
+
+
+def save(name, value):
+    with (ROOT / name).open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def tar_bytes(raw, prefix):
+    require(len(raw) < 64 * 1024**2, "Compressed archive bound exceeded")
+    result, folded, total = {}, set(), 0
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+        for member in archive:
+            path = PurePosixPath(member.name)
+            require(member.isfile() and not member.islnk() and not member.issym()
+                    and not path.is_absolute() and len(path.parts) > 1 and path.parts[0] == prefix
+                    and ".." not in path.parts and "\\" not in member.name and ":" not in member.name,
+                    "Unsafe or nonregular archive member")
+            name = path.relative_to(prefix).as_posix()
+            total += member.size
+            require(name not in result and name.casefold() not in folded and len(result) < 1000
+                    and member.size <= 8 * 1024**2 and total <= 64 * 1024**2, "Duplicate or oversized archive")
+            stream = archive.extractfile(member)
+            require(stream is not None, "Missing archive member")
+            content = stream.read(member.size + 1)
+            require(len(content) == member.size, "Truncated archive member")
+            result[name] = content
+            folded.add(name.casefold())
+    return result
+
+
+def inventory(folder):
+    result = {}
+    for path in sorted(folder.rglob("*")):
+        require(not path.is_symlink(), "Restored symlink refused")
+        if path.is_file():
+            result[path.relative_to(folder).as_posix()] = digest(path.read_bytes())
+    return result
+
+
+def main():
+    require(ROOT is not None and SEALED is not None and DELIVERY_PATH is not None and BINDINGS_PATH is not None
+            and type(SOURCE_MEMBERS) is int and SOURCE_MEMBERS > 0
+            and type(DELTA_CASES) is int and DELTA_CASES > 0
+            and isinstance(JOB_ID, str) and JOB_ID.isdigit()
+            and type(EXPECTED_BYTES) is int and EXPECTED_BYTES > 0
+            and isinstance(EXPECTED_ARCHIVE, str) and len(EXPECTED_ARCHIVE) == 64,
+            "Unbound cold receiver: real source/job/archive receipts required")
+    require(all(isinstance(path, Path) and path.is_absolute()
+                for path in (ROOT, SEALED, DELIVERY_PATH, BINDINGS_PATH, PROJECT))
+            and ROOT.resolve().is_relative_to(BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g")
+            and SEALED.resolve().is_relative_to(BASE / "outputs")
+            and DELIVERY_PATH.resolve().is_relative_to(BASE / "outputs")
+            and BINDINGS_PATH.resolve().is_relative_to(BASE / "outputs"),
+            "Exact workspace reception/source/bindings paths required before archive access")
+    require(not any(name == "hpc_forest" or name.startswith("hpc_forest.") for name in sys.modules),
+            "Previously loaded project modules cannot replace the newly verified local reader")
+    archive = ROOT / ("envelope-results-" + JOB_ID + ".tar.gz")
+    raw = archive.read_bytes()
+    require(digest(raw) == EXPECTED_ARCHIVE and len(raw) == EXPECTED_BYTES, "Exact received archive required")
+    transfer = json.loads((ROOT / "archive-transfert.json").read_text(encoding="utf-8"))["structuredContent"]
+    sidecar_path = ROOT / "archive-annoncee.json"
+    sidecar_transfer = json.loads((ROOT / "transfert-annonce.json").read_text(encoding="utf-8"))["structuredContent"]
+    require(sidecar_transfer["verifie"] is True and digest(sidecar_path.read_bytes()) == sidecar_transfer["remote_sha256"], "Raw producer sidecar transfer SHA differs")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    require(sidecar["path"].endswith("/envelope-results-" + JOB_ID + ".tar.gz") and sidecar["bytes"] == EXPECTED_BYTES and sidecar["passed"] is True and sidecar["native_model_calls"] == 0 and sidecar["native_research_admitted"] is False, "Raw producer sidecar binding differs")
+    require(transfer["verifie"] is True and transfer["remote_sha256"] == sidecar["sha256"] == EXPECTED_ARCHIVE,
+            "Three archive hashes must be equal")
+    status = json.loads((ROOT / "statut-terminal.json").read_text(encoding="utf-8"))["structuredContent"]
+    efficiency = json.loads((ROOT / "efficacite.json").read_text(encoding="utf-8"))["structuredContent"]
+    require(status["job_id"] == efficiency["job_id"] == JOB_ID and status["state"] == efficiency["state"] == "COMPLETED"
+            and status["exit_code"] == efficiency["exit_code"] == "0:0", "Successful scheduler observation required")
+    material = tar_bytes(raw, "qualification-envelope")
+    restored = ROOT / "restauration-neuve-parent-r2"
+    restored.mkdir(exist_ok=False)
+    for name, content in material.items():
+        target = restored.joinpath(*PurePosixPath(name).parts)
+        require(target.resolve().is_relative_to(restored.resolve()), "Restore escaped")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as stream:
+            stream.write(content)
+    before = inventory(restored)
+    save("inventaire-avant-r2.json", before)
+    envelope = json.loads(material["envelope-receipt.json"])
+    require(envelope["passed"] is True and envelope["qualification_launched_count"] == 1
+            and envelope["qualification_returncode"] == 0 and envelope["input_files_unchanged"] is True
+            and envelope["native_model_calls"] == 0 and envelope["native_research_admitted"] is False,
+            "Original allocation envelope must pass once with zero model calls")
+    local_bindings = json.loads(BINDINGS_PATH.read_text(encoding="utf-8"))
+    require(envelope["bindings"] == local_bindings, "Envelope binding changed")
+    expected_allocation = {"job_id": JOB_ID, "architecture": "aarch64", "nodes": 1, "tasks": 1,
+                           "cpus_per_task": 4, "memory_mib": 16384, "gpus": 0, "affinity_cpu_count": 4}
+    require(all(envelope["allocation"].get(k) == v for k, v in expected_allocation.items()), "Actual allocation differs")
+    require(len(envelope["allocation"]["affinity_cpu_ids"]) == 4, "Four affined CPUs required")
+    require(envelope["lane_delta_tests"]["passed"] == DELTA_CASES and envelope["lane_delta_tests"]["executions"] == 1, "One 36-test lane run required")
+    suites = ET.fromstring(material["lane-delta.xml"]).findall(".//testsuite")
+    require(sum(int(s.get("tests", "0")) for s in suites) == DELTA_CASES
+            and all(int(s.get(k, "0")) == 0 for s in suites for k in ("failures", "errors", "skipped")), "Exact successful JUnit required")
+    require(digest(material["lane-delta.xml"]) == envelope["lane_delta_tests"]["junit_sha256"], "JUnit bytes differ")
+    require(material["lane-delta.stderr"] == material["qualification-launch.stderr"] == b"", "Unexpected compute stderr")
+    inputs_before = json.loads(material["input-inventory-before.json"])
+    inputs_after = json.loads(material["input-inventory-after.json"])["files"]
+    actual_inputs = {name.removeprefix("extraction/"): digest(content) for name, content in material.items() if name.startswith("extraction/")}
+    require(inputs_before == inputs_after == actual_inputs, "Exact original extraction inventory differs")
+    delivery = json.loads(DELIVERY_PATH.read_text(encoding="utf-8"))
+    runtime = json.loads((SEALED / "runtime-manifest-r2max.json").read_text(encoding="utf-8"))
+    local_inventory = inventory(PROJECT)
+    require(len(runtime) == SOURCE_MEMBERS and all(local_inventory.get(k) == v for k,v in runtime.items()), "Local manifested source bytes differ")
+    local_extra = sorted(set(local_inventory) - set(runtime))
+    require(all(k.startswith((".pytest_cache/", ".ruff_cache/")) for k in local_extra), "Unclassified extra local project file")
+    local_before = inventory(PROJECT)
+    zip_raw = material["extraction/HPC-Forest-Primes-Natif-MAX-r2g.zip"]
+    require(digest(zip_raw) == delivery["source_zip"]["sha256"], "Source ZIP differs")
+    with zipfile.ZipFile(io.BytesIO(zip_raw)) as z:
+        source_bytes = {i.filename.removeprefix("HPC-Forest/"): z.read(i) for i in z.infolist()}
+    require({k: digest(v) for k, v in source_bytes.items()} == runtime, "Exact source ZIP membership differs")
+    require(all(material["extraction/HPC-Forest/" + k] == v for k, v in source_bytes.items()), "Expanded source differs")
+    require(digest(material["extraction/native-max-plan.json"]) == delivery["plan"]["sha256"], "Research plan differs")
+    original = material["qualification-original.json"]
+    require(material["Q/qualification.json"] == original, "Original qualification changed")
+    qualification = json.loads(original)
+    inner_raw = material["Q.tar.gz"]
+    inner = tar_bytes(inner_raw, "qualification")
+    require(inner["qualification.json"] == original and qualification["verified"] is True and qualification["scope_id"] == SCOPE,
+            "Inner qualification identity differs")
+    expected = {"qualification.json": digest(original),
+                **{"prepared/" + k: v for k, v in qualification["prepared_files"].items()},
+                **{"official-evaluator-trace/" + k: v for k, v in qualification["official_evaluator_trace_files"].items()}}
+    require({k: digest(v) for k, v in inner.items()} == expected, "All original inner member hashes must match")
+    require(digest(inner_raw) == envelope["qualification_archive_sha256"], "Inner archive digest differs")
+    # Only local source verified above is imported. Pure readers consume received bytes as data.
+    sys.path.insert(0, str(PROJECT / "src"))
+    from hpc_forest import native_r2max as native
+    native.verify_qualification(qualification, delivery["source_zip"]["sha256"], prepared=False)
+    package = SEALED / "certified-preparation"
+    prepared = native.verify_preparation(package)
+    native.verify_qualification_members(qualification, lambda n: inner["prepared/" + n], prepared)
+    trace = native.verify_trace_members(qualification, lambda n: inner["official-evaluator-trace/" + n],
+                                        read_prepared_member=lambda n: inner["prepared/" + n])
+    (ROOT / "qualification.json").write_bytes(original)
+    (ROOT / "qualification.tar.gz").write_bytes(inner_raw)
+    audit = {"schema": "hpc-forest-primes-r2max-allocated-contract-reception-audit-v1", "scope_id": SCOPE, "verified": True,
+        "source_zip_sha256": delivery["source_zip"]["sha256"], "plan_sha256": delivery["plan"]["sha256"],
+        "preparation_manifest_sha256": native.PREPARATION_MANIFEST_SHA256,
+        "qualification_sha256": digest(original), "archive_sha256": digest(inner_raw),
+        "all_members_regular_unique": True, "restored_files_byte_identical": True,
+        "actual_compiler_command_verified": True, "certified_twelve_case_contract_verified": True,
+        "native_model_calls": 0, "job_id": JOB_ID, "source_files_verified": SOURCE_MEMBERS,
+        "outer_archive_sha256": EXPECTED_ARCHIVE, "neutral_lane_tests_passed": DELTA_CASES,
+        "trace_links": trace, "native_research_admitted": False}
+    after = inventory(restored)
+    require(before == after and local_before == inventory(PROJECT) and digest(archive.read_bytes()) == EXPECTED_ARCHIVE,
+            "Readonly audit changed sources or received bytes")
+    save("inventaire-apres-r2.json", after)
+    save("audit-natif-parent-r2.json", audit)
+    print(json.dumps({"audit": ref(ROOT / "audit-natif-parent-r2.json"), "qualification": ref(ROOT / "qualification.json"),
+                      "inner_archive": ref(ROOT / "qualification.tar.gz"), "restored_files": len(material),
+                      "source_files": SOURCE_MEMBERS, "neutral_lane_tests": DELTA_CASES, "native_model_calls": 0}))
+
+
+if __name__ == "__main__":
+    main()

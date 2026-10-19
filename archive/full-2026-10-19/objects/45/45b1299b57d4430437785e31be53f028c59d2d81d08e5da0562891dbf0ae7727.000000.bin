@@ -1,0 +1,250 @@
+"""Local, cold-evidence lane projection. No census collection or native execution.
+
+The caller supplies already received files. Windows evidence remains local;
+only the closed versioned digest projection can be transported to ARM.
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import re
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PREP = HERE.parents[2]
+BASE = PREP.parents[1]
+DESIGN = PREP / "revision-source-lane-r2/DESIGN-INTERFACE.json"
+DESIGN_SHA = "4d20be6fd5e79a89447f0a545f0af12328b486dd9525de8f830cd19d839d9ea3"
+DEPENDENCIES = {
+    "source_state": (None, None),  # Only reader_bridge's reviewed versioned r3 binding may populate this.
+    "cells": (HERE / "launcher/cell_selection.py",
+              "0306a4c948f38385bf70da32287c6b724a27e92750cace89005e31efc2bebe67"),
+    "detection": (HERE / "launcher/native_worker_detection.py",
+                  "07fb437746064f20d0be33fcef748d1f9b0f0028214f02a042540d97e4c51766"),
+    "observer_proof_reader": (PREP / "observateur-neuf-sessions-r4/observer-mixte.py",
+                              "a8903b386a2d53cb663e75d719a50c2c8c39931e91d9c3e664f0d41bd29d54a8"),
+}
+R2_CLOSURE_SHA = "f9d64a0e87ad68248429681cb3efe01a9e56289fba615eeb55291089665aee3d"
+CELL_NAMES = {"scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "session_id", "job_id", "remote_root"}
+INPUT_NAMES = {"schema", "source_only_state", "scientific_reception", "reconciliation", "source_only_absence",
+               "fresh_private_full_cim", "r2_main_closure", "owned_descendant_review", "observer_release",
+               "local_projection_producer_review", "active_native_groups", "parent_observations"}
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def artifact(ref):
+    need(isinstance(ref, dict) and set(ref) == {"path", "sha256"}, "Closed path/SHA reference required")
+    path = Path(ref["path"])
+    need(path.is_absolute() and ".." not in path.parts and path.is_file()
+         and not any(p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents))
+         and isinstance(ref["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"])
+         and sha(path) == ref["sha256"], "Missing, aliased or changed evidence")
+    return path
+
+
+def read(ref):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, "Duplicate JSON member")
+            result[key] = value
+        return result
+    value = json.loads(artifact(ref).read_text(encoding="utf-8-sig"), object_pairs_hook=pairs,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+    need(isinstance(value, dict), "JSON object required")
+    return value
+
+
+def dependency(name):
+    path, checksum = DEPENDENCIES[name]
+    need(path is not None and checksum is not None, "Actual reviewed versioned source-state binding is required")
+    artifact({"path": str(path), "sha256": checksum})
+    spec = importlib.util.spec_from_file_location("lane_r2_external_" + name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def design():
+    return read({"path": str(DESIGN), "sha256": DESIGN_SHA})
+
+
+def projection_value(cell, mode, count, observed_at, evidence):
+    """Pure construction only. Production callers must first validate local evidence."""
+    specification = design()
+    need(set(cell) == CELL_NAMES, "Exact eight-field cell required")
+    need(mode in {"live", "received_absent"}, "Explicit source-only state required")
+    need(type(count) is int and 0 <= count < 4, "Exact total active count0..3 required")
+    contribution = int(mode == "live")
+    need(count >= contribution, "SO contribution exceeds the actual total")
+    need(set(evidence) == set(specification["evidence_sha256_fields_exact"]), "Exact nine evidence digests required")
+    value = {"schema": specification["projection_schema"], "verified": True, **cell,
+             "source_only_state": mode, "source_only_preserved": mode == "live",
+             "source_only_active_workers": contribution, "other_native_workers_count": count - contribution,
+             "active_native_workers_before_start": count, "maximum_native_workers_total": 4,
+             "observed_at": observed_at, "observation_origin": "parent-private-Windows-census",
+             "windows_census_observed_by_arm": False, "full_census_exported": False,
+             "foreign_configuration_or_credentials_exported": False, "evidence_sha256": evidence}
+    need(set(value) == set(specification["projection_fields_exact"]), "Projection differs from frozen design")
+    return value
+
+
+def verified_review(ref, *, kind, bindings):
+    value = read(ref)
+    accepted_schema = value.get("schema") == kind
+    if kind == "hpc-forest-lane-r2-local-projection-producer-review-v1":
+        accepted_schema = value.get("schema") == "hpc-forest-dynamic-r4b-integration-review-v1"
+        need(value.get("reviewed_files", {}).get("lane_projection.py") == bindings["producer_sha256"],
+             "Actual integration review must cover this projection producer")
+    need(accepted_schema and value.get("verified") is True
+         and value.get("blocking_findings") == []
+         and all(value.get(k) == v for k, v in bindings.items()), "Missing or unrelated actual local review")
+    for evidence in value.get("evidence_refs", []):
+        artifact(evidence)
+    return value
+
+
+def count_groups(groups, rows, *, mode, selected_session, binding, validate_authorization):
+    """Exact owned pairs plus conservative native-family census, without collection."""
+    cells, detection, state = (dependency(name) for name in ("cells", "detection", "source_state"))
+    need(isinstance(groups, list), "Explicit active group list required")
+    by_pid = {r["ProcessId"]: r for r in rows}
+    owned_pids, sessions = set(), set()
+    for group in groups:
+        need(isinstance(group, dict) and set(group) == {
+            "model", "phase", "session_id", "job_id", "full_identities", "authorization"}, "Closed active group required")
+        session = cells.select(group["model"], group["phase"], session_id=group["session_id"], job_id=group["job_id"])
+        need(session != selected_session and session not in sessions, "Started or duplicate proposed session")
+        sessions.add(session)
+        pair = group["full_identities"]
+        need(isinstance(pair, list) and len(pair) == 2, "Two-member active worker identity required")
+        a, b = pair
+        need(state.identity(a) != state.identity(b) and a["CommandLine"] == b["CommandLine"]
+             and (a["ParentProcessId"] == b["ProcessId"] or b["ParentProcessId"] == a["ProcessId"]), "Unbound active pair")
+        pids = {a["ProcessId"], b["ProcessId"]}
+        need(len(pids) == 2 and not pids.intersection(owned_pids), "Duplicate active identity")
+        for row in pair:
+            expected_bootstrap = str(HERE / "launcher/bootstrap_worker.py").replace("/", "\\").casefold()
+            command = row["CommandLine"].replace("/", "\\").casefold()
+            need(row["ProcessId"] in by_pid and state.identity(by_pid[row["ProcessId"]]) == state.identity(row)
+                 and session in row["CommandLine"] and group["model"] in row["CommandLine"]
+                 and expected_bootstrap in command, "Active pair differs from full census or exact reviewed bootstrap")
+        authorization = read(group["authorization"])
+        expected = {**binding, "model": group["model"], "effort": "max", "session_id": session,
+                    "job_id": group["job_id"], "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session}
+        need(all(authorization.get(k) == v for k, v in expected.items())
+             and authorization.get("purpose") == "technical-contract"
+             and authorization.get("technical_phase") == group["phase"], "Active authorization binding differs")
+        # This exact already-present pair is counted, never started or readmitted.
+        # The proposed worker retains the factory/bootstrap initial=True gate.
+        validate_authorization(artifact(group["authorization"]), {binding["scope_id"]}, initial=False)
+        owned_pids.update(pids)
+    native = {r["ProcessId"] for r in rows if detection.is_native_worker_command(r.get("CommandLine"))}
+    if mode == "live":
+        so = {r["ProcessId"] for r in rows if state.SO_SESSION in (r.get("CommandLine") or "")
+              and detection.is_native_worker_command(r.get("CommandLine"))}
+        need(len(so) == 2, "Exact source-only launcher/Python pair required")
+        owned_pids.update(so)
+    need(native == owned_pids, "Unclassified native process or fifth lane refused")
+    count = len(groups) + int(mode == "live")
+    need(0 <= count < 4, "Cap4 includes the proposed worker")
+    return count
+
+
+def prepare(inputs, cell, *, binding, validate_authorization, now=None):
+    """Validate supplied actual cold files, then return digest-only projection.
+
+    Observer release and producer/descendant reviews are distinct received inputs.
+    This function never creates an authorization, ready marker or process.
+    """
+    now = time.time() if now is None else now
+    need(isinstance(inputs, dict) and set(inputs) == INPUT_NAMES
+         and inputs.get("schema") == "hpc-forest-lane-r2-private-projection-input-v1", "Closed private input required")
+    need(set(cell) == CELL_NAMES and all(cell.get(k) == v for k, v in binding.items())
+         and cell["effort"] == "max", "Exact derivative cell required")
+    cells, state = dependency("cells"), dependency("source_state")
+    phases = [p for p in cells.PHASES if cells.CELLS.get(cell["model"], {}).get(p) == cell["session_id"]]
+    need(len(phases) == 1, "Only nine exact MAX technical sessions; Luna/pilot closed")
+    cells.select(cell["model"], phases[0], session_id=cell["session_id"], job_id=cell["job_id"])
+    need(cell["remote_root"] == "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + cell["session_id"], "Wrong exact owned root")
+    closure_ref = inputs["r2_main_closure"]
+    need(closure_ref.get("sha256") == R2_CLOSURE_SHA, "Exact historical R2 closure required")
+    closure = read(closure_ref)
+    need(closure.get("verified") is True and closure.get("all_three_main_identities_absent") is True,
+         "R2 closure not verified")
+    expected_pair = closure["source_only"]
+    census = read(inputs["fresh_private_full_cim"])
+    rows, captured = state.complete_census(census, now=now, fresh=True)
+    observations = read(inputs["parent_observations"])
+    need(observations.get("schema") == "hpc-forest-dynamic-r4b-parent-observations-v1"
+         and observations.get("verified") is True and all(observations.get(k) == v for k, v in cell.items())
+         and observations.get("fresh_private_full_cim") == inputs["fresh_private_full_cim"]
+         and type(observations.get("observed_at")) in (int, float)
+         and 0 <= now - observations["observed_at"] <= 120,
+         "Actual fresh exact-cell parent observations required")
+    need(all(observations.get(k) is True for k in ("full_census_locally_reviewed", "no_unclassified_research_processes",
+         "remote_registry_absent", "prior_session_claims_absent", "local_cache_absent", "local_registry_absent",
+         "existing_transport_only", "no_new_authentication", "CLI_tools_disabled")),
+         "Actual new cache/registry/claim/transport observations required")
+    cache = PREP / "lancement-modeles-max-r2" / ("worker-" + cell["session_id"])
+    need(observations.get("proposed_cache") == str(cache) and not cache.exists(), "Original exact new cache anchor must be absent")
+    for ref in observations.get("evidence_refs", []):
+        artifact(ref)
+    state.scientific_closure(inputs["scientific_reception"], inputs["reconciliation"])
+    result = state.validate_state(inputs["source_only_state"], census, expected_pair,
+        absence_ref=inputs["source_only_absence"], science_ref=inputs["scientific_reception"],
+        recon_ref=inputs["reconciliation"], now=now)
+    by_pid = {r["ProcessId"]: r for r in rows}
+    for action in closure["actions"]:
+        old = action["identity"]
+        state.identity(old)
+        if old["ProcessId"] in by_pid:
+            need(state.identity(by_pid[old["ProcessId"]]) != state.identity(old), "Historical R2 main remains present")
+    producer_ref = inputs["local_projection_producer_review"]
+    verified_review(producer_ref, kind="hpc-forest-lane-r2-local-projection-producer-review-v1",
+        bindings={"producer_sha256": sha(__file__), "design_sha256": DESIGN_SHA,
+                  "source_state_reader_sha256": DEPENDENCIES["source_state"][1]})
+    release = read(inputs["observer_release"])
+    need(release.get("schema") == "hpc-forest-passive-owned-pair-absence-v1" and release.get("subject") == "observer3"
+         and release.get("verified") is True and release.get("no_stop_or_replay") is True,
+         "Actual independently received OBS3 release required")
+    for ref in release.get("evidence_refs", []):
+        artifact(ref)
+    # Reuse only the pinned observer's pure cold-proof reader; never its census,
+    # transport, lock or run functions. Anchor the expected old pair to its real
+    # immutable reception rather than trusting the supplied absence identities.
+    observer = dependency("observer_proof_reader")
+    legacy = read({"path": str(observer.LEGACY_RESUME), "sha256": observer.LEGACY_RESUME_SHA})
+    observer.verify_cold_absence(release, legacy["observer_full_identities"], rows, "observer3", initial=True)
+    count = count_groups(inputs["active_native_groups"], rows, mode=inputs["source_only_state"],
+                         selected_session=cell["session_id"], binding=binding, validate_authorization=validate_authorization)
+    absent = inputs["source_only_state"] == "received_absent"
+    evidence = {"scientific_reception": inputs["scientific_reception"]["sha256"],
+                "reconciliation": inputs["reconciliation"]["sha256"],
+                "private_full_census": inputs["fresh_private_full_cim"]["sha256"],
+                "source_only_absence": None, "prior_owned_census": None, "cold_absence_census": None,
+                "owned_descendant_review": None, "observer_release": inputs["observer_release"]["sha256"],
+                "local_projection_producer_review": producer_ref["sha256"]}
+    if absent:
+        absence = read(inputs["source_only_absence"])
+        descendant_ref = inputs["owned_descendant_review"]
+        verified_review(descendant_ref, kind="hpc-forest-lane-r2-owned-descendant-review-v1",
+            bindings={"source_only_absence": inputs["source_only_absence"],
+                      "source_state_reader_sha256": DEPENDENCIES["source_state"][1], "unresolved_owned_descendants": []})
+        evidence.update(source_only_absence=inputs["source_only_absence"]["sha256"],
+            prior_owned_census=absence["prior_full_cim"]["sha256"],
+            cold_absence_census=absence["fresh_full_cim"]["sha256"], owned_descendant_review=descendant_ref["sha256"])
+    else:
+        need(inputs["owned_descendant_review"] is None, "Live SO cannot carry a closed-absence descendant review")
+    need(result["source_only_preserved"] is (not absent), "Truthful SO preservation projection required")
+    return projection_value(cell, inputs["source_only_state"], count, captured, evidence)

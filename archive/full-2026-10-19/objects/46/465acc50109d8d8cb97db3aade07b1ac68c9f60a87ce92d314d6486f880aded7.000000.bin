@@ -1,0 +1,340 @@
+"""Allocated delivery ONLY of Q753709 bytes. Never import/run received code or tests.
+
+Descriptors remain below one exact source root. Symlinks are inert readlink
+metadata, never followed or tar members. The new output is outside the source.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import platform
+import re
+import stat
+import tarfile
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path, PurePosixPath
+
+SOURCE_ROOT = '/scratch_p/nimarano/hpc-forest-r4b-source110-completeQ-20261018-1e60da6d5b51'
+OUTPUT_ROOT = SOURCE_ROOT + '-delivery-only-Q753709-r1'
+SOURCE = 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48'
+PLAN = 'd08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27'
+COMPONENTS = '1e60da6d5b51afaf3c857b1ba215927e7e1201c297241afd6390212a89d5e449'
+WRAPPER = '6f5a91e1e36884dee323d68bba891cd8317f428342de6eb76380c22a1bfce448'
+QUALIFICATION = '520573e89fb4505e791a0b70a4a97ee6d59db149af5d79f6af535aabd747724f'
+DEADLINE = 1793487600
+SUITES = {'source-lane': 26, 'source-cli-privacy': 152, 'source-prior-privacy': 9,
+          'adapter-portable': 73, 'observer-neutral': 5}
+MAX_ENTRIES, MAX_FILE, MAX_TOTAL = 100000, 256 * 1024**2, 2 * 1024**3
+
+
+def need(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def metadata(value):
+    return {name: getattr(value, 'st_' + name) for name in
+            ('dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime_ns', 'ctime_ns')}
+
+
+def decode(raw):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            need(key not in value, 'Duplicate JSON member')
+            value[key] = item
+        return value
+    return json.loads(raw.decode('utf8'), object_pairs_hook=pairs,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+
+
+def allocation_guard(*, now=None):
+    now = time.time() if now is None else now
+    need(now + 600 + 10800 < DEADLINE, 'Delivery maximum plus three-hour audit must precede exclusive deadline')
+    need(platform.machine().lower() == 'aarch64' and os.name == 'posix', 'Allocated ARM64 POSIX delivery only')
+    for name, expected in {'SLURM_CPUS_PER_TASK': '4', 'SLURM_NTASKS': '1',
+        'SLURM_JOB_NUM_NODES': '1', 'SLURM_MEM_PER_NODE': '16384'}.items():
+        need(os.environ.get(name) == expected, 'Exact 4CPU/1task/1node/16GiB allocation required')
+    job = os.environ.get('SLURM_JOB_ID', '')
+    need(re.fullmatch('[0-9]+', job) and job != '753709', 'A new delivery-only allocation is required')
+    need(not os.environ.get('SLURM_JOB_GPUS', '') and not os.environ.get('SLURM_STEP_GPUS', '')
+         and os.environ.get('SLURM_GPUS', '0') == '0' and os.environ.get('SLURM_GPUS_ON_NODE', '0') == '0',
+         'Zero GPU allocation required')
+    need(hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_DIRECTORY')
+         and hasattr(os, 'O_NONBLOCK') and hasattr(os, 'O_CLOEXEC')
+         and os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+         and os.readlink in os.supports_dir_fd and os.scandir in os.supports_fd,
+         'Descriptor-relative no-follow APIs are mandatory')
+    affinity = sorted(os.sched_getaffinity(0))
+    need(len(affinity) == 4, 'Exactly four bound CPUs required')
+    return {'slurm_job_id': job, 'architecture': 'ARM64', 'nodes': 1, 'tasks': 1,
+        'cpu_cores': 4, 'allocated_memory_mib': 16384, 'allocated_gpus': 0,
+        'affinity_cpu_ids': affinity, 'source_test_job_id': '753709', 'delivery_only': True}
+
+
+def root_fd(path):
+    need(str(path) == SOURCE_ROOT, 'Exact immutable Q753709 source root required')
+    before = os.lstat(path)
+    need(stat.S_ISDIR(before.st_mode), 'Source root must be a real directory')
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        need(metadata(os.fstat(fd)) == metadata(before), 'Source root changed while opening')
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, metadata(before)
+
+
+def regular_bytes(parent, name, expected):
+    """Open only an observed regular file, without following even a raced link."""
+    need(stat.S_ISREG(expected.st_mode) and 0 <= expected.st_size <= MAX_FILE, 'Bounded regular file required')
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
+    try:
+        need(metadata(os.fstat(fd)) == metadata(expected), 'File identity changed before read')
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            need(total <= expected.st_size, 'File grew while reading')
+            chunks.append(chunk)
+        need(total == expected.st_size and metadata(os.fstat(fd)) == metadata(expected)
+             and metadata(os.stat(name, dir_fd=parent, follow_symlinks=False)) == metadata(expected),
+             'File bytes/identity changed while reading')
+        return b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
+def walk(fd, *, on_regular=None):
+    """Complete no-follow census, optionally adding only regular bytes to tar."""
+    result, budget = {}, [0]
+
+    def visit(parent, prefix):
+        before = metadata(os.fstat(parent))
+        need(stat.S_ISDIR(before['mode']), 'Directory descriptor required')
+        with os.scandir(parent) as stream:
+            names = sorted(entry.name for entry in stream)
+        need(len(names) == len(set(names)), 'Repeated directory entry')
+        for name in names:
+            need(name not in {'.', '..'} and '/' not in name and '\\' not in name and '\0' not in name,
+                 'Ordinary single directory entry required')
+            relative = (prefix + '/' if prefix else '') + name
+            need(len(result) < MAX_ENTRIES, 'Source inventory exceeds bounded entry count')
+            observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            record = {'metadata': metadata(observed)}
+            if stat.S_ISLNK(observed.st_mode):
+                target = os.readlink(name, dir_fd=parent)
+                need(isinstance(target, str) and '\0' not in target
+                     and metadata(os.stat(name, dir_fd=parent, follow_symlinks=False)) == metadata(observed),
+                     'Symlink changed during inert readlink')
+                record.update(kind='symlink', link_target=target, target_followed=False, tar_member=False, bytes_read=False)
+            elif stat.S_ISDIR(observed.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                try:
+                    need(metadata(os.fstat(child)) == metadata(observed), 'Directory replaced before traversal')
+                    record.update(kind='directory', tar_member=False)
+                    result[relative] = record
+                    visit(child, relative)
+                    need(metadata(os.fstat(child)) == metadata(observed)
+                         and metadata(os.stat(name, dir_fd=parent, follow_symlinks=False)) == metadata(observed),
+                         'Directory changed during traversal')
+                finally:
+                    os.close(child)
+                continue
+            elif stat.S_ISREG(observed.st_mode):
+                raw = regular_bytes(parent, name, observed)
+                budget[0] += len(raw)
+                need(budget[0] <= MAX_TOTAL, 'Total regular byte bound exceeded')
+                record.update(kind='regular', sha256=digest(raw), bytes=len(raw), tar_member=True)
+                if on_regular:
+                    on_regular(relative, raw)
+            else:
+                raise ValueError('Special file refused: ' + relative)
+            result[relative] = record
+        need(metadata(os.fstat(parent)) == before, 'Directory changed during complete census')
+    visit(fd, '')
+    return result
+
+
+def fixed_read(fd, relative, inventory):
+    rel = PurePosixPath(relative)
+    need(rel.as_posix() == relative and not rel.is_absolute() and all(p not in {'.', '..', ''} for p in rel.parts),
+         'Fixed safe relative proof path required')
+    parent = os.dup(fd)
+    try:
+        prefixes = []
+        for name in rel.parts[:-1]:
+            prefixes.append(name)
+            expected_dir = inventory['/'.join(prefixes)]
+            observed_dir = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            need(expected_dir['kind'] == 'directory' and metadata(observed_dir) == expected_dir['metadata'],
+                 'Fixed proof parent differs from complete census')
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            try:
+                need(metadata(os.fstat(child)) == expected_dir['metadata'], 'Fixed proof directory changed before open')
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(parent); parent = child
+        observed = os.stat(rel.name, dir_fd=parent, follow_symlinks=False)
+        record = inventory[relative]
+        need(record['kind'] == 'regular' and metadata(observed) == record['metadata'], 'Fixed proof differs from complete census')
+        raw = regular_bytes(parent, rel.name, observed)
+        need(digest(raw) == record['sha256'], 'Fixed proof bytes changed')
+        return raw
+    finally:
+        os.close(parent)
+
+
+def validate_existing(fd, inventory, expected_qualification):
+    """Read data only. Never import any test, helper or received source module."""
+    need(expected_qualification == QUALIFICATION, 'Pinned complete received qualification text required')
+    read = lambda name: fixed_read(fd, name, inventory)
+    need(digest(read('qualification-wrapper.py')) == WRAPPER, 'Actual Q wrapper changed')
+    need(digest(read('adapters/COMPONENTS.json')) == COMPONENTS, 'Exact62component manifest changed')
+    need(digest(read('source/project.zip')) == SOURCE and digest(read('source/dynamic-plan.json')) == PLAN,
+         'Original source110/plan changed')
+    raw = read('qualification-output/qualification.json')
+    need(digest(raw) == QUALIFICATION, 'Actual raw qualification differs from received complete text')
+    q = decode(raw)
+    need(q.get('schema') == 'hpc-forest-lane-r2-zero-model-allocated-qualification-v1'
+         and q.get('verified') is True and q.get('scope_id') == 'hpc-forest-dynamic-independent-roots-r4b-max'
+         and q.get('source_zip_sha256') == SOURCE and q.get('plan_sha256') == PLAN
+         and q.get('source_file_count') == 110 and type(q.get('source_file_count')) is int
+         and q.get('adapter_components_manifest_sha256') == COMPONENTS
+         and q.get('allocated_contract_tests_returncode') == 0 and type(q.get('allocated_contract_tests_returncode')) is int
+         and q.get('native_model_calls') == 0 and type(q.get('native_model_calls')) is int
+         and q.get('source_files_before_after_identical') is True and q.get('adapter_files_before_after_identical') is True
+         and q.get('native_generation_admitted') is False and q.get('normal_first_start_verified') is False
+         and q.get('independent_performance_audit_verified') is False
+         and q.get('allocation', {}).get('slurm_job_id') == '753709', 'Real mechanical qualification only required')
+    for prefix, expected_count in (('source', 110), ('adapter', 63)):
+        before = decode(read('qualification-output/' + prefix + '-before.json'))
+        after = decode(read('qualification-output/' + prefix + '-after.json'))
+        base = 'source/project/' if prefix == 'source' else 'adapters/'
+        actual = {name.removeprefix(base): row['sha256'] for name, row in inventory.items()
+                  if name.startswith(base) and row['kind'] == 'regular'}
+        need(before == after == actual and len(actual) == expected_count, 'Existing complete source/adapter inventories differ')
+    components = decode(read('adapters/COMPONENTS.json'))['code_pins']
+    need(len(components) == 62 and all(inventory['adapters/' + name]['sha256'] == value for name, value in components.items()),
+         'All62 actual component pins required')
+    summaries, ids = {}, set()
+    for label, count in SUITES.items():
+        junit = read('qualification-output/' + label + '-junit.xml')
+        cases = list(ET.fromstring(junit).iter('testcase'))
+        case_ids = {(c.get('classname'), c.get('name')) for c in cases}
+        need(len(cases) == len(case_ids) == count and not ids.intersection(case_ids)
+             and all(all(c.find(k) is None for k in ('failure', 'error', 'skipped')) for c in cases),
+             'Exact265 unique already-run cases without errors/skips required')
+        ids.update(case_ids)
+        recorded = q['suite_results'][label]
+        execution = decode(read('qualification-output/' + label + '-execution.json'))
+        need(recorded['returncode'] == 0 and type(recorded['returncode']) is int
+             and recorded['counts'] == {'passed': count, 'failed': 0}
+             and recorded['details']['junit_sha256'] == digest(junit)
+             and execution['returncode'] == 0 and type(execution['returncode']) is int
+             and execution['run_count'] == 1 and type(execution['run_count']) is int
+             and execution['model_calls'] == 0 and type(execution['model_calls']) is int
+             and execution['testcases'] == count and execution['skipped'] == 0
+             and execution['junit_sha256'] == digest(junit), 'Original single-execution/JUnit proofs disagree')
+        summaries[label] = {'already_completed_cases': count, 'junit_sha256': digest(junit), 'run_count_in_original_Q': 1}
+    need(len(ids) == 265, 'Exact265 already-completed unique testcases required')
+    return {'qualification_sha256': QUALIFICATION, 'already_completed_suites': summaries,
+        'already_completed_unique_cases': 265, 'source_files': 110, 'component_pins': 62,
+        'tests_executed_by_delivery': 0, 'received_source_code_imported': False,
+        'models_CLI_compilation_installation_or_transport_executed': 0}
+
+
+def save(path, value):
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+
+
+def local_ref(path):
+    return {'path': str(path), 'sha256': digest(path.read_bytes()), 'bytes': path.stat().st_size}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source-root', required=True)
+    parser.add_argument('--output-root', required=True)
+    parser.add_argument('--qualification-sha256', required=True)
+    args = parser.parse_args()
+    allocation = allocation_guard()  # Before opening source, making output or archiving.
+    need(args.source_root == SOURCE_ROOT and args.output_root == OUTPUT_ROOT,
+         'Only exact source and separate new delivery root permitted')
+    fd, initial_root = root_fd(args.source_root)
+    output = Path(args.output_root)
+    try:
+        need(not output.exists() and not output.is_symlink(), 'Fresh delivery output required; never overwrite')
+        output.mkdir(exist_ok=False)
+        save(output / 'DELIVERY-INTENTION.json', {'allocation': allocation, 'source_root': SOURCE_ROOT,
+            'source_test_job_id': '753709', 'source_modified': False, 'no_retry_or_tests_or_model': True,
+            'qualification_expected_sha256': QUALIFICATION, 'qualification_hash_prior_provenance':
+            'Complete received UTF8 report text; actual raw file verified by this helper before archive',
+            'symlinks_followed_or_archived': False})
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        before = walk(fd)
+        save(output / 'source-entire-inventory-before.json', before)
+        verified = validate_existing(fd, before, args.qualification_sha256)
+        save(output / 'EXISTING-QUALIFICATION-VERIFIED.json', verified)
+        archive_path = output / ('qualification-existing-Q753709-delivery-' + allocation['slurm_job_id'] + '.tar.gz')
+        archived = {}
+        with archive_path.open('xb') as destination, tarfile.open(fileobj=destination, mode='w:gz') as archive:
+            def add(name, raw):
+                need(before[name]['kind'] == 'regular' and before[name]['sha256'] == digest(raw), 'Archive bytes changed from first census')
+                item = tarfile.TarInfo(name); item.size = len(raw); item.mode = 0o600; item.mtime = 0
+                archive.addfile(item, io.BytesIO(raw)); archived[name] = digest(raw)
+            during = walk(fd, on_regular=add)
+        need(during == before, 'Complete source changed during archive')
+        after = walk(fd)
+        need(before == after and metadata(os.fstat(fd)) == initial_root
+             and metadata(os.lstat(SOURCE_ROOT)) == initial_root, 'Complete source/root changed during delivery')
+        save(output / 'source-entire-inventory-after.json', after)
+        regular = {name: row['sha256'] for name, row in before.items() if row['kind'] == 'regular'}
+        need(archived == regular, 'All and only regular source files must be archived')
+        save(output / 'archive-regular-members.json', archived)
+        links = {name: row for name, row in before.items() if row['kind'] == 'symlink'}
+        save(output / 'inert-symlink-metadata-only.json', links)
+        receipt = {'schema': 'hpc-forest-Q753709-existing-byte-delivery-only-v1', 'verified_delivery_only': True,
+            'source_test_job_id': '753709', 'allocation': allocation, 'source_root': SOURCE_ROOT,
+            'original_complete_qualification_sha256': QUALIFICATION, 'source_before_after_identical': True,
+            'regular_files_archived': len(regular), 'symlink_metadata_records': len(links),
+            'symlinks_followed_or_archived': False, 'other_special_types_admitted': False,
+            'tests_reexecuted': 0, 'source_imported': False, 'native_model_calls': 0,
+            'old_failed_archives_preserved_as_opaque_regular_bytes': True,
+            'archive': {'path': str(archive_path), 'sha256': digest(archive_path.read_bytes()), 'bytes': archive_path.stat().st_size},
+            'root_metadata_before_after': initial_root,
+            'source_entire_inventory_before': local_ref(output / 'source-entire-inventory-before.json'),
+            'source_entire_inventory_after': local_ref(output / 'source-entire-inventory-after.json'),
+            'regular_archive_members': local_ref(output / 'archive-regular-members.json'),
+            'inert_symlinks_only': local_ref(output / 'inert-symlink-metadata-only.json'),
+            'existing_qualification_validation': local_ref(output / 'EXISTING-QUALIFICATION-VERIFIED.json'),
+            'source_zip_sha256': SOURCE, 'plan_sha256': PLAN, 'adapter_components_manifest_sha256': COMPONENTS,
+            'native_generation_admitted': False, 'scientific_or_performance_admission': False}
+        save(output / 'DELIVERY-RECEIPT.json', receipt)
+        print(json.dumps(receipt), flush=True)
+    except BaseException as exc:
+        save(output / 'DELIVERY-FIRST-REFUSAL.json', {'verified_delivery_only': False, 'error_type': type(exc).__name__,
+            'error': str(exc), 'partial_files_preserved': True, 'automatic_retry_allowed': False,
+            'source_not_modified': True, 'tests_or_models_executed': 0})
+        raise
+    finally:
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    main()

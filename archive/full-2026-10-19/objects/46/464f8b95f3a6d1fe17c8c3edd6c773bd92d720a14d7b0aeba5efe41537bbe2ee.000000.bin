@@ -1,0 +1,227 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#define RADIX 256
+
+static void input_error(const char *message) {
+   fprintf(stderr, "ERROR %s\n", message);
+   exit(EXIT_FAILURE);
+}
+
+static inline unsigned char sort_byte(const char *strings, long int index,
+                                      int length, int position) {
+   return (unsigned char)strings[(size_t)index * (size_t)length +
+                                 (size_t)position];
+}
+
+static long int *serial_radix_sort(const char *strings, int length,
+                                   long int size, long int *first,
+                                   long int *second) {
+   long int *source = first;
+   long int *destination = second;
+
+   for (int position = length - 2; position >= 0; --position) {
+      long int counts[RADIX] = {0};
+
+      for (long int i = 0; i < size; ++i)
+         ++counts[sort_byte(strings, source[i], length, position)];
+
+      long int next = 0;
+      for (int value = 0; value < RADIX; ++value) {
+         long int count = counts[value];
+         counts[value] = next;
+         next += count;
+      }
+
+      for (long int i = 0; i < size; ++i) {
+         unsigned char value = sort_byte(strings, source[i], length, position);
+         destination[counts[value]++] = source[i];
+      }
+
+      long int *temporary = source;
+      source = destination;
+      destination = temporary;
+   }
+
+   return source;
+}
+
+#ifdef _OPENMP
+static long int *parallel_radix_sort(const char *strings, int length,
+                                     long int size, long int *first,
+                                     long int *second, int thread_capacity) {
+   size_t workspace = (size_t)thread_capacity * RADIX;
+   if (workspace > (size_t)-1 / sizeof(long int))
+      return serial_radix_sort(strings, length, size, first, second);
+
+   long int *counts = calloc(workspace, sizeof(*counts));
+   long int *starts = malloc(workspace * sizeof(*starts));
+   if (counts == NULL || starts == NULL) {
+      free(counts);
+      free(starts);
+      return serial_radix_sort(strings, length, size, first, second);
+   }
+
+   long int *source = first;
+   long int *destination = second;
+   int active_threads = 1;
+
+#pragma omp parallel default(none) shared(strings, length, size, source, destination, counts, starts, active_threads)
+   {
+#pragma omp single
+      active_threads = omp_get_num_threads();
+
+      for (int position = length - 2; position >= 0; --position) {
+#pragma omp for schedule(static)
+         for (int thread = 0; thread < active_threads; ++thread) {
+            long int begin = size * (long int)thread / active_threads;
+            long int end = size * (long int)(thread + 1) / active_threads;
+            long int *local_counts = counts + (size_t)thread * RADIX;
+
+            memset(local_counts, 0, RADIX * sizeof(*local_counts));
+            for (long int i = begin; i < end; ++i)
+               ++local_counts[sort_byte(strings, source[i], length, position)];
+         }
+
+#pragma omp single
+         {
+            long int next = 0;
+            for (int value = 0; value < RADIX; ++value) {
+               for (int thread = 0; thread < active_threads; ++thread) {
+                  size_t offset = (size_t)thread * RADIX + value;
+                  starts[offset] = next;
+                  next += counts[offset];
+               }
+            }
+         }
+
+#pragma omp for schedule(static)
+         for (int thread = 0; thread < active_threads; ++thread) {
+            long int begin = size * (long int)thread / active_threads;
+            long int end = size * (long int)(thread + 1) / active_threads;
+            long int *local_starts = starts + (size_t)thread * RADIX;
+
+            for (long int i = begin; i < end; ++i) {
+               unsigned char value = sort_byte(strings, source[i], length, position);
+               destination[local_starts[value]++] = source[i];
+            }
+         }
+
+#pragma omp single
+         {
+            long int *temporary = source;
+            source = destination;
+            destination = temporary;
+         }
+      }
+   }
+
+   free(counts);
+   free(starts);
+   return source;
+}
+#endif
+
+static long int *bucket_sort(const char *strings, int length, long int size) {
+   if (size <= 0)
+      return NULL;
+
+   if ((size_t)size > (size_t)-1 / sizeof(long int))
+      input_error("memory");
+
+   long int *first = malloc((size_t)size * sizeof(*first));
+   long int *second = malloc((size_t)size * sizeof(*second));
+   if (first == NULL || second == NULL) {
+      free(first);
+      free(second);
+      input_error("memory");
+   }
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+   for (long int i = 0; i < size; ++i)
+      first[i] = i;
+
+   long int *result;
+#ifdef _OPENMP
+   int thread_capacity = omp_get_max_threads();
+   if (thread_capacity > 1 && size >= 4096)
+      result = parallel_radix_sort(strings, length, size, first, second,
+                                   thread_capacity);
+   else
+      result = serial_radix_sort(strings, length, size, first, second);
+#else
+   result = serial_radix_sort(strings, length, size, first, second);
+#endif
+
+   free(result == first ? second : first);
+   return result;
+}
+
+static void load(char **v_string, long int *count, int *record_length) {
+   int declared_length;
+   int ignored_offset;
+   int ignored_bucket_count;
+   long int n;
+
+   if (fscanf(stdin, "%d", &declared_length) != 1)
+      input_error("len");
+   if (fscanf(stdin, "%ld", &n) != 1)
+      input_error("n");
+   if (fscanf(stdin, "%d", &ignored_offset) != 1)
+      input_error("offset");
+   if (fscanf(stdin, "%d", &ignored_bucket_count) != 1)
+      input_error("nbucket");
+
+   if (declared_length < 0 || declared_length == INT_MAX || n < 0)
+      input_error("parameters");
+
+   int length = declared_length + 1;
+   if (n != 0 && (size_t)n > (size_t)-1 / (size_t)length)
+      input_error("memory");
+
+   char *strings = NULL;
+   if (n != 0) {
+      strings = calloc((size_t)n, (size_t)length);
+      if (strings == NULL)
+         input_error("memory");
+   }
+
+   for (long int i = 0; i < n; ++i) {
+      if (fscanf(stdin, "%s", strings + (size_t)i * (size_t)length) != 1)
+         input_error("string");
+   }
+
+   *v_string = strings;
+   *count = n;
+   *record_length = length;
+}
+
+static void save(const char *strings, const long int *index,
+                 long int count, int length) {
+   for (long int i = 0; i < count; ++i) {
+      fputs(strings + (size_t)index[i] * (size_t)length, stdout);
+      putchar('\n');
+   }
+}
+
+int main(void) {
+   char *strings = NULL;
+   long int count = 0;
+   int length = 0;
+
+   load(&strings, &count, &length);
+   long int *index = bucket_sort(strings, length, count);
+   save(strings, index, count, length);
+
+   free(strings);
+   free(index);
+   return EXIT_SUCCESS;
+}

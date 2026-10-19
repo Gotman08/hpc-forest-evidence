@@ -1,0 +1,342 @@
+"""Reconcile immutable captured payloads and archive only; no native source import."""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+import zipfile
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RX = HERE.parent
+COMPARE = RX.parent.parent
+ROOT = RX / 'restauration-neuve/results-751592'
+WORKER = COMPARE / 'runs/source-only-gpt-6.1-sol-max/worker'
+SESSION = '665743a02b824021a697b6a4884a667c'
+SOURCE = '9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb'
+MODEL, EFFORT = 'gpt-6.1-sol', 'max'
+LOGGERS = {('WARN', 'codex_agent_roles::loader'), ('WARN', 'codex_core::responses_retry'),
+    ('ERROR', 'codex_models_manager::manager'), ('ERROR', 'codex_api::endpoint::responses_websocket'),
+    ('WARN', 'codex_core::session::startup_prewarm')}
+EVENTS = {'thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'item.started', 'item.updated', 'item.completed', 'error'}
+
+
+def need(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def sha(path):
+    need(path.is_file() and not path.is_symlink(), 'Regular immutable evidence required')
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {'path': str(path.resolve(strict=True)), 'sha256': sha(path)}
+
+
+def decode(raw):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            need(key not in value, 'Duplicate JSON key')
+            value[key] = item
+        return value
+    return json.loads(raw.decode('utf-8-sig', errors='strict'), object_pairs_hook=pairs,
+                      parse_constant=lambda value: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+
+
+def load(path):
+    return decode(path.read_bytes())
+
+
+def save(name, value):
+    path = HERE / name
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    return ref(path)
+
+
+def wire(schema):
+    value = copy.deepcopy(schema)
+    def visit(item):
+        if isinstance(item, dict):
+            item.pop('uniqueItems', None);item.pop('maxItems', None)
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+    visit(value)
+    return value
+
+
+def error_class(value):
+    if value is None:
+        return 'none'
+    if value == 'Request expired before generation':
+        return 'expired_before_invocation'
+    if value == 'Worker interrupted after claiming this request; not replayed':
+        return 'interrupted_claim_not_replayed'
+    if value == 'Codex failed or exceeded the generation deadline; inspect its log':
+        return 'cli_failed_or_generation_deadline'
+    if value == 'Codex attempted a tool call in a source-only generation':
+        return 'native_tool_attempt'
+    if isinstance(value, str) and value.startswith('Local Codex interface failed:'):
+        return 'local_interface_exception'
+    if isinstance(value, str) and value.startswith('Codex returned no valid structured proposal:'):
+        return 'invalid_structured_output'
+    return 'unknown_error_preserved'
+
+
+def journal(raw):
+    counts, item_counts, logger_counts = Counter(), Counter(), Counter()
+    usages, threads, unknown, tools = [], [], [], []
+    for number, line in enumerate(raw.decode('utf8', errors='strict').splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            event = decode(line.encode('utf8'))
+        except (ValueError, UnicodeError):
+            clean = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+            match = re.search(r'\b(WARN|ERROR|INFO|DEBUG)\s+([A-Za-z0-9_:]+):', clean)
+            signature = (match.group(1), match.group(2)) if match else None
+            if signature in LOGGERS:
+                logger_counts['/'.join(signature)] += 1
+            else:
+                unknown.append({'line': number, 'sha256': hashlib.sha256(line.encode()).hexdigest(), 'kind': 'unknown_nonJSON_line'})
+            continue
+        if not isinstance(event, dict) or event.get('type') not in EVENTS:
+            unknown.append({'line': number, 'sha256': hashlib.sha256(line.encode()).hexdigest(), 'kind': 'unknown_JSON_event'})
+            continue
+        kind = event['type'];counts[kind] += 1
+        if kind == 'thread.started':
+            need(isinstance(event.get('thread_id'), str) and event['thread_id'], 'Native thread identity missing')
+            threads.append(event['thread_id'])
+        if kind == 'turn.completed':
+            usage = event.get('usage')
+            need(isinstance(usage, dict) and set(usage) == {'input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'reasoning_output_tokens'}
+                 and all(type(v) is int and v >= 0 for v in usage.values()), 'Closed nonnegative actual CLI usage required')
+            need(usage['cached_input_tokens'] <= usage['input_tokens'] and usage['reasoning_output_tokens'] <= usage['output_tokens'], 'Usage subdivision inconsistent')
+            usages.append(usage)
+        if kind.startswith('item.'):
+            item = event.get('item', {});item_counts[item.get('type')] += 1
+            if item.get('type') not in {None, 'agent_message', 'reasoning', 'error'}:
+                tools.append(item.get('type'))
+    need(len(threads) == len(set(threads)) == 1 and counts['turn.started'] == 1 and len(usages) <= 1,
+         'One fresh native CLI thread/turn required per observed invocation')
+    return {'event_counts': dict(counts), 'item_type_counts': dict(item_counts), 'logger_counts': dict(logger_counts),
+        'usage_events': usages, 'thread_id': threads[0], 'unknown_lines_or_events': unknown, 'tool_events': tools}
+
+
+def verify_invocation(invocation, process, original_folder, cli, request_sha):
+    argv = invocation['argv']
+    need(Path(argv[0]) == Path(cli) and sha(Path(argv[0])) == 'f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312', 'Exact copied executable path/SHA required; Windows case only')
+    prefix = [argv[0], 'exec', '--ignore-user-config', '--strict-config', '--ephemeral', '--skip-git-repo-check',
+              '--sandbox', 'read-only', '--json', '--color', 'never', '--model', MODEL,
+              '--output-schema', str(original_folder / 'output-schema.json'), '--output-last-message',
+              str(original_folder / 'agent-result.json'), '-C', str(original_folder)]
+    need(argv[:len(prefix)] == prefix and argv[-1] == '-', 'Exact source-only native CLI prefix/path/model required')
+    middle = argv[len(prefix):-1]
+    need(len(middle) % 2 == 0 and all(middle[i] == '--config' for i in range(0, len(middle), 2)), 'Unexpected CLI argument')
+    overrides = {}
+    for i in range(1, len(middle), 2):
+        key, value = middle[i].split('=', 1);need(key not in overrides, 'Duplicate CLI override')
+        overrides[key] = json.loads(value)
+    expected = {'model_reasoning_effort': 'max', 'model_instructions_file': str(original_folder / 'instructions.txt'),
+        'model_context_window': 65536, 'project_doc_max_bytes': 0, 'skills.max_content_bytes': 1,
+        'forced_login_method': 'chatgpt', 'web_search': 'disabled', 'features.skip_host_skill_discovery': True,
+        **{'features.' + name: False for name in ('shell_tool', 'unified_exec', 'apps', 'plugins', 'memories',
+            'multi_agent', 'multi_agent_v2', 'hooks', 'skill_search', 'browser_use', 'computer_use', 'image_generation',
+            'view_image', 'workspace_dependencies', 'code_mode_host', 'sleep_tool', 'unbounded_connection_retries', 'shell_snapshot', 'goals')}}
+    need(overrides == expected, 'Native source-only permissions, MAX or context profile changed')
+    need(invocation['model'] == MODEL and invocation['reasoning_effort'] == EFFORT
+         and invocation['request_sha256'] == request_sha and invocation['source_execution_allowed'] is False,
+         'Actual invocation identity/request mismatch')
+    need(set(process) == {'argv', 'returncode', 'seconds', 'timed_out', 'log'} and process['argv'] == argv
+         and type(process['returncode']) is int and type(process['timed_out']) is bool
+         and type(process['seconds']) in (int, float) and math.isfinite(process['seconds']) and process['seconds'] >= 0
+         and process['log'] == str(original_folder / 'codex.jsonl'), 'Typed terminal process evidence differs')
+
+
+def main():
+    cap_path = HERE / 'capture-01/PRESERVATION-PAR-NONCE.json'
+    need(sha(cap_path) == '394e77b7139d64710ae4bda97d3a6772a08d97256bb73511def4169882fd93ea', 'Captured nonce manifest changed')
+    cap = load(cap_path)
+    need(cap['verified'] is True and cap['before_after_SHA_identical'] is True and cap['nonce_names_before_after_identical'] is True
+         and cap['orphan_nonce_directories'] == [] and cap['nonterminal_nonce_directories'] == [] and cap['conflicts'] == [],
+         'Incomplete/unknown/live payloads cannot be reconciled')
+    original_paths = [RX / n for n in ('audit-initial.json', 'verification-index-stable-apres-baseline.json', 'inventaire-requetes-archive.json',
+        'LIVRAISON-BASELINE-SOL-MAX-751592.json', 'inventaire-avant-audit.json', 'inventaire-apres-audit.json')]
+    original_paths += [ROOT / 'results.json', ROOT / 'channel.json', ROOT.parent / 'manifest-verifie.json', cap_path]
+    need(sha(RX / 'LIVRAISON-BASELINE-SOL-MAX-751592.json') == 'ad022b58b994c5dab3cba64aa4a7e8df9d061f784cbd8fc936f1cb38f3287e1c', 'Stable B delivery changed')
+    source_zip = COMPARE / 'HPC-Forest-Harnais-Comparaison-r1.zip';original_paths.append(source_zip)
+    need(sha(source_zip) == SOURCE, 'Exact frozen source-only ZIP required')
+    with zipfile.ZipFile(source_zip) as z:
+        members = [m for m in z.infolist() if not m.is_dir()]
+        need(len(members) == len({m.filename for m in members}) == 94 and all(m.filename.startswith('HPC-Forest/') for m in members), 'Exact94 source ZIP members required')
+    migration_path = COMPARE / 'runs/source-only-gpt-6.1-sol-max/cli-migration.json';original_paths.append(migration_path)
+    migration = load(migration_path);cli = migration['cli_executable'];cli_path = Path(cli)
+    need(migration['cli_sha256'] == sha(cli_path) == 'f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312', 'Copied CLI identity changed, no CLI execution allowed')
+    original_paths.append(cli_path)
+    before = {str(p): sha(p) for p in original_paths}
+    payloads, payload_refs, all_paths = defaultdict(dict), defaultdict(dict), {}
+    for key, item in cap['files'].items():
+        nonce, name = key.split('/', 1);path = Path(item['preserved']['path'])
+        need(re.fullmatch('[0-9a-f]{32}', nonce) and (path.resolve().is_relative_to(HERE) or path.resolve().is_relative_to(ROOT))
+             and not path.resolve().is_relative_to(WORKER) and sha(path) == item['sha256'] == item['preserved']['sha256'], 'Only preserved immutable payloads may be read')
+        raw = path.read_bytes();need(len(raw) == item['bytes'], 'Preserved byte count mismatch')
+        payloads[nonce][name] = raw;payload_refs[nonce][name] = item['preserved'];all_paths[str(path)] = item['sha256']
+    top = {name: load(Path(v['preserved']['path'])) for name, v in cap['top_identity_metadata'].items()}
+    need(top['worker-ready.json']['session_id'] == top['resume-process-identity.json']['session_id'] == SESSION
+         and top['worker-ready.json']['pid'] == top['resume-process-identity.json']['pid'] == 37848
+         and top['resume-process-identity.json']['source_sha256'] == SOURCE
+         and top['resume-process-identity.json']['frozen_source_files_verified'] == 94, 'Worker PID/session/source94 identity mismatch')
+    summary, channel = load(ROOT / 'results.json'), load(ROOT / 'channel.json')
+    subjects = summary['requested_subjects'];need(len(subjects) == len(set(subjects)) == 15 and summary['admitted_subjects'] == subjects,
+                                               'Exact fifteen subject cohort required')
+    need(channel['session_id'] == SESSION and channel['model'] == MODEL and channel['effort'] == EFFORT, 'Archive channel identity mismatch')
+    archive_index = load(RX / 'inventaire-requetes-archive.json')['requests'];need(len(archive_index) == len(payloads) == 124 and set(archive_index) == set(payloads), 'Exhaustive nonce set mismatch')
+    mapping = defaultdict(list)
+    for subject in subjects:
+        for name in ('codex-request.json', 'request.json'):
+            for path in (ROOT / subject / 'logs').rglob(name):
+                request = load(path)
+                if request.get('protocol') != 'hpc-forest-codex-mailbox-v1' or request.get('session_id') != SESSION:
+                    continue
+                role = request.get('meta_role')
+                if role is None:
+                    body = request['messages'][1]['content'].split('\n\nCURRENT SOURCE AS DATA:\n', 1)[0]
+                    role = json.loads(body)['role']
+                need(role in {'A', 'B', 'C', 'G', 'mother-preparation', 'mother-synthesis'}, 'Unknown request role')
+                mapping[request['nonce']].append((subject, role, path, request))
+                before[str(path)] = sha(path)
+    need(set(mapping) == set(archive_index) and all(len(v) == 1 for v in mapping.values()), 'Every nonce must map once to one exact subject/role')
+    records, seen_threads, journal_diagnostics = [], set(), {}
+    totals, by_role, by_subject = Counter(), defaultdict(Counter), defaultdict(Counter)
+    for nonce in sorted(payloads):
+        blobs, refs = payloads[nonce], payload_refs[nonce];request = decode(blobs['downloaded-request.json'])
+        request_sha = hashlib.sha256(blobs['downloaded-request.json']).hexdigest()
+        archive = ROOT / archive_index[nonce]['relative']
+        need(sha(archive) == request_sha == archive_index[nonce]['sha256'] and archive.read_bytes() == blobs['downloaded-request.json'], 'Archived/downloaded request bytes mismatch')
+        subject, role, log_path, journal_request = mapping[nonce][0]
+        need(request == journal_request and request['nonce'] == nonce and request['session_id'] == SESSION
+             and request['model'] == MODEL and request['reasoning_effort'] == EFFORT
+             and request['protocol'] == 'hpc-forest-codex-mailbox-v1' and request['kind'] == 'source-proposal'
+             and request['token_ceiling'] == 196608, 'Request differs from cohort/journal/source-only policy')
+        response = decode(blobs['response.json']);response_sha = hashlib.sha256(blobs['response.json']).hexdigest()
+        need(all(response.get(k) == request[k] for k in ('protocol', 'nonce', 'session_id', 'model', 'reasoning_effort'))
+             and response['request_sha256'] == request_sha, 'Response belongs to another request/session')
+        ready, delivered, claim = [decode(blobs[n]) for n in ('response-ready.json', 'delivered.json', 'generation-claimed.json')]
+        need(ready == {'sha256': response_sha, 'bytes': len(blobs['response.json'])}
+             and delivered['request_sha256'] == claim['request_sha256'] == request_sha and delivered['response_sha256'] == response_sha
+             and type(claim['claimed_at']) in (int, float) and type(delivered['delivered_at']) in (int, float)
+             and delivered['delivered_at'] >= claim['claimed_at'], 'Claim/response/ready/delivered chain mismatch')
+        remote_response = ROOT / 'mailbox/responses' / (nonce + '.response.json')
+        in_archive = remote_response.is_file()
+        if in_archive:
+            need(remote_response.read_bytes() == blobs['response.json'], 'Archived response differs from preserved local delivery')
+        record = {'nonce': nonce, 'subject': subject, 'role': role, 'mission_id': request['mission_id'],
+            'request_sha256': request_sha, 'response_sha256': response_sha, 'payload_refs': refs,
+            'archive_request': ref(archive), 'subject_journal_request': ref(log_path),
+            'archived_response_present': in_archive, 'late_local_delivery_only': not in_archive,
+            'claimed_at': claim['claimed_at'], 'delivered_at': delivered['delivered_at'], 'expires_at': request['expires_at'],
+            'native_invocation_observed': 'invocation.json' in blobs, 'usage_measured': False,
+            'known_exact_tokens': None, 'unknown_consumption': True, 'not_called_before_expiry': False,
+            'response_error_class': error_class(response.get('error')), 'infrastructure_error_reported': response.get('infrastructure_error'),
+            'process_returncode': None, 'timed_out': None, 'reported_token_accounting': response.get('usage', {}).get('token_accounting'),
+            'reported_upper_bound_tokens_not_consumption': None, 'normal_R3_admission_gate_applied': False}
+        usage = response.get('usage', {})
+        if record['native_invocation_observed']:
+            need(all(n in blobs for n in ('request.json', 'instructions.txt', 'output-schema.json', 'codex.jsonl', 'codex.jsonl.json')), 'Invoked nonce has incomplete native artifacts')
+            invocation, process = decode(blobs['invocation.json']), decode(blobs['codex.jsonl.json'])
+            verify_invocation(invocation, process, WORKER / nonce, cli, request_sha)
+            need(decode(blobs['request.json']) == request, 'Native full request differs semantically from full downloaded request')
+            need(blobs['instructions.txt'].decode('utf8') == request['messages'][0]['content']
+                 and decode(blobs['output-schema.json']) == wire(request['schema']), 'Actual native instruction/schema differs')
+            events = journal(blobs['codex.jsonl']);need(events['thread_id'] not in seen_threads, 'CLI thread reused across request nonce')
+            seen_threads.add(events['thread_id']);journal_diagnostics[nonce] = {k: v for k, v in events.items() if k not in ('usage_events', 'thread_id')}
+            need(usage.get('codex_jsonl_sha256') == hashlib.sha256(blobs['codex.jsonl']).hexdigest()
+                 and usage.get('events') == events['usage_events'], 'Response usage events/raw journal hash mismatch')
+            need(not events['unknown_lines_or_events'] and not events['tool_events'], 'Unknown journal bytes/native tool remain unresolved')
+            record.update(process_returncode=process['returncode'], timed_out=process['timed_out'], process_seconds=process['seconds'], thread_id=events['thread_id'])
+            if usage.get('token_accounting') == 'exact':
+                need(len(events['usage_events']) == 1, 'Exact usage requires one closed completed turn')
+                u = events['usage_events'][0];tokens = u['input_tokens'] + u['output_tokens']
+                need(usage.get('tokens') == tokens and usage.get('llm_calls') == 1, 'Exact reported usage differs from raw final event')
+                record.update(usage_measured=True, known_exact_tokens=tokens, unknown_consumption=False, usage_subdivisions=u)
+            else:
+                need(usage.get('token_accounting') == 'upper_bound' and not events['usage_events']
+                     and usage.get('tokens') == 196608, 'Unknown consumption must remain a separate explicit reservation bound')
+                record['reported_upper_bound_tokens_not_consumption'] = usage['tokens']
+            if 'agent-result.json' in blobs and response.get('data') is not None:
+                need(decode(blobs['agent-result.json']) == response['data'], 'Native agent result differs from reconciled response data')
+        else:
+            need(set(blobs) == {'delivered.json', 'download-receipt.json', 'downloaded-request.json', 'generation-claimed.json', 'response-ready.json', 'response.json'},
+                 'Zero calls requires exhaustive absence of all native invocation/process/output artifacts')
+            need(response.get('error') == 'Request expired before generation' and response.get('infrastructure_error') is True
+                 and usage == {'tokens': 0, 'token_accounting': 'exact', 'llm_calls': 0}, 'Zero consumption requires explicit before-invocation expiry evidence')
+            record.update(usage_measured=True, known_exact_tokens=0, unknown_consumption=False, not_called_before_expiry=True)
+        records.append(record)
+        for target in (totals, by_role[role], by_subject[subject]):
+            target['requests'] += 1;target['native_invocations_observed'] += int(record['native_invocation_observed'])
+            target['expired_before_invocation'] += int(record['not_called_before_expiry'])
+            target['requests_with_unknown_consumption'] += int(record['unknown_consumption'])
+            target['known_exact_tokens'] += record['known_exact_tokens'] or 0
+            target['completed_turns_with_exact_usage'] += int(record['native_invocation_observed'] and record['usage_measured'])
+            target['upper_bound_tokens_not_consumption'] += record['reported_upper_bound_tokens_not_consumption'] or 0
+            target['negative_responses_preserved'] += int(record['response_error_class'] != 'none')
+    after = {key: sha(Path(key)) for key in before}
+    need(before == after and all(sha(Path(key)) == digest for key, digest in all_paths.items()), 'Immutable inputs changed during reconciliation')
+    save('INVENTAIRE-ENTREES-AVANT.json', before);save('INVENTAIRE-ENTREES-APRES.json', after)
+    diagnostics_ref = save('DIAGNOSTICS-JSONL-MINIMISES.json', {'schema': 'hpc-forest-source-only-jsonl-minimal-diagnostics-v1',
+        'model_text_error_bodies_or_sources_exported': False, 'records_by_nonce': journal_diagnostics,
+        'raw_journals_preserved_by_explicit_SHA_refs': True, 'diagnostics_do_not_create_or_require_R3_NORMAL_admission': True})
+    records_ref = save('LEDGER-PAR-NONCE.json', {'schema': 'hpc-forest-source-only-nonce-ledger-v1', 'session_id': SESSION,
+        'job_id': '751592', 'deduplication_key': ['session_id', 'nonce'], 'records': records})
+    first_negatives = sorted([r for r in records if r['response_error_class'] != 'none'], key=lambda r: r['claimed_at'])
+    field_names = ('nonce', 'subject', 'role', 'claimed_at', 'delivered_at', 'response_error_class', 'process_returncode', 'timed_out',
+                   'known_exact_tokens', 'unknown_consumption', 'not_called_before_expiry', 'response_sha256')
+    receipt = {'schema': 'hpc-forest-source-only-native-delivery-reconciliation-v1', 'verified': True,
+        'verification_scope': 'read-only full nonce/claim/native-process/local-delivery/usage reconciliation; scientific audit remains separate',
+        'scope_id': 'hpc-forest-harness-comparison-20261016-r1', 'arm': 'source-only', 'model': MODEL, 'effort': EFFORT,
+        'session_id': SESSION, 'job_id': '751592', 'source_zip_sha256': SOURCE, 'source_frozen_files': 94,
+        'created_at_utc': datetime.now(timezone.utc).isoformat(), 'deduplication_key': ['session_id', 'nonce'],
+        'requests': len(records), 'records': records, **dict(totals), 'unknown_invocations': 0, 'unresolved': [],
+        'all_started_calls_reconciled': True, 'all_published_requests_have_bound_local_delivery_receipt': True,
+        'all_archived_responses_match_preserved_local_bytes': True, 'late_local_delivery_count': sum(r['late_local_delivery_only'] for r in records),
+        'total_exact_consumption_available': totals['requests_with_unknown_consumption'] == 0,
+        'exact_consumption_tokens_total': totals['known_exact_tokens'] if totals['requests_with_unknown_consumption'] == 0 else None,
+        'unmeasured_native_invocations': totals['requests_with_unknown_consumption'],
+        'reservations_are_not_consumption': True, 'cache_and_reasoning_subdivisions_not_added_again': True,
+        'by_role': {key: dict(value) for key, value in by_role.items()}, 'by_subject': {key: dict(value) for key, value in by_subject.items()},
+        'first_negative_responses_by_claim_time': [{k: r[k] for k in field_names} for r in first_negatives],
+        'source_only_protocol94_verified': True, 'source_only_native_cli_path_and_sha256_verified': ref(cli_path),
+        'all_cli_source_execution_allowed_false': True, 'all_mother_child_G_requested_model_effort_same': True,
+        'all_started_call_states_terminal': True, 'identity_and_freshness_gate': cap['identity_gate'],
+        'bounded_finished_nonce_preservation': ref(cap_path), 'baseline': ref(RX / 'LIVRAISON-BASELINE-SOL-MAX-751592.json'),
+        'archive_manifest': ref(ROOT.parent / 'manifest-verifie.json'), 'source_zip': ref(source_zip),
+        'nonce_ledger': records_ref, 'minimal_jsonl_diagnostics': diagnostics_ref,
+        'input_inventory_before': ref(HERE / 'INVENTAIRE-ENTREES-AVANT.json'), 'input_inventory_after': ref(HERE / 'INVENTAIRE-ENTREES-APRES.json'),
+        'scoped_inputs_unchanged_before_after': True, 'live_cache_not_reopened_after_bounded_preservation': True,
+        'worker_lock_opened_or_copied': False, 'database_or_database_lock_opened_or_copied': False,
+        'complete_live_cache_snapshot': False, 'native_calls_started_by_auditor': 0, 'native_calls_replayed': 0,
+        'stop_executed': False, 'stop_authorized_by_this_receipt': False, 'scientific_gain_or_final_selection_audited_here': False,
+        'normal_R3_admission_gate_applied': False, 'global_admission_verified': False, 'independent_performance_verified': False,
+        'limitations': ['Ten terminal observed CLI invocations lack completed usage: their consumption stays null, never zero or a fabricated exact total.',
+          'The one local late response is not in the immutable received mailbox; its source-backed delivered marker is preserved, not presented as a new independent remote readback.',
+          'Invocation counts describe observed local CLI processes; no independent backend-model-per-inference or billing attestation exists.',
+          'Structured CLI errors and stderr warnings are retained; source-only94 protocol is not reclassified using the later R3 NORMAL admission rules.',
+          'No locks, live databases or complete live cache are read/copied; an individual stop requires the parent final audit/review/fresh identities and a separately reviewed plan.']}
+    result = save('RECONCILIATION-LIVRAISONS.json', receipt)
+    print(json.dumps({'receipt': result, 'ledger': records_ref, 'totals': dict(totals),
+        'exact_consumption_tokens_total': receipt['exact_consumption_tokens_total'], 'late_local_delivery_count': receipt['late_local_delivery_count'],
+        'all_started_calls_reconciled': True, 'stop_authorized': False}, indent=2))
+
+
+if __name__ == '__main__':
+    main()

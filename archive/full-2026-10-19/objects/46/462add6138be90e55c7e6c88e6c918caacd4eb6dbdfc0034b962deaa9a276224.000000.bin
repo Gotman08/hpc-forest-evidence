@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cstdint>\n#include <iostream>\n#include <utility>\n#include <vector>\n\n#if defined(__aarch64__)\n#include <arm_neon.h>\n#endif\n\nnamespace {\nconstexpr std::uint32_t MOD = 1000000007u;\n\nvoid update_diagonal(const std::uint32_t* __restrict previous,\n                     std::uint32_t* __restrict current,\n                     int begin, int end) {\n    int row = begin;\n#if defined(__aarch64__)\n    const uint32x4_t modulus = vdupq_n_u32(MOD);\n    for (; row + 4 <= end; row += 4) {\n        const uint32x4_t left = vld1q_u32(previous + row);\n        const uint32x4_t above = vld1q_u32(previous + row - 1);\n        const uint32x4_t sum = vaddq_u32(left, above);\n        const uint32x4_t reduced =\n            vminq_u32(sum, vsubq_u32(sum, modulus));\n        vst1q_u32(current + row, reduced);\n    }\n#endif\n    for (; row < end; ++row) {\n        const std::uint32_t sum = previous[row] + previous[row - 1];\n        current[row] = sum >= MOD ? sum - MOD : sum;\n    }\n}\n\n// Fuse two wavefronts only when the intermediate wavefront has no blockers.\n// Return its final value for the growing second wavefront's extra high row.\nstd::uint32_t update_clear_pair(\n    const std::uint32_t* __restrict previous,\n    std::uint32_t* __restrict current,\n    int begin, int end) {\n    int row = begin;\n    std::uint32_t carry = 0;\n#if defined(__aarch64__)\n    if (row + 4 <= end) {\n        const uint32x4_t modulus = vdupq_n_u32(MOD);\n        uint32x4_t preceding_input = vdupq_n_u32(previous[row - 1]);\n        uint32x4_t preceding_middle = vdupq_n_u32(0);\n        do {\n            const uint32x4_t input = vld1q_u32(previous + row);\n            const uint32x4_t input_before =\n                vextq_u32(preceding_input, input, 3);\n            const uint32x4_t middle_sum = vaddq_u32(input, input_before);\n            const uint32x4_t middle =\n                vminq_u32(middle_sum, vsubq_u32(middle_sum, modulus));\n\n            const uint32x4_t middle_before =\n                vextq_u32(preceding_middle, middle, 3);\n            const uint32x4_t sum = vaddq_u32(middle, middle_before);\n            const uint32x4_t reduced =\n                vminq_u32(sum, vsubq_u32(sum, modulus));\n            vst1q_u32(current + row, reduced);\n\n            preceding_input = input;\n            preceding_middle = middle;\n            row += 4;\n        } while (row + 4 <= end);\n        carry = vgetq_lane_u32(preceding_middle, 3);\n    }\n#endif\n    for (; row < end; ++row) {\n        const std::uint32_t middle_sum = previous[row] + previous[row - 1];\n        const std::uint32_t middle =\n            middle_sum >= MOD ? middle_sum - MOD : middle_sum;\n        const std::uint32_t sum = middle + carry;\n        current[row] = sum >= MOD ? sum - MOD : sum;\n        carry = middle;\n    }\n    return carry;\n}\n}\n\nint main() {\n    std::ios::sync_with_stdio(false);\n    std::cin.tie(nullptr);\n\n    int n, m;\n    if (!(std::cin >> n >> m)) {\n        return 0;\n    }\n\n    const int diagonal_count = 2 * n - 1;\n    std::vector<std::vector<int>> blocked_by_diagonal(diagonal_count);\n    for (int obstacle = 0; obstacle < m; ++obstacle) {\n        int row, column;\n        std::cin >> row >> column;\n        blocked_by_diagonal[row + column].push_back(row);\n    }\n\n    // Index -1 remains zero. Entries above the growing wavefront have\n    // never been written and therefore also remain zero.\n    std::vector<std::uint32_t> first(n + 1, 0);\n    std::vector<std::uint32_t> second(n + 1, 0);\n    std::uint32_t* previous = first.data() + 1;\n    std::uint32_t* current = second.data() + 1;\n    previous[0] = blocked_by_diagonal[0].empty() ? 1u : 0u;\n\n    int diagonal = 1;\n    while (diagonal < diagonal_count) {\n        const int begin = std::max(0, diagonal - n + 1);\n        const int end = std::min(n, diagonal + 1);\n        int output_diagonal = diagonal;\n\n        if (diagonal + 1 < diagonal_count &&\n            blocked_by_diagonal[diagonal].empty()) {\n            const std::uint32_t carry =\n                update_clear_pair(previous, current, begin, end);\n            if (end < n) {\n                current[end] = carry;\n            }\n            // In the shrinking half, the extra low output is outside\n            // the second wavefront and is never used by a later update.\n            ++output_diagonal;\n        } else {\n            update_diagonal(previous, current, begin, end);\n        }\n\n        for (int row : blocked_by_diagonal[output_diagonal]) {\n            current[row] = 0;\n        }\n        std::swap(previous, current);\n        diagonal = output_diagonal + 1;\n    }\n\n    std::cout << previous[n - 1] << '\\n';\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Selectively fuse two antidiagonals when the intermediate one has no blockers, reducing memory traffic without sorting or segmented-kernel overhead. Retain the measured-best single-antidiagonal kernel otherwise.",
+    "notes": "One serial integration candidate; not executed locally. Duplicate blockers remain idempotent, and n=1 retains the origin initialization.",
+    "sources_kept": [
+      "f6306d74a90f4bd8",
+      "919357e09c7e47e5"
+    ],
+    "transformations": [
+      "Retain rolling zero-padded antidiagonal buffers, diagonal-grouped blockers, NEON modular addition and portable scalar fallback.",
+      "Fuse pairs only across blocker-free intermediate antidiagonals, reusing preceding input and intermediate lanes through NEON shifts.",
+      "Apply output-wavefront blockers before advancing; use the incumbent single-wavefront kernel whenever the intermediate wavefront is blocked.",
+      "Retain unsynchronized, untied standard input."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "e064f429cb18493e8eca7d4900000d2d",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "e16df16c0cea41ddc035b2f4eef6a82f05be04ec7461cac6e7f7a0b6ebf55ba5",
+  "session_id": "665743a02b824021a697b6a4884a667c",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "67cca2f1af6c567f32744e10bc6d730b94590230f3cfee146f0907e4ace4c99f",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 20391,
+        "output_tokens": 5802,
+        "reasoning_output_tokens": 4142
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 26193,
+    "tool_events": []
+  }
+}

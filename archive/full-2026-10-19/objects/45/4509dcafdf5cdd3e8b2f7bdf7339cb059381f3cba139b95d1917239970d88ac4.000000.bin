@@ -1,0 +1,50 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <limits>\n#include <memory>\n#include <vector>\n\n#ifdef _OPENMP\n#include <omp.h>\n#endif\n\nclass FastInput {\n    unsigned char buffer_[1u << 16];\n    std::size_t position_ = 0;\n    std::size_t length_ = 0;\n\n    int get() {\n        if (position_ == length_) {\n            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);\n            position_ = 0;\n            if (length_ == 0) return EOF;\n        }\n        return buffer_[position_++];\n    }\n\npublic:\n    bool read_int(int& value) {\n        int c;\n        do {\n            c = get();\n            if (c == EOF) return false;\n        } while (c <= ' ');\n\n        bool negative = false;\n        if (c == '-' || c == '+') {\n            negative = c == '-';\n            c = get();\n        }\n\n        long long magnitude = 0;\n        while (c >= '0' && c <= '9') {\n            magnitude = magnitude * 10 + (c - '0');\n            c = get();\n        }\n        value = static_cast<int>(negative ? -magnitude : magnitude);\n        return true;\n    }\n};\n\nint main() {\n    FastInput input;\n    int n, s;\n    if (!input.read_int(n) || !input.read_int(s)) return 0;\n    if (n <= 0 || s <= 0 || s > n) return 0;\n\n    const std::size_t cells = static_cast<std::size_t>(n) * n;\n    std::unique_ptr<int[]> matrix(new int[cells]);\n    for (std::size_t i = 0; i < cells; ++i) {\n        if (!input.read_int(matrix[i])) return 0;\n    }\n    const int* const values = matrix.get();\n    const int m = n - s + 1;\n\n    int workers = 1;\n#ifdef _OPENMP\n    workers = omp_get_max_threads();\n#endif\n    const int cache_blocks = (n + 7) / 8;\n    const int grain_limit = static_cast<int>(\n        std::max<std::size_t>(1, cells / 32768u));\n    workers = std::max(1, std::min(workers,\n                                 std::min(cache_blocks, grain_limit)));\n    const int bands = std::min(workers, m);\n\n    std::vector<int> starts(bands + 1);\n    for (int b = 0; b <= bands; ++b) {\n        starts[b] = static_cast<int>(static_cast<long long>(m) * b / bands);\n    }\n\n    // Align states and column-stripe boundaries to avoid false sharing.\n    const std::size_t pitch = static_cast<std::size_t>(cache_blocks) * 8;\n    std::unique_ptr<long long[]> storage(\n        new long long[static_cast<std::size_t>(bands) * pitch + 8]);\n    const std::uintptr_t address =\n        reinterpret_cast<std::uintptr_t>(storage.get());\n    const std::size_t alignment_offset = (64 - address % 64) % 64;\n    long long* const columns =\n        storage.get() + alignment_offset / sizeof(long long);\n\n    long long answer = std::numeric_limits<long long>::lowest();\n\n#pragma omp parallel num_threads(workers) if(workers > 1) reduction(max:answer)\n    {\n        // Each column stripe seeds every band without inter-band barriers.\n#pragma omp for schedule(static)\n        for (int stripe = 0; stripe < workers; ++stripe) {\n            const int col_begin = static_cast<int>(\n                static_cast<long long>(cache_blocks) * stripe / workers) * 8;\n            const int col_end = std::min(n, static_cast<int>(\n                static_cast<long long>(cache_blocks) * (stripe + 1) / workers) * 8);\n            int previous_start = 0;\n\n            for (int b = 0; b < bands; ++b) {\n                const int begin = starts[b];\n                const int shift = begin - previous_start;\n                long long* const state = columns + static_cast<std::size_t>(b) * pitch;\n\n                if (b == 0 || s <= 2 * shift) {\n#pragma omp simd\n                    for (int c = col_begin; c < col_end; ++c) {\n                        state[c] = 0;\n                    }\n                    for (int row = begin; row < begin + s; ++row) {\n                        const int* const source = values + static_cast<std::size_t>(row) * n;\n#pragma omp simd\n                        for (int c = col_begin; c < col_end; ++c) {\n                            state[c] += static_cast<long long>(source[c]);\n                        }\n                    }\n                } else {\n                    const long long* const previous =\n                        columns + static_cast<std::size_t>(b - 1) * pitch;\n#pragma omp simd\n                    for (int c = col_begin; c < col_end; ++c) {\n                        state[c] = previous[c];\n                    }\n                    for (int row = previous_start; row < begin; ++row) {\n                        const int* const outgoing =\n                            values + static_cast<std::size_t>(row) * n;\n                        const int* const incoming =\n                            values + static_cast<std::size_t>(row + s) * n;\n#pragma omp simd\n                        for (int c = col_begin; c < col_end; ++c) {\n                            state[c] += static_cast<long long>(incoming[c])\n                                      - static_cast<long long>(outgoing[c]);\n                        }\n                    }\n                }\n                previous_start = begin;\n            }\n        }\n\n        // Seed construction is complete; bands now advance independently.\n#pragma omp for schedule(static) nowait\n        for (int b = 0; b < bands; ++b) {\n            long long* const state = columns + static_cast<std::size_t>(b) * pitch;\n            const int begin = starts[b];\n            const int end = starts[b + 1];\n            long long local_best = std::numeric_limits<long long>::lowest();\n\n            for (int row = begin; row < end; ++row) {\n                if (row != begin) {\n                    const int* const outgoing =\n                        values + static_cast<std::size_t>(row - 1) * n;\n                    const int* const incoming =\n                        values + static_cast<std::size_t>(row + s - 1) * n;\n#pragma omp simd\n                    for (int c = 0; c < n; ++c) {\n                        state[c] += static_cast<long long>(incoming[c])\n                                  - static_cast<long long>(outgoing[c]);\n                    }\n                }\n\n                long long sum = 0;\n#pragma omp simd reduction(+:sum)\n                for (int c = 0; c < s; ++c) {\n                    sum += state[c];\n                }\n                local_best = std::max(local_best, sum);\n                for (int c = s; c < n; ++c) {\n                    sum += state[c] - state[c - s];\n                    local_best = std::max(local_best, sum);\n                }\n            }\n            answer = std::max(answer, local_best);\n        }\n    }\n\n    std::printf(\"%lld\\n\", answer);\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Cooperative initialization followed by independent output-row bands should eliminate batch synchronization and improve four-core utilization while retaining O(N²) work.",
+    "notes": "Unmeasured. Retains the full matrix plus O(TN) auxiliary storage; small matrices use one thread.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Use a bounded fread parser and contiguous matrix storage.",
+      "Cooperatively seed cache-line-aligned 64-bit column states, reusing overlapping windows.",
+      "Statically distribute independent row bands within one OpenMP team, with SIMD column updates and a final maximum reduction.",
+      "Bound thread count by available OpenMP threads and matrix work; preserve 64-bit intermediate arithmetic."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "a8fb27e74f8b451dbee32ad3f4abc6fe",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "392aedc968d81be3e6386ac9ce5559cc10391363e7af830a6abc9c22ce96dc45",
+  "session_id": "a80da638e1054b3a9d13f66e5787f89f",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "53a52548a316bae85503af3b68a6f8cb9450a4a7a7b7d3f9d692bd22a16ff26d",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 11892,
+        "output_tokens": 17279,
+        "reasoning_output_tokens": 15280
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 29171,
+    "tool_events": []
+  }
+}

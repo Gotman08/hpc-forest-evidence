@@ -1,0 +1,186 @@
+--- delivered-r1/preparer-arret-possede.py
++++ revision-r2/preparer-arret-possede.py
+@@ -24,7 +24,7 @@
+ PRESERVE = (37900, 37848)
+ KEYS = ("ProcessId", "ParentProcessId", "CreationDate", "ExecutablePath", "CommandLine")
+ OWN = Path(__file__).resolve().parent
+-BASE = OWN.parents[2]
++BASE = OWN.parents[3]
+ RECEPTION = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r1/reception-finale-751992"
+ WORKER = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r1/worker"
+ 
+@@ -88,7 +88,8 @@
+     raise ValueError("Cyclic/unstable CIM ancestry")
+ 
+ 
+-def classify(baseline, current, allow_absent):
++def classify(baseline, current, allow_absent, preserved_foreign=None):
++    preserved_foreign = preserved_foreign or {}
+     old, now = index(baseline), index(current)
+     need(family(baseline, 41808) == set(ORDER), "Baseline owned family differs from the sealed seven identities")
+     for pid in PRESERVE:
+@@ -116,6 +117,11 @@
+     for pid, row in now.items():
+         if pid in ORDER or pid in PRESERVE or pid in old and identity(row) == identity(old[pid]):
+             continue
++        if pid in preserved_foreign:
++            need(identity(row) == identity(preserved_foreign[pid]), "Explicit foreign identity changed; preserve and block")
++            foreign_changes.append({"identity": row, "classification": "explicit_five_field_foreign_preservation_with_sealed_absent_parent",
++                                    "historical_parent_attribution_independently_verified": False, "never_a_stop_target": True})
++            continue
+         chain, seen, child = [], {pid}, row
+         while True:
+             parent_pid = child["ParentProcessId"]
+@@ -133,6 +139,51 @@
+             child = parent
+     return {"present_owned": present, "naturally_absent_owned": absent,
+             "foreign_new_or_changed_preserved": foreign_changes, "source_only_full_identities_preserved": [now[p] for p in PRESERVE]}
++
++
++FOREIGN_IDS = {42296, 53668, 6816, 44736, 55372}
++FOREIGN_PARENT = 31268
++
++
++def foreign_preservation_map(receipt, baseline, observed, current):
++    expected = {"schema": "hpc-forest-primes-r2max-explicit-foreign-preservation-v1", "scope_id": SCOPE,
++                "job_id": JOB, "session_id": SESSION, "model": "gpt-6-luna", "effort": "max",
++                "source_zip_sha256": SOURCE, "plan_sha256": PLAN, "preparation_manifest_sha256": PREP,
++                "owner_identity_sha256": OWNER, "baseline_cim_sha256": BASELINE}
++    need(all(receipt.get(k) == v for k, v in expected.items()) and receipt.get("verified") is True
++         and receipt.get("preservation_only") is True and receipt.get("never_stop_targets") is True
++         and receipt.get("historical_parent_attribution_independently_verified") is False,
++         "No exact explicit foreign-only preservation receipt")
++    old, seen, now = index(baseline), index(observed), index(current)
++    parent = receipt["sealed_absent_parent_identity"]
++    need(parent["ProcessId"] == FOREIGN_PARENT and FOREIGN_PARENT in old
++         and identity(parent) == identity(old[FOREIGN_PARENT])
++         and FOREIGN_PARENT not in seen and FOREIGN_PARENT not in now,
++         "Sealed foreign parent absent condition changed or PPID reused")
++    need(stamp(parent["CreationDate"]) < min(stamp(old[p]["CreationDate"]) for p in ORDER),
++         "Foreign baseline parent must predate the owned family")
++    entries = index(receipt["observed_foreign_identities"])
++    need(set(entries) == FOREIGN_IDS and not (set(entries) & (set(ORDER) | set(PRESERVE))), "Only the five exact observed foreign identities may be preserved")
++    for pid, entry in entries.items():
++        need(pid in seen and identity(entry) == identity(seen[pid]), "Foreign receipt does not match immutable observed census")
++        need(entry["ExecutablePath"] == parent["ExecutablePath"], "Different executable in narrow foreign receipt")
++        if pid in now:
++            need(identity(entry) == identity(now[pid]), "Foreign PID reused or five-field identity changed")
++        child, walked = entry, {pid}
++        while child["ParentProcessId"] != FOREIGN_PARENT:
++            parent_pid = child["ParentProcessId"]
++            need(parent_pid in entries and parent_pid not in walked and parent_pid not in ORDER,
++                 "Unknown/cyclic/owned parent in explicit foreign chain")
++            ancestor = entries[parent_pid]
++            need(stamp(child["CreationDate"]) >= stamp(ancestor["CreationDate"]), "Foreign child predates its admitted parent")
++            if parent_pid in now:
++                need(identity(now[parent_pid]) == identity(ancestor), "Intermediate foreign PPID reused")
++            walked.add(parent_pid)
++            child = ancestor
++        need(stamp(child["CreationDate"]) >= stamp(parent["CreationDate"]), "Foreign child predates sealed parent")
++    for pid in (*ORDER, *PRESERVE):
++        need(pid in seen and identity(old[pid]) == identity(seen[pid]), "Immutable exception census does not preserve original owned/source-only identity")
++    return entries
+ 
+ 
+ def validate_audit(data):
+@@ -201,7 +252,27 @@
+     captured = stamp(fresh["captured_at_utc"])
+     need(0 <= time.time() - captured <= 30 and fresh.get("complete_census") is True
+          and fresh.get("rows_count") == len(fresh["rows"]), "CIM is stale or incomplete")
+-    classified = classify(baseline, fresh["rows"], args.allow_absent_owned)
++    preserved_foreign, foreign_ref = {}, None
++    if args.foreign_receipt is not None or args.foreign_receipt_sha256 is not None:
++        need(args.foreign_receipt is not None and args.foreign_receipt_sha256 is not None
++             and sha(args.foreign_receipt) == args.foreign_receipt_sha256, "Explicit foreign receipt path/SHA required together")
++        foreign_receipt = load(args.foreign_receipt)
++        observed_ref = foreign_receipt["observed_census_ref"]
++        observed_path = Path(observed_ref["path"])
++        need(sha(observed_path) == observed_ref["sha256"] == "7dcd67760dfe63d06978e98c8ef62a274684fbdd64d83588ca51e455930fd76a", "Changed immutable refused census")
++        observed_envelope = load(observed_path)
++        need(observed_envelope.get("complete_census") is True
++             and observed_envelope.get("rows_count") == len(observed_envelope["rows"]), "Exception proof census incomplete")
++        refusal_ref = foreign_receipt["refusal_reconciliation_ref"]
++        refusal_path = Path(refusal_ref["path"])
++        need(sha(refusal_path) == refusal_ref["sha256"] == "b018c24103412a2f26a8fffbe5b0de060159942555ac8d8bdae1f7c54242ba22", "Changed first refusal reconciliation")
++        refusal = load(refusal_path)
++        need(refusal.get("no_intent_created") is True and refusal.get("no_actions_created") is True
++             and refusal.get("owned_targets_all_unchanged") is True and refusal.get("source_only_unchanged") is True
++             and refusal.get("no_process_stopped") is True, "Original failed attempt did not remain action-free")
++        preserved_foreign = foreign_preservation_map(foreign_receipt, baseline, observed_envelope["rows"], fresh["rows"])
++        foreign_ref = ref(args.foreign_receipt)
++    classified = classify(baseline, fresh["rows"], args.allow_absent_owned, preserved_foreign)
+     expected = load(RECEPTION / "cache-snapshot-inventaire.json")
+     actual = check_cache(expected)
+     need(audit.get("inventory_sha256", {}).get("cache") == hashlib.sha256(json.dumps(actual, sort_keys=True).encode()).hexdigest(),
+@@ -215,7 +286,7 @@
+             "fresh_cim_ref": ref(args.fresh_cim), "prepared_utc": datetime.now(UTC).isoformat(),
+             "original_cache_reverified_files": 132, "worker_lock_bytes_read": False, "worker_lock_sha256_before": None,
+             "owned_targets_in_stop_order": [old[p] for p in ORDER], "preserve_source_only_relay_identities": [old[p] for p in PRESERVE],
+-            "classification": classified, "no_recursive_stop": True, "no_stop_by_name": True, "foreign_processes_targeted": False,
++            "classification": classified, "explicit_foreign_preservation_ref": foreign_ref, "no_recursive_stop": True, "no_stop_by_name": True, "foreign_processes_targeted": False,
+             "native_research_admitted": False, "independent_performance_audit_verified": False,
+             "limits": ["Not an independent raw-stdout/performance admission.", "Changed/new foreign identities require a full stable baseline ancestry anchor; unknown/orphan/related identities block.", "Parent alone reviews and executes. No route change performed."]}
+ 
+@@ -228,6 +299,8 @@
+     p.add_argument("--fresh-cim-sha256", required=True)
+     p.add_argument("--allow-absent-owned", action="store_true")
+     p.add_argument("--plan-out", type=Path)
++    p.add_argument("--foreign-receipt", type=Path)
++    p.add_argument("--foreign-receipt-sha256")
+     args = p.parse_args()
+     result = build(args)
+     if args.plan_out:
+--- delivered-r1/arreter-individuellement.ps1
++++ revision-r2/arreter-individuellement.ps1
+@@ -1,11 +1,13 @@
+ param(
+     [Parameter(Mandatory=$true)][string]$AuditPath,
+     [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$AuditSha256,
++    [string]$ForeignReceiptPath,
++    [string]$ForeignReceiptSha256,
+     [switch]$Execute
+ )
+ $ErrorActionPreference = 'Stop'
+ $receiptRoot = $PSScriptRoot
+-$baseRoot = Split-Path (Split-Path (Split-Path $receiptRoot -Parent) -Parent) -Parent
++$baseRoot = (Resolve-Path -LiteralPath (Join-Path $receiptRoot '../../../..')).Path
+ $pythonPath = Join-Path $baseRoot 'work/.venv/Scripts/python.exe'
+ $preparerPath = Join-Path $receiptRoot 'preparer-arret-possede.py'
+ $planPath = Join-Path $receiptRoot 'plan-arret-individuel.json'
+@@ -31,6 +33,10 @@
+ function Validate-Current([bool]$writePlan) {
+     $freshPath = Fresh-Census
+     $arguments = @('-B',$preparerPath,'--audit',$AuditPath,'--audit-sha256',$AuditSha256,'--fresh-cim',$freshPath,'--fresh-cim-sha256',(File-Ref $freshPath).sha256,'--allow-absent-owned')
++    if ($ForeignReceiptPath -or $ForeignReceiptSha256) {
++        if (-not $ForeignReceiptPath -or $ForeignReceiptSha256 -cnotmatch '^[0-9a-f]{64}$') {throw 'Explicit foreign preservation path/SHA pair required'}
++        $arguments += @('--foreign-receipt',$ForeignReceiptPath,'--foreign-receipt-sha256',$ForeignReceiptSha256)
++    }
+     if ($writePlan) {$arguments += @('--plan-out',$planPath)}
+     $resultText = & $pythonPath @arguments
+     if ($LASTEXITCODE -ne 0) {throw 'Complete audit/cache/fresh-CIM preparation refused; no individual stop permitted'}
+@@ -50,11 +56,15 @@
+ $prepared = Validate-Current (-not (Test-Path -LiteralPath $planPath))
+ $plan = Get-Content -LiteralPath $planPath -Raw -Encoding utf8 | ConvertFrom-Json
+ if ($plan.schema -ne 'hpc-forest-primes-r2max-owned-individual-stop-plan-v1' -or $plan.job_id -ne '751992' -or $plan.session_id -ne 'c8044062692149138d826d3f388a08ef' -or $plan.pre_stop_audit_sha256 -cne $AuditSha256 -or $plan.owner_identity_sha256 -cne 'dd3e98c9f64528569c6b9fae6814c17f13847ce5f4dd89dd7b3dbc9c4688f3db') {throw 'Wrong exact owned stop plan'}
++if (($null -eq $plan.explicit_foreign_preservation_ref) -ne ($null -eq $prepared.explicit_foreign_preservation_ref)) {throw 'Explicit foreign preservation scope changed since stop plan'}
++if ($null -ne $plan.explicit_foreign_preservation_ref) {
++    if ($plan.explicit_foreign_preservation_ref.sha256 -cne $prepared.explicit_foreign_preservation_ref.sha256 -or $plan.explicit_foreign_preservation_ref.path -cne $prepared.explicit_foreign_preservation_ref.path) {throw 'Explicit foreign preservation receipt changed since stop plan'}
++}
+ foreach ($identity in @($plan.owned_targets_in_stop_order) + @($plan.preserve_source_only_relay_identities)) {
+     $peer = @($prepared.owned_targets_in_stop_order + $prepared.preserve_source_only_relay_identities | Where-Object {$_.ProcessId -eq $identity.ProcessId})
+     if ($peer.Count -ne 1 -or -not (Same-Identity $peer[0] $identity)) {throw 'Plan/full baseline identity mismatch'}
+ }
+-$preflight = @{schema='hpc-forest-primes-r2max-owned-stop-preflight-v1';verified=$true;verification_scope='Audit/cache and complete fresh CIM gate only; no stop';job_id='751992';session_id=$plan.session_id;scope_id=$plan.scope_id;source_zip_sha256=$plan.source_zip_sha256;plan_sha256=$plan.plan_sha256;preparation_manifest_sha256=$plan.preparation_manifest_sha256;model=$plan.model;effort=$plan.effort;at_utc=[DateTime]::UtcNow.ToString('o');executed=$false;pre_stop_audit_sha256=$AuditSha256;owner_identity_sha256=$plan.owner_identity_sha256;stop_plan_ref=(File-Ref $planPath);fresh_classification=$prepared.classification;worker_lock_bytes_read=$false;native_research_admitted=$false}
++$preflight = @{schema='hpc-forest-primes-r2max-owned-stop-preflight-v1';verified=$true;verification_scope='Audit/cache and complete fresh CIM gate only; no stop';job_id='751992';session_id=$plan.session_id;scope_id=$plan.scope_id;source_zip_sha256=$plan.source_zip_sha256;plan_sha256=$plan.plan_sha256;preparation_manifest_sha256=$plan.preparation_manifest_sha256;model=$plan.model;effort=$plan.effort;at_utc=[DateTime]::UtcNow.ToString('o');executed=$false;pre_stop_audit_sha256=$AuditSha256;owner_identity_sha256=$plan.owner_identity_sha256;stop_plan_ref=(File-Ref $planPath);explicit_foreign_preservation_ref=$prepared.explicit_foreign_preservation_ref;fresh_classification=$prepared.classification;worker_lock_bytes_read=$false;native_research_admitted=$false}
+ Write-NewJson $preflight (Join-Path $receiptRoot ('prevol-' + [guid]::NewGuid().ToString('N') + '.json'))
+ if (-not $Execute) {$preflight | ConvertTo-Json -Depth 30; return}
+ $intentPath = Join-Path $receiptRoot 'arret-individuel-intention.json'
+@@ -83,7 +93,7 @@
+     }
+     $after = Validate-Current $false
+     if (@($after.classification.present_owned).Count -ne 0) {throw 'An original owned process identity remains; no positive stop receipt'}
+-    $result = @{schema='hpc-forest-primes-r2max-owned-stop-receipt-v1';verified=$true;verification_scope='Owned individual stop or observed natural exits after pre-stop reconciliation';owned_stop_verified=$true;scope_id=$plan.scope_id;source_zip_sha256=$plan.source_zip_sha256;plan_sha256=$plan.plan_sha256;preparation_manifest_sha256=$plan.preparation_manifest_sha256;model=$plan.model;effort=$plan.effort;job_id='751992';session_id=$plan.session_id;owner_identity_sha256=$plan.owner_identity_sha256;pre_stop_audit_sha256=$AuditSha256;pre_stop_audit_ref=$plan.pre_stop_audit_ref;stop_plan_ref=(File-Ref $planPath);intent_ref=(File-Ref $intentPath);actions=$actions;all_owned_process_identities_absent_after_stop=$true;source_only_relay_identities_preserved=$true;preserved_source_only_full_identities=$after.classification.source_only_full_identities_preserved;final_full_cim_ref=$after.fresh_cim_ref;recursive_stop=$false;stop_by_name=$false;foreign_processes_targeted=$false;worker_lock_bytes_read=$false;worker_lock_sha256_before=$null;secondary_route_clear_required_after_verified_absence=$true;secondary_route_modified=$false;native_research_admitted=$false;independent_performance_audit_verified=$false;completed_utc=[DateTime]::UtcNow.ToString('o');limits=@('No independent raw/performance admission','Lock byte must be received separately after this owned stop; no before SHA invented','Secondary route must be cleared only by parent after verified absence')}
++    $result = @{schema='hpc-forest-primes-r2max-owned-stop-receipt-v1';verified=$true;verification_scope='Owned individual stop or observed natural exits after pre-stop reconciliation';owned_stop_verified=$true;scope_id=$plan.scope_id;source_zip_sha256=$plan.source_zip_sha256;plan_sha256=$plan.plan_sha256;preparation_manifest_sha256=$plan.preparation_manifest_sha256;model=$plan.model;effort=$plan.effort;job_id='751992';session_id=$plan.session_id;owner_identity_sha256=$plan.owner_identity_sha256;pre_stop_audit_sha256=$AuditSha256;pre_stop_audit_ref=$plan.pre_stop_audit_ref;stop_plan_ref=(File-Ref $planPath);intent_ref=(File-Ref $intentPath);actions=$actions;explicit_foreign_preservation_ref=$after.explicit_foreign_preservation_ref;all_owned_process_identities_absent_after_stop=$true;source_only_relay_identities_preserved=$true;preserved_source_only_full_identities=$after.classification.source_only_full_identities_preserved;final_full_cim_ref=$after.fresh_cim_ref;recursive_stop=$false;stop_by_name=$false;foreign_processes_targeted=$false;worker_lock_bytes_read=$false;worker_lock_sha256_before=$null;secondary_route_clear_required_after_verified_absence=$true;secondary_route_modified=$false;native_research_admitted=$false;independent_performance_audit_verified=$false;completed_utc=[DateTime]::UtcNow.ToString('o');limits=@('No independent raw/performance admission','Lock byte must be received separately after this owned stop; no before SHA invented','Secondary route must be cleared only by parent after verified absence')}
+     Write-NewJson $result (Join-Path $receiptRoot 'owned-worker-stopped.json')
+     $result | ConvertTo-Json -Depth 30
+ } catch {

@@ -1,0 +1,145 @@
+"""Closed model feedback for dynamic R4b; raw audit records are never prompt data."""
+from __future__ import annotations
+
+import json
+import math
+import re
+from pathlib import Path
+
+STATUSES = frozenset({"pending", "valid", "development_valid", "build_failed", "incorrect",
+    "runtime_failed", "duplicate", "rejected", "infrastructure_failed", "infrastructure_error",
+    "budget_exhausted", "failed", "completed", "generation_failed", "contract_violation",
+    "depth_limited", "cancelled_interrupted", "cancelled_budget", "cancelled_deadline"})
+CODES = frozenset({"compilation_failed", "execution_failed", "execution_timeout",
+    "output_size_or_missing", "output_mismatch", "check_passed", "unavailable_diagnostic",
+    "infrastructure_error", "private_audit_invalid"})
+CASE = re.compile(r"(?:search|confirmation)-case-(?:[1-9]|[12][0-9]|3[0-2])\Z|benchmark-case-1\Z")
+
+
+def public_outcome(value):
+    value = value if isinstance(value, dict) else {}
+    result = {"status": value.get("status") if value.get("status") in STATUSES else "failed"}
+    if type(value.get("correct")) is bool:
+        result["correct"] = value["correct"]
+    for key in ("score", "mean_seconds"):
+        number = value.get(key)
+        if key in value and number is None:
+            result[key] = None
+        elif type(number) in (int, float) and math.isfinite(number) and number >= 0:
+            result[key] = number
+    return result
+
+
+def public_diagnostic(value):
+    if not isinstance(value, dict):
+        return {"status": "failed", "code": "unavailable_diagnostic"}
+    diagnostic = value.get("diagnostic", value)
+    if not isinstance(diagnostic, dict):
+        diagnostic = {}
+    code = diagnostic.get("code")
+    if code not in CODES:
+        code = "check_passed" if value.get("correct") is True else "unavailable_diagnostic"
+    already_closed_success = (set(value) <= {"status", "code", "case", "returncode"}
+                              and value.get("status") == "completed" and code == "check_passed")
+    result = {"status": "completed" if code == "check_passed" and (value.get("correct") is True or already_closed_success) else "failed", "code": code}
+    case = diagnostic.get("case")
+    if isinstance(case, str) and CASE.fullmatch(case):
+        result["case"] = case
+    rc = diagnostic.get("returncode")
+    if type(rc) is int and -255 <= rc <= 255:
+        result["returncode"] = rc
+    return result
+
+
+def diagnostic_logs(root: Path, outcome: dict):
+    result = []
+    for name in outcome.get("logs", [])[:2]:
+        path = Path(name)
+        if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+            continue
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(65537)
+            value = json.loads(raw) if len(raw) <= 65536 else None
+        except (ValueError, OSError):
+            value = None
+        result.append(public_diagnostic(value))
+    return result
+
+
+def public_attempts(history):
+    result = []
+    for item in history[:32]:
+        row = {key: item[key] for key in ("attempt", "llm_calls", "tokens")
+               if type(item.get(key)) is int and item[key] >= 0}
+        if item.get("state") in {"model_call_claimed", "generation_interrupted", "generation_failed",
+                                 "documentation_read", "development_passed", "development_failed"}:
+            row["state"] = item["state"]
+        if "development_outcome" in item:
+            row["development_outcome"] = public_outcome(item["development_outcome"])
+            row["development_outcome"].pop("score", None)
+            row["development_outcome"].pop("mean_seconds", None)
+        row["measured_diagnostics"] = [public_diagnostic(d) for d in item.get("measured_diagnostics", [])[:2]]
+        # Documentation bodies are separately admitted by DocumentationReader. The
+        # arbitrary generation error/usage and process diagnostics never enter history.
+        if isinstance(item.get("research_results"), list):
+            row["research_results"] = item["research_results"]
+        result.append(row)
+    return result
+
+
+def public_observation(value):
+    if not isinstance(value, dict):
+        return None
+    result = {k: value[k] for k in ("experiment_id", "role", "hypothesis") if isinstance(value.get(k), str)}
+    if "outcome" in value:
+        result["outcome"] = public_outcome(value["outcome"])
+    if "measured_outcome" in value:
+        result["measured_outcome"] = public_outcome(value["measured_outcome"])
+    result["raw_logs"] = [public_diagnostic(v) for v in value.get("raw_logs", [])[:2]]
+    if isinstance(value.get("duplicate_of"), dict):
+        result["duplicate_of"] = public_observation(value["duplicate_of"])
+    return result
+
+
+def public_observations(value):
+    value = value if isinstance(value, dict) else {}
+    result = {k: public_observation(value[k]) for k in ("baseline", "selected_parent") if k in value}
+    if isinstance(value.get("selected_base_commit"), str):
+        result["selected_base_commit"] = value["selected_base_commit"]
+    result["recent_own_role"] = [public_observation(v) for v in value.get("recent_own_role", [])[:3]]
+    result["own_role_history"] = [{"experiment_id": v.get("experiment_id"), **public_outcome(v)}
+                                  for v in value.get("own_role_history", [])[:32]]
+    if isinstance(value.get("node_development"), dict):
+        node = value["node_development"]
+        result["node_development"] = {k: node[k] for k in ("attempt", "remaining_attempts")
+                                       if type(node.get(k)) is int and node[k] >= 0}
+        result["node_development"].update(previous_attempts=public_attempts(node.get("previous_attempts", [])),
+                                            confirmation_data_available=False)
+    return result
+
+
+def public_context(value):
+    # These fields originate in fixed controller/target code or in permitted model
+    # code/ideas. Unknown keys cannot create a new diagnostic or operator channel.
+    keys = ("sources", "documents_as_data", "deadline", "generation_deadline", "protocol_id",
+            "remaining_tokens", "official_statement_as_data", "runtime_as_data",
+            "mother_direction_as_data", "harvest_source_programs_as_data", "node_research")
+    result = {k: value[k] for k in keys if k in value}
+    result["interactions"] = [{"sources": v.get("sources", []), "outcome": public_outcome(v.get("outcome"))}
+                               for v in value.get("interactions", [])[:5]]
+    if "automatic_observations" in value:
+        result["automatic_observations"] = public_observations(value["automatic_observations"])
+    return result
+
+
+def public_meta_payload(phase, value):
+    keys = {"roots": ("official_statement_as_data", "official_source_as_data", "target_as_data", "max_roots"),
+            "advice": ("branch_id", "own_direction_as_data", "official_statement_as_data", "own_source_as_data", "target_as_data"),
+            "harvest": ("official_statement_as_data", "target_as_data", "admissible_programs_as_data", "max_sources")}
+    result = {k: value[k] for k in keys[phase] if k in value}
+    if phase == "roots" and "reference_measurement_as_data" in value:
+        result["reference_measurement_as_data"] = public_outcome(value["reference_measurement_as_data"])
+    if phase == "advice" and "own_observations_as_data" in value:
+        result["own_observations_as_data"] = public_observations(value["own_observations_as_data"])
+    return result

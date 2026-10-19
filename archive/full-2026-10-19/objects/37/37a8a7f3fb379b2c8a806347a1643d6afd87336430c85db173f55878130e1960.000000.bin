@@ -1,0 +1,198 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using Word = std::uint32_t;
+using Sum = std::int32_t;
+
+class FastInput {
+    unsigned char buffer_[1 << 16];
+    std::size_t position_ = 0;
+    std::size_t length_ = 0;
+
+    int nextByte() {
+        if (position_ == length_) {
+            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (length_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    bool readInt(int& value) {
+        int c;
+        do {
+            c = nextByte();
+            if (c == EOF) return false;
+        } while (c <= ' ');
+
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = nextByte();
+        Word magnitude = 0;
+        while (c >= '0' && c <= '9') {
+            magnitude = magnitude * 10u + static_cast<Word>(c - '0');
+            c = nextByte();
+        }
+        value = static_cast<int>(negative
+            ? -static_cast<std::int64_t>(magnitude)
+            : static_cast<std::int64_t>(magnitude));
+        return true;
+    }
+};
+
+static inline Sum signedSum(Word bits) {
+    Sum value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+#if defined(__aarch64__)
+static inline uint32x4_t prefixFour(uint32x4_t values) {
+    const uint32x4_t zero = vdupq_n_u32(0);
+    values = vaddq_u32(values, vextq_u32(zero, values, 3));
+    return vaddq_u32(values, vextq_u32(zero, values, 2));
+}
+
+template <bool Expires, bool Complete>
+static inline void scanEight(const int* entering, const int* leaving,
+                             Word* history, Word* vertical,
+                             Word& horizontal,
+                             int32x4_t& best0, int32x4_t& best1) {
+    const uint32x4_t in0 = vreinterpretq_u32_s32(vld1q_s32(entering));
+    const uint32x4_t in1 = vreinterpretq_u32_s32(vld1q_s32(entering + 4));
+    const uint32x4_t out0 = vreinterpretq_u32_s32(vld1q_s32(leaving));
+    const uint32x4_t out1 = vreinterpretq_u32_s32(vld1q_s32(leaving + 4));
+
+    uint32x4_t first = prefixFour(vsubq_u32(in0, out0));
+    uint32x4_t second = prefixFour(vsubq_u32(in1, out1));
+    second = vaddq_u32(second, vdupq_n_u32(vgetq_lane_u32(first, 3)));
+    const uint32x4_t base = vdupq_n_u32(horizontal);
+    first = vaddq_u32(first, base);
+    second = vaddq_u32(second, base);
+    horizontal = vgetq_lane_u32(second, 3);
+
+    uint32x4_t total0 = vaddq_u32(vld1q_u32(vertical), first);
+    uint32x4_t total1 = vaddq_u32(vld1q_u32(vertical + 4), second);
+    if (Expires) {
+        total0 = vsubq_u32(total0, vld1q_u32(history));
+        total1 = vsubq_u32(total1, vld1q_u32(history + 4));
+    }
+    vst1q_u32(history, first);
+    vst1q_u32(history + 4, second);
+    vst1q_u32(vertical, total0);
+    vst1q_u32(vertical + 4, total1);
+
+    if (Complete) {
+        best0 = vmaxq_s32(best0, vreinterpretq_s32_u32(total0));
+        best1 = vmaxq_s32(best1, vreinterpretq_s32_u32(total1));
+    }
+}
+#endif
+
+template <bool Expires, bool Complete>
+static void readRow(FastInput& input, int s, int windows, int* row,
+                    Word* history, Word* vertical, Sum& maximum) {
+    Word horizontal = 0;
+    for (int c = 0; c < s; ++c) {
+        input.readInt(row[c]);
+        horizontal += static_cast<Word>(row[c]);
+    }
+
+    Word total = vertical[0] + horizontal;
+    if (Expires) total -= history[0];
+    history[0] = horizontal;
+    vertical[0] = total;
+    if (Complete) maximum = std::max(maximum, signedSum(total));
+
+    int c = 1;
+#if defined(__aarch64__)
+    int32x4_t best0 = vdupq_n_s32(std::numeric_limits<Sum>::lowest());
+    int32x4_t best1 = best0;
+    int32x4_t best2 = best0;
+    int32x4_t best3 = best0;
+
+    for (; c + 16 <= windows; c += 16) {
+        const int incoming = c + s - 1;
+        // Parse the complete block before reading overlapping outgoing values.
+        for (int k = 0; k < 16; ++k) input.readInt(row[incoming + k]);
+        scanEight<Expires, Complete>(row + incoming, row + c - 1,
+            history + c, vertical + c, horizontal, best0, best1);
+        scanEight<Expires, Complete>(row + incoming + 8, row + c + 7,
+            history + c + 8, vertical + c + 8, horizontal, best2, best3);
+    }
+    for (; c + 8 <= windows; c += 8) {
+        const int incoming = c + s - 1;
+        for (int k = 0; k < 8; ++k) input.readInt(row[incoming + k]);
+        scanEight<Expires, Complete>(row + incoming, row + c - 1,
+            history + c, vertical + c, horizontal, best0, best1);
+    }
+#endif
+
+    for (; c < windows; ++c) {
+        input.readInt(row[c + s - 1]);
+        horizontal += static_cast<Word>(row[c + s - 1])
+                    - static_cast<Word>(row[c - 1]);
+        total = vertical[c] + horizontal;
+        if (Expires) total -= history[c];
+        history[c] = horizontal;
+        vertical[c] = total;
+        if (Complete) maximum = std::max(maximum, signedSum(total));
+    }
+
+#if defined(__aarch64__)
+    if (Complete) {
+        const int32x4_t best = vmaxq_s32(vmaxq_s32(best0, best1),
+                                        vmaxq_s32(best2, best3));
+        maximum = std::max(maximum, vmaхvq_s32(best));
+    }
+#endif
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.readInt(n) || !input.readInt(s)) return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const int windows = n - s + 1;
+    std::unique_ptr<int[]> row(new int[n]);
+    std::vector<Word> vertical(windows, 0);
+    const std::size_t historySize = static_cast<std::size_t>(s) * windows;
+    std::unique_ptr<Word[]> history(new Word[historySize]);
+    Sum maximum = std::numeric_limits<Sum>::lowest();
+
+    int ringRow = 0;
+    for (int r = 0; r < n; ++r) {
+        Word* const historyRow = history.get()
+            + static_cast<std::size_t>(ringRow) * windows;
+        if (r < s - 1) {
+            readRow<false, false>(input, s, windows, row.get(),
+                                  historyRow, vertical.data(), maximum);
+        } else if (r == s - 1) {
+            readRow<false, true>(input, s, windows, row.get(),
+                                 historyRow, vertical.data(), maximum);
+        } else {
+            readRow<true, true>(input, s, windows, row.get(),
+                                historyRow, vertical.data(), maximum);
+        }
+        if (++ringRow == s) ringRow = 0;
+    }
+
+    std::printf("%d\n", static_cast<int>(maximum));
+    return 0;
+}

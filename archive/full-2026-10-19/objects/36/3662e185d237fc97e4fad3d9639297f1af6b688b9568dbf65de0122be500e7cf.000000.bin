@@ -1,0 +1,55 @@
+"""Opaque fresh restoration and SHA inventories only; never interprets C, SQLite or locks."""
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import tarfile
+from pathlib import Path, PurePosixPath
+
+HERE=Path(__file__).resolve().parent
+ARCHIVE=HERE.parent/'results-752651.tar.gz'
+PIN='8c37656bd7f844eedd55c6fad50c470829c15299d9d991ee389226764d8669c1'
+DEST=HERE/'restauration-neuve'
+
+
+def sha(path):
+    with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
+
+
+def inventory():
+    return {str(path.relative_to(DEST).as_posix()):{'sha256':sha(path),'bytes':path.stat().st_size}
+        for path in sorted(DEST.rglob('*')) if path.is_file()}
+
+
+def main():
+    assert sha(ARCHIVE)==PIN and not DEST.exists()
+    with tarfile.open(ARCHIVE,'r:gz') as tar:
+        members=tar.getmembers();names=set();total=0
+        for member in members:
+            pure=PurePosixPath(member.name)
+            assert pure.parts and pure.parts[0]=='results-752651' and not pure.is_absolute()
+            assert '..' not in pure.parts and '\\' not in member.name and str(pure)==member.name.rstrip('/')
+            assert pure.as_posix() not in names and (member.isdir() or member.isfile())
+            names.add(pure.as_posix());total+=member.size
+        assert len(members)<=2000 and total<=64*1024*1024
+        DEST.mkdir()
+        for member in members:
+            target=DEST/Path(*PurePosixPath(member.name).parts)
+            assert target.resolve().is_relative_to(DEST.resolve())
+            if member.isdir():target.mkdir(parents=True,exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True,exist_ok=True)
+                with tar.extractfile(member) as source,target.open('xb') as output:shutil.copyfileobj(source,output)
+    before=inventory()
+    with (HERE/'inventaire-restauration-avant.json').open('x',encoding='utf8') as stream:json.dump(before,stream,indent=2)
+    assert sha(ARCHIVE)==PIN
+    with (HERE/'restauration-opaque.json').open('x',encoding='utf8') as stream:json.dump({'schema':'hpc-forest-terra-opaque-fresh-restoration-v1',
+        'archive_sha256':PIN,'archive_bytes':ARCHIVE.stat().st_size,'member_count':len(members),'regular_files':len(before),
+        'uncompressed_bytes':total,'new_root':str(DEST),'links_or_special_members':0,
+        'C_sources_and_database_bytes_restored_opaquely_only':True,'C_compilation_or_execution':False,
+        'SQLite_connection_or_query':False,'live_lock_or_registry_opened':False},stream,indent=2)
+    print(json.dumps({'regular_files_restored':len(before),'members':len(members),'uncompressed_bytes':total,'opaque_only':True}))
+
+
+if __name__=='__main__':main()

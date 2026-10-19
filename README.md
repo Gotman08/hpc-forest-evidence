@@ -7,6 +7,12 @@ _A public protocol and evidence record for evaluating program optimization._
 
 [Français](README.fr.md) · [Protocol](docs/PROTOCOL.md) · [Results](docs/RESULTS.md) · [Reproduce the calculations](docs/REPRODUCIBILITY.md)
 
+## Received evidence and article · 19 October 2026
+
+The [research article (19 pages)](docs/article/ARTICLE.pdf), [technical appendices (308 pages)](docs/article/ANNEXES-TECHNIQUES.pdf), their Markdown sources and all 275 figures are now included. The [received-data inventory](evidence/received-2026-10-19/README.md) extends the initial subset with the complete admitted historical measurements, confirmations, search records and reconciled cost projections. The historical data cutoff is 18 October 2026 at 05:03:23.898140 UTC; the separately reported Sol R2h supplement and article technical snapshot are dated 19 October.
+
+Sol MAX's frozen primes pair was remeasured in a separate allocation: 43.8546 ms reference versus 4.9124 ms candidate (8.9273×), over twelve certified inputs and five timing pairs. This is a finite benchmark result, using the same evaluator implementation, rather than an independent implementation or a model ranking. The supplement retains unsuccessful attempts and unknown costs. See the [updated observations and campaign scope](docs/RECEIVED-2026-10-19.md).
+
 HPC Forest studies a practical question: **can a system produce correct programs that run faster under a fixed search budget?** The evaluation uses frozen starting programs, external correctness checks, raw timings and a separate final confirmation. Another system can follow the same contract without disclosing its internal implementation.
 
 This repository publishes the evaluation method, selected audited observations and the tools needed to recalculate them. It is the **public evidence repository**; the internal optimization engine and protected evaluation inputs are not distributed here.
@@ -77,7 +83,7 @@ Read the [full protocol](docs/PROTOCOL.md), [limitations](docs/LIMITATIONS.md), 
 
 ## Project status and citation
 
-This is an experimental research record, version **0.1.0**, dated 16 October 2026. New real-model comparisons and weight-learning experiments remain future work; no unexecuted experiment is counted as a result. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
+The first release is **0.1.0**, dated 16 October 2026; the current checkout also includes the received evidence update of 19 October. Cite the exact commit for that update. The next campaign covers fifteen subjects and four models, all at MAX, after one completed primes pilot and the remaining technical qualification. No unexecuted cell is counted as a result. Weight-learning experiments remain future work. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
 
 Authors: **Nicolas Marano and Romain Despoullain**. Use [CITATION.cff](CITATION.cff) and include the exact commit or release when citing a result. Code, original documentation and the published timing projection are provided under the [MIT license](LICENSE). Third-party benchmark statements and programs are not redistributed.
 

@@ -6,6 +6,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 from .manifest import public_files
+from .received import verify as verify_received
 from .recompute import ROOT, EvidenceError, compare, compute, load_json
 
 
@@ -52,9 +53,12 @@ def verify_links(root: Path):
 def main():
     count = verify_manifest(ROOT)
     compare(compute(), load_json((ROOT / "evidence/results.json").read_text(encoding="utf-8")))
+    received = verify_received(ROOT)
     links = verify_links(ROOT)
     print(f"Verified {count} file hashes and {links} relative links.")
     print("Recomputed 144 controller series (2,400 measured cycles) and 200 CPU samples (40 configurations).")
+    print(f"Received update: {received['cpu_samples']} CPU samples, {received['confirmations']} confirmations, "
+          f"{received['registers']} search registers and {received['cost_exports']} separate cost views.")
     print("This checks integrity and arithmetic; it does not execute or certify the evaluated programs.")
 
 

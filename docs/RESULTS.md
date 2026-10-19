@@ -2,6 +2,8 @@
 
 _Observed on 16 October 2026 · two distinct experiments · no model ranking._
 
+The sections below retain the initial release and its explicit subset. The [19 October update](RECEIVED-2026-10-19.md) adds the complete admitted historical projection and the separately audited Sol R2h supplement. The [article](article/ARTICLE.pdf) and [appendices](article/ANNEXES-TECHNIQUES.pdf) describe those datasets without merging overlapping cohorts into independent replications.
+
 ## Controller overhead
 
 The controller dataset uses four anonymous implementation variants. `kernel-A`/`kernel-B` compare two narrow kernels; `system-A`/`system-B` compare two policies within the same larger processing pipeline. The pair types perform different work and must not be mixed into a claim about whole-system speed.

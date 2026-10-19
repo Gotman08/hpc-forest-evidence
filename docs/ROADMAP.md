@@ -12,6 +12,8 @@ _Future work is listed as planned, not as evidence._
 
 ## Planned evaluations
 
+The 19 October instruction uses the completed Sol MAX primes run as a single technical pilot, then moves to fifteen subjects × four models (Sol, Luna, Astra and Terra), all at MAX. A full primes campaign for every model is no longer a prerequisite. Subject qualification, deployment, fresh capacity checks, unchanged budgets and audited reception remain required before new model calls. See the [dated campaign scope](RECEIVED-2026-10-19.md). The planned sixty cells are not sixty received results.
+
 | Question | Status | Evidence needed before a claim |
 | --- | --- | --- |
 | Does the controller change improve programs produced by real models? | Not demonstrated | Fresh matched searches, qualified transport/evaluator, identical budgets and audited final confirmations |

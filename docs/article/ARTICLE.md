@@ -4,7 +4,7 @@
 
 **Nicolas Marano · Romain Despoullain**
 
-Rapport de recherche expérimental · Version du 19 octobre 2026 · Données scientifiques admises arrêtées à 18/10/2026 à 05 h 03 UTC · Suivi technique et remesure R2h : 19/10/2026 à 06 h 05 UTC
+Rapport de recherche expérimental · Version du 19 octobre 2026 · Données scientifiques admises arrêtées à 18/10/2026 à 05 h 03 UTC · Suivi technique et remesure R2h : 19/10/2026 à 08 h 40 UTC
 
 ## Résumé
 
@@ -316,7 +316,7 @@ La conservation des sources, des empreintes, des registres et des réponses perm
 
 Le préenregistrement historique visait quinze sujets et vingt couples modèle–effort, soit 300 recherches source-only puis 300 avec le véritable agent Codex. La consigne humaine actuelle privilégie MAX uniquement : Luna, Astra, Terra et Sol source-only sont reçus et audités sur quinze sujets chacun, soit 60/60 MAX, en regard des 60/60 R1 MAX déjà reçus. Les 118 observations R1 historiques restent distinctes. Le véritable adaptateur Codex n’est pas admis par cette réception. Une seule graine, l’ordre temporel et les incidents limitent toute interprétation causale ; des réplications resteraient nécessaires pour établir une efficacité générale.
 
-La priorité suivante est R2 : terminer les nombres premiers pour Sol, Luna, Astra et Terra MAX, puis étendre les quatre modèles aux quinze sujets de R1, soit soixante cellules neuves. Les nombres premiers restent un supplément distinct. La cellule Sol est reçue et auditée après arrêt ; sa paire de programmes est remesurée indépendamment. Les trois allocations suivantes, lancées dans la même vague pour Astra, Terra et Luna, ont expiré pendant l’attente de publication des autorisations. Aucun de ces trois modèles n’a démarré, aucun appel ni chronométrage scientifique n’a été produit. Leurs anciennes intentions restent consommées ; une nouvelle tentative exige ses propres preuves de non-démarrage. Aucune cellule de l’extension quinze sujets n’a encore démarré à cet arrêté.
+La priorité suivante est R2 : terminer les nombres premiers pour Sol, Luna, Astra et Terra MAX, puis étendre les quatre modèles aux quinze sujets de R1, soit soixante cellules neuves. Les nombres premiers restent un supplément hors de ces quinze sujets. Sol est reçu et audité après arrêt ; sa paire de programmes est remesurée indépendamment. Pour Astra, Terra et Luna, trois tentatives d’admission ont expiré avant tout appel natif. La dernière conserve 78 fichiers, dont les trois autorisations corrompues par le flux d’encodage local ; les authorization-ready sont absents et aucun worker n’a démarré. Le correctif ASCII et 23 empreintes après décodage sont validés localement, sans nouvelle réussite distante. La préparation suivante reste technique. Le tableau préparatoire distingue 60 confirmations historiques R1 et 60 cellules R2 non lancées (NA), soit aucune paire complète. Une absence de recherche n’est pas un gain nul.
 
 R2g reste une tentative close partiellement, conservée sans rejeu et sans nouveau gain indépendant admis. R3 avec implémentation corrigée R4b reste une campagne distincte, bloquée techniquement ; ses contrats négatifs et ses coûts techniques sont conservés. La limite est quatre workers natifs. R5 doit être seul après clôture et réconciliation des autres générations, avec ses propres prérequis ; aucun R5/Flash appris n’est admis. L’échéance exclusive reste le 31 octobre 2026 à 23 h UTC, avec trois heures de réception et d’audit réservées avant tout nouveau maximum.
 

@@ -1,0 +1,150 @@
+"""New helper guards only: metadata doubles; never import official source or compile."""
+import ast
+import copy
+import importlib.util
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('target_preparation_neutral', HERE / 'qualifier-cible-source110.py')
+p = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(p)
+
+
+def allocated(monkeypatch):
+    env = {'SLURM_CPUS_PER_TASK': '4', 'SLURM_NTASKS': '1', 'SLURM_JOB_NUM_NODES': '1',
+        'SLURM_MEM_PER_NODE': '16384', 'SLURM_JOB_ID': '999999'}
+    fake = SimpleNamespace(environ=env, name='posix', sched_getaffinity=lambda _: {0, 1, 2, 3})
+    monkeypatch.setattr(p, 'os', fake)
+    monkeypatch.setattr(p.platform, 'machine', lambda: 'aarch64')
+    return env, fake
+
+
+def test_allocation_exact_positive(monkeypatch):
+    allocated(monkeypatch)
+    assert p.allocation_guard(now=1)['affinity_cpu_ids'] == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(('field', 'value'), [('SLURM_CPUS_PER_TASK', '8'), ('SLURM_NTASKS', '2'),
+    ('SLURM_MEM_PER_NODE', '32768'), ('SLURM_JOB_NUM_NODES', '2'), ('SLURM_JOB_GPUS', '0'),
+    ('SLURM_GPUS', '1'), ('SLURM_JOB_ID', '753709'), ('SLURM_JOB_ID', 'not-a-job')])
+def test_allocation_mismatch_refuses_before_source(monkeypatch, field, value):
+    env, _ = allocated(monkeypatch)
+    env[field] = value
+    with pytest.raises(ValueError):
+        p.allocation_guard(now=1)
+
+
+def test_deadline_exclusive(monkeypatch):
+    allocated(monkeypatch)
+    with pytest.raises(ValueError, match='strictly before'):
+        p.allocation_guard(now=p.DEADLINE - 600 - 10800)
+
+
+def test_affinity_exact(monkeypatch):
+    _, fake = allocated(monkeypatch)
+    fake.sched_getaffinity = lambda _: {0, 1, 2, 3, 4}
+    with pytest.raises(ValueError, match='four bound'):
+        p.allocation_guard(now=1)
+
+
+def profile():
+    allocation = {'slurm_job_id': '999999', 'architecture': 'ARM64', 'cpu_cores': 4, 'tasks': 1,
+        'nodes': 1, 'allocated_memory_mib': 16384, 'allocated_gpus': 0}
+    compiler = {'path': str(HERE / 'SYNTHETIC-COMPILER-NEVER-EXECUTED'), 'sha256': 'a' * 64,
+        'version': 'SYNTHETIC', 'probe_returncode': 0, 'probe_stdout': '4\n', 'probe_binary_sha256': 'b' * 64}
+    value = {'schema': 'hpc-forest-target-profile-v1', **allocation,
+        'verified_capabilities': ['cpu', 'c', 'cxx', 'openmp'], 'operator_algorithm_advice': False,
+        'compilers': {'gcc': copy.deepcopy(compiler), 'g++': copy.deepcopy(compiler)}}
+    value['profile_digest'] = p.digest(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode())
+    return value, allocation
+
+
+def test_both_actual_neutral_record_contracts():
+    value, allocation = profile()
+    assert p.validate_profile(value, allocation) is value
+
+
+@pytest.mark.parametrize('mutation', ['different_job', 'probe_failed', 'wrong_threads', 'missing_cxx', 'digest_changed'])
+def test_profile_refuses_missing_or_wrong_actual_evidence(mutation):
+    value, allocation = profile()
+    if mutation == 'different_job':
+        value['slurm_job_id'] = '753709'
+    elif mutation == 'probe_failed':
+        value['compilers']['gcc']['probe_returncode'] = 1
+    elif mutation == 'wrong_threads':
+        value['compilers']['g++']['probe_stdout'] = '8\n'
+    elif mutation == 'missing_cxx':
+        del value['compilers']['g++']
+    else:
+        value['profile_digest'] = 'f' * 64
+    with pytest.raises(ValueError):
+        p.validate_profile(value, allocation)
+
+
+def test_q_three_original_received_bytes_only(monkeypatch):
+    docs = {
+        'q753709-qualification.json': {'verified': True, 'native_model_calls': 0, 'source_file_count': 110,
+            'adapter_components_manifest_sha256': p.COMPONENTS, 'source_zip_sha256': p.SOURCE,
+            'plan_sha256': p.PLAN, 'allocation': {'slurm_job_id': '753709'}},
+        'q753709-bootstrap-allocation.json': {'slurm_job_id': '753709', 'guard_before_any_extraction': True},
+        'q753709-bindings.json': {'adapter_components_manifest_sha256': p.COMPONENTS,
+            'source_zip_sha256': p.SOURCE, 'plan_sha256': p.PLAN}}
+    raw = {name: json.dumps(value).encode() for name, value in docs.items()}
+    pins = {name: p.digest(value) for name, value in raw.items()}
+    monkeypatch.setattr(p, 'Q_PINS', pins)
+    monkeypatch.setattr(p, 'read_regular', lambda path: raw[path.name])
+    assert p.verify_Q(HERE) == pins
+    raw['q753709-bindings.json'] += b' '
+    with pytest.raises(ValueError, match='changed'):
+        p.verify_Q(HERE)
+
+
+def test_shared_rejects_other_root_before_reads(monkeypatch):
+    monkeypatch.setattr(p, 'read_regular', lambda _: pytest.fail('Read before exact root refusal'))
+    with pytest.raises(ValueError, match='exact shared'):
+        p.verify_shared(HERE)
+
+
+def test_whole_113_official_bytes_without_source_import(monkeypatch):
+    # Existing immutable source data is parsed and hashed only, never imported or executed.
+    shared = HERE.parent / 'operations-parent-premier-roots-source110-r1/transport-partage' / Path(p.SHARED).name
+    monkeypatch.setattr(p, 'SHARED', str(shared))
+    monkeypatch.setattr(p, 'read_regular', lambda path: path.read_bytes())
+    actual = p.verify_shared(shared)
+    assert len(actual) == 113
+    original = p.inventory
+    monkeypatch.setattr(p, 'inventory', lambda root: {**original(root), 'not-official.txt': 'a' * 64})
+    with pytest.raises(ValueError, match='no extras'):
+        p.verify_shared(shared)
+
+
+def test_main_allocation_and_pins_precede_single_official_call_no_monkeypatch():
+    tree = ast.parse((HERE / 'qualifier-cible-source110.py').read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+    calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
+    target = [node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == 'prepare_target_profile']
+    imports = [node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == 'import_module']
+    allocation = [node for node in calls if isinstance(node.func, ast.Name) and node.func.id == 'allocation_guard']
+    source = [node for node in calls if isinstance(node.func, ast.Name) and node.func.id == 'verify_shared']
+    q = [node for node in calls if isinstance(node.func, ast.Name) and node.func.id == 'verify_Q']
+    assert len(target) == len(imports) == len(allocation) == 1
+    assert allocation[0].lineno < min(node.lineno for node in source) < q[0].lineno < imports[0].lineno < target[0].lineno
+    forbidden = {'setattr', 'exec', 'eval', 'compile', 'system', 'Popen', 'subprocess', 'socket'}
+    assert not any(isinstance(node.func, ast.Name) and node.func.id in forbidden for node in calls)
+    assignments = [target for node in ast.walk(main) if isinstance(node, ast.Assign) for target in node.targets]
+    assert not any(isinstance(part, ast.Attribute) and isinstance(part.value, ast.Name) and part.value.id == 'target'
+        for target in assignments for part in ast.walk(target))
+
+
+def test_archive_regular_members_only_and_no_received_import():
+    text = (HERE / 'qualifier-cible-source110.py').read_text()
+    tree = ast.parse(text)
+    assert 'packed.addfile(item, io.BytesIO(raw))' in text
+    assert 'inventory(output) == archived' in text and 'item = tarfile.TarInfo' in text
+    assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {'extract', 'extractall', 'add', 'run', 'Popen'} for node in ast.walk(tree))
+    assert 'os.O_NOFOLLOW' in text and 'same(os.fstat(fd)) == same(before)' in text

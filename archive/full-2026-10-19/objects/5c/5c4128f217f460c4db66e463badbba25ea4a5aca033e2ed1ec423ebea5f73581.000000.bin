@@ -1,0 +1,48 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "/*\n    This program solves Laplace's equation on a regular 2D grid using simple Jacobi iteration.\n\n    The stencil calculation stops when  ( err >= CONV_THRESHOLD OR  iter > ITER_MAX )\n*/\n#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n#include <sys/time.h>\n#ifdef _OPENMP\n#include <omp.h>\n#endif\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\n#define CONV_THRESHOLD 1.0e-5f // threshold of convergence\n\n// matrix to be solved\ndouble **grid;\n\n// auxiliary matrix\ndouble **new_grid;\n\n// size of each side of the grid\nint size;\nint iter_max_num;\n\n// Separate thread flags and phase banks to avoid false sharing.\ntypedef struct {\n    int changed;\n    unsigned char padding[128 - sizeof(int)];\n} convergence_flag;\n\n// return the absolute value of a number\ndouble absolute(double num){\n    if(num < 0)\n        return -1.0 * num;\n    return num;\n}\n\n// allocate memory for the grid\nvoid allocate_memory(){\n    grid = (double **) malloc(size * sizeof(double *));\n    new_grid = (double **) malloc(size * sizeof(double *));\n\n    for(int i = 0; i < size; i++){\n        grid[i] = (double *) malloc(size * sizeof(double));\n        new_grid[i] = (double *) malloc(size * sizeof(double));\n    }\n}\n\n// initialize the grid\nvoid initialize_grid(){\n    int center = size / 2;\n    int linf = center - (size / 10);\n    int lsup = center + (size / 10);\n    for (int i = 0; i < size; i++){\n        for (int j = 0; j < size; j++){\n            // inicializa região de calor no centro do grid\n            if ( i >= linf && i <= lsup && j >= linf && j <= lsup)\n                grid[i][j] = 100;\n            else\n                grid[i][j] = 0;\n            // Both buffers retain the original fixed boundary values.\n            new_grid[i][j] = grid[i][j];\n        }\n    }\n}\n\nstatic int relax_grid(void){\n    int max_threads = 1;\n    int completed_iterations = 0;\n    convergence_flag *flags = NULL;\n\n#ifdef _OPENMP\n    int use_parallel = 0;\n    max_threads = omp_get_max_threads();\n    // Avoid team startup for small grids and single-sweep calls.\n    if(size >= 64 && iter_max_num > 1 && max_threads > 1){\n        flags = (convergence_flag *) malloc(2 * (size_t)max_threads * sizeof(*flags));\n        use_parallel = (flags != NULL);\n    }\n\n#pragma omp parallel if(use_parallel) shared(flags, max_threads, completed_iterations)\n#endif\n    {\n        int thread_id = 0;\n        int thread_count = 1;\n#ifdef _OPENMP\n        thread_id = omp_get_thread_num();\n        thread_count = omp_get_num_threads();\n#endif\n        const int interior_rows = size > 2 ? size - 2 : 0;\n        const int first_row = 1 + (int)((size_t)interior_rows * thread_id / thread_count);\n        const int end_row = 1 + (int)((size_t)interior_rows * (thread_id + 1) / thread_count);\n        double **current = grid;\n        double **next = new_grid;\n        int has_error = 1;\n        int iteration = 0;\n        int phase = 0;\n#if defined(__aarch64__) && defined(__ARM_NEON)\n        const float64x2_t convergence_threshold =\n            vdupq_n_f64((double)CONV_THRESHOLD);\n#endif\n\n        while(has_error && iteration < iter_max_num){\n            int local_error = 0;\n#if defined(__aarch64__) && defined(__ARM_NEON)\n            uint64x2_t changed = vdupq_n_u64(0);\n#endif\n            for(int i = first_row; i < end_row; i++){\n                const double *restrict row = current[i];\n                const double *restrict north = current[i - 1];\n                const double *restrict south = current[i + 1];\n                double *restrict out = next[i];\n                int j = 1;\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n                // Each lane retains the original left-to-right addition order.\n                for(; j < size - 2; j += 2){\n                    float64x2_t value = vaddq_f64(vld1q_f64(row + j + 1),\n                                                 vld1q_f64(row + j - 1));\n                    value = vaddq_f64(value, vld1q_f64(north + j));\n                    value = vaddq_f64(value, vld1q_f64(south + j));\n                    value = vmulq_n_f64(value, 0.25);\n                    vst1q_f64(out + j, value);\n\n                    const float64x2_t error =\n                        vabsq_f64(vsubq_f64(value, vld1q_f64(row + j)));\n                    changed = vorrq_u64(changed,\n                                         vcgtq_f64(error, convergence_threshold));\n                }\n#endif\n                for(; j < size - 1; j++){\n                    double value = 0.25 * (row[j + 1] + row[j - 1] +\n                                           north[j] + south[j]);\n                    out[j] = value;\n                    local_error |= (absolute(value - row[j]) > CONV_THRESHOLD);\n                }\n            }\n#if defined(__aarch64__) && defined(__ARM_NEON)\n            local_error |= ((vgetq_lane_u64(changed, 0) |\n                             vgetq_lane_u64(changed, 1)) != 0);\n#endif\n\n            if(thread_count > 1){\n                convergence_flag *phase_flags = flags + (size_t)phase * max_threads;\n                phase_flags[thread_id].changed = local_error;\n#ifdef _OPENMP\n#pragma omp barrier\n#endif\n                has_error = 0;\n                for(int t = 0; t < thread_count; t++){\n                    has_error |= phase_flags[t].changed;\n                }\n            } else {\n                has_error = local_error;\n            }\n\n            // Private pointer swaps need no shared-pointer broadcast.\n            double **temporary = current;\n            current = next;\n            next = temporary;\n            // Alternating flag banks prevent overwriting a slower reader's vote.\n            phase ^= 1;\n            iteration++;\n        }\n\n        if(thread_id == 0){\n            completed_iterations = iteration;\n        }\n    }\n\n    free(flags);\n    if(completed_iterations & 1){\n        double **temporary = grid;\n        grid = new_grid;\n        new_grid = temporary;\n    }\n    return completed_iterations;\n}\n\n// save the grid in a file\nvoid save_grid(){\n\n    for(int i = 0; i < size; i++){\n        for(int j = 0; j < size; j++){\n            fprintf(stdout, \"%lf \", grid[i][j]);\n        }\n        fprintf(stdout, \"\\n\");\n    }\n}\n\nint main(int argc, char *argv[]){\n\n    fscanf(stdin, \"%d\", &size);\n    fscanf(stdin, \"%d\", &iter_max_num);\n\n    int iter = 0;\n\n    struct timeval time_start;\n    struct timeval time_end;\n\n    // allocate memory to the grid (matrix)\n    allocate_memory();\n\n    // set grid initial conditions\n    initialize_grid();\n\n    //printf(\"Jacobi relaxation calculation: %d x %d grid\\n\", size, size);\n\n    // get the start time\n    //gettimeofday(&time_start, NULL);\n\n    // Jacobi iteration\n    iter = relax_grid();\n\n    // get the end time\n    //gettimeofday(&time_end, NULL);\n\n    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +\n    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;\n\n    //save the final grid in file\n    save_grid();\n\n    //printf(\"\\nKernel executed in %lf seconds with %d iterations.\\n\", exec_time, iter);\n\n    return 0;\n}\n",
+        "path": "src/laplace_seq.c"
+      }
+    ],
+    "hypothesis": "The compact two-lane NEON kernel may improve end-to-end performance of the persistent-team ping-pong solver by reducing register pressure and instruction footprint relative to the measured eight-column integration.",
+    "notes": "Unmeasured alternative integration. Preserves zero-iteration behavior, fixed boundaries, buffer parity, convergence-triggering sweeps, and exact output formatting. No commands executed.",
+    "sources_kept": [
+      "4ea2272b65094b10",
+      "84ca0b31e9814cce"
+    ],
+    "transformations": [
+      "Retain persistent OpenMP execution, balanced contiguous row ownership, small-grid/single-sweep serial execution, private buffer swaps, and alternating padded convergence-flag banks.",
+      "Integrate guarded two-lane AArch64 NEON FP64 updates with restrict-qualified row pointers, scalar tails and portable scalar fallback.",
+      "Accumulate SIMD comparison masks across each worker's sweep and reduce once, preserving the original addition order and float-rounded convergence threshold; omit eight-column unrolling."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "21dc4b42ca6746a6b44402ebdd4fbaa3",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "909ab6ce73cf698dec3cdd6842ab42776b145da6ddbacd7320e787e2ba6b45da",
+  "session_id": "665743a02b824021a697b6a4884a667c",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "1eec3bd4c34fc2e8699c90812db8875c1e65d4a5982a6a34a45f00613200d059",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 25056,
+        "output_tokens": 11714,
+        "reasoning_output_tokens": 9431
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 36770,
+    "tool_events": []
+  }
+}

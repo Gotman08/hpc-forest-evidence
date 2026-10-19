@@ -1,0 +1,223 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define FORCE_PANEL 32
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static void body_force_direct(Body *p, float dt, int n) {
+  #pragma omp parallel for schedule(static) if(n >= 64)
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; j++) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+/*
+ * Share off-diagonal inverse distances between both directions of a pair.
+ * Every body's force terms are still accumulated in increasing source order.
+ */
+void body_force(Body *p, float dt, int n) {
+  if (n < 2 * FORCE_PANEL) {
+    body_force_direct(p, dt, n);
+    return;
+  }
+
+  for (int i = 0; i < n; ++i) {
+    if (!isfinite(p[i].x) || !isfinite(p[i].y) || !isfinite(p[i].z)) {
+      body_force_direct(p, dt, n);
+      return;
+    }
+  }
+
+  const size_t count = (size_t)n;
+  if (count > SIZE_MAX / sizeof(float) / (FORCE_PANEL + 3)) {
+    body_force_direct(p, dt, n);
+    return;
+  }
+
+  float *scratch = (float *)malloc(count * (FORCE_PANEL + 3) * sizeof(float));
+  if (scratch == NULL) {
+    body_force_direct(p, dt, n);
+    return;
+  }
+  float *force_x = scratch;
+  float *force_y = force_x + count;
+  float *force_z = force_y + count;
+  float *inverse_cube = force_z + count;
+
+  #pragma omp parallel
+  {
+    #pragma omp for schedule(static)
+    for (int i = 0; i < n; ++i) {
+      force_x[i] = 0.0f;
+      force_y[i] = 0.0f;
+      force_z[i] = 0.0f;
+    }
+
+    int base = 0;
+    while (base < n) {
+      int width = n - base;
+      if (width > FORCE_PANEL) width = FORCE_PANEL;
+      const int end = base + width;
+
+      /* Append this panel's lower-index terms to future target bodies. */
+      #pragma omp for schedule(static)
+      for (int i = end; i < n; ++i) {
+        const float xi = p[i].x;
+        const float yi = p[i].y;
+        const float zi = p[i].z;
+        float fx = force_x[i];
+        float fy = force_y[i];
+        float fz = force_z[i];
+
+        for (int s = base; s < end; ++s) {
+          float dx = p[s].x - xi;
+          float dy = p[s].y - yi;
+          float dz = p[s].z - zi;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+          inverse_cube[(size_t)(s - base) * count + (size_t)i] = inv_dist3;
+
+          fx += dx * inv_dist3;
+          fy += dy * inv_dist3;
+          fz += dz * inv_dist3;
+        }
+
+        force_x[i] = fx;
+        force_y[i] = fy;
+        force_z[i] = fz;
+      }
+
+      /* Finish active bodies using their ordered diagonal and upper terms. */
+      #pragma omp for schedule(static)
+      for (int s = base; s < end; ++s) {
+        const float xi = p[s].x;
+        const float yi = p[s].y;
+        const float zi = p[s].z;
+        float fx = force_x[s];
+        float fy = force_y[s];
+        float fz = force_z[s];
+
+        for (int j = base; j < end; ++j) {
+          float dx = p[j].x - xi;
+          float dy = p[j].y - yi;
+          float dz = p[j].z - zi;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+          fx += dx * inv_dist3;
+          fy += dy * inv_dist3;
+          fz += dz * inv_dist3;
+        }
+
+        const float *cached = inverse_cube + (size_t)(s - base) * count;
+        for (int j = end; j < n; ++j) {
+          float dx = p[j].x - xi;
+          float dy = p[j].y - yi;
+          float dz = p[j].z - zi;
+          float inv_dist3 = cached[j];
+
+          fx += dx * inv_dist3;
+          fy += dy * inv_dist3;
+          fz += dz * inv_dist3;
+        }
+
+        p[s].vx += dt*fx;
+        p[s].vy += dt*fy;
+        p[s].vz += dt*fz;
+      }
+
+      base = end;
+    }
+  }
+
+  free(scratch);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    #pragma omp parallel for schedule(static) if(nbodies >= 64)
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

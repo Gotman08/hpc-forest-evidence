@@ -1,0 +1,104 @@
+"""Bind frozen proposals, Git sources, real build worktrees and protocol scripts."""
+from __future__ import annotations
+
+import ast
+import shlex
+import zipfile
+from pathlib import Path
+
+from audit_common import (
+    CAMPAIGN,
+    JOB,
+    inventory,
+    need,
+    read_json,
+    rebased,
+    relative,
+    sha,
+)
+from git_loose_readonly import LooseGit
+
+PROTOCOL_COMMANDS = {
+    "build": ["{python}", "{trusted}/contract_tool.py", "build", "{worktree}", "{build}"],
+    "check": ["{python}", "{trusted}/contract_tool.py", "check", "{binary}", "{phase}"],
+    "benchmark": ["/bin/sh", "{trusted}/benchmark.sh", "{binary}"],
+}
+
+
+def proposal_evidence(generation, generated, calls):
+    evidence = calls["response_refs_by_mission"][generation]
+    response_path = generated.parent / "codex-response.json"
+    # The campaign's copy must match the actual archived/cached response envelope.
+    bound_path = Path(evidence["path"])
+    bound = read_json(bound_path)
+    need(sha(bound_path.read_bytes()) == evidence["sha256"]
+         and read_json(response_path) == bound, "Campaign response differs from reconciled mailbox response")
+    data = bound.get("data")
+    need(isinstance(data, dict) and set(data) == {"hypothesis", "transformations", "sources_kept", "files", "notes"}
+         and isinstance(data["hypothesis"], str) and isinstance(data["notes"], str)
+         and isinstance(data["transformations"], list) and all(isinstance(x, str) for x in data["transformations"])
+         and isinstance(data["sources_kept"], list) and all(isinstance(x, str) for x in data["sources_kept"])
+         and len(data["sources_kept"]) == len(set(data["sources_kept"]))
+         and isinstance(data["files"], list) and 1 <= len(data["files"]) <= 20,
+         "Response source proposal is not a typed closed object")
+    names, total = set(), 0
+    for edit in data["files"]:
+        need(isinstance(edit, dict) and set(edit) == {"path", "content"}
+             and isinstance(edit["content"], str), "Untyped model source file")
+        name = relative(edit["path"])
+        need(name.startswith("src/") and not any(part.startswith(".") for part in name.split("/"))
+             and name.casefold() not in names, "Unsafe/duplicate proposed source path")
+        names.add(name.casefold())
+        total += len(edit["content"].encode("utf8"))
+    need(total <= 1024 * 1024 and read_json(generated) == data, "Agent-result substituted for reconciled response.data")
+    return data
+
+
+def worktree_evidence(root, original_path, commit, git):
+    path = rebased(original_path, root)
+    campaign = root / ("results-" + JOB) / CAMPAIGN
+    central = campaign / "repo"
+    worktrees = campaign / "worktrees"
+    is_central = path.resolve() == central.resolve()
+    if is_central:
+        need(isinstance(git, LooseGit) and git.repo == central.resolve()
+             and git.gitdir == central.resolve() / ".git"
+             and git.gitdir.is_dir() and not git.gitdir.is_symlink(),
+             "Central Git metadata allowed only for the exact already-verified central repository")
+    else:
+        need(path.parent.resolve() == worktrees.resolve()
+             and (path / ".git").is_file() and not (path / ".git").is_symlink(),
+             "Unexpected worktree location or Git metadata directory")
+    files = git.files_at(commit)
+    actual = inventory(path)  # All metadata bytes remain in this inventory and the enclosing before/after inventory.
+    for name in actual:
+        parts = name.split("/")
+        need(not any(part.casefold() == ".git" for part in parts[1:]), "Nested .git path is not permitted metadata")
+    if is_central:
+        actual = {name: value for name, value in actual.items() if not name.startswith(".git/")}
+    else:
+        actual.pop(".git", None)  # Archived secondary-worktree pointer; never followed.
+    expected = {name: {"sha256": sha(raw), "bytes": len(raw)} for name, raw in files.items()}
+    need(actual == expected, "Build/confirmation worktree bytes differ from selected Git commit")
+    return path
+
+
+def frozen_protocol_evidence(trusted, contract, protocol, source_zip):
+    need(all(protocol.get(key) == value for key, value in PROTOCOL_COMMANDS.items()), "Protocol command shortcut or changed arguments")
+    with zipfile.ZipFile(source_zip) as source:
+        frozen = source.read("HPC-Forest/src/hpc_forest/contracts.py")
+    need((trusted / "contract_tool.py").read_bytes() == frozen, "Correctness checker differs from frozen ZIP implementation")
+    # Read the literal script preamble from the actual frozen implementation, never execute it.
+    tree = ast.parse(frozen)
+    prepare = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "prepare")
+    assignments = [node for node in prepare.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "script" for target in node.targets)]
+    need(len(assignments) == 1, "Unsupported frozen benchmark generator")
+    preamble = ast.literal_eval(assignments[0].value)
+    need(isinstance(preamble, list) and all(isinstance(line, str) for line in preamble), "Frozen benchmark preamble not literal")
+    bench = contract["benchmark"]
+    need(bench["argv"] == [] and bench["files"] == [] and bench["capture_files"] == [], "Certified benchmark I/O changed")
+    expected = ("\n".join([*preamble, 'exec "$binary" ' + shlex.join(bench["argv"]) + ' < "$resources/"' + shlex.quote(bench["stdin"])]) + "\n").encode("utf8")
+    need((trusted / "benchmark.sh").read_bytes() == expected, "Benchmark script differs from deterministic frozen certified generator")
+    return {"correctness_checker_sha256": sha(frozen), "benchmark_script_sha256": sha(expected),
+            "fixed_command_templates_verified": True, "benchmark_and_correctness_scripts_verified": True}

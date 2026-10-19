@@ -1,0 +1,98 @@
+"""Neutral checks; no MCP, Codex process or model generation."""
+import copy
+import importlib.util
+import time
+import unittest
+from pathlib import Path
+
+SPEC = importlib.util.spec_from_file_location("strict_observer", Path(__file__).with_name("observer-strict.py"))
+observer = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(observer)
+
+
+class ObserverTests(unittest.TestCase):
+    def setUp(self):
+        self.lane = observer.LANES["source_only"]
+        self.cell = {"key": self.lane["key"], "job_id": self.lane["job"], "session_id": self.lane["session"],
+                     "model": self.lane["model"], "effort": self.lane["effort"], "state": "working"}
+        self.state = {"current_key": self.lane["key"], "source_zip_sha256": self.lane["source"], "queue": [self.cell]}
+        self.pair = [{"ProcessId": 1, "ParentProcessId": 8, "ExecutablePath": "launcher.exe", "CommandLine": "same", "CreationDate": "/Date(100)/"},
+                     {"ProcessId": 2, "ParentProcessId": 1, "ExecutablePath": "real.exe", "CommandLine": "same", "CreationDate": "/Date(101)/"}]
+
+    def test_valid_cell(self):
+        self.assertIs(observer.verify_cell(self.state, self.lane), self.cell)
+
+    def test_each_binding_rejected(self):
+        for field in ("job_id", "session_id", "model", "effort", "state"):
+            with self.subTest(field=field):
+                state = copy.deepcopy(self.state)
+                state["queue"][0][field] = "wrong"
+                with self.assertRaises(RuntimeError):
+                    observer.verify_cell(state, self.lane)
+
+    def test_wrong_source_or_key(self):
+        for field in ("source_zip_sha256", "current_key"):
+            state = copy.deepcopy(self.state)
+            state[field] = "wrong"
+            with self.assertRaises(RuntimeError):
+                observer.verify_cell(state, self.lane)
+
+    def test_duplicate_cell(self):
+        self.state["queue"].append(dict(self.cell))
+        with self.assertRaises(RuntimeError):
+            observer.verify_cell(self.state, self.lane)
+
+    def test_valid_pair(self):
+        observer.verify_pair(self.pair, self.pair)
+
+    def test_missing_or_changed_identity(self):
+        for field in observer.FIELDS:
+            current = copy.deepcopy(self.pair)
+            current[1][field] = "different"
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                observer.verify_pair(self.pair, current)
+        with self.assertRaises(RuntimeError):
+            observer.verify_pair(self.pair, [])
+
+    def test_unbound_parent(self):
+        self.pair[1]["ParentProcessId"] = 3
+        with self.assertRaises(RuntimeError):
+            observer.verify_pair(self.pair, self.pair)
+
+    def test_rpc_allowlist(self):
+        for tool in ("job_status", "job_efficiency"):
+            observer.check_rpc(self.lane, tool, {"job_id": self.lane["job"]})
+
+    def test_rpc_other_actions_rejected(self):
+        for tool in ("job_submit", "job_cancel", "download_from_romeo", "upload_to_romeo", "romeollm_chat", "generate"):
+            with self.subTest(tool=tool), self.assertRaises(RuntimeError):
+                observer.check_rpc(self.lane, tool, {"job_id": self.lane["job"]})
+
+    def test_rpc_wrong_job_or_extra_argument(self):
+        for arguments in ({"job_id": "other"}, {"job_id": self.lane["job"], "extra": True}):
+            with self.assertRaises(RuntimeError):
+                observer.check_rpc(self.lane, "job_status", arguments)
+
+    def test_current_status(self):
+        value = {"ok": True, "job_id": self.lane["job"], "state": "RUNNING", "finished": False,
+                 "observation": {"current_state_observed": True, "observed_at": time.time()}}
+        self.assertFalse(observer.verify_status(value, self.lane))
+        value.update(state="COMPLETED", finished=True)
+        self.assertTrue(observer.verify_status(value, self.lane))
+
+    def test_cached_or_wrong_status_rejected(self):
+        for value in ({"ok": False, "job_id": self.lane["job"], "state": "COMPLETED"},
+                      {"ok": True, "job_id": "other", "state": "RUNNING"},
+                      {"ok": True, "job_id": self.lane["job"], "state": "COMPLETED", "finished": True},
+                      {"ok": True, "job_id": self.lane["job"], "state": "RUNNING", "observation": {"current_state_observed": True, "observed_at": 1}}):
+            with self.assertRaises(RuntimeError):
+                observer.verify_status(value, self.lane)
+
+    def test_accounting_fallback(self):
+        with self.assertRaises(RuntimeError):
+            observer.verify_status({"ok": True, "job_id": self.lane["job"], "found": False}, self.lane, True)
+        self.assertTrue(observer.verify_status({"ok": True, "job_id": self.lane["job"], "found": True, "state": "TIMEOUT"}, self.lane, True))
+
+
+if __name__ == "__main__":
+    unittest.main()

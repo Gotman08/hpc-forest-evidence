@@ -1,0 +1,86 @@
+"""Review complete actual prepared Slurm scripts as data; never submit or execute."""
+import hashlib
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[3]
+REL = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2g'
+FACTORY = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2g/revision-r1'
+OLD_REVIEW = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2f/reception-premier-batch-r1/revue-collecteurs-parent-r1/LECTURE-TROIS-SCRIPTS-REELS.json'
+FACTORY_REVIEW = REL / 'correction-cli/revue-factory-g/REVUE-FACTORY-R2G-SCELLEE.json'
+MODELS = {'astra-max': 'gpt-6-astra', 'terra-max': 'gpt-5.6-terra', 'sol-max': 'gpt-6.1-sol'}
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def ref(path):
+    raw = path.read_bytes()
+    return {'path': str(path.resolve()), 'sha256': digest(raw)}
+
+
+def received(path):
+    value = json.loads(path.read_text('utf8'))
+    assert isinstance(value.get('structuredContent'), dict), 'Exact received tool structured content required'
+    return value['structuredContent']
+
+
+def main():
+    assert ref(OLD_REVIEW)['sha256'] == 'aa6d297e2dfa25c2437aadf297969e82bcef12583f1c5c9a6d00d2def81dffbd'
+    assert ref(FACTORY_REVIEW)['sha256'] == '71276c4991b5edb26654d72c6b84e82cbab008ba846175a1b019c5658b3864b6'
+    historical = json.loads(OLD_REVIEW.read_text('utf8'))
+    old_by_slug = {row['slug']: row for row in historical['three_scripts']}
+    factory_review = json.loads(FACTORY_REVIEW.read_text('utf8'))
+    rows = []
+    for slug, model in MODELS.items():
+        directory = REL / 'operations-parent' / slug
+        prepared, reread = directory / 'plan-prepare.json', directory / 'plan-relu.json'
+        p, r = received(prepared), received(reread)
+        command = FACTORY / slug / 'commande-allouee-proposee.sh'
+        body = command.read_text('utf8')
+        script = p['script']
+        assert p['ok'] is True and r['ok'] is True and r['state'] == 'ready' and r['expired'] is False
+        assert p['plan_id'] == r['plan_id'] and p['plan_sha256'] == r['plan_sha256'] and p['expires_at'] == r['expires_at']
+        assert script == r['plan']['preview']['script'] and len(r['plan']['entries']) == 1
+        assert script == r['plan']['entries'][0]['plan']['script']
+        assert script.count(body) == 1 and sum(line.startswith('srun ') for line in script.splitlines()) == 1
+        assert ref(command)['sha256'] == factory_review['command_sha256_by_model'][model]
+        before, after = script.split(body)
+        prior = old_by_slug[slug]
+        assert ref(Path(prior['prepared']['path']))['sha256'] == prior['prepared']['sha256']
+        assert ref(Path(prior['command']['path']))['sha256'] == prior['command']['sha256']
+        old_body = Path(prior['command']['path']).read_text('utf8')
+        old_script = received(Path(prior['prepared']['path']))['script']
+        old_before, old_after = old_script.split(old_body)
+        assert digest(old_before.encode()) == prior['prefix_sha256'] and digest(old_after.encode()) == prior['suffix_sha256']
+        # Actual plans deliberately keep the historical Slurm display name.
+        # Scientific scope/session/root/source are the exact reviewed G command.
+        expected_before = old_before
+        assert before == expected_before and after == old_after, 'Unreviewed whole-script wrapper delta'
+        assert p['resolved'] == prior['resources'], 'Exact unchanged ARM64 short3h/4CPU/16Gi/0GPU environment required'
+        rows.append({'slug': slug, 'model': model, 'plan_id': p['plan_id'], 'plan_sha256': p['plan_sha256'],
+            'prepared': ref(prepared), 'reread': ref(reread), 'command': ref(command),
+            'script_utf8_sha256': digest(script.encode()), 'prefix_sha256': digest(before.encode()),
+            'suffix_sha256': digest(after.encode()), 'prepare_equals_reread': True,
+            'reviewed_command_occurrences': 1, 'resources': p['resolved'],
+            'outer_wrapper_delta': 'All outer wrapper bytes unchanged, including historical Slurm display-name suffix r2f. Exact selected body is the reviewed new G scope/session/root/source command.'})
+    value = {'schema': 'hpc-forest-r2e-parent-three-whole-scripts-readonly-review-v1',
+        'scope_id': 'hpc-forest-primes-native-max-r2g', 'verified': True, 'blocking_findings': [],
+        'scope': 'Exact three received plans and complete external MCP wrappers only; no generic shell analyzer.',
+        'three_scripts': rows, 'factory_review': ref(FACTORY_REVIEW),
+        'historical_wrapper_review': ref(OLD_REVIEW),
+        'script_sha256_by_model': {row['model']: row['script_utf8_sha256'] for row in rows},
+        'wrapper_read': 'ROMEO environment, allocated provenance with empty data_files and read-only git rev-parse, trace start/end, one independently reviewed selected MAX srun; no model or candidate body.',
+        'submissions_performed': 0, 'native_calls': 0, 'shell_or_tests_executed': False,
+        'fresh_CURRENT_or_role_or_CLI_observation_claimed': False,
+        'collector_code_admitted_by_this_record': False, 'native_research_admitted': False}
+    target = HERE / 'LECTURE-TROIS-SCRIPTS-REELS.json'
+    with target.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+    print(json.dumps({'review': ref(target), 'scripts': value['script_sha256_by_model']}))
+
+
+if __name__ == '__main__':
+    main()

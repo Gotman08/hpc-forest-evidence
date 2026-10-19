@@ -1,0 +1,54 @@
+set -euo pipefail
+archive=/scratch_p/nimarano/hpc-forest-gpt61sol-max-harness-20261015-r2.tar.gz
+root=/scratch_p/nimarano/hpc-forest-gpt61sol-max-harness-20261015-r2
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r2/venv-r3/bin/python
+test ! -e "$root"
+printf '%s  %s\n' 'ac88d47bdcd4ac65f27f797b01d7b8f730eed46975e1391757cdd2a258109aeb' "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" --strip-components=1 -C "$root"
+"$py" - "$root" <<'PY'
+import hashlib,json,os,platform,shutil,stat,sys,zipfile
+from pathlib import Path
+root=Path(sys.argv[1])
+manifest=json.loads((root/'payload-manifest.json').read_text())
+for name,expected in manifest['files'].items():
+    assert (root/name).resolve().is_relative_to(root.resolve())
+    assert hashlib.sha256((root/name).read_bytes()).hexdigest()==expected,name
+project=root/'project'
+with zipfile.ZipFile(root/'project.zip') as z:
+    for info in z.infolist():
+        assert info.filename.startswith('HPC-Forest/') and not stat.S_ISLNK(info.external_attr >> 16)
+        target=project/info.filename.removeprefix('HPC-Forest/')
+        assert target.resolve().is_relative_to(project.resolve())
+        if info.is_dir():target.mkdir(parents=True,exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(z.read(info))
+for name,expected in json.loads((project/'FILES.sha256.json').read_text()).items():
+    assert hashlib.sha256((project/name).read_bytes()).hexdigest()==expected,name
+shutil.copytree(project/'src/hpc_forest',root/'runtime/hpc_forest')
+shutil.copytree(project/'tests',root/'tests')
+shutil.copytree(project/'examples',root/'examples')
+for p in (project/'examples/marathon22').iterdir():
+    if p.is_file():shutil.copyfile(p,root/p.name)
+official=root/'sources-officielles'
+official.mkdir()
+for name,expected in manifest['official_files'].items():
+    original=Path('/scratch_p/nimarano/hpc-forest-marathon22-20261015-r2/sources-officielles')/name
+    shutil.copyfile(original,official/name)
+    assert hashlib.sha256((official/name).read_bytes()).hexdigest()==expected,name
+resources={'machine':platform.machine(),'affinity_cpus':sorted(os.sched_getaffinity(0)),
+    'slurm_job_id':os.environ.get('SLURM_JOB_ID'),'slurm_cpus_per_task':os.environ.get('SLURM_CPUS_PER_TASK'),
+    'slurm_memory_mb':os.environ.get('SLURM_MEM_PER_NODE'),'candidate_gpus':0,
+    'disk_free_bytes':shutil.disk_usage(root).free}
+(root/'resources-romeo.json').write_text(json.dumps(resources,indent=2)+'\n')
+print('Verified frozen source, payload and official inputs',flush=True)
+PY
+export PYTHONPATH="$root/runtime:$root/qa-deps"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export OPENBLAS_NUM_THREADS=1
+flock -w 120 /tmp/hpc-forest-preflight-nimarano.lock "$py" -m pytest "$root/tests" -q -p no:cacheprovider --junitxml="$root/preflight-junit.xml" > "$root/preflight-tests.log" 2>&1
+cat "$root/preflight-tests.log"
+"$py" "$root/timer_probe.py" "$root/timer-probe.json"
+exec "$py" -u "$root/romeo_harness_comparison.py" --root "$root" --session-id e102a585de23492ca9019858dac5af4d --worker-wait-seconds 600

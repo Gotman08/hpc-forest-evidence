@@ -1,0 +1,122 @@
+"""Review actual three R2e prepared plans and write durable intents only. Never submit."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import os
+import re
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+COMMON_SHA = '6b2dc4f236fd9dc3f2a11f088717df5434ca1bf34fa4b8545218e5909c0c445f'
+if hashlib.sha256((HERE / 'commun.py').read_bytes()).hexdigest() != COMMON_SHA:
+    raise ValueError('Changed exact pure common metadata module before import')
+spec = importlib.util.spec_from_file_location('r2e_parent_metadata_common_intents', HERE / 'commun.py')
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+
+
+def check_plan(prepared, reread, command, command_sha, review, model, *, script_sha_expected, now=None):
+    now = time.time() if now is None else now
+    prepared = prepared.get('structuredContent', prepared)
+    reread = reread.get('structuredContent', reread)
+    c.need(prepared.get('ok') is True and reread.get('ok') is True
+        and reread.get('state') == 'ready' and reread.get('expired') is False
+        and type(reread.get('expires_at')) in (int, float) and type(reread.get('created_at')) in (int, float)
+        and reread['created_at'] <= now < reread['expires_at'], 'Actual ready unexpired prepared plan required')
+    c.need(prepared.get('plan_id') == reread.get('plan_id')
+        and prepared.get('plan_sha256') == reread.get('plan_sha256')
+        and prepared.get('expires_at') == reread.get('expires_at')
+        and isinstance(prepared.get('plan_id'), str) and re.fullmatch(r'[0-9a-f]{32}', prepared['plan_id'])
+        and re.fullmatch(r'[0-9a-f]{64}', prepared.get('plan_sha256', '')),
+        'Prepared/reread plan identity or SHA differs')
+    preview = reread.get('plan', {}).get('preview', {}).get('script')
+    script = prepared.get('script')
+    c.need(isinstance(script, str) and re.fullmatch(r'[0-9a-f]{64}', script_sha_expected)
+        and hashlib.sha256(script.encode('utf8')).hexdigest() == script_sha_expected,
+        'Whole script bytes must equal the exact independent parent review for these three plans')
+    c.need(isinstance(command, str) and bool(command) and isinstance(script, str)
+        and script == preview and script.count(command) == 1
+        and sum(line.startswith('srun ') for line in script.splitlines()) == 1
+        and len(reread.get('plan', {}).get('entries', [])) == 1,
+        'Actual whole script must contain exactly one reviewed single-cell command/srun')
+    c.need(review.get('command_sha256_by_model', {}).get(model) == command_sha,
+           'Actual prepared command is not the independently reviewed cell command')
+    expected = {'arch': 'armgpu', 'partition': 'short', 'total_cpus': 4, 'total_gpus': 0,
+        'mem_gb': 16, 'time': '03:00:00', 'ntasks_per_node': 1}
+    c.need(all(prepared.get('resolved', {}).get(k) == v for k, v in expected.items()),
+           'Prepared resources must remain3h/4CPU/16Gi/0GPU')
+    directives = ['#SBATCH --partition=short', '#SBATCH --time=03:00:00', '#SBATCH --cpus-per-task=4',
+        '#SBATCH --mem=16G', '#SBATCH --nodes=1', '#SBATCH --ntasks-per-node=1']
+    c.need(all(line in script.splitlines() for line in directives), 'Actual Slurm directives differ')
+    return prepared, script
+
+
+def prepare(census_path, census_sha, source_state_directory):
+    c.deadline()
+    c.pinned(census_path, census_sha)
+    factory = c.load_factory()
+    census = c.read(census_path)
+    c.fresh(census, 'captured_at_utc')
+    source_only = c.source_only_inputs(source_state_directory)
+    status = factory.check_census(census, source_only, running_cells=[], census_ref=c.ref(census_path))
+    c.need(status.get('active_native_workers') == 0 and status.get('source_only_active_workers') == 0,
+           'Actual full CURRENT must prove no native workers before this cohort submission')
+    refs = [*c.role_and_human_refs(), c.ref(c.REVIEW), c.ref(c.SCRIPT_REVIEW), c.ref(c.BINDINGS), c.ref(census_path),
+            source_only['current_verification'], source_only['source_only_absence'], source_only['observer_release']]
+    review = c.read(c.REVIEW)
+    pending = []
+    for slug, (model, session) in c.MODELS.items():
+        directory = c.OPS / slug
+        c.need(directory.is_dir() and not directory.is_symlink(), 'Actual parent plan directory required')
+        c.need(not (directory / 'submission-observed.json').exists()
+            and not (directory / 'submission-intent.json').exists()
+            and not (directory / 'job-reviewed.sbatch').exists(), 'Existing intent/submission/script: reconcile, never retry')
+        command_path = c.FACTORY / slug / 'commande-allouee-proposee.sh'
+        command_ref = c.ref(command_path)
+        prepared, script = check_plan(c.read(directory / 'plan-prepare.json'), c.read(directory / 'plan-relu.json'),
+            command_path.read_text(encoding='utf8'), command_ref['sha256'], review, model,
+            script_sha_expected=c.SCRIPT_SHA[model])
+        pending.append((slug, model, session, prepared, script, command_ref))
+    c.need(len({row[3]['plan_id'] for row in pending}) == 3, 'Three distinct actual prepared plans required')
+    results = []
+    for slug, model, session, prepared, script, command_ref in pending:
+        c.deadline()
+        c.fresh(census, 'captured_at_utc')
+        c.need(time.time() < prepared['expires_at'], 'Plan expired before durable intent; no submission allowed')
+        directory = c.OPS / slug
+        script_path = directory / 'job-reviewed.sbatch'
+        with script_path.open('x', encoding='utf8', newline='\n') as stream:
+            stream.write(script)
+            stream.flush()
+            os.fsync(stream.fileno())
+        value = {'schema': 'hpc-forest-max-cell-submit-intent-v1', 'verified': True,
+            'scope_id': c.SCOPE, 'model': model, 'effort': 'max', 'session_id': session,
+            'source_zip_sha256': c.SOURCE, 'research_plan_sha256': c.PLAN,
+            'plan_id': prepared['plan_id'], 'plan_sha256': prepared['plan_sha256'], 'command': command_ref,
+            'job_script': c.ref(script_path), 'full_script_reviewed': True, 'one_submit_only': True,
+            'no_resubmit_if_unknown': True, 'normal_first_call_proved': False, 'allocation_max_seconds': 10800,
+            'maximum_native_workers': 4, 'source_only_preserved': False, 'source_only_state': 'received_absent',
+            'observed_at': datetime.now(UTC).isoformat(),
+            'evidence_refs': [*refs, c.ref(directory / 'plan-prepare.json'), c.ref(directory / 'plan-relu.json')]}
+        result = c.save(directory / 'submission-intent.json', value)
+        results.append({'slug': slug, 'plan_id': prepared['plan_id'], 'intent': result})
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--census', type=Path, required=True)
+    parser.add_argument('--census-sha256', required=True)
+    parser.add_argument('--source-state-directory', type=Path, required=True)
+    args = parser.parse_args()
+    results = prepare(args.census.absolute(), args.census_sha256, args.source_state_directory)
+    print(__import__('json').dumps({'durable_intents': results, 'submissions_performed': 0, 'native_calls': 0}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

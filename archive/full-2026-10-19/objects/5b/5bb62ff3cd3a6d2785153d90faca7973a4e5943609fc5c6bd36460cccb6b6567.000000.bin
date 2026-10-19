@@ -1,0 +1,134 @@
+"""LOCAL rendering only: nine separate conditional commands, no submit or model loop."""
+from __future__ import annotations
+
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+import shlex
+import tarfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SHARED = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-qualification-20261018-eaff9217499f"
+STAGE_ARCHIVE = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-native-interface-lane-r3-eaff9217499f.tar.gz"
+_spec = importlib.util.spec_from_file_location("r4b_render_cells", HERE / "cell_selection.py")
+cells = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cells)
+
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf8")
+
+
+def write_new(path, raw):
+    with path.open("xb") as stream:
+        stream.write(raw)
+
+
+def render():
+    pins = json.loads((HERE / "pins-source-plan.json").read_text(encoding="utf8"))
+    source = (HERE / "remote_stage.py").read_bytes()
+    runtime = {"remote_stage.py": source, "cell_selection.py": (HERE / "cell_selection.py").read_bytes()}
+    data = {**runtime, "stage-manifest.json": json_bytes({k: hashlib.sha256(v).hexdigest() for k, v in runtime.items()})}
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, filename="", mode="wb", mtime=0) as zipped, \
+            tarfile.open(fileobj=zipped, mode="w") as archive:
+        for name, raw in sorted(data.items()):
+            item = tarfile.TarInfo(name)
+            item.size, item.mode, item.mtime = len(raw), 0o600, 0
+            archive.addfile(item, io.BytesIO(raw))
+    stage_sha = hashlib.sha256(buffer.getvalue()).hexdigest()
+    write_new(HERE / "native-interface-models-max-r3.tar.gz", buffer.getvalue())
+    commands = {}
+    for model, phase in ((m, p) for m in cells.MODELS for p in cells.PHASES):
+        session = cells.select(model, phase)
+        slug = cells.SLUGS[model]
+        root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session
+        admission = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + session
+        driver = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-stage-lane-r3-" + phase + "-" + session
+        command = f'''set -euo pipefail
+[[ ${{SLURM_JOB_ID:-}} =~ ^[0-9]+$ ]]
+test "$(uname -m)" = aarch64
+test "${{SLURM_CPUS_PER_TASK:-}}" = 4
+test "${{SLURM_NTASKS:-1}}" = 1
+test "${{SLURM_JOB_NUM_NODES:-1}}" = 1
+test "${{SLURM_MEM_PER_NODE:-}}" = 16384
+test -z "${{SLURM_JOB_GPUS:-}}${{SLURM_STEP_GPUS:-}}"
+test "${{SLURM_GPUS:-0}}" = 0
+test "${{SLURM_GPUS_ON_NODE:-0}}" = 0
+py={pins["python_arm64"]}
+shared={SHARED}
+stage_archive={STAGE_ARCHIVE}
+driver={driver}
+native_root={root}
+admission_root={admission}
+test -x "$py"
+test -d "$shared"
+test ! -e "$driver"
+test ! -e "$native_root"
+test ! -e "$admission_root"
+printf '%s  %s\\n' {stage_sha} "$stage_archive" | sha256sum -c -
+printf '%s  %s\\n' {pins["source_zip"]["sha256"]} "$shared/project.zip" | sha256sum -c -
+printf '%s  %s\\n' {pins["plan"]["sha256"]} "$shared/dynamic-plan.json" | sha256sum -c -
+test -f "$shared/mechanical-reception-native.json"
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
+"$py" -I -B - "$stage_archive" "$driver" "$shared" <<'STAGE'
+import hashlib,json,sys,tarfile
+from pathlib import Path
+archive,driver,shared=map(Path,sys.argv[1:])
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+expected=json.loads((shared/'runtime-manifest.json').read_text())
+paths=list((shared/'project').rglob('*'));assert not any(p.is_symlink() for p in paths)
+actual={{p.relative_to(shared/'project').as_posix():sha(p) for p in paths if p.is_file()}}
+assert actual==expected and len(actual)==110
+driver.mkdir(parents=True,exist_ok=False)
+with tarfile.open(archive) as t:
+ members=t.getmembers();assert len(members)==3 and {{m.name for m in members}}=={{'remote_stage.py','cell_selection.py','stage-manifest.json'}}
+ assert all(m.isfile() for m in members)
+ for m in members:(driver/m.name).write_bytes(t.extractfile(m).read())
+assert json.loads((driver/'stage-manifest.json').read_text())=={{name:sha(driver/name) for name in ('remote_stage.py','cell_selection.py')}}
+STAGE
+romeo_load_armgpu_env
+spack load /zrtbeqke25s2vbqo4yrhsowjz7mg3pjf
+export OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=TRUE OPENBLAS_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=
+ulimit -s unlimited
+exec srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores "$py" -I -B -u "$driver/remote_stage.py" --shared "$shared" --qualification-reception "$shared/mechanical-reception-native.json" --model {model} --effort max --phase {phase} --root "$native_root" --admission-root "$admission_root"
+'''
+        folder = HERE / slug / phase
+        folder.mkdir(parents=True, exist_ok=True)
+        write_new(folder / "commande-allouee.sh", command.encode("utf8"))
+        job = {"name": "forest-r4b-" + slug + "-" + phase, "command": "bash -lc " + shlex.quote(command),
+               "arch": "armgpu", "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0,
+               "time_limit": "01:00:00", "workdir": "/scratch_p/nimarano", "spack_packages": []}
+        write_new(folder / "job-prepare-propose.json", json_bytes(job))
+        template = {"schema": "hpc-forest-dynamic-r4b-launch-inputs-v1", "verified": False,
+            "scope_id": pins["scope_id"], "phase": phase, "model": model, "effort": "max", "session_id": session,
+            "job_id": None, "source_zip_sha256": pins["source_zip"]["sha256"], "plan_sha256": pins["plan"]["sha256"],
+            "real_qualification_reception": pins["qualification_reception"], "allocation_marker": None, "request_prepared": None,
+            "submission_intent": None, "submission_observed": None, "script_reread": None,
+            "parent_observations": None, "fresh_private_full_cim": None,
+            "r2_main_closure": pins["real_r2_main_closure"], "mixed_observer_admission": None,
+            "oauth_observation": None, "codex_config": None, "transport_probe_readback": None,
+            "factory_review": None, "reader_integration_review": None,
+            "private_lane_inputs": None, "source_state_binding": None, "cli_policy":None, "latest_native_generation_closure":None,
+            "native_contract_phase_receipts": []}
+        # The earlier unfilled draft stays intact; this is a distinct concrete template.
+        write_new(folder / "factory-input-NON-ADMIS.json", json_bytes(template))
+        commands[model + ":" + phase] = {"model": model, "phase": phase,"session_id": session, "native_root": root, "admission_root": admission,
+            "driver_root": driver, "command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+            "job_request_sha256": hashlib.sha256((folder / "job-prepare-propose.json").read_bytes()).hexdigest(),
+            "expected_initial_marker": admission + "/allocation-marker.json",
+            "expected_owner": root + "/results-JOB/mailbox/OWNER.json",
+            "ready_last": admission + "/authorization-ready.json", "verified": False, "native_generation_admitted": False}
+    write_new(HERE / "COMMANDES-PROPOSEES.json", json_bytes({"schema": "hpc-forest-dynamic-r4b-separate-commands-v1",
+        "verified": False, "scope_id": pins["scope_id"], "source_zip_sha256": pins["source_zip"]["sha256"],
+        "plan_sha256": pins["plan"]["sha256"], "commands": commands, "automatic_loop": False,
+        "stage_archive": {"local_path": str(HERE / "native-interface-models-max-r3.tar.gz"), "sha256": stage_sha, "remote_path": STAGE_ARCHIVE},
+        "qualification_reception_still_required": True, "launcher_review_still_required": True, "pilot_admitted": False, "later_phases_reader_gate_open": False, "native_model_calls": 0}))
+    print(json.dumps({"stage_sha256": stage_sha, "commands": {k: v["command_sha256"] for k, v in commands.items()}, "executed": False}, indent=2))
+
+
+if __name__ == "__main__":
+    render()

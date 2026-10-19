@@ -6,6 +6,8 @@ The [19 October received-data inventory](received-2026-10-19/README.md) adds the
 
 The later [first native R2 batch](native-first-batch-2026-10-19/README.md) is a separate initial-search projection for Luna MAX on 2020-quicksort, with a contemporary reference, exact role-level costs, private audit and ARM release acceptance. It has no final confirmation or admitted scientific gain and does not replace the dated r4 missing-data snapshot.
 
+The current article's [R1/R2 numeric comparison](../docs/article/donnees-r1-r2/comparison.json) adds the later source-confirmed final timings for that one cell and preserves all 60 historical R1 cells. It contains 26 samples across six series; 59 R2 cells have no scientific measurement and there are zero scientifically admitted R1/R2 pairs. The [article](../docs/article/ARTICLE.pdf) explains the different searches, audit pause and limits of these descriptive comparisons. Earlier inventories above retain their own cutoffs and bytes.
+
 | File | Coverage | Unit |
 | --- | --- | --- |
 | [controller/timings.jsonl](controller/timings.jsonl) | 144 series; 24 warmups excluded; 2,400 measured cycles | Integer wall/CPU nanoseconds per cycle |

@@ -9,7 +9,9 @@ _A public protocol and evidence record for evaluating program optimization._
 
 ## Received evidence and article · 19 October 2026
 
-The exact r4 edition of the [research article (19 pages)](docs/article/ARTICLE.pdf) and [technical appendices (308 pages)](docs/article/ANNEXES-TECHNIQUES.pdf), their Markdown sources and all 275 figures are included, with a technical cutoff of 19 October 2026 at 08:40 UTC. Read the [article in HTML](docs/article/ARTICLE.html) and the [appendices in HTML](docs/article/ANNEXES-TECHNIQUES.html). The [historical inventory](evidence/received-2026-10-19/README.md) retains the complete admitted historical measurements, confirmations, search records and reconciled cost projections. Its scientific cutoff remains 18 October 2026 at 05:03:23.898140 UTC.
+The current r5 [research article](docs/article/ARTICLE.pdf) and [technical appendices](docs/article/ANNEXES-TECHNIQUES.pdf) integrate the received R2 observations into the abstract, section 3.9 and Appendix L, with three new R1/R2 figures. Read the [article in HTML](docs/article/ARTICLE.html), the [appendices in HTML](docs/article/ANNEXES-TECHNIQUES.html), and the [numeric comparison](docs/article/donnees-r1-r2/comparison.json) at the 19 October 2026, 11:40:35.931 UTC source cutoff. It covers 60 historical R1 cells and one R2 cell with source-confirmed final timings; 59 R2 cells lack scientific measurements. There are **zero scientifically admitted R2 gains and zero admitted R1/R2 pairs**. The timing and cost comparisons are descriptive: the searches differ, and the audit pause consumed the existing wall-clock budget.
+
+The exact earlier [r4 article (19 pages)](docs/article/history/r4/ARTICLE.pdf), [r4 appendices (308 pages)](docs/article/history/r4/ANNEXES-TECHNIQUES.pdf), their sources and all 275 original figures remain available at the 08:40 UTC technical cutoff. The [historical inventory](evidence/received-2026-10-19/README.md) retains the complete admitted historical measurements, confirmations, search records and reconciled cost projections. Its scientific cutoff remains 18 October 2026 at 05:03:23.898140 UTC.
 
 The separate [r4 inventory and provenance](evidence/received-2026-10-19-r4/README.md) records the received operational state and [sixty-cell matrix](evidence/received-2026-10-19-r4/matrix15.csv): fifteen subjects × four models at MAX, seed 23. Eleven measured R1 zero gains retain the reference program (speedup 1); all R2 results remain `NA`, with zero R1/R2 pairs. Failed transports and local validation add no scientific result; A4 is preparation only at this cutoff.
 
@@ -17,7 +19,7 @@ Sol MAX's frozen primes pair was remeasured in a separate allocation: 43.8546 ms
 
 The subsequent [zero-model baseline qualification](evidence/qualification-2026-10-19/README.md) has also completed: all fifteen references, 75 confirmation timings, received and checked from one 65-second ARM allocation. These are baseline measurements; no native R2 model result or speedup is claimed by this qualification.
 
-The separate [first native R2 batch](evidence/native-first-batch-2026-10-19/README.md), at the later 11:11:41.348 UTC cutoff, records Luna MAX on 2020-quicksort: three initial search timings, a contemporary reference, two delivered calls and 32,765 exact tokens. Private CLI audit and ARM release acceptance are received. This initial observation has no final confirmation or scientifically admitted gain; it does not complete the cell or campaign or establish launch of the other 59 cells. The earlier r4 snapshot remains unchanged.
+The separate [first native R2 batch](evidence/native-first-batch-2026-10-19/README.md), at the 11:11:41.348 UTC cutoff, records Luna MAX on 2020-quicksort: three initial search timings, a contemporary reference, two delivered calls and 32,765 exact tokens. Private CLI audit and ARM release acceptance are received. This dated initial observation contains no final confirmation or scientifically admitted gain. Its bytes and the earlier r4 snapshot remain unchanged; the current article separately adds the later source-confirmed five-plus-five timings without promoting them to independent performance proof.
 
 HPC Forest studies a practical question: **can a system produce correct programs that run faster under a fixed search budget?** The evaluation uses frozen starting programs, external correctness checks, raw timings and a separate final confirmation. Another system can follow the same contract without disclosing its internal implementation.
 
@@ -51,7 +53,7 @@ python -m tools.verify
 python -m unittest discover -s tests -v
 ```
 
-The verifier checks file hashes, local documentation links, design completeness and the published arithmetic: **144 controller series, 2,400 measured cycles, and 200 CPU timings across 40 configurations**. It does not certify the original execution environment or independently reproduce program correctness. [Reproduction scope](docs/REPRODUCIBILITY.md) explains the distinction.
+The verifier checks file hashes, local documentation links, design completeness and the published arithmetic: **144 controller series, 2,400 measured cycles, and 200 CPU timings across 40 configurations**, plus the current comparison's **60 cells and 26 timing samples**. It does not certify the original execution environment or independently reproduce program correctness. [Reproduction scope](docs/REPRODUCIBILITY.md) explains the distinction.
 
 ## The evaluation idea
 
@@ -89,7 +91,7 @@ Read the [full protocol](docs/PROTOCOL.md), [limitations](docs/LIMITATIONS.md), 
 
 ## Project status and citation
 
-The first release is **0.1.0**, dated 16 October 2026; the current checkout also includes the received evidence update of 19 October. Cite the exact commit for that update. The native campaign plan covers fifteen subjects and four models, all at MAX, after the completed primes pilot and baseline qualification. Its first received batch is published separately with its audit and release acceptance; no unexecuted cell is counted as a result. Weight-learning experiments remain future work. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
+The first release is **0.1.0**, dated 16 October 2026; the current checkout also includes the received evidence update and article r5 of 19 October. Cite the exact commit for that update. The native campaign plan covers fifteen subjects and four models, all at MAX, after the completed primes pilot and baseline qualification. The current article distinguishes one source-confirmed R2 cell from 59 cells without measurements and from scientifically admitted comparisons, whose count remains zero. Weight-learning experiments remain future work. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
 
 Authors: **Nicolas Marano and Romain Despoullain**. Use [CITATION.cff](CITATION.cff) and include the exact commit or release when citing a result. Code, original documentation and the published timing projection are provided under the [MIT license](LICENSE). Third-party benchmark statements and programs are not redistributed.
 

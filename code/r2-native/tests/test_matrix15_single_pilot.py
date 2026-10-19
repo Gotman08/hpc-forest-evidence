@@ -1,0 +1,118 @@
+"""Private local read-only receipt tests; no candidate, CLI, model or HPC execution."""
+from __future__ import annotations
+
+import ast
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+from hpc_forest import matrix15_contract as contract
+from hpc_forest import native_matrix15 as native
+from hpc_forest.core import InfrastructureError, file_digest
+
+CURRENT = Path("C:/Users/nicol/Documents/Codex/2026-10-19/je-voudrais-que-tu-commit-et")
+ORIGINAL = Path("C:/Users/nicol/Documents/Codex/2026-10-19/c-users-nicol-documents-codex-2026-4")
+OUTPUT = CURRENT / "outputs/HPC-Forest-Matrice15-Pilote-Unique-r1"
+SOURCE = ORIGINAL / "work/r2-matrix15-preparation-r1/project"
+SOL = ORIGINAL / "outputs/HPC-Forest-R2-Reprise-20261019-r1/LIBERATION-SCIENTIFIQUE-SOL-COMPLETE.json"
+PROTOCOL = OUTPUT / "PROTOCOLE-60-CELLULES-PILOTE-UNIQUE.json"
+
+
+def release_copy(tmp_path, update=None):
+    value = json.loads(SOL.read_text(encoding="utf8"))
+    if update:
+        value.update(update)
+    path = tmp_path / "NEUTRAL-local-receipt-copy.json"
+    path.write_text(json.dumps(value), encoding="utf8")
+    return path
+
+
+def test_real_received_sol_pilot_passes_without_four_model_cohort():
+    receipt = native.verify_primes_release(SOL)
+    assert receipt["model"] == "gpt-6.1-sol"
+    assert receipt["exact_known_native_calls"] == 3
+    assert receipt["exact_known_tokens"] == 59037
+    assert "cells" not in receipt
+    # The bounded audit's global verified=False is preserved, not promoted.
+    bounded = next(ref for ref in receipt["evidence_refs"]
+                   if ref["sha256"] == native.SOL_PILOT_FINAL_AUDIT_SHA256)
+    assert native.read_json(native.artifact(bounded))["verified"] is False
+
+
+@pytest.mark.parametrize("update", [
+    {"pipeline_complete": False}, {"five_confirmations_verified": False},
+    {"independent_performance_remeasurement_verified": False},
+    {"owned_worker_and_passives_absent": False}, {"all_started_calls_reconciled": False},
+    {"exact_known_native_calls": 2}, {"exact_known_native_calls": True},
+    {"exact_known_tokens": 59036}, {"unknown_usage_calls": 1}, {"replayed_claims": 1},
+    {"prepared": True}, {"synthetic": True}, {"budget_or_chronology_reset": True},
+])
+def test_incomplete_unknown_or_replayed_pilot_rejected(tmp_path, update):
+    with pytest.raises(InfrastructureError, match="incomplete|synthetic|unreconciled|unknown/replayed"):
+        native.verify_primes_release(release_copy(tmp_path, update))
+
+
+@pytest.mark.parametrize("update", [
+    {"effort": "high"}, {"model": "gpt-6-astra"}, {"session_id": "f" * 32},
+    {"job_id": "755433"}, {"source_zip_sha256": "f" * 64},
+])
+def test_non_max_or_foreign_pilot_rejected(tmp_path, update):
+    with pytest.raises(InfrastructureError, match="exact already received Sol MAX"):
+        native.verify_primes_release(release_copy(tmp_path, update))
+
+
+def test_semantically_equal_but_unreviewed_receipt_bytes_are_rejected(tmp_path):
+    with pytest.raises(InfrastructureError, match="release SHA differs"):
+        native.verify_primes_release(release_copy(tmp_path))
+
+
+def test_missing_hashed_evidence_cannot_be_skipped():
+    def missing(_):
+        raise InfrastructureError("NEUTRAL missing actual evidence")
+    with pytest.raises(InfrastructureError, match="missing actual evidence"):
+        native.verify_primes_release(SOL, read_ref=missing)
+
+
+def test_new_protocol_preserves_matrix_budgets_and_has_sixty_fresh_sessions():
+    revision = json.loads(PROTOCOL.read_text(encoding="utf8"))
+    old = native.read_json(native.artifact(revision["revision_of"]))
+    assert file_digest(PROTOCOL) == contract.PROTOCOL_SHA256
+    assert revision["primes_release"]["sha256"] == native.SOL_PILOT_RELEASE_SHA256
+    assert revision["remaining_primes_cells_to_launch"] == 0
+    assert revision["launch_ready"] is False
+    for key in ("models", "efforts", "subjects", "budgets_per_cell", "target", "cell_count",
+                "maximum_native_workers_total", "exclusive_deadline_utc", "reception_audit_reserve_seconds"):
+        assert revision[key] == old[key]
+    assert len(revision["cells"]) == len(contract.REGISTERED_CELLS) == 60
+    assert {cell["session_id"] for cell in revision["cells"]}.isdisjoint(
+        {cell["session_id"] for cell in old["cells"]})
+    for old_cell, new_cell in zip(old["cells"], revision["cells"], strict=True):
+        assert {k: v for k, v in old_cell.items() if k != "session_id"} == {
+            k: v for k, v in new_cell.items() if k != "session_id"}
+        assert contract.validate_cell(new_cell) == new_cell
+        with pytest.raises(InfrastructureError):
+            contract.validate_cell(copy.deepcopy(old_cell))
+
+
+def test_guards_outside_reviewed_pilot_and_hash_dependency_revision_preserved():
+    old_source = (SOURCE / "src/hpc_forest/native_matrix15.py").read_text(encoding="utf8")
+    new_source = Path(native.__file__).read_text(encoding="utf8").replace(
+        "Prepared plan cannot launch without the reviewed single Sol primes pilot",
+        "Prepared plan cannot launch without actual four-model primes scientific release")
+    old_functions = {node.name: ast.dump(node, include_attributes=False)
+                     for node in ast.parse(old_source).body if isinstance(node, ast.FunctionDef)}
+    new_functions = {node.name: ast.dump(node, include_attributes=False)
+                     for node in ast.parse(new_source).body if isinstance(node, ast.FunctionDef)}
+    assert set(new_functions) - set(old_functions) == {"validate_alias_dependencies"}
+    revised = {"verify_primes_release", "verify_qualification", "validate_receipt"}
+    for name, body in old_functions.items():
+        if name not in revised:
+            assert new_functions[name] == body, name
+    # Q15, oracle pairing, path resolution, capacity and no-replay source remain identical.
+    project = Path(contract.__file__).parents[2]
+    for relative in ("src/hpc_forest/matrix15_lane_contract.py", "src/hpc_forest/matrix15_worker.py",
+                     "src/hpc_forest/matrix15_provenance.py", "src/hpc_forest/evaluator.py",
+                     "src/hpc_forest/generation_admission.py", "src/hpc_forest/codex_worker.py"):
+        assert file_digest(project / relative) == file_digest(SOURCE / relative), relative

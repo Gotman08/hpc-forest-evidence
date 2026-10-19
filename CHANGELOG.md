@@ -4,6 +4,7 @@ _Public versions preserve the evidence and its interpretation._
 
 ## Received evidence update — 2026-10-19
 
+- Add a separate later technical-status supplement for Sol/count and Astra/count; preserve the article r5 cutoff, all frozen performance data, source-announced token accounting and zero admitted new gains or pairs
 - Integrate received R2 observations into article r5, section 3.9 and Appendix L, with three R1/R2 figures and public numeric figure-rebuild inputs
 - Publish the 60-cell comparison and 26 timing samples at the 11:40:35.931 UTC source cutoff: one source-confirmed R2 cell, 59 R2 cells without measurements, zero scientifically admitted gains and zero admitted R1/R2 pairs
 - Preserve the exact r4 PDF, HTML, Markdown, provenance and 275 figures under `docs/article/history/r4`, along with the unchanged earlier data snapshots

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
@@ -119,6 +120,71 @@ def verify_article_bundle(root: Path):
     return len(files)
 
 
+def verify_native_incidents(root: Path):
+    raw = (root / "evidence/native-incidents-2026-10-19/incidents.json").read_text(encoding="utf-8")
+    data = load_json(raw)
+    shapes = {
+        "": "schema article_source_cutoff_utc observed_at_utc coverage sol_count astra_count limits sources",
+        "coverage": "registered_cells source_final_timing_cells technical_incident_cells not_launched_cells cells_without_included_scientific_measurement scientifically_admitted_pairs new_scientific_gains_admitted",
+        "sol_count": "job_id subject_id declared_model declared_effort scheduler_state scheduler_elapsed_seconds bootstrap_failed_at_utc original_admission_deadline_utc admission_accepted native_child_launch_attempted model_calls exact_tokens deadline_expired_at_observation failure_caused_by_deadline_expiry budget_or_chronology_reset replay_performed",
+        "astra_count": "job_id subject_id declared_model declared_effort scheduler_state scheduler_exit_code scheduler_ended_at_utc allocation_admission_accepted pipeline_complete source_first_start_verified source_invocation_unknown source_delivered_calls_announced source_exact_tokens_announced_per_call source_exact_tokens_announced scientific_timing_samples_published original_archive later_reception",
+        "astra_count.original_archive": "members regular_file_members links preceding_metadata_artifacts_expected preceding_metadata_artifacts_present preceding_metadata_regular_and_bounded second_delivery_receipt_present",
+        "astra_count.later_reception": "scp_transfers_requested scp_transfers_received all_scp_transfers_verified second_delivery_receipt_received",
+        "limits": "model_and_effort_are_declared_source_metadata tokens_are_source_cache_and_response_announcements independent_private_cli_audit_performed independent_performance_audit_verified final_performance_admission_claimed article_r5_and_numeric_dataset_modified scientific_jobs_launched_for_publication model_calls_issued_for_publication",
+    }
+    def require(condition, message):
+        if not condition:
+            raise EvidenceError("Native technical incidents: " + message)
+    def object_at(path):
+        item = data
+        for key in path.split(".") if path else []:
+            item = item[key]
+        return item
+    for path, fields in shapes.items():
+        item = object_at(path)
+        require(type(item) is dict and set(item) == set(fields.split()), "closed fields required at " + path)
+    def exact(path, wanted):
+        actual = object_at(path)
+        require(type(actual) is type(wanted) and actual == wanted, "unsupported status or count at " + path)
+    exact("schema", "hpc-forest-native-r2-technical-incidents-v1")
+    exact("article_source_cutoff_utc", "2026-10-19T11:40:35.931000+00:00")
+    exact("observed_at_utc", "2026-10-19T12:34:58.457867+00:00")
+    expected = {
+        "coverage": [60, 1, 2, 57, 59, 0, 0],
+        "sol_count": {"job_id":"755766", "subject_id":"2023-count", "declared_model":"gpt-6.1-sol", "declared_effort":"max", "scheduler_state":"FAILED", "scheduler_elapsed_seconds":3, "admission_accepted":False, "native_child_launch_attempted":False, "model_calls":0, "exact_tokens":0, "deadline_expired_at_observation":True, "failure_caused_by_deadline_expiry":False, "budget_or_chronology_reset":False, "replay_performed":False},
+        "astra_count": {"job_id":"755862", "subject_id":"2023-count", "declared_model":"gpt-6-astra", "declared_effort":"max", "scheduler_state":"FAILED", "scheduler_exit_code":"1:0", "allocation_admission_accepted":True, "pipeline_complete":False, "source_first_start_verified":False, "source_invocation_unknown":True, "source_delivered_calls_announced":2, "source_exact_tokens_announced":30919, "scientific_timing_samples_published":0},
+        "astra_count.original_archive": [295, 190, 0, 12, 11, True, False],
+        "astra_count.later_reception": [6, 6, True, True],
+        "limits": [True, True, False, False, False, False, 0, 0],
+    }
+    for path, wanted in expected.items():
+        if isinstance(wanted, list):
+            wanted = dict(zip(shapes[path].split(), wanted, strict=True))
+        for key, value in wanted.items():
+            exact(path + "." + key, value)
+    coverage = data["coverage"]
+    require(coverage["registered_cells"] == coverage["source_final_timing_cells"] + coverage["technical_incident_cells"] + coverage["not_launched_cells"], "cell coverage does not sum to 60")
+    require(coverage["cells_without_included_scientific_measurement"] == coverage["technical_incident_cells"] + coverage["not_launched_cells"], "missing scientific measurements promoted")
+    tokens = data["astra_count"]["source_exact_tokens_announced_per_call"]
+    require(type(tokens) is list and all(type(n) is int for n in tokens) and tokens == [14753, 16166], "source-announced per-call tokens differ")
+    require(sum(tokens) == data["astra_count"]["source_exact_tokens_announced"], "source-announced token sum differs")
+    chronology = [data["sol_count"]["bootstrap_failed_at_utc"], data["article_source_cutoff_utc"], data["sol_count"]["original_admission_deadline_utc"], data["astra_count"]["scheduler_ended_at_utc"], data["observed_at_utc"]]
+    moments = [datetime.fromisoformat(value) for value in chronology]
+    require(all(moment.utcoffset() is not None and moment.utcoffset().total_seconds() == 0 for moment in moments) and all(a < b for a, b in zip(moments, moments[1:])), "failure, deadline and receipt chronology differs")
+    sources = data["sources"]
+    names = {"sol-bootstrap-result":"bootstrap-failed-755766.json", "astra-readonly-summary":"SYNTHESE-CAUSE-r1.json", "astra-original-archive":"results-755862.tar.gz", "astra-later-delivery-receipt":None, "sol-bootstrap-scp-receipt":"BOOTSTRAP-FAILED-SCP-REEL-r1.json", "sol-scheduler-summary":"JOB-EFFICIENCY-FAILED-REEL-r1.json", "astra-cache-worker-summary":"LOCAL-CACHE-AND-WORKER-SUMMARY-r1.json", "astra-scheduler-status":"JOB-STATUS-r1.json"}
+    require(type(sources) is list and len(sources) == len(names), "source fingerprint inventory differs")
+    seen = set()
+    for item in sources:
+        require(type(item) is dict and set(item) == {"id", "basename", "bytes", "sha256"}, "closed source metadata required")
+        name = item["id"]
+        require(type(name) is str and name in names and name not in seen and item["basename"] == names[name], "private or duplicate source name")
+        require(type(item["bytes"]) is int and item["bytes"] > 0 and type(item["sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]), "invalid source fingerprint")
+        seen.add(name)
+    require(not re.search(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]|/scratch/|/home/|Bearer\s|sk-[A-Za-z0-9]{16}", raw, re.I), "private path or credential pattern")
+    return coverage
+
+
 def main():
     count = verify_manifest(ROOT)
     compare(compute(), load_json((ROOT / "evidence/results.json").read_text(encoding="utf-8")))
@@ -128,6 +194,7 @@ def main():
     native = verify_native_first(ROOT)
     article = verify_article_r5(ROOT)
     article_files = verify_article_bundle(ROOT)
+    incidents = verify_native_incidents(ROOT)
     links = verify_links(ROOT)
     print(f"Verified {count} file hashes and {links} relative links.")
     print("Recomputed 144 controller series (2,400 measured cycles) and 200 CPU samples (40 configurations).")
@@ -140,6 +207,8 @@ def main():
           "audited release accepted on ARM, with no final confirmation or admitted scientific gain.")
     print(f"Article r5: {article_files} artifacts, {article['matrix_cells']} cells and {article['timing_samples']} timings; "
           f"{article['r2_missing_cells']} R2 cells without measurements and zero scientifically admitted pairs.")
+    print(f"Later technical supplement: {incidents['technical_incident_cells']} incidents, "
+          f"{incidents['not_launched_cells']} unlaunched cells and {incidents['cells_without_included_scientific_measurement']} cells without included comparison measurements; no new performance result.")
     print("This checks integrity and arithmetic; it does not execute or certify the evaluated programs.")
 
 

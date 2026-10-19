@@ -1,0 +1,103 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+#define TILE 64
+
+void body_force(Body * restrict p, float dt, int n) {
+  const int n_tiles = (n + TILE - 1) / TILE;
+  #pragma omp parallel for schedule(static)
+  for (int t = 0; t < n_tiles; ++t) {
+    const int start = t * TILE;
+    const int end = (start + TILE < n) ? start + TILE : n;
+    float px[TILE], py[TILE], pz[TILE];
+    for (int i = start; i < end; ++i) {
+      const int k = i - start;
+      px[k] = p[i].x;
+      py[k] = p[i].y;
+      pz[k] = p[i].z;
+    }
+    float fx[TILE] = {0.0f};
+    float fy[TILE] = {0.0f};
+    float fz[TILE] = {0.0f};
+
+    for (int j = 0; j < n; ++j) {
+      const float xj = p[j].x;
+      const float yj = p[j].y;
+      const float zj = p[j].z;
+      #pragma omp simd
+      for (int i = start; i < end; ++i) {
+        const int k = i - start;
+        const float dx = xj - px[k];
+        const float dy = yj - py[k];
+        const float dz = zj - pz[k];
+        const float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        const float inv_dist = 1.0f / sqrt(sqrd_dist);
+        const float inv_dist3 = inv_dist * inv_dist * inv_dist;
+        fx[k] += dx * inv_dist3;
+        fy[k] += dy * inv_dist3;
+        fz[k] += dz * inv_dist3;
+      }
+    }
+
+    for (int i = start; i < end; ++i) {
+      const int k = i - start;
+      p[i].vx += dt*fx[k];
+      p[i].vy += dt*fy[k];
+      p[i].vz += dt*fz[k];
+    }
+  }
+}
+
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+  
+  exit(EXIT_SUCCESS);
+}

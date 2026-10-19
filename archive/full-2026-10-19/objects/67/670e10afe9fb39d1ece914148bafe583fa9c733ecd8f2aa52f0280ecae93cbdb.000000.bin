@@ -1,0 +1,227 @@
+"""ROOT-only independent cold metadata review writer. No source import or collection.
+
+Requires a real complete SO proof from the parent, its exact SHA and a fresh census.
+Missing, stale, changed, opaque or unresolved evidence produces no positive review.
+"""
+from __future__ import annotations
+import argparse
+import ast
+import hashlib
+import json
+import re
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[4]
+OP = HERE.parents[1]
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+READER_SHA = "564398d676dceb6b5ba893fcbb3835c7aec31a1cbd5d5c5dcef6b361a3a23338"
+META_SHA = "6a0b0c2e9e2562daeb6837f517d75fc360fa5f3696bab6bf0274dc0c02d67838"
+COLD_SHA = "111e3e09d9cb14b7aca3e5859b971cd2d543610bc5b5e93bfbbf888ea4b3c1a5"
+SESSION = "665743a02b824021a697b6a4884a667c"
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def raw(path):
+    path = Path(path)
+    need(path.is_absolute() and ".." not in path.parts and path.is_relative_to(BASE)
+         and path.is_file() and not any(p.is_symlink() or p.is_junction() for p in (path, *path.parents)), "Ordinary exact local evidence only")
+    before = path.stat()
+    data = path.read_bytes()
+    after = path.stat()
+    need((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+         (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), "Evidence changed while reading")
+    return data
+
+
+def reference(path, expected=None):
+    path = Path(path)
+    digest = hashlib.sha256(raw(path)).hexdigest()
+    need(expected is None or expected == digest, "Exact evidence SHA differs")
+    return {"path": str(path), "sha256": digest}
+
+
+def read(ref, pins):
+    need(isinstance(ref, dict) and set(ref) == {"path", "sha256"}
+         and isinstance(ref["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]), "Closed evidence reference required")
+    data = raw(ref["path"])
+    need(hashlib.sha256(data).hexdigest() == ref["sha256"], "Changed evidence")
+    def pairs(items):
+        value = {}
+        for name, item in items:
+            need(name not in value, "Duplicate JSON member")
+            value[name] = item
+        return value
+    value = json.loads(data.decode("utf-8-sig"), object_pairs_hook=pairs,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+    need(isinstance(value, dict), "JSON object required")
+    pins[ref["path"]] = ref["sha256"]
+    return value
+
+
+def key(timestamp):
+    need(isinstance(timestamp, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z", timestamp), "Exact UTC timestamp required")
+    datetime.fromisoformat(timestamp)
+    second, _, fraction = timestamp[:-1].partition(".")
+    return second + "." + fraction.ljust(7, "0")
+
+
+def identity(row):
+    need(isinstance(row, dict) and all(k in row for k in FIELDS)
+         and all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+         and all(isinstance(row[k], str) and row[k] for k in FIELDS[2:]), "Five complete identity fields required")
+    key(row["CreationDate"])
+    return tuple(row[k] for k in FIELDS)
+
+
+def census(ref, pins, now):
+    value = read(ref, pins)
+    need(value.get("schema") == "hpc-forest-dynamic-r4b-full-cim-v1"
+         and value.get("complete_census") is True and value.get("strict_utf8_decoding") is True,
+         "Actual complete strict UTF8 census required")
+    rows = value.get("rows")
+    need(isinstance(rows, list) and rows and type(value.get("rows_count")) is int
+         and value["rows_count"] == len(rows), "Complete row count required")
+    pids = set()
+    for row in rows:
+        need(isinstance(row, dict) and all(k in row for k in FIELDS)
+             and all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+             and row["ProcessId"] not in pids and all(row[k] is None or isinstance(row[k], str) for k in FIELDS[2:]), "Malformed or duplicate census identity")
+        pids.add(row["ProcessId"])
+        if row["CreationDate"] is not None:
+            key(row["CreationDate"])
+            need(datetime.fromisoformat(row["CreationDate"]).timestamp() <= now, "Future process creation")
+    key(value["captured_at_utc"])
+    need(datetime.fromisoformat(value["captured_at_utc"]).timestamp() <= now, "Future census")
+    return value
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--complete-absence", type=Path, required=True)
+    parser.add_argument("--complete-absence-sha256", required=True)
+    args = parser.parse_args()
+    need(args.complete_absence.parent == OP / "preparation-roots-operationnelle-r1", "Only the new exact parent complete-proof directory")
+    need(re.fullmatch(r"[0-9a-f]{64}", args.complete_absence_sha256), "Exact caller pin required")
+    pins, now = {}, time.time()
+    proof_ref = reference(args.complete_absence, args.complete_absence_sha256)
+    proof = read(proof_ref, pins)
+    need(proof.get("schema") == "hpc-forest-passive-owned-pair-absence-v1" and proof.get("subject") == "source-only"
+         and proof.get("verified") is True and proof.get("no_stop_or_replay") is True
+         and proof.get("complete_lane_graph_verified") is True and proof.get("source_state_reader_sha256") == READER_SHA
+         and proof.get("job_id") == "751592" and proof.get("session_id") == SESSION
+         and proof.get("source_zip_sha256") == "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb", "Actual completed ROOT SO proof required")
+    reader_ref = reference(BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2d/source-only-reader-r4/source_only_state.py", READER_SHA)
+    ast.parse(raw(reader_ref["path"]).decode("utf-8-sig"))  # Parse only, never import or call.
+    closure_ref = reference(BASE / "outputs/HPC-Forest-Harnais-Comparaison-r1/reprises/r3-corrige-r4-parallele-20261018/fermeture-r2-main-only-verifiee.json", "f9d64a0e87ad68248429681cb3efe01a9e56289fba615eeb55291089665aee3d")
+    closure = read(closure_ref, pins)
+    pair = proof["owned_full_identities"]
+    need(len(pair) == 2 and {identity(row) for row in pair} == {identity(row) for row in closure["source_only"]}
+         and pair[0]["CommandLine"] == pair[1]["CommandLine"]
+         and (pair[0]["ParentProcessId"] == pair[1]["ProcessId"] or pair[1]["ParentProcessId"] == pair[0]["ProcessId"]), "Original received two-member SO pair required")
+    refs = proof.get("evidence_refs")
+    need(isinstance(refs, list), "Explicit evidence inventory required")
+    for item in refs:
+        read(item, pins) if str(item["path"]).endswith(".json") else reference(item["path"], item["sha256"])
+    for name in ("prior_full_cim", "historical_cold_cim", "fresh_full_cim", "cold_metadata_reception"):
+        need(proof[name] in refs, "Actual graph reference omitted")
+    need(proof["historical_cold_cim"]["sha256"] == COLD_SHA and proof["cold_metadata_reception"]["sha256"] == META_SHA, "Exact historical bridge required")
+    reception = read(proof["cold_metadata_reception"], pins)
+    need(reception.get("schema") == "hpc-forest-natural-exit-cold-metadata-reception-v1" and reception.get("verified") is True
+         and reception.get("cold_full_cim") == proof["historical_cold_cim"] and reception.get("prior_full_cim") == proof["prior_full_cim"], "Historical bridge graph differs")
+    snapshots = [census(proof[name], pins, now) for name in ("prior_full_cim", "historical_cold_cim", "fresh_full_cim")]
+    captures = [key(value["captured_at_utc"]) for value in snapshots]
+    need(captures == sorted(captures), "Prior/cold/current order differs")
+    fresh_time = datetime.fromisoformat(snapshots[-1]["captured_at_utc"]).timestamp()
+    need(0 <= now - fresh_time <= 120 and type(proof.get("observed_at")) in (int, float)
+         and fresh_time <= proof["observed_at"] <= now and proof["observed_at"] - fresh_time <= 120, "Fresh actual SO proof and census required at this review")
+    owned, remaining = list(pair), list(proof["owned_descendants"])
+    prior = {row["ProcessId"]: row for row in snapshots[0]["rows"]}
+    for row in owned:
+        need(row["ProcessId"] in prior and identity(prior[row["ProcessId"]]) == identity(row), "Exact prior pair presence required")
+    while remaining:
+        progressed = False
+        for item in list(remaining):
+            need(set(item) == {"identity", "ownership_evidence"}, "Closed attributed descendant entry required")
+            child = item["identity"]
+            parents = [row for row in owned if row["ProcessId"] == child["ParentProcessId"]]
+            if not parents:
+                continue
+            need(item["ownership_evidence"] in refs, "Unlinked attribution")
+            fact = read(item["ownership_evidence"], pins)
+            need(fact.get("schema") == "hpc-forest-owned-native-descendant-v1" and fact.get("verified") is True
+                 and fact.get("owner_session_id") == SESSION and fact.get("identity") == child and fact.get("parent_identity") == parents[0], "Full original attribution required")
+            need(child["ProcessId"] in prior and identity(prior[child["ProcessId"]]) == identity(child)
+                 and key(parents[0]["CreationDate"]) <= key(child["CreationDate"]) <= captures[0]
+                 and child["ProcessId"] not in {row["ProcessId"] for row in owned}, "Actual prior attributed identity/chronology differs")
+            owned.append(child); remaining.remove(item); progressed = True
+        need(progressed, "Ownership cycle or unlinked descendant")
+    need(len(owned) == 7, "Exactly the original pair and five attributed descendants required")
+    declared = {identity(row) for row in owned}
+    candidates = {tuple(row[k] for k in FIELDS): row for value in snapshots for row in value["rows"]}
+    frontier, visited, unresolved = list(owned), set(), {}
+    while frontier:
+        parent = frontier.pop(); parent_key = identity(parent)
+        if parent_key in visited:
+            continue
+        visited.add(parent_key)
+        for child_key, child in candidates.items():
+            if child["ParentProcessId"] != parent["ProcessId"] or child_key == parent_key:
+                continue
+            if child["CreationDate"] is not None and key(child["CreationDate"]) < key(parent["CreationDate"]):
+                continue
+            identity(child)  # Never prune an opaque possible child by a later bound.
+            impossible = False
+            for snapshot, captured in zip(snapshots, captures, strict=True):
+                if captured < key(parent["CreationDate"]) or not key(child["CreationDate"]) > captured:
+                    continue
+                same_pid = next((row for row in snapshot["rows"] if row["ProcessId"] == parent["ProcessId"]), None)
+                impossible = same_pid is None or (all(isinstance(same_pid.get(k), str) and same_pid[k] for k in FIELDS[2:])
+                    and identity(same_pid) != parent_key and key(parent["CreationDate"]) < key(same_pid["CreationDate"]) <= captured)
+                if impossible:
+                    break
+            if impossible:
+                continue
+            if child_key not in declared:
+                unresolved[child_key] = child
+            if child_key not in visited:
+                frontier.append(child)
+    need(not unresolved, "Possible original owned descendant unresolved")
+    for snapshot in snapshots[1:]:
+        by_pid = {row["ProcessId"]: row for row in snapshot["rows"]}
+        for old in owned:
+            if old["ProcessId"] in by_pid:
+                actual = by_pid[old["ProcessId"]]
+                need(identity(actual) != identity(old) and key(actual["CreationDate"]) > key(old["CreationDate"]), "Exact identity remains or PID reuse ambiguous")
+        need(not any(SESSION in (row.get("CommandLine") or "") for row in snapshot["rows"]), "SO session remains")
+    candidate_ref = reference(HERE / "ANALYSE-DESCENDANTS-SO-FROIDE-CANDIDATE.json", "f286941c5a10e0b33b0061acc2adfb610a39bf5a7404a58b36b956464218b90b")
+    for path, digest in pins.items():
+        reference(path, digest)
+    need(0 <= time.time() - fresh_time <= 120, "Fresh census expired before review publication")
+    review = {"schema": "hpc-forest-lane-r2-owned-descendant-review-v1", "verified": True, "blocking_findings": [],
+        "reviewer": "independent /root/prepare_r2g_owned_closure; ROOT-only execution of reviewed metadata writer",
+        "source_only_absence": proof_ref, "source_state_reader_sha256": READER_SHA, "unresolved_owned_descendants": [],
+        "observed_at_utc": datetime.now(UTC).isoformat(), "verified_at_unix": time.time(),
+        "owned_identity_count": len(owned), "owned_identity_pids_for_inventory_only": [row["ProcessId"] for row in owned],
+        "current_full_cim": proof["fresh_full_cim"], "current_census_captured_at_utc": snapshots[-1]["captured_at_utc"],
+        "all_original_attributed_identities_present_in_prior_and_absent_after": True,
+        "possible_graph_rechecked_across_prior_historical_cold_and_actual_current": True,
+        "prior_independent_four_snapshot_cold_analysis": candidate_ref,
+        "metadata_writer": reference(Path(__file__)), "evidence_refs": [proof_ref, reader_ref, closure_ref, candidate_ref, *refs],
+        "native_generation_admitted": False, "activation_admitted": False, "science_performance_or_method_R5_admitted": False,
+        "source_module_import_test_replay_CIM_capture_cache_lock_model_MCP_job_process_effect": False,
+        "limits": "Exact received cold metadata and the caller-pinned actual current SO proof only. Freshness was checked at publication; it is not a promise of future state. Production source564/lane must independently revalidate its current full census and all other exact-cell/runtime gates before any admission. No process action or ownership of foreign/reused PIDs is granted."}
+    target = HERE / ("REVUE-DESCENDANTS-SO-" + proof_ref["sha256"][:12] + ".json")
+    with target.open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(review, stream, ensure_ascii=False, indent=2); stream.write("\n")
+    print(json.dumps(reference(target), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

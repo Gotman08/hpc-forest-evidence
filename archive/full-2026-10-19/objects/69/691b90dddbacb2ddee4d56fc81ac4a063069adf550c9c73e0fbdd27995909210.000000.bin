@@ -1,0 +1,109 @@
+"""Isolated local identity derivation; no native worker, service, job or model."""
+import hashlib
+import json
+import runpy
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OLD = HERE.with_name('revision-r6-revue-source-state-reelle')
+OLD_COMPONENTS = 'a7ad420aa58dee4633b35b3fec744af6e0879440b246f7c57a5ed6f44b001574'
+PLAN_PATH = HERE / 'plan-technique-neuf/dynamic-plan-r4b-lane-r3-max-r7.json'
+PLAN = '5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70'
+REVIEW = HERE / 'revue-source110-plan-r7/REVUE-INDEPENDANTE-SOURCE110-PLAN-R7.json'
+REVIEW_SHA = '33b05b6825f1eb340073a63c13bdc1e11696db14b3e9b33ce48b3dcfcb0c326a'
+OLD_PLAN = 'd08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27'
+OLD_REVIEW = '58a08df4fcccdf9b91a39ddacecb95f65b66fb90855298a470e40e01ec1bab2d'
+SHARED = '/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-r7-5c3cc0082589'
+STAGE = '/scratch_p/nimarano/hpc-forest-dynamic-r4b-native-interface-lane-r3-r7-5c3cc0082589.tar.gz'
+HISTORY = {'LANE-SCHEMA-HISTORIQUE.json', 'NEGATIVE-HISTORIQUE-NON-EXECUTABLE.txt',
+           'PROVENANCE-SOCLE-HISTORIQUE.json', 'G-POST-CONTRAT-PRODUCTEUR.json'}
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('xb') as stream:
+        stream.write(value)
+
+
+def json_bytes(value):
+    return (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode('utf8')
+
+
+def generated(name):
+    path = Path(name)
+    return name in {'launcher/COMMANDES-PROPOSEES.json', 'launcher/native-interface-models-max-r3.tar.gz'} or (
+        len(path.parts) == 4 and path.parts[0] == 'launcher' and path.parts[1] in {'sol-max', 'astra-max', 'terra-max'}
+        and path.parts[2] in {'roots', 'advice', 'harvest'})
+
+
+def main():
+    assert sha(OLD / 'COMPONENTS.json') == OLD_COMPONENTS and sha(PLAN_PATH) == PLAN and sha(REVIEW) == REVIEW_SHA
+    old = json.loads((OLD / 'COMPONENTS.json').read_bytes()); assert len(old['code_pins']) == 62
+    plan = json.loads(PLAN_PATH.read_bytes()); review = json.loads(REVIEW.read_bytes())
+    assert review['verified_source_preparation_only'] is True and review['blocking_findings'] == []
+    assert review['source_zip']['sha256'] == old['source_zip_sha256'] and review['plan']['sha256'] == PLAN
+    before = json.loads((OLD / 'launcher/pins-source-plan.json').read_bytes())
+    pairs = {OLD_PLAN: PLAN, OLD_REVIEW: REVIEW_SHA,
+        '/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-qualification-20261018-eaff9217499f': SHARED,
+        '/scratch_p/nimarano/hpc-forest-dynamic-r4b-native-interface-lane-r3-eaff9217499f.tar.gz': STAGE}
+    for model in ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-terra'):
+        pairs[before['contract_cells'][model]['roots']] = plan['contract_cells'][model]['roots']
+        assert all(before['contract_cells'][model][phase] == plan['contract_cells'][model][phase]
+                   for phase in ('advice', 'harvest'))
+    values = {}
+    for name, checksum in old['code_pins'].items():
+        assert sha(OLD / name) == checksum
+        if generated(name):
+            continue
+        value = (OLD / name).read_bytes()
+        if name not in HISTORY:
+            for left, right in pairs.items():
+                value = value.replace(left.encode(), right.encode())
+        values[name] = value
+    pins = json.loads(values['launcher/pins-source-plan.json'])
+    pins['plan'] = {'path': str(PLAN_PATH), 'sha256': PLAN}
+    pins['independent_source_review'] = {'path': str(REVIEW), 'sha256': REVIEW_SHA}
+    pins['contract_cells'] = plan['contract_cells']
+    pins['remote_shared_proposed'] = SHARED
+    assert pins['qualification_reception'] is None and pins['native_generation_admitted'] is False
+    values['launcher/pins-source-plan.json'] = values['reader/pins-source-plan.json'] = json_bytes(pins)
+    # These are concrete hash dependencies, not permission or qualification claims.
+    old_receipt = old['code_pins']['reader/receipt_native.py']
+    new_receipt = hashlib.sha256(values['reader/receipt_native.py']).hexdigest()
+    values['reader/receive_phase.py'] = values['reader/receive_phase.py'].replace(old_receipt.encode(), new_receipt.encode())
+    old_bootstrap = old['code_pins']['launcher/bootstrap_worker.py']
+    new_bootstrap = hashlib.sha256(values['launcher/bootstrap_worker.py']).hexdigest()
+    values['observer/observer-mixte.py'] = values['observer/observer-mixte.py'].replace(old_bootstrap.encode(), new_bootstrap.encode())
+    abi = json.loads(values['observer/ABI.json'])
+    abi['bootstrap'] = {'path': str(HERE / 'launcher/bootstrap_worker.py'), 'sha256': new_bootstrap}
+    values['observer/ABI.json'] = json_bytes(abi)
+    for dependency in ('launcher/cell_selection.py', 'observer/observer-mixte.py'):
+        values['lane_projection.py'] = values['lane_projection.py'].replace(old['code_pins'][dependency].encode(),
+            hashlib.sha256(values[dependency]).hexdigest().encode())
+    for name, value in values.items():
+        write(HERE / name, value)
+    # Exact qualified producer, run locally only in its designed new output tree.
+    # It writes proposals and a three-member stage archive; it never submits or starts a worker.
+    runpy.run_path(str(HERE / 'launcher/render_launch.py'), run_name='__main__')
+    actual = {name: sha(HERE / name) for name in old['code_pins']}
+    prototype = {**old, 'plan_sha256': PLAN, 'candidate_revision': HERE.name, 'code_pins': actual}
+    write(HERE / 'COMPONENTS.pre-validation.json', json_bytes(prototype))
+    write(HERE / 'COMPONENTS.json', json_bytes(prototype))
+    write(HERE / 'ETAPE1-CANDIDAT-NON-ADMIS.json', json_bytes({'schema': 'hpc-forest-r7-active-identities-prevalidation-v1',
+        'source_zip_sha256': old['source_zip_sha256'], 'plan_sha256': PLAN, 'component_count': len(actual),
+        'historical_files_unchanged': sorted(HISTORY), 'all_six_later_phase_sessions_unchanged': True,
+        'observer_local_proof_still_OLD_and_REFUSED_until_new_five_cases': True,
+        'old_Q_or_integration_review_admitted': False, 'native_generation_admitted': False}))
+    assert sha(OLD / 'COMPONENTS.json') == OLD_COMPONENTS
+    assert all(sha(OLD / name) == checksum for name, checksum in old['code_pins'].items())
+    print(json.dumps({'prototype_components_sha256': sha(HERE / 'COMPONENTS.json'), 'code_files': len(actual),
+        'source_unchanged': old['source_zip_sha256'], 'new_plan_sha256': PLAN, 'shared': SHARED,
+        'generation_admitted': False, 'local_new_observer_validation_required': True}))
+
+
+if __name__ == '__main__':
+    main()

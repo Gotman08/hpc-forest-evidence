@@ -1,0 +1,114 @@
+"""Guarded local delivery of R5. No Git mutation, worker or network operation."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+WORKSPACE = HERE.parent.parent
+CANONICAL = WORKSPACE / "outputs/HPC-Forest"
+STAGED = WORKSPACE / "work/hpc-forest-evolution-r5/project"
+ALLOWED_EXISTING = {"README.md", "src/hpc_forest/cli.py"}
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    args = argparse.ArgumentParser()
+    args.add_argument("--integrate", action="store_true")
+    options = args.parse_args()
+    if options.integrate and (HERE / "integration-verifiee.json").exists():
+        raise RuntimeError("R5 is already sealed; create a new revision instead of overwriting its archive")
+    before = json.loads((HERE / "inventaire-avant.json").read_bytes())
+    baseline = {r["path"]: r for r in before}
+    plan = json.loads((HERE / "PLAN.json").read_bytes())
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=CANONICAL, check=True,
+                          capture_output=True, text=True).stdout.strip()
+    if head != plan["head"]:
+        raise RuntimeError("Canonical HEAD changed; preserve and review before delivery")
+    # Insert the guide without normalizing or replacing the user's previous text.
+    with zipfile.ZipFile(HERE / "avant-amelioration-r5.zip") as archive:
+        original_readme = archive.read("HPC-Forest/README.md")
+    staged_text = (STAGED / "README.md").read_text(encoding="utf-8")
+    start = staged_text.index("## Extension expérimentale R5")
+    end = staged_text.index("## Préparation opérateur", start)
+    section = staged_text[start:end]
+    newline = "\r\n" if b"\r\n" in original_readme else "\n"
+    addition = section.replace("\n", newline).encode("utf-8")
+    marker = "## Préparation opérateur".encode("utf-8")
+    prepared = original_readme.replace(marker, addition + marker, 1)
+    if prepared.replace(addition, b"", 1) != original_readme:
+        raise RuntimeError("Existing README content was not preserved")
+    if (STAGED / "README.md").read_bytes() != prepared:
+        (STAGED / "README.md").write_bytes(prepared)
+    new = [p.relative_to(STAGED).as_posix() for p in (STAGED / "src/hpc_forest/evolution").glob("*.py")]
+    new += [p.relative_to(STAGED).as_posix() for p in (STAGED / "tests").glob("test_evolution_*.py")]
+    new += ["docs/evolution-r5.md"]
+    if set(new) & set(baseline):
+        raise RuntimeError("An allegedly new file existed in the preserved baseline")
+    selected = sorted(ALLOWED_EXISTING | set(new))
+    for name, row in baseline.items():
+        current = CANONICAL / name
+        staged = STAGED / name
+        if sha(staged) != row["sha256"] and name not in ALLOWED_EXISTING:
+            raise RuntimeError("Unowned staged edit: " + name)
+        accepted = {row["sha256"]}
+        if name in ALLOWED_EXISTING:
+            accepted.add(sha(staged))
+        if not current.is_file() or sha(current) not in accepted:
+            raise RuntimeError("Concurrent canonical edit: " + name)
+    for name in selected:
+        target = CANONICAL / name
+        if not target.resolve().is_relative_to(CANONICAL.resolve()):
+            raise RuntimeError("Delivery target escapes the canonical project")
+        if name in new and target.exists() and sha(target) != sha(STAGED / name):
+            raise RuntimeError("Foreign file occupies a new R5 path: " + name)
+    changes = [{"path": name, "sha256": sha(STAGED / name),
+                "previous_sha256": baseline[name]["sha256"] if name in baseline else None}
+               for name in selected]
+    write_json(HERE / "changements-prevus.json", changes)
+    if not options.integrate:
+        print(json.dumps({"ready": True, "changes": len(changes), "head": head}))
+        return
+    for name in selected:
+        target = CANONICAL / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((STAGED / name).read_bytes())
+    files = sorted(set(baseline) | set(new))
+    manifest = []
+    for name in files:
+        path = CANONICAL / name
+        if sha(path) != sha(STAGED / name):
+            raise RuntimeError("Post-delivery bytes differ: " + name)
+        manifest.append({"path": name, "sha256": sha(path), "bytes": path.stat().st_size})
+    write_json(HERE / "manifeste-source-r5.json", manifest)
+    bundle = HERE / "HPC-Forest-Evolution-r5-source.zip"
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in files:
+            archive.write(CANONICAL / name, name)
+    receipt = {"schema": "hpc-forest-r5-local-delivery-v1", "utc": datetime.now(timezone.utc).isoformat(),
+               "head_unchanged": head, "baseline_files": len(baseline), "source_files": len(manifest),
+               "new_files": len(new), "existing_files_changed": sorted(ALLOWED_EXISTING),
+               "previous_files_byte_identical": len(baseline) - len(ALLOWED_EXISTING),
+               "previous_readme_body_byte_identical": True,
+               "bundle": str(bundle), "sha256": sha(bundle),
+               "manifest_sha256": sha(HERE / "manifeste-source-r5.json"),
+               "canonical_commits_created": 0, "pushes": 0, "model_calls": 0, "hpc_jobs": 0,
+               "native_runtime_admitted": False, "llm_weights_trained": False}
+    write_json(HERE / "integration-verifiee.json", receipt)
+    print(json.dumps(receipt, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

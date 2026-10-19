@@ -1,0 +1,213 @@
+#include "knn.h"
+#include <float.h>
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+enum {
+    KNN_TILE_POINTS = 256,
+    KNN_RADIX_BITS = 11,
+    KNN_RADIX_BUCKETS = 1 << KNN_RADIX_BITS
+};
+
+static char knn_vote(const size_t *counts) {
+    char winner = (char)-1;
+    size_t best = 0;
+
+    for (int i = 0; i <= UCHAR_MAX; i++) {
+        char label = (char)(unsigned char)i;
+        if (counts[i] > best ||
+            (counts[i] == best && best != 0 && label < winner)) {
+            winner = label;
+            best = counts[i];
+        }
+    }
+
+    return winner;
+}
+
+static char knn_insertion_fallback(int n_groups, Group *groups, int k,
+                                   Point to_evaluate) {
+    char *labels = (char *)malloc((size_t)k * sizeof(*labels));
+    float *distances = (float *)malloc((size_t)k * sizeof(*distances));
+    size_t counts[UCHAR_MAX + 1] = {0};
+
+    if (labels == NULL || distances == NULL) {
+        free(labels);
+        free(distances);
+        on_error();
+    }
+
+    for (int i = 0; i < k; i++) {
+        labels[i] = (char)-1;
+        distances[i] = -1;
+    }
+
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (int x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (int y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < k; i++) {
+        counts[(unsigned char)labels[i]]++;
+    }
+    free(labels);
+    free(distances);
+    return knn_vote(counts);
+}
+
+static int knn_distance_keys(Point target, const Point *points, int count,
+                             uint32_t *keys) {
+    float distances[KNN_TILE_POINTS];
+
+    /* Keep independent distance calculations separate from histogram updates. */
+    for (int i = 0; i < count; i++) {
+        distances[i] = euclidean_distance_no_sqrt(target, points[i]);
+    }
+
+    for (int i = 0; i < count; i++) {
+        uint32_t bits;
+        if (distances[i] != distances[i] || distances[i] < 0.0f) {
+            return 0;
+        }
+        memcpy(&bits, &distances[i], sizeof(bits));
+        keys[i] = distances[i] == 0.0f ? UINT32_C(0) : bits;
+    }
+    return 1;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    size_t counts[UCHAR_MAX + 1] = {0};
+    size_t total = 0;
+    uint32_t keys[KNN_TILE_POINTS];
+
+    if (k <= 0) {
+        return (char)-1;
+    }
+
+    for (int i = 0; i < n_groups; i++) {
+        total += (size_t)groups[i].length;
+    }
+
+    if ((size_t)k >= total) {
+        for (int i = 0; i < n_groups; i++) {
+            counts[(unsigned char)groups[i].label] += (size_t)groups[i].length;
+        }
+        counts[(unsigned char)(char)-1] += (size_t)k - total;
+        return knn_vote(counts);
+    }
+
+    if (sizeof(float) != sizeof(uint32_t) || FLT_RADIX != 2 ||
+        FLT_MANT_DIG != 24 || FLT_MAX_EXP != 128) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t rank = (size_t)k;
+    size_t take_equal = 0;
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    uint32_t cutoff = 0;
+
+    /* Nonnegative binary32 keys have the same order as their distances. */
+    for (int shift = 22; shift >= 0; shift -= KNN_RADIX_BITS) {
+        size_t bins[KNN_RADIX_BUCKETS] = {0};
+
+        for (int i = 0; i < n_groups; i++) {
+            const Group *group = &groups[i];
+            int base = 0;
+            while (base < group->length) {
+                int count = group->length - base;
+                if (count > KNN_TILE_POINTS) {
+                    count = KNN_TILE_POINTS;
+                }
+                if (!knn_distance_keys(to_evaluate, group->points + base,
+                                       count, keys)) {
+                    return knn_insertion_fallback(n_groups, groups, k,
+                                                   to_evaluate);
+                }
+                for (int j = 0; j < count; j++) {
+                    if ((keys[j] & prefix_mask) == prefix) {
+                        bins[(keys[j] >> shift) &
+                             (KNN_RADIX_BUCKETS - 1)]++;
+                    }
+                }
+                base += count;
+            }
+        }
+
+        unsigned int bucket = 0;
+        while (rank > bins[bucket]) {
+            rank -= bins[bucket];
+            bucket++;
+        }
+
+        prefix |= (uint32_t)bucket << shift;
+        prefix_mask = UINT32_MAX << shift;
+
+        if (shift == 0 || rank == bins[bucket]) {
+            cutoff = prefix | ((UINT32_C(1) << shift) - UINT32_C(1));
+            take_equal = rank;
+            break;
+        }
+    }
+
+    /* Encounter order resolves ties exactly as the original insertion loop. */
+    for (int i = 0; i < n_groups; i++) {
+        const Group *group = &groups[i];
+        size_t chosen = 0;
+        int base = 0;
+
+        while (base < group->length) {
+            int count = group->length - base;
+            if (count > KNN_TILE_POINTS) {
+                count = KNN_TILE_POINTS;
+            }
+            if (!knn_distance_keys(to_evaluate, group->points + base,
+                                   count, keys)) {
+                return knn_insertion_fallback(n_groups, groups, k,
+                                               to_evaluate);
+            }
+            for (int j = 0; j < count; j++) {
+                if (keys[j] < cutoff) {
+                    chosen++;
+                } else if (keys[j] == cutoff && take_equal != 0) {
+                    chosen++;
+                    take_equal--;
+                }
+            }
+            base += count;
+        }
+        counts[(unsigned char)group->label] += chosen;
+    }
+
+    return knn_vote(counts);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

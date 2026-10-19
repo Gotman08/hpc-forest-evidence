@@ -1,0 +1,273 @@
+"""Artifact verification and page proofs, independent of the PDF renderer."""
+
+import hashlib
+import json
+import math
+import re
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pymupdf as fitz
+from PIL import Image, ImageDraw, ImageFont
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+PROOF = HERE / "controle-rendu"
+PROOF.mkdir(exist_ok=True)
+
+
+def read(p):
+    return json.loads(Path(p).read_text(encoding="utf-8-sig"))
+
+
+def digest(p):
+    with Path(p).open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def main():
+    global PROOF
+    PROOF = PROOF / (
+        "edition-"
+        + digest(ROOT / "ARTICLE.pdf")[:10]
+        + "-"
+        + digest(ROOT / "ANNEXES-TECHNIQUES.pdf")[:10]
+    )
+    PROOF.mkdir(exist_ok=True, parents=True)
+    audit = read(HERE / "audit-calculs.json")
+    for rel, expected in audit["frozen_data_files"].items():
+        assert digest(HERE / "donnees" / rel) == expected, rel
+    extra_checks = Counter()
+    deep = read(HERE / "donnees/deepseek.json")
+    decode_rates = {}
+    for job in deep["verified_jobs"]:
+        for p in job["problems"]:
+            assert p["input_tokens"] + p["output_tokens"] == p["exact_tokens"]
+            assert math.isclose(
+                p["output_tokens"] / p["decode_seconds_sum"],
+                p["decode_tokens_per_second_weighted"],
+                rel_tol=1e-10,
+            )
+            extra_checks["ollama_input_output_and_decoding"] += 1
+        assert (
+            sum(p["exact_tokens"] for p in job["problems"]) == job["exact_total_tokens"]
+        )
+        decode_rates[job["job_id"]] = sum(
+            p["output_tokens"] for p in job["problems"]
+        ) / sum(p["decode_seconds_sum"] for p in job["problems"])
+    assert sum(j["exact_total_tokens"] for j in deep["verified_jobs"]) == 11416821
+    assert round(decode_rates["747505"], 2) == 62.35
+    history = read(HERE / "donnees/historique-preserve.json")
+    for row in history["rows"]:
+        b = row.get("best_confirmed_as_recorded")
+        if b:
+            assert math.isclose(
+                1 - b["mean_seconds"] / b["reference_seconds"],
+                b["improvement_fraction"],
+                abs_tol=1e-12,
+            )
+            extra_checks["historical_summary_gain_arithmetic_only"] += 1
+    for row in history["legacy_consolidation"]["corrected_comparisons"]:
+        assert math.isclose(
+            1 - row["candidate"] / row["reference"], row["gain"], abs_tol=1e-12
+        )
+        extra_checks["corrected_historical_gain_arithmetic"] += 1
+    small = history["legacy_consolidation"]["small_models"]
+    assert (
+        sum(r["tokens"] for r in small["problems"])
+        == small["optimization_tokens"]
+        == 447778
+    )
+    assert sum(r["model_calls"] for r in small["problems"]) == 54
+    extra_checks["small_model_cost_totals"] += 1
+    rows = read(HERE / "donnees/confirmations-recalculees.json")
+    count = [r for r in rows if r["cohort"] == "count"]
+    luna = [r for r in rows if r["cohort"] == "luna"]
+    astra = [r for r in rows if r["cohort"] == "astra"]
+    terra = [r for r in rows if r["cohort"] == "terra"]
+    assert len(count) == 20 and sum(not r["baseline_retained"] for r in count) == 19
+    assert sum(not r["baseline_retained"] for r in luna) == 12
+    assert len(astra) == 14 and sum(not r["baseline_retained"] for r in astra) == 12
+    assert len(terra) == 14 and sum(not r["baseline_retained"] for r in terra) == 9
+    assert len(rows) == 77 and audit["registry_count"] == 93
+    assert (
+        round(min(r["gain_percent"] for r in count if not r["baseline_retained"]), 2)
+        == 39.78
+    )
+    assert round(max(r["gain_percent"] for r in count), 2) == 90.68
+    assert sum(r["native_calls"] for r in rows if r["cohort"] != "deepseek") == 786
+    assert (
+        sum(r["known_exact_tokens"] for r in rows if r["cohort"] != "deepseek")
+        == 17556652
+    )
+    assert sum(r["unmetered_calls"] for r in rows if r["cohort"] != "deepseek") == 73
+    gpt96 = [r for r in rows if r["cohort"] == "gpt96"]
+    assert len(gpt96) == 3 and all(not r["baseline_retained"] for r in gpt96)
+    assert sum(r["native_calls"] for r in gpt96) == 177
+    assert sum(r["known_exact_tokens"] for r in gpt96) == 5126918
+    assert sum(r["unmetered_calls"] for r in gpt96) == 17
+    gpt96_costs = read(HERE / "donnees/couts-gpt96.json")
+    assert sum(x["expired_without_native_invocation"] for x in gpt96_costs["per_subject"].values()) == 2
+    assert not gpt96_costs["total_exact_consumption_available"]
+    terra_costs = read(HERE / "donnees/couts-terra.json")
+    assert sum(x["expired_unanswered_requests"] for x in terra_costs["per_subject"].values()) == 1
+    assert not terra_costs["total_exact_consumption_available"]
+    main_text = (ROOT / "ARTICLE.md").read_text(encoding="utf-8")
+    paras = [
+        re.sub(r"\s+", " ", p.strip())
+        for p in main_text.split("\n\n")
+        if len(p.split()) > 20 and not p.startswith(("|", "!["))
+    ]
+    repeats = [p for p, n in Counter(paras).items() if n > 1]
+    assert not repeats, repeats
+    assert not re.search(r"\{\{.+?\}\}|C:\\|/gpfs/|nimarano|(?i:TODO|TBD)", main_text)
+    assert "Nicolas Marano" in main_text and "Romain Despoullain" in main_text
+    captions = [int(n) for n in re.findall(r"!\[Figure (\d+) —", main_text)]
+    assert captions == list(range(1, 8)), captions
+    table_captions = [int(n) for n in re.findall(r"\*Tableau (\d+) —", main_text)]
+    assert table_captions == list(range(1, 7)), table_captions
+    documents = []
+    contacts = []
+    font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", 15)
+    for name in ("ARTICLE", "ANNEXES-TECHNIQUES"):
+        md = (ROOT / (name + ".md")).read_text(encoding="utf-8")
+        for block in re.findall(r"(?:^\|.*\n)+", md, re.MULTILINE):
+            assert len(block.strip().splitlines()) >= 3, (name, "empty table", block)
+        figures = re.findall(r"!\[([^\]]+)\]\(([^)]+)\)", md)
+        for cap, p in figures:
+            assert (ROOT / p).is_file(), p
+            assert (ROOT / p).with_suffix(".svg").is_file(), p
+        doc = fitz.open(ROOT / (name + ".pdf"))
+        outline_pages = {re.sub(r"\s+", " ", title.strip()): page
+                         for _, title, page in doc.get_toc()}
+        for parent, child in re.findall(r"^## ([^\n]+)\n\s*### ([^\n]+)", md, re.MULTILINE):
+            parent = re.sub(r"\s+", " ", parent.strip())
+            child = re.sub(r"\s+", " ", child.strip())
+            assert outline_pages[parent] == outline_pages[child], (name, "orphan parent heading", parent, child)
+            extra_checks["consecutive_parent_child_headings_same_page"] += 1
+        assert (
+            "Marano" in doc.metadata["author"]
+            and "Despoullain" in doc.metadata["author"]
+        )
+        pages = []
+        bad_glyphs = []
+        outside = []
+        blank = []
+        pngs = []
+        for i, page in enumerate(doc):
+            text = page.get_text()
+            if not text.strip():
+                blank.append(i + 1)
+            if any(c in text for c in ("\x00", "\ufffd", "\u25a0")):
+                bad_glyphs.append({"page": i + 1, "excerpt": repr(text[:200])})
+            blocks = page.get_text("dict")["blocks"]
+            for b in blocks:
+                if b["type"] != 0:
+                    continue
+                for line in b["lines"]:
+                    for span in line["spans"]:
+                        x0, y0, x1, y1 = span["bbox"]
+                        if (
+                            x0 < 0
+                            or y0 < 0
+                            or x1 > page.rect.width + 0.5
+                            or y1 > page.rect.height + 0.5
+                        ):
+                            outside.append(
+                                {
+                                    "page": i + 1,
+                                    "bbox": span["bbox"],
+                                    "text": span["text"],
+                                }
+                            )
+            path = PROOF / f"{name}-{i + 1:03d}.png"
+            page.get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False).save(path)
+            pngs.append(path)
+            pages.append(
+                {
+                    "page": i + 1,
+                    "text_chars": len(text),
+                    "images": len(page.get_images()),
+                    "links": len(page.get_links()),
+                    "png_sha256": digest(path),
+                }
+            )
+        assert not blank, (name, blank)
+        assert not bad_glyphs, (name, bad_glyphs)
+        assert not outside, (name, outside)
+        for start in range(0, len(pngs), 6):
+            sheet = Image.new("RGB", (920, 2010), "#e4eaf0")
+            draw = ImageDraw.Draw(sheet)
+            for j, p in enumerate(pngs[start : start + 6]):
+                im = Image.open(p).convert("RGB")
+                im.thumbnail((440, 625))
+                x = (j % 2) * 460 + 10
+                y = (j // 2) * 670 + 28
+                draw.text(
+                    (x, y - 23), f"{name} · {start + j + 1}", font=font, fill="#17354a"
+                )
+                sheet.paste(im, (x, y))
+            p = PROOF / f"planche-{name}-{start // 6 + 1:02d}.jpg"
+            sheet.save(p, quality=90)
+            contacts.append(str(p))
+        documents.append(
+            {
+                "name": name,
+                "pages": len(doc),
+                "figures": len(figures),
+                "pdf_sha256": digest(ROOT / (name + ".pdf")),
+                "metadata": doc.metadata,
+                "page_proofs": pages,
+                "glyph_errors": bad_glyphs,
+                "outside_page": outside,
+                "blank_pages": blank,
+            }
+        )
+    report = {
+        "schema": "hpc-forest-professional-article-quality-v1",
+        "checked_utc": datetime.now(UTC).isoformat(),
+        "arithmetic_audit_verified": audit["verified"],
+        "additional_arithmetic_checks": dict(extra_checks),
+        "weighted_ollama_decode_tokens_per_second": decode_rates,
+        "frozen_inputs_still_match": True,
+        "author_names_verified": True,
+        "duplicated_main_paragraphs": repeats,
+        "main_figure_numbers_contiguous": True,
+        "main_table_numbers_contiguous": True,
+        "all_images_exist_in_png_and_svg": True,
+        "all_pdf_pages_rendered": True,
+        "visual_review_completed": False,
+        "documents": documents,
+        "contact_sheets": contacts,
+        "source_audit_sha256": digest(HERE / "audit-calculs.json"),
+        "operator_report_is_never_model_input": True,
+    }
+    (HERE / "controle-qualite.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                "documents": [
+                    {
+                        k: d[k]
+                        for k in (
+                            "name",
+                            "pages",
+                            "figures",
+                            "glyph_errors",
+                            "outside_page",
+                            "blank_pages",
+                        )
+                    }
+                    for d in documents
+                ],
+                "contact_sheets": len(contacts),
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

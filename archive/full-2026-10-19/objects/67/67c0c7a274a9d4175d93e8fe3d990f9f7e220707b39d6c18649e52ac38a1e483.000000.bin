@@ -1,0 +1,31 @@
+param([Parameter(Mandatory=$true)][string]$OutputPath)
+$ErrorActionPreference = 'Stop'
+if(Test-Path -LiteralPath $OutputPath){throw 'Census target already exists'}
+$r4bRows = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
+    [ordered]@{
+        ProcessId=[int]$_.ProcessId
+        ParentProcessId=[int]$_.ParentProcessId
+        ExecutablePath=$_.ExecutablePath
+        CommandLine=$_.CommandLine
+        CreationDate=if($null -ne $_.CreationDate){$_.CreationDate.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'")}else{$null}
+    }
+})
+$r4bNative = @($r4bRows | Where-Object { $_.CommandLine -match '(?:["\s]|^)-m["\s]+hpc_forest\.\w*worker(?:["\s]|$)' -or $_.CommandLine -match 'bootstrap_worker\.py' })
+$r4bOther = @($r4bNative | Where-Object { $_.ProcessId -notin @(37900,37848) })
+$r4bValue = [ordered]@{
+    schema='hpc-forest-dynamic-r4b-full-cim-v1'
+    complete_census=$true
+    strict_utf8_decoding=$true
+    captured_at_utc=[DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'")
+    rows_count=$r4bRows.Count
+    rows=$r4bRows
+    other_native_groups=$r4bOther
+}
+$r4bText=($r4bValue | ConvertTo-Json -Depth 12)+"`n"
+$r4bStream=[IO.File]::Open($OutputPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+try{
+    $r4bBytes=[Text.UTF8Encoding]::new($false,$true).GetBytes($r4bText)
+    $r4bStream.Write($r4bBytes,0,$r4bBytes.Length)
+    $r4bStream.Flush($true)
+}finally{$r4bStream.Dispose()}
+[ordered]@{path=$OutputPath;sha256=(Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256).Hash.ToLowerInvariant();rows_count=$r4bRows.Count;native_pids=@($r4bNative|ForEach-Object{$_.ProcessId});other_native_pids=@($r4bOther|ForEach-Object{$_.ProcessId})}|ConvertTo-Json -Depth 5 -Compress

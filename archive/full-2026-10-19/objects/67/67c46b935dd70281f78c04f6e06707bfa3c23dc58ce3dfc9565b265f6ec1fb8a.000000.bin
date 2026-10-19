@@ -1,0 +1,72 @@
+"""Copy the sealed r2c bytes to an isolated, unadmitted r2d derivative."""
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import uuid
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+BASE = OUT.parents[2]
+OLD = OUT.parent / "revision-r2c"
+PROJECT = BASE / "work/hpc-forest-primes-native-max-r2d/project"
+PARENT = BASE / "work/hpc-forest-primes-native-max-r2c/project"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): sha(p) for p in sorted(root.rglob("*"))
+            if p.is_file() and not any(part in {"__pycache__", ".pytest_cache", ".ruff_cache"}
+                                      for part in p.relative_to(root).parts)}
+
+
+def save(path, value):
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+
+
+def main():
+    source = OLD / "HPC-Forest-Primes-Natif-MAX-r2c.zip"
+    if sha(source) != "ade344bfec4322e8aaecc99cfbf7bd502e6d39b55c62180e8f552a3d6391e680":
+        raise ValueError("Sealed r2c source changed")
+    original = inventory(PARENT)
+    if len(original) != 103:
+        raise ValueError("Expected exactly 103 parent files")
+    with zipfile.ZipFile(source) as archive:
+        items = archive.infolist()
+        archived = {item.filename.removeprefix("HPC-Forest/"): archive.read(item) for item in items}
+        if len(items) != len(archived) or {name: hashlib.sha256(raw).hexdigest()
+                for name, raw in archived.items()} != original:
+            raise ValueError("Parent runtime differs from sealed ZIP")
+    PROJECT.mkdir(parents=True, exist_ok=False)
+    for name, raw in archived.items():
+        target = PROJECT / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+    shutil.copytree(OLD / "certified-preparation", OUT / "certified-preparation")
+    shutil.copyfile(OLD / "preparation-review-original.json", OUT / "preparation-review-original.json")
+    sessions = {model: uuid.uuid4().hex for model in
+                ("gpt-6-astra", "gpt-5.6-terra", "gpt-6.1-sol")}
+    pinned = {str(path.resolve()): sha(path) for path in [source, OLD / "native-max-plan.json",
+              OLD / "LIVRAISON-LOCALE-FINALE.json", OLD / "runtime-manifest-r2max.json"]}
+    pinned.update({str((PARENT / name).resolve()): digest for name, digest in original.items()})
+    save(OUT / "origine-preservee.json", {
+        "created_utc": datetime.now(UTC).isoformat(), "parent_source_zip_sha256": sha(source),
+        "parent_plan_sha256": sha(OLD / "native-max-plan.json"),
+        "parent_runtime_manifest": original, "original_files": pinned,
+        "certified_preparation_manifest": inventory(OUT / "certified-preparation"),
+        "new_scope": "hpc-forest-primes-native-max-r2d", "new_sessions": sessions,
+        "parent_sessions": json.loads((OLD / "native-max-plan.json").read_text(encoding="utf8"))["cells"],
+        "calls_started": 0, "jobs_submitted": 0, "native_admitted": False})
+    print(json.dumps({"scope": "hpc-forest-primes-native-max-r2d", "sessions": sessions}))
+
+
+if __name__ == "__main__":
+    main()

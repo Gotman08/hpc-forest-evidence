@@ -1,0 +1,201 @@
+"""Actual cold metadata/static contract checks; no worker, allocation or model."""
+import ast
+import hashlib
+import importlib.util
+import io
+import json
+import re
+import shlex
+import tarfile
+from pathlib import Path
+
+import pytest
+
+OWN = Path(__file__).resolve().parent
+P8 = OWN.parent
+OP = P8.parent
+PREP = OP.parent
+BASE = PREP.parents[1]
+HERE = PREP / 'adaptateurs-source110-r1/revision-r8-racines-techniques-neuves'
+OLD = PREP / 'adaptateurs-source110-r1/revision-r7-racines-techniques-neuves'
+INPUTS = OWN / 'ENTREES-EXACTES-STATIQUES-R8.json'
+INPUTS_SHA = 'f90ec69b945becac511286374f9e46b31bb859e50463e04d3faffb565f8f693b'
+PLAN = 'f927d37098f3fd50cc4916195da3e300bd7c29597ba7ece4b9669abd715897fe'
+PARENT_PLAN_SHA = '5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70'
+SOURCE = 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48'
+MODELS = ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-terra')
+PHASES = ('roots', 'advice', 'harvest')
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read(path):
+    return json.loads(path.read_text(encoding='utf8'))
+
+
+def ref(path):
+    return {'path': str(path), 'sha256': sha(path)}
+
+
+def load(name, relative):
+    spec = importlib.util.spec_from_file_location(name, HERE / relative)
+    expected = prepared_inputs()['existing60_observed_inventory'][relative]['sha256']
+    assert sha(HERE / relative) == expected
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+
+def prepared_inputs():
+    assert sha(INPUTS) == INPUTS_SHA
+    value = read(INPUTS)
+    assert value['schema'] == 'hpc-forest-r8-static16-preparation-inputs-v1'
+    assert value['plan_sha256'] == PLAN and value['source_zip_sha256'] == SOURCE
+    assert len(value['existing60_observed_inventory']) == 60 and value['native_generation_admitted'] is False
+    return value
+
+
+def constants(path):
+    result = {}
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for name in node.targets:
+                if isinstance(name, ast.Name):
+                    result[name.id] = node.value.value
+    return result
+
+
+def test_plan_has_only_three_fresh_root_uuid_changes():
+    old_path = OLD / 'plan-technique-neuf/dynamic-plan-r4b-lane-r3-max-r7.json'
+    path = HERE / 'plan-technique-neuf/dynamic-plan-r4b-lane-r3-max-r8.json'
+    assert sha(old_path) == PARENT_PLAN_SHA and sha(path) == PLAN
+    old, new = read(old_path), read(path)
+    assert new['source_zip_sha256'] == old['source_zip_sha256'] == SOURCE
+    assert set(old['cells']) == set(new['cells']) == {'gpt-6.1-sol', 'gpt-6-luna', 'gpt-6-astra', 'gpt-5.6-terra'}
+    assert json.dumps(new['cells'], sort_keys=True) == json.dumps(old['cells'], sort_keys=True)
+    assert all(new['contract_cells'][m][p] == old['contract_cells'][m][p]
+               for m in MODELS for p in ('advice', 'harvest'))
+    reserved = set(re.findall(r'\b[0-9a-f]{32}\b', json.dumps(old)))
+    fresh = []
+    for model in MODELS:
+        session = new['contract_cells'][model]['roots']
+        assert isinstance(session, str) and re.fullmatch('[0-9a-f]{32}', session) and session not in reserved
+        fresh.append(session)
+        old['contract_cells'][model]['roots'] = session
+    assert len(set(fresh)) == 3
+    # Type-sensitive canonical equality preserves every other field, including
+    # science, method, budgets, limits, resources, Luna and dated provenance.
+    assert json.dumps(new, sort_keys=True) == json.dumps(old, sort_keys=True)
+
+
+@pytest.mark.parametrize('model', MODELS)
+def test_new_roots_selectable_and_old_roots_refused(model):
+    current = load('r8_actual_selection', 'launcher/cell_selection.py')
+    data = prepared_inputs()
+    ancestor_path = Path(data['parent_components']['path'])
+    assert sha(ancestor_path) == data['parent_components']['sha256']
+    assert sha(OLD / 'launcher/pins-source-plan.json') == read(ancestor_path)['code_pins']['launcher/pins-source-plan.json']
+    old = read(OLD / 'launcher/pins-source-plan.json')['contract_cells']
+    new = read(HERE / 'launcher/pins-source-plan.json')['contract_cells']
+    assert current.select(model, 'roots') == new[model]['roots'] != old[model]['roots']
+    with pytest.raises(ValueError):
+        current.select(model, 'roots', session_id=old[model]['roots'])
+    assert all(current.select(model, phase) == old[model][phase] for phase in ('advice', 'harvest'))
+
+
+@pytest.mark.parametrize('model,phase', [(model, phase) for model in MODELS for phase in PHASES])
+def test_nine_actual_command_job_registry_and_stage_bytes(model, phase):
+    data = prepared_inputs()
+    assert sha(HERE / 'launcher/COMMANDES-PROPOSEES.json') == data['actual_command_registry']['sha256']
+    registry = read(HERE / 'launcher/COMMANDES-PROPOSEES.json')
+    assert set(registry['commands']) == {m + ':' + p for m in MODELS for p in PHASES}
+    assert registry['stage_archive'] == data['actual_stage_archive']
+    row = registry['commands'][model + ':' + phase]
+    slug = {'gpt-6.1-sol': 'sol-max', 'gpt-6-astra': 'astra-max', 'gpt-5.6-terra': 'terra-max'}[model]
+    folder = HERE / 'launcher' / slug / phase
+    command = (folder / 'commande-allouee.sh').read_text()
+    job = read(folder / 'job-prepare-propose.json')
+    assert shlex.split(job['command']) == ['bash', '-lc', command]
+    assert row['command_sha256'] == sha(folder / 'commande-allouee.sh')
+    assert row['job_request_sha256'] == sha(folder / 'job-prepare-propose.json')
+    assert job['cpus_per_task'] == 4 and job['mem_gb'] == 16 and job['gpus_per_node'] == 0
+    assert job['time_limit'] == '01:00:00' and job['arch'] == 'armgpu'
+    session = read(HERE / 'launcher/pins-source-plan.json')['contract_cells'][model][phase]
+    assert row['session_id'] == session and row['native_root'].endswith('-' + session)
+    assert 'shared=/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-r8-f927d37098f3\n' in command
+    assert 'test ! -e "$driver"' in command and 'test ! -e "$native_root"' in command and 'test ! -e "$admission_root"' in command
+    assert PLAN in command and SOURCE in command and '--model ' + model + ' --effort max --phase ' + phase in command
+    template = read(folder / 'factory-input-NON-ADMIS.json')
+    assert template['verified'] is False and template['job_id'] is None and template['real_qualification_reception'] is None
+    stage = HERE / 'launcher/native-interface-models-max-r3.tar.gz'
+    assert sha(stage) == registry['stage_archive']['sha256'] and registry['stage_archive']['sha256'] in command
+    with tarfile.open(fileobj=io.BytesIO(stage.read_bytes()), mode='r:gz') as archive:
+        headers = archive.getmembers()
+        assert len(headers) == 3 and all(h.isfile() and not h.issym() and not h.islnk() for h in headers)
+        files = {h.name: archive.extractfile(h).read() for h in headers}
+    manifest = json.loads(files['stage-manifest.json'])
+    assert manifest == {name: hashlib.sha256(files[name]).hexdigest() for name in ('cell_selection.py', 'remote_stage.py')}
+    assert all(files[name] == (HERE / 'launcher' / name).read_bytes() for name in manifest)
+
+
+def test_actual_whole_manifest_review_and_transitive_pins():
+    bridge = load('r8_actual_bridge_statics', 'reader_bridge.py')
+    manifest = bridge.verify_dependencies()
+    assert len(manifest['code_pins']) == 62
+    data = prepared_inputs()
+    ancestor = read(Path(data['parent_components']['path']))
+    assert sha(Path(data['parent_components']['path'])) == data['parent_components']['sha256']
+    assert set(manifest['code_pins']) == set(ancestor['code_pins'])
+    for name, observed in data['existing60_observed_inventory'].items():
+        assert sha(HERE / name) == observed['sha256'] == manifest['code_pins'][name]
+    for name, observed_sha in data['observed_transitive_source_sha256'].items():
+        assert sha(HERE / name) == observed_sha
+    pins = read(HERE / 'launcher/pins-source-plan.json')
+    assert pins == read(HERE / 'reader/pins-source-plan.json') and pins['plan']['sha256'] == PLAN
+    assert pins['qualification_reception'] is None and pins['native_generation_admitted'] is False and pins['pilot_admitted'] is False
+    actual_review = bridge.read(pins['independent_source_review'])
+    bridge.contract.source_review(actual_review)
+    assert actual_review['native_generation_admitted'] is False
+    observer = constants(HERE / 'observer/observer-mixte.py')
+    assert observer['BOOTSTRAP_SHA'] == sha(HERE / 'launcher/bootstrap_worker.py')
+    assert observer['SOURCE_REVIEW_SHA'] == pins['independent_source_review']['sha256']
+    assert pins['independent_source_review'] == data['source_plan_review']
+    assert read(HERE / 'observer/ABI.json')['bootstrap'] == ref(HERE / 'launcher/bootstrap_worker.py')
+    obs_module = load('r8_actual_local_observer_validation', 'observer/observer-mixte.py')
+    assert obs_module.verify_local_validation()['testcases'] == 5
+    assert constants(HERE / 'reader/receive_phase.py')['AUDIT_SHA256'] == sha(HERE / 'reader/receipt_native.py')
+    projection = load('r8_actual_projection_statics', 'lane_projection.py')
+    for name in ('cells', 'observer_proof_reader'):
+        path, expected = projection.DEPENDENCIES[name]
+        assert sha(path) == expected
+
+
+class NoSourceImported(Exception):
+    pass
+
+
+def stop_before_source():
+    raise NoSourceImported
+
+
+def test_actual_review1a65_still_accepted_before_any_source_import(monkeypatch):
+    bridge = load('r8_actual_source_state_review', 'reader_bridge.py')
+    monkeypatch.setattr(bridge, 'source_modules', stop_before_source)
+    path = (BASE / 'outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3/'
+            'operations-parent-premier-roots-source110-r1/preparation-roots-operationnelle-r1/'
+            'revision-source-state-binding-r2/SOURCE-STATE-BINDING-R2-CANDIDAT-NON-ADMIS.json')
+    with pytest.raises(NoSourceImported):
+        bridge.produce_projection({}, {}, ref(path), now=0)
+
+
+def test_factory_real_entry_refuses_old_integration_before_bootstrap(monkeypatch, tmp_path):
+    factory = load('r8_actual_factory_old_review_refusal', 'assemble_admissions.py')
+    monkeypatch.setattr(factory, 'bootstrap_source', stop_before_source)
+    old_review = (HERE.parent / 'revue-integration-source110-parent-r1/revision-r2-OBS4-reel/'
+                  'REVUE-INTEGRATION-SOURCE110-OBS4-REELLE.json')
+    with pytest.raises(ValueError):
+        factory.assemble({'reader_integration_review': ref(old_review)}, tmp_path / 'never-created')
+    assert not (tmp_path / 'never-created').exists()

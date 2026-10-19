@@ -1,0 +1,63 @@
+"""Admit the closed Luna xhigh group under the existing R1 coordinator lock."""
+import importlib.util
+import json
+import shutil
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+
+
+def main():
+    spec = importlib.util.spec_from_file_location("luna_xhigh_receipt_legacy", STUDY / "coordonner-matrice.py")
+    legacy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(legacy)
+    load = lambda p: json.loads(p.read_text(encoding="utf-8-sig"))
+    digest = legacy.file_digest
+    with legacy.FileLock(STUDY / "coordinator.lock"):
+        assert not (HERE / "reception-verifiee.json").exists()
+        native = load(HERE / "audit-initial.json")
+        extra = load(HERE / "audit-complementaire.json")
+        stopped = load(HERE / "owned-worker-stopped.json")
+        assert native["coverage_and_final_confirmations_verified"] and extra["all_restored_bytes_unchanged"]
+        assert stopped["after_audit"] and stopped["after_deliveries"]
+        assert stopped["all_owned_process_identities_absent_after_stop"]
+        assert stopped["reconciliation_sha256"] == digest(HERE / "reconciliation-livraisons.json")
+        state_path = STUDY / "coordinator-state.json"
+        shutil.copy2(state_path, HERE / "coordinator-avant-admission.json")
+        state = load(state_path)
+        cell = next(g for g in state["queue"] if g["key"] == "coverage-gpt-6-luna-xhigh")
+        assert cell["job_id"] == "749940" and cell["state"] == "working"
+        assert state["current_key"] == cell["key"]
+        folder = STUDY / "runs" / cell["key"]
+        for source, target in [(HERE / "audit-initial.json", folder / "audit.json"),
+            (HERE / "archive/results-749940.tar.gz", folder / "results-749940.tar.gz"),
+            (HERE / "owned-worker-stopped.json", folder / "owned-worker-stopped.json")]:
+            assert not target.exists()
+            shutil.copy2(source, target)
+            assert digest(source) == digest(target)
+        cell.update(state="received_and_audited", archive_sha256=digest(folder / "results-749940.tar.gz"),
+                    audit_path=str(folder / "audit.json"), reception_path=str(HERE / "reception-verifiee.json"))
+        state.update(stage="ready_for_next_group_after_audited_reception", error=None, updated_at=time.time())
+        legacy.atomic_json(state_path, state)
+        proof = {"schema": "hpc-forest-reception-luna-xhigh-v1", "verified": True, "job_id": "749940",
+            "verified_at": time.time(), "archive_sha256_announced_remote_and_local": cell["archive_sha256"],
+            "restored_files_unchanged_before_after_audit": 12427, "source_files_verified": 90,
+            "audit": {"path": str(HERE / "audit-initial.json"), "sha256": digest(HERE / "audit-initial.json")},
+            "supplemental_audit": {"path": str(HERE / "audit-complementaire.json"), "sha256": digest(HERE / "audit-complementaire.json")},
+            "reconciliation": {"path": str(HERE / "reconciliation-livraisons.json"), "sha256": digest(HERE / "reconciliation-livraisons.json")},
+            "owned_stop": {"path": str(HERE / "owned-worker-stopped.json"), "sha256": digest(HERE / "owned-worker-stopped.json")},
+            "subjects_received": 14, "modified_programs_confirmed_on_received_finite_contracts": 13,
+            "references_kept": 1, "native_invocations_observed": 158, "known_exact_tokens": 3434224,
+            "unmeasured_native_invocations": 0, "all_158_published_requests_delivered_and_reconciled": True,
+            "research_replayed": False, "candidate_or_oracle_modified": False,
+            "global_causal_gain_claimed": False, "r1_lane_remains_reserved": True,
+            "article_admission_pending": True}
+        legacy.atomic_json(HERE / "reception-verifiee.json", proof)
+        print(json.dumps({"verified": True, "groups_received": sum(g["state"] == "received_and_audited" for g in state["queue"]),
+                          "next_key": next(g["key"] for g in state["queue"] if g["state"] == "not_started")}))
+
+
+if __name__ == "__main__":
+    main()

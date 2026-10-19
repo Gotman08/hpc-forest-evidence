@@ -1,0 +1,79 @@
+"""Seal this sidecar's finite evidence without editing any canonical source."""
+from __future__ import annotations
+
+import hashlib
+import json
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DELIVERY = ROOT.parent / "HPC-Forest-Evolution-r5"
+CANONICAL = ROOT.parent / "HPC-Forest"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    if (ROOT / "validation-livraison.json").exists():
+        raise RuntimeError("Preserve the sealed evidence; create a new receipt revision")
+    manifest_path = DELIVERY / "manifeste-source-r5.json"
+    if sha(manifest_path) != "d6e3400824f8b6353ad4988c5d2891a9986a97efb53622678cf83fb06a1f48fa":
+        raise ValueError("The canonical source manifest changed")
+    source = json.loads(manifest_path.read_bytes())
+    for item in source:
+        path = CANONICAL / item["path"]
+        if path.is_symlink() or sha(path) != item["sha256"] or path.stat().st_size != item["bytes"]:
+            raise ValueError(f"Canonical sealed source changed: {item['path']}")
+    if sha(DELIVERY / "HPC-Forest-Evolution-r5-source.zip") != "a522c879dada0d87fa49b9b52fcb5f8cc1c9dd7ed0e2235a926184f072e9a90b":
+        raise ValueError("The sealed source archive changed")
+    audit = json.loads((ROOT / "audit-prevol-arm64.json").read_bytes())
+    plan = json.loads((ROOT / "plan-pilote-reel.json").read_bytes())
+    if (len(plan["cells"]) != 36 or plan["submitted"] or plan["native_model_calls"]
+            or any(cell["state"] != "not_started" or cell["inherits_candidate"] for cell in plan["cells"])):
+        raise ValueError("Preregistered pilot execution state differs")
+    if len({c["root"] for c in plan["cells"]}) != 36 or len({c["context_session"] for c in plan["cells"]}) != 36:
+        raise ValueError("Fresh pilot roots/sessions are not unique")
+    xml_path = ROOT / "deepseek/tests-encodage-final-v2.xml"
+    cases = list(ET.parse(xml_path).getroot().iter("testcase"))
+    if len(cases) != 24 or any(list(case) for case in cases):
+        raise ValueError("Data adapter checks are not 24 passing tests")
+    encoding = json.loads((ROOT / "deepseek/qualification-encodage.json").read_bytes())
+    for field in ("weights_trained", "training_runtime_qualified", "tools_qualified", "thinking_qualified"):
+        if encoding[field]:
+            raise ValueError("Data-only qualification scope changed")
+    if encoding["model_calls"]:
+        raise ValueError("Unexpected model calls in data preparation")
+    state = json.loads((ROOT / "suivi-a-faire.json").read_bytes())
+    if state["fresh_model_pilot"]["cells_started"] or state["deepseek_weight_learning"]["weights_trained"]:
+        raise ValueError("The living state overstates the completed work")
+    selected = []
+    for path in ROOT.rglob("*"):
+        relative = path.relative_to(ROOT)
+        if (not path.is_file() or any(part in {"__pycache__", ".pytest_cache", ".ruff_cache"}
+                                      for part in relative.parts)
+                or relative.parts[0] in {"payload", "payload-r2", "reception-neuve-749209"}
+                or path.name in {"validation-livraison.json", "manifeste-livraison.json", "automation-verifiee.json"}):
+            continue
+        selected.append({"path": relative.as_posix(), "bytes": path.stat().st_size, "sha256": sha(path)})
+    selected.sort(key=lambda item: item["path"])
+    receipt = {"schema": "hpc-forest-r5-evaluation-delivery-v1", "utc": datetime.now(UTC).isoformat(),
+               "canonical_source_files_unchanged": len(source),
+               "controller_audit_sha256": sha(ROOT / "audit-prevol-arm64.json"),
+               "controller_job": audit["job_id"], "restored_files_reverified": audit["files_restored_and_reverified"],
+               "project_tests_ARM64": audit["tests"]["project"], "benchmark_tests_ARM64": audit["tests"]["benchmarks"],
+               "actual_tokenizer_adapter_tests_passed": len(cases), "data_tests_sha256": sha(xml_path),
+               "pilot_plan_sha256": sha(ROOT / "plan-pilote-reel.json"), "pilot_cells_started": 0,
+               "weight_learning_executed": False, "model_calls": 0,
+               "program_quality_gain_established": False, "learning_gain_established": False,
+               "manifest_files": len(selected)}
+    (ROOT / "manifeste-livraison.json").write_text(json.dumps(selected, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    receipt["manifest_sha256"] = sha(ROOT / "manifeste-livraison.json")
+    (ROOT / "validation-livraison.json").write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(receipt, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

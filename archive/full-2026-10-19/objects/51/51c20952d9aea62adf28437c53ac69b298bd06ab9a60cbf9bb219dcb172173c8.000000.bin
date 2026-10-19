@@ -1,0 +1,208 @@
+"""Bounded native Astra r2b receiver: original archive/claims/Git/private evidence, no execution.
+
+Exit 1: refused/incomplete; exit 2: bounded inspection succeeded. No global admission/exit 0.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import tarfile
+import zipfile
+from pathlib import Path
+
+import audit_context as context
+from audit_campaign import campaign_evidence
+from audit_common import (
+    FLAGS,
+    PREPARATION_SHA,
+    digest,
+    finite_contract,
+    inventory,
+    need,
+    open_closed_database,
+    read_json,
+    rebased,
+    sha,
+    validate_admissions,
+    verify_archive,
+)
+from audit_private_r2b import raw_evidence, ref_file
+from audit_transport import mailbox_and_cache
+
+LIMITS = [
+    "Received native checker protocol, lineage, recorded samples and private provenance only; global verified/admission stay false.",
+    "External Python/GCC/CLI executable bytes and execution attestation are not independently established by this archive.",
+    "No hardware/process isolation, causal model ranking, contest-domain generalization or replay.",
+    "Only a terminal fresh restoration and separately preserved stable cache are read; no writable SQLite, C, Git CLI or model.",
+    "Required Git objects must be loose and hash-valid; packed/missing objects block, without checkout or repair.",
+    "Operator receipt authorship/authority needs external review; file hashes alone do not authenticate an operator.",
+]
+
+
+def native_start_evidence(output, root, calls):
+    binding = context.recheck()
+    first = read_json(output / "premier-demarrage-verifie.json")
+    final = read_json(output / "reconciliation-finale-verifiee.json")
+    for record in (first, final):
+        need(record.get("schema") == "hpc-forest-primes-r2max-first-start-verified-v1"
+             and record.get("verified") is True and record.get("scope_id") == context.SCOPE
+             and record.get("model") == context.MODEL and record.get("effort") == "max"
+             and record.get("session_id") == context.SESSION and record.get("job_id") == context.JOB
+             and record.get("source_zip_sha256") == context.SOURCE_SHA and record.get("plan_sha256") == context.PLAN_SHA
+             and record.get("technical_errors_found") is False and record.get("invocation_unknown") is False
+             and record.get("extension_to_other_models_allowed") is False,
+             "Actual normal native start/reconciliation missing, unknown or unrelated")
+        need(record.get('admission_artifacts') == json.loads(binding.controller_artifacts_json),
+             'Actual first-start admission refs differ from immutable controller authorization')
+        for call in record.get("all_started_calls_reconciled", []):
+            for key in ("request", "response", "ready", "invocation", "delivered", "process", "error_and_usage_log"):
+                ref_file(call[key], root)
+            need(call.get("normal_delivered") is True and call.get("usage_exact") is True,
+                 "Native batch call was not fully delivered/reconciled")
+    final_missions = [call['mission_id'] for call in final.get('all_started_calls_reconciled', [])]
+    need(len(final_missions) == len(set(final_missions)) and set(final_missions) == set(calls["mission_ids"]),
+         "Final batch reconciliation is not exhaustive over all received native claims")
+    normal = first.get("first_normal_delivered_call", {})
+    normal_ids = {row['mission_id'] for row in calls['nonce_records'] if not row['mother']}
+    need(normal.get("mother_call") is False and normal.get("mission_id") in normal_ids,
+         "First start is not a normal delivered child invocation")
+    evaluation = first.get("first_real_evaluation", {})
+    need(any(mission == evaluation.get('experiment_id') or mission.startswith(str(evaluation.get('experiment_id')) + '-h')
+             for mission in normal_ids), 'First evaluation has no delivered normal model proposal')
+    snapshot = read_json(ref_file(first.get("evaluation_snapshot"), root))
+    need(snapshot.get("experiment_id") == evaluation.get("experiment_id")
+         and digest(snapshot.get("outcome")) == evaluation.get("outcome_sha256")
+         and evaluation.get("status") in {"valid", "incorrect", "build_failed", "runtime_failed"},
+         "First real candidate evaluation snapshot differs")
+    db = open_closed_database(output / context.CAMPAIGN / "registry.sqlite3")
+    try:
+        row = db.execute("SELECT result FROM trials WHERE id=?", (evaluation["experiment_id"],)).fetchone()
+        need(row is not None and json.loads(row["result"]) == snapshot["outcome"],
+             "Actual first candidate evaluation differs from the closed registry")
+    finally:
+        db.close()
+    actual_provenance = {ref_file(ref, root) for ref in first.get('private_execution_provenance', [])}
+    expected_provenance = {rebased(name, root).with_name(Path(name).name + '.private-execution.json')
+                           for name in snapshot['outcome'].get('logs', [])}
+    need(actual_provenance == expected_provenance and len(actual_provenance) == len(first.get('private_execution_provenance', [])),
+         'First real evaluation private sidecars differ from the exact outcome logs')
+    need(first.get("private_execution_provenance"), "First normal native evaluation has no private provenance")
+    return {"actual_first_normal_call_and_candidate_evaluation_received": True,
+            "all_final_started_calls_reconciled": len(calls["mission_ids"]),
+            "first_candidate_status": evaluation["status"], "first_candidate_negative_preserved": evaluation["status"] != "valid",
+            "first_start_report_sha256": sha((output / "premier-demarrage-verifie.json").read_bytes())}
+
+
+def audit(root, cache, reception_path, cache_receipt_path, source_zip, plan, certified):
+    binding = context.recheck()
+    result = {"schema": "hpc-forest-primes-r2max-readonly-audit-v1", **binding.cell,
+              "preparation_manifest_sha256": PREPARATION_SHA, "verified": False,
+              "native_research_admitted": False, "independent_performance_audit_verified": False,
+              "independent_raw_stdout_per_candidate_verified": False,
+              "received_cohort_audited_with_explicit_raw_attribution_limit": False,
+              "received_native_cohort_audited_with_explicit_limits": False,
+              "received_model_artifacts_audited_with_owned_lock_pending": False,
+              "hardware_or_process_isolation_proved": False, "limits": LIMITS,
+              "immutable_expectation_sha256": binding.expectation_sha256}
+    before = {}
+    try:
+        need(root.resolve() != cache.resolve() and not root.resolve().is_relative_to(cache.resolve())
+             and not cache.resolve().is_relative_to(root.resolve()), "Fresh restoration/cache must be separate")
+        before = {"restoration": inventory(root), "cache": inventory(cache)}
+        need(sha(source_zip.read_bytes()) == context.SOURCE_SHA and sha(plan.read_bytes()) == context.PLAN_SHA,
+             "Immutable native source/plan differs")
+        reception, cache_receipt = read_json(reception_path), read_json(cache_receipt_path)
+        archive = Path(reception["archive"]["path"])
+        cache_status = validate_admissions(reception, cache_receipt, root, cache, archive)
+        result["cache_preservation"] = cache_status
+        verify_archive(archive, root)
+        output = root / ("results-" + context.JOB)
+        outer = read_json(output / "results.json")
+        need(outer.get("schema") == "hpc-forest-primes-r2max-native-single-cell-v1"
+             and outer.get("scope_id") == context.SCOPE and outer.get("model") == outer.get("mother_model") == context.MODEL
+             and outer.get("effort") == outer.get("mother_effort") == "max" and outer.get("session_id") == context.SESSION
+             and outer.get("allocation", {}).get("job_id") == context.JOB
+             and outer.get("source_zip_sha256") == context.SOURCE_SHA and outer.get("plan_sha256") == context.PLAN_SHA
+             and outer.get("automatic_extension") is False and outer.get("other_cells_started") == 0,
+             "Native result differs from one selected immutable Astra cell")
+        allocation = outer["allocation"]
+        need(all(allocation.get(key) == value for key, value in {"architecture": "aarch64", "nodes": 1, "tasks": 1,
+             "cpus_per_task": 4, "memory_mib": 16384, "gpus": 0, "affinity_cpu_count": 4}.items())
+             and len(set(allocation.get("affinity_cpu_ids", []))) == 4, "Actual native ARM64 allocation/affinity differs")
+        origin = read_json(output / "runtime-reference-origin.json")
+        need(origin.get("schema") == "hpc-forest-primes-r2max-runtime-reference-v1" and origin.get("verified") is True
+             and origin.get("job_id") == context.JOB and origin.get("allocation") == allocation
+             and origin.get("source_zip_sha256") == context.SOURCE_SHA and origin.get("plan_sha256") == context.PLAN_SHA
+             and origin.get("preparation_manifest_sha256") == PREPARATION_SHA
+             and origin.get("reference_origin_is_current_allocation") is True and origin.get("qualification_timings_imported") is False
+             and origin.get("native_model_calls") == origin.get("new_inputs_or_candidates") == 0
+             and origin.get("compiler_flags") == FLAGS, "Native reference is not fresh in this same allocation")
+        finite_contract(root / "runtime-preparation-private-audit/validation", certified)
+        worker = read_json(output / "worker-identity.json")
+        need(worker == read_json(output / "mailbox/worker-ready.json") == read_json(cache / "worker-ready.json"),
+             "Worker identity archive/mailbox/cache differs")
+        result["immutable_binding"] = context.runtime_evidence(output, cache)
+        calls = mailbox_and_cache(output / "mailbox", cache)
+        result["transport_cost_reconciliation"] = calls
+        need(calls["unique_session_nonce_pairs"] > 0 and not calls["unresolved_nonces"]
+             and calls["unknown_native_invocations"] == 0, "Unknown native claims/costs block complete audit")
+        need(outer.get("pipeline_complete") is True and not outer.get("error"),
+             "Native pipeline incomplete; retain negative evidence and never replay")
+        result["recorded_first_start_control"] = native_start_evidence(output, root, calls)
+        result["campaign"] = campaign_evidence(root, certified, source_zip, calls)
+        need(result["campaign"]["selected_reported_by_frozen_checker"] == outer.get("best_confirmed"),
+             "Outer/closed-registry selection differs")
+        result["raw_evidence"] = raw_evidence(root)
+        complete = cache_status["total_cache_bytes_preservation_complete"]
+        result["received_cohort_audited_with_explicit_raw_attribution_limit"] = complete
+        result["received_native_cohort_audited_with_explicit_limits"] = complete
+        result["received_model_artifacts_audited_with_owned_lock_pending"] = cache_status["owned_operational_lock_pending"]
+    except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, sqlite3.DatabaseError,
+            tarfile.TarError, zipfile.BadZipFile) as exc:
+        result["audit_error"] = type(exc).__name__ + ": " + str(exc)
+    finally:
+        try:
+            context.recheck()
+            if before:
+                same = before == {"restoration": inventory(root), "cache": inventory(cache)}
+                result["evidence_inventory_before_after_identical"] = same
+                result["inventory_sha256"] = {key: sha(json.dumps(value, sort_keys=True).encode()) for key, value in before.items()}
+                need(same, "Readonly evidence changed during audit")
+        except (OSError, ValueError) as exc:
+            result["audit_error"] = "Final immutable source/evidence inventory failed: " + str(exc)
+        if result.get("audit_error"):
+            for key in ("received_cohort_audited_with_explicit_raw_attribution_limit",
+                        "received_native_cohort_audited_with_explicit_limits",
+                        "received_model_artifacts_audited_with_owned_lock_pending"):
+                result[key] = False
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("binding", "root", "cache", "reception", "cache-receipt", "source-zip", "plan", "certified", "output"):
+        parser.add_argument("--" + name, required=True, type=Path)
+    args = parser.parse_args(argv)
+    output = args.output.resolve()
+    own = Path(__file__).resolve().parent
+    need(output.is_relative_to(own) and output.parent.is_dir() and not output.exists(), "New report must be inside auditor folder")
+    for evidence in (args.root, args.cache, args.certified):
+        need(not output.is_relative_to(evidence.resolve()), "Report must stay outside all evidence")
+    try:
+        context.configure(args.binding)
+        result = audit(args.root, args.cache, args.reception, args.cache_receipt, args.source_zip, args.plan, args.certified)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as exc:
+        result = {"schema": "hpc-forest-primes-r2max-readonly-audit-v1", "verified": False,
+                  "native_research_admitted": False, "independent_raw_stdout_per_candidate_verified": False,
+                  "independent_performance_audit_verified": False,
+                  "received_native_cohort_audited_with_explicit_limits": False,
+                  "audit_error": type(exc).__name__ + ": " + str(exc)}
+    with output.open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(result, stream, indent=2, ensure_ascii=True)
+        stream.write("\n")
+    return 1 if result.get("audit_error") else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

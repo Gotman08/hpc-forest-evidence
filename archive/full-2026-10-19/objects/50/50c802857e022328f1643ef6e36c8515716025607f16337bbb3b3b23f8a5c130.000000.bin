@@ -1,0 +1,151 @@
+#include "knn.h"
+#include <string.h>
+
+char knn_flat(size_t total, const float *xs, const float *ys, const char *labels, int k, Point to_evaluate) {
+    float *heap_dist = (float *) malloc(sizeof(float) * k);
+    char *heap_label = (char *) malloc(sizeof(char) * k);
+    int hsize = 0;
+    float px = to_evaluate.x;
+    float py = to_evaluate.y;
+
+    for (size_t i = 0; i < total; i++) {
+        // Prefetch a few iterations ahead to hide memory latency.
+        if (i + 8 < total) {
+            __builtin_prefetch(&xs[i+8], 0, 1);
+            __builtin_prefetch(&ys[i+8], 0, 1);
+            __builtin_prefetch(&labels[i+8], 0, 1);
+        }
+
+        float dx = xs[i] - px;
+        float dy = ys[i] - py;
+        float d = dx * dx + dy * dy;
+        char label = labels[i];
+
+        if (hsize < k) {
+            int pos = hsize++;
+            heap_dist[pos] = d;
+            heap_label[pos] = label;
+
+            while (pos > 0) {
+                int parent = (pos - 1) >> 1;
+                if (heap_dist[parent] < heap_dist[pos]) {
+                    float td = heap_dist[parent];
+                    heap_dist[parent] = heap_dist[pos];
+                    heap_dist[pos] = td;
+
+                    char tl = heap_label[parent];
+                    heap_label[parent] = heap_label[pos];
+                    heap_label[pos] = tl;
+
+                    pos = parent;
+                } else {
+                    break;
+                }
+            }
+        } else if (d < heap_dist[0]) {
+            heap_dist[0] = d;
+            heap_label[0] = label;
+
+            int pos = 0;
+            while (1) {
+                int left = (pos << 1) + 1;
+                int right = left + 1;
+                int largest = pos;
+
+                if (left < hsize && heap_dist[left] > heap_dist[largest]) {
+                    largest = left;
+                }
+                if (right < hsize && heap_dist[right] > heap_dist[largest]) {
+                    largest = right;
+                }
+
+                if (largest != pos) {
+                    float td = heap_dist[pos];
+                    heap_dist[pos] = heap_dist[largest];
+                    heap_dist[largest] = td;
+
+                    char tl = heap_label[pos];
+                    heap_label[pos] = heap_label[largest];
+                    heap_label[largest] = tl;
+
+                    pos = largest;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    int freq[256] = {0};
+    for (int i = 0; i < hsize; i++) {
+        freq[(unsigned char)heap_label[i]]++;
+    }
+
+    // The original implementation initializes all k slots with label -1.
+    // If fewer than k points were seen, those missing slots still participate
+    // in the frequency count and tie-breaking.
+    if (hsize < k) {
+        freq[255] += k - hsize;
+    }
+
+    char best = 0;
+    int best_count = -1;
+    for (int c = -128; c <= 127; c++) {
+        unsigned char idx = (unsigned char)c;
+        if (freq[idx] > best_count) {
+            best_count = freq[idx];
+            best = (char)c;
+        }
+    }
+
+    free(heap_dist);
+    free(heap_label);
+    return best;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        total += (size_t)groups[i].length;
+    }
+
+    float *xs_all = (float *) malloc(sizeof(float) * total);
+    float *ys_all = (float *) malloc(sizeof(float) * total);
+    char *labels_all = (char *) malloc(sizeof(char) * total);
+
+    size_t offset = 0;
+    for (int i = 0; i < n_groups; i++) {
+        int len = groups[i].length;
+        if (len > 0) {
+            memcpy(xs_all + offset, groups[i].xs, sizeof(float) * len);
+            memcpy(ys_all + offset, groups[i].ys, sizeof(float) * len);
+            memset(labels_all + offset, groups[i].label, (size_t)len);
+        }
+        offset += (size_t)len;
+    }
+
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn_flat(total, xs_all, ys_all, labels_all, k, to_evaluate));
+
+    // Free allocations.
+    for (int i = 0; i < n_groups; i++) {
+        free(groups[i].xs);
+        free(groups[i].ys);
+    }
+    free(groups);
+    free(xs_all);
+    free(ys_all);
+    free(labels_all);
+
+    return 0;
+}

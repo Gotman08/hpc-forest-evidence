@@ -1,0 +1,176 @@
+"""Own review metadata writer. Hash/AST only; never load any reviewed module."""
+import ast
+from datetime import UTC, datetime
+import hashlib
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PORT = HERE.parent
+OP = PORT.parent
+PREP = OP.parent
+CHAIN = PREP / 'adaptateurs-source110-r1/revision-r7-racines-techniques-neuves'
+PINS = {}
+
+def need(value, message):
+    if not value:
+        raise ValueError(message)
+
+def raw(path, expected=None):
+    path = Path(path)
+    need(path.is_absolute() and path.is_relative_to(PREP) and '..' not in path.parts,
+         'Only named static preparation and cold evidence')
+    need(path.name.rstrip(' .').casefold() not in {'worker.lock', 'observer.lock', 'observer-state.json', 'terminal-statuses.json', 'stdout.log', 'stderr.log'},
+         'No live operational metadata, log or lock')
+    need(not any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)() for p in (path, *path.parents)), 'Ordinary static input only')
+    data = path.read_bytes()
+    checksum = hashlib.sha256(data).hexdigest()
+    need(expected is None or checksum == expected, 'Exact static pin changed: ' + path.name)
+    need(str(path) not in PINS or PINS[str(path)] == checksum, 'Static input changed during review')
+    PINS[str(path)] = checksum
+    return data
+
+def read(path, expected=None):
+    return json.loads(raw(path, expected))
+
+def ref(path):
+    return {'path': str(path), 'sha256': hashlib.sha256(raw(path)).hexdigest()}
+
+def load(reference):
+    need(set(reference) == {'path', 'sha256'}, 'Exact static reference')
+    return read(reference['path'], reference['sha256'])
+
+delivery_path = PORT / 'LIVRAISON-OBSERVATION-R7-POUR-REVUE.json'
+delivery = read(delivery_path, 'c57c32e520ec49b33a077dc13f41332f73a009cb6c83fcb44cdc799dcdcbdeb5')
+manifest = load(delivery['manifest'])
+need(delivery['manifest']['sha256'] == 'c0e943265ed82d6aaa1971e1ff2c851245fa3ce9e68fbb6cc97bfe821f548e03', 'Final author manifest')
+for name, checksum in manifest['files'].items():
+    raw(PORT / name, checksum)
+contract = load(delivery['review_contract'])
+delta = load(delivery['static_derivation'])
+components = load(manifest['component62_manifest'])
+need(manifest['component62_manifest']['sha256'] == 'dc64e1360ea8c7b061cbda5eb2dc638f7cb76d9f4264c2f062a495c62ba12f30'
+     and len(components['code_pins']) == 62, 'Exact R7 qualified62')
+for name, checksum in components['code_pins'].items():
+    raw(CHAIN / name, checksum)
+for reference in delta['references'].values():
+    raw(reference['path'], reference['sha256'])
+closure = load(delivery['actual_historical_old_closure'])
+closure_review = load(delivery['actual_independent_old_closure_review'])
+q = load(delivery['actual_R7_Q'])
+integration = load(delivery['actual_integration_review'])
+need(closure['verified_owned_observer_absence'] is True
+     and closure_review['closure'] == delivery['actual_historical_old_closure']
+     and closure_review['no_future_state_promised'] is True, 'Historical closure stays historical')
+need(q['verified'] is True and q['native_model_calls'] == 0
+     and q['plan_sha256'] == '5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70'
+     and q['source_zip_sha256'] == 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48', 'Actual current-plan Q only')
+need(integration['reviewed_files'] == components['code_pins'] and integration['blocking_findings'] == []
+     and integration['observer_sha256'] == components['code_pins']['observer/observer-mixte.py']
+     and integration['abi_sha256'] == components['code_pins']['observer/ABI.json'], 'Actual R7 integration/OBS4 ABI review')
+expected_launch = {'verifier-absence-ancien-OBS4-R7.py', 'preparer-observation-froide-R7.py', 'preparer-policy-routes-R7.py', 'lancer-observateur-R7.ps1'}
+launch_pins = {name: manifest['files'][name] for name in sorted(expected_launch)}
+sidecar_pins = {'admettre-cellule-externe-R7.py': manifest['files']['admettre-cellule-externe-R7.py']}
+need(contract['passive_launch_review_required']['reviewed_files'] == launch_pins
+     and contract['separate_sidecar_review_required']['reviewed_files'] == sidecar_pins, 'Exact distinct review interfaces')
+for name in (*expected_launch, 'admettre-cellule-externe-R7.py'):
+    source = raw(PORT / name)
+    if name.endswith('.py'):
+        ast.parse(source)  # Parse source text only; no compile/import/function/main/test.
+for name, derivation in delta['ports'].items():
+    old = ast.parse(raw(derivation['ancestor']['path'], derivation['ancestor']['sha256']))
+    new = ast.parse(raw(PORT / name))
+    definitions = lambda tree: {node.name: ast.dump(node, include_attributes=False) for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    a, b = definitions(old), definitions(new)
+    need(sorted(key for key in a.keys() & b.keys() if a[key] == b[key]) == derivation['functions_AST_identical']
+         and sorted(key for key in a.keys() & b.keys() if a[key] != b[key]) == derivation['functions_changed']
+         and sorted(b.keys() - a.keys()) == derivation['functions_added']
+         and sorted(a.keys() - b.keys()) == derivation['functions_removed'], 'Closed AST derivation differs')
+inventory_before = dict(PINS)
+inventory_after = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in inventory_before}
+need(inventory_before == inventory_after, 'Static review inputs changed')
+common = {
+    'verified_source_preparation_only': False, 'native_generation_admitted': False,
+    'reviewed_at_utc': datetime.now(UTC).isoformat(), 'author_delivery': {'path': str(delivery_path), 'sha256': PINS[str(delivery_path)]},
+    'author_manifest': delivery['manifest'], 'qualified_R7_components': manifest['component62_manifest'],
+    'actual_R7_qualification': delivery['actual_R7_Q'], 'actual_R7_integration_review': delivery['actual_integration_review'],
+    'historical_old_observer_closure': delivery['actual_historical_old_closure'],
+    'historical_old_closure_review': delivery['actual_independent_old_closure_review'],
+    'independence_disclosure': 'Reviewer is not author of this external R7 port. Reviewer authored earlier source/plan and Q cold reviews, and the earlier base/r2 closure guard plus actual cold closure review. A authored this port; no new current state is asserted here.',
+    'review_method': 'Full text/interface reading, pinned hashes, AST parsing/comparison only. No reviewed module import, function, main, test or PowerShell parser execution.',
+    'new_tests_or_old_tests_replayed': 0, 'reviewer_CIM_CLI_MCP_cache_lock_process_model_or_service_effects': 0,
+    'source110_or_qualified62_modified': False, 'all62_rehashed_unchanged': True,
+    'input_inventory_before': dict(inventory_before), 'input_inventory_after': dict(inventory_after), 'input_bytes_unchanged': True,
+    'current_full_CIM_received_by_this_review': False, 'actual_new_start_pair_or_passive_state_qualified': False,
+    'future_absence_or_native_admission_promised': False,
+    'science_performance_pilot_extension_or_method_R5_admitted': False,
+}
+launch = {**common, 'schema': 'hpc-forest-r7-observation-preparation-review-v1', 'passive_observer_only': True,
+    'reviewed_files': launch_pins, 'verdict': 'REFUS_SOURCE_PREPARATION_PATH_BOUNDARY',
+    'blocking_findings': [{
+        'id': 'R7-PATH-PS-01', 'file': str(PORT / 'lancer-observateur-R7.ps1'), 'line': 26,
+        'observation': 'Ordinary checks ReparsePoint only when File.Exists or Directory.Exists is true. Those target-existence predicates can omit a dangling alias instead of inspecting that directory entry.',
+        'impact': 'The promised no-reparse input/output ancestor boundary is not established before directory creation, intent or Start-Process. This is a missing guard, not a claim that an escape was exercised.',
+        'required_change': 'Inspect each existing directory entry and ancestor independently of target existence, rejecting every symlink/junction/reparse point and every unknown inspection failure. Preserve the sealed candidate and use an isolated revision.',
+        'counterexample_executed': False,
+    }],
+    'reviewed_interfaces': {
+        'old_closure_historical_and_new_CIM_separate': True,
+        'full_unfiltered_strict_UTF8_CIM_exact7keys5fields_UTC_Z_count_and_age120': True,
+        'all7_old_identities_PIDreuse_equivalent_observer_and_ambiguous_descendants_fail_closed': True,
+        'qualified_typed_and_conservative_native_zero_before_preparation_and_before_start': True,
+        'SO_and_OBS3_original_pairs_scientific_receipts_and_intermediate_absence_preserved': True,
+        'policy_Q8e2d_plan5c_source110_componentsDC64_OBS4_5e_ABI_and_review026_exact': True,
+        'all9_routes_absent_and_all_job_ids_null': True,
+        'PowerShell_Core7point5_minimum_before_capture_and_documented7point6point5_path': True,
+        'Python819c_and_all62_rehashed_before_the_effect': True,
+        'exact_whitespace_free_argv_includes_one_explicit_run': True,
+        'global_CreateNew_FlushTrue_intention_precedes_single_StartProcess_Hidden': True,
+        'no_recursive_name_PIDonly_stop_or_automatic_retry': True,
+        'raw_post_CIM_identity_rows_remain_pair_unverified': True,
+    },
+    'future_ROOT_requirements': [
+        'Use the documented PowerShell7 path and this exact review; -Execute is explicit.',
+        'Two actual fresh full censuses are required; historical closure or former absence files cannot substitute.',
+        'Receive after-start full CIM, exact new launcher/Python pair, state and errors before any cell admission.',
+        'An existing intention, unknown launch outcome or any refusal forbids automatic replay.',
+        'No model, native job, receipt lifecycle, stop or methodR5 is admitted by this review.',
+    ],
+}
+sidecar = {**common, 'schema': 'hpc-forest-r7-external-admission-preparation-review-v1',
+    'reviewed_files': sidecar_pins, 'verdict': 'REFUS_SOURCE_PREPARATION_PATH_BOUNDARY',
+    'blocking_findings': [{
+        'id': 'R7-PATH-SIDECAR-02', 'file': str(PORT / 'admettre-cellule-externe-R7.py'), 'line': 73,
+        'observation': 'read_startup checks dotdot and symlink/junction parents only for the envelope. Each of its ten refs is tested only by lexical is_relative_to(HERE) before obs.bound/read; the frozen bound function does not reject parent aliases or dotdot.',
+        'impact': 'A path syntactically below HERE containing a parent alias or dotdot can resolve outside the owned startup-evidence boundary. The expected hash binds bytes, not their physical namespace.',
+        'required_change': 'Apply absolute/canonical/no-dotdot/no-ADS/no-reparse validation to every referenced path and its parents before any bound/read, and retain the same closed metadata boundary for the newly added startup graph.',
+        'counterexample_executed': False,
+    }],
+    'reviewed_interfaces': {
+        'actual_startup_graph_exact10refs_required_null_template_refused': True,
+        'startup_pair_full5_parent_child_argv_run_and_before_intent_birth_after_chronology': True,
+        'initial_freshness120_bound_to_actual_births_without_timestamp_replacement': True,
+        'old_OBS4_actual_closure_and_second_start_CIM_refs_kept_distinct': True,
+        'qualified_observer5e_and62_rehashed_original_module_identity_preserved': True,
+        'current_complete_census_pair_and_guard_initialFalse_transition_initialFalse': True,
+        'current_CIM_age120_and_original_admit_cell_state_age90_enforced': True,
+        'original_admission_receipt_retained_and_state_before_after_and_last_SHA_exact': True,
+        'only_derived_envelope_replaces_mutable_state_ref_with_byte_equal_cold_copy_and_review': True,
+        'all_original_route_allocation_phase_cap4_and_authorization_guards_retained': True,
+        'no_start_stop_replay_RPC_transport_watch_or_native_worker_called_by_sidecar': True,
+    },
+    'future_ROOT_requirements': [
+        'Provide actual startup graph and actual exact pair from the new passive start; raw pair=false is never an admission.',
+        'Provide separate current complete ABS SO/parent inputs as required by reader564 and the parents; the sidecar does not replace them.',
+        'Current routes and state must satisfy all original allocated_pending/phase/cap4/authorization checks.',
+        'On state mutation or any refusal, retain original metadata and refuse derivative publication; no repair or replay.',
+        'Source preparation review asserts no real cell admission or model generation.',
+    ],
+}
+outputs = []
+for name, value in [('REFUS-PREPARATION-OBSERVATION-R7.json', launch), ('REFUS-PREPARATION-ADMISSION-EXTERNE-R7.json', sidecar)]:
+    path = HERE / name
+    with path.open('xb') as stream:
+        stream.write((json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode())
+    outputs.append({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+print(json.dumps({'reviews': outputs, 'static_inputs': len(inventory_before), 'operational_effects': 0}))

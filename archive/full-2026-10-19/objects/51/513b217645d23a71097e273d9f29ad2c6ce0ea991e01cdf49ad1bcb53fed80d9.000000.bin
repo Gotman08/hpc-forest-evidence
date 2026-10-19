@@ -1,0 +1,36 @@
+import importlib.util
+from pathlib import Path
+
+from hpc_forest.controller import Controller
+
+
+def test_comparison_keeps_fresh_arms_and_equal_outer_evaluation(monkeypatch, tmp_path):
+    examples = Path(__file__).parents[1] / "examples/marathon22"
+    monkeypatch.syspath_prepend(str(examples))
+    spec = importlib.util.spec_from_file_location("comparison_test", examples / "romeo_harness_comparison.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert set(module.ORDER) == {(arm, slug) for arm in ("reference", "mixed-harness")
+                                 for slug in ("knn", "sum", "nbody")}
+    assert len(module.ORDER) == 6
+    module.runner.CHANNEL, module.runner.SESSION_ID = tmp_path / "mailbox", "a" * 32
+    for name, value in module.SCHEDULE.items():
+        monkeypatch.setitem(module.runner.reference.SCHEDULE, name, value)
+    for name, value in module.LIMITS.items():
+        monkeypatch.setitem(module.runner.reference.LIMITS, name, value)
+    monkeypatch.setattr(module.runner, "HARNESS", None)
+    reference = module.runner.config_for("unused", "knn", "target", {"protocol_timeout_seconds": 40})
+    monkeypatch.setattr(module.runner, "HARNESS", {"enabled": True, "max_attempts": 3,
+        "call_token_ceiling": 196608, "research": {"enabled": True}})
+    mixed = module.runner.config_for("unused", "knn", "target", {"protocol_timeout_seconds": 40})
+    assert reference["protocol"] == mixed["protocol"]
+    assert reference["seed"] == mixed["seed"] == 23
+    for field in ("tokens", "wall_seconds", "generation_seconds", "max_workers"):
+        assert reference["budget"][field] == mixed["budget"][field]
+    assert reference["budget"]["mission_tokens"] == 196608
+    assert mixed["budget"]["mission_tokens"] == 589824
+    for config in (reference, mixed):
+        controller = Controller.__new__(Controller)
+        controller.config = config
+        roles = [role for batch in controller.plan() for role in batch]
+        assert len(roles) == 24 and roles.count("G") == 6

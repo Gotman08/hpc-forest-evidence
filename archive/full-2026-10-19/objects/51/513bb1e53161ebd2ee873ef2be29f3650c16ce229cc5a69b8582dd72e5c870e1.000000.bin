@@ -1,0 +1,117 @@
+#include <iostream>
+#include <vector>
+#include <cstdio>
+#include <cassert>
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+
+static inline int64x2_t maximum64(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+int main() {
+    int n, s;
+    std::cin >> n >> s;
+    std::vector<std::vector<int> > matrix(n, std::vector<int>(n));
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            scanf("%d", &(matrix[i][j]));
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::vector<std::int64_t> columns(n, 0);
+    std::int64_t* const col = columns.data();
+    for (int i = 0; i < s; ++i) {
+        const int* const row = matrix[i].data();
+        for (int j = 0; j < n; ++j)
+            col[j] += static_cast<std::int64_t>(row[j]);
+    }
+
+    const int shifts = n - s;
+    std::int64_t best = std::numeric_limits<std::int64_t>::min();
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const int64x2_t zero = vdupq_n_s64(0);
+    int64x2_t best0 = vdupq_n_s64(best);
+    int64x2_t best1 = vdupq_n_s64(best);
+#endif
+
+    for (int top = 0; top <= shifts; ++top) {
+        std::int64_t sum = 0;
+        for (int j = 0; j < s; ++j)
+            sum += col[j];
+        best = std::max(best, sum);
+
+        int j = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        int64x2_t carry = vdupq_n_s64(sum);
+
+        // Horizontal shifts form a prefix scan, not independent iterations.
+        // Scan four differences per block, carrying only the final window.
+        for (; j + 4 <= shifts; j += 4) {
+            const int64x2_t delta0 = vsubq_s64(
+                vld1q_s64(col + j + s), vld1q_s64(col + j));
+            const int64x2_t delta1 = vsubq_s64(
+                vld1q_s64(col + j + s + 2), vld1q_s64(col + j + 2));
+
+            const int64x2_t prefix0 = vaddq_s64(
+                delta0, vextq_s64(zero, delta0, 1));
+            const int64x2_t pair1 = vaddq_s64(
+                delta1, vextq_s64(zero, delta1, 1));
+            const int64x2_t prefix1 = vaddq_s64(
+                pair1, vdupq_n_s64(vgetq_lane_s64(prefix0, 1)));
+
+            const int64x2_t windows0 = vaddq_s64(carry, prefix0);
+            const int64x2_t windows1 = vaddq_s64(carry, prefix1);
+            best0 = maximum64(best0, windows0);
+            best1 = maximum64(best1, windows1);
+            carry = vdupq_n_s64(vgetq_lane_s64(windows1, 1));
+        }
+
+        if (j + 2 <= shifts) {
+            const int64x2_t delta = vsubq_s64(
+                vld1q_s64(col + j + s), vld1q_s64(col + j));
+            const int64x2_t prefix = vaddq_s64(
+                delta, vextq_s64(zero, delta, 1));
+            const int64x2_t windows = vaddq_s64(carry, prefix);
+            best0 = maximum64(best0, windows);
+            carry = vdupq_n_s64(vgetq_lane_s64(windows, 1));
+            j += 2;
+        }
+        sum = vgetq_lane_s64(carry, 0);
+#endif
+
+        for (; j < shifts; ++j) {
+            sum += col[j + s] - col[j];
+            best = std::max(best, sum);
+        }
+
+        if (top == shifts)
+            break;
+
+        const int* const exiting = matrix[top].data();
+        const int* const entering = matrix[top + s].data();
+        // Each column update is independent and can be vectorized legally.
+        for (int c = 0; c < n; ++c) {
+            col[c] += static_cast<std::int64_t>(entering[c])
+                    - static_cast<std::int64_t>(exiting[c]);
+        }
+    }
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    best0 = maximum64(best0, best1);
+    best = std::max(best, vgetq_lane_s64(best0, 0));
+    best = std::max(best, vgetq_lane_s64(best0, 1));
+#endif
+
+    printf("%lld\n", static_cast<long long>(best));
+    return 0;
+}

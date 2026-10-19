@@ -1,0 +1,163 @@
+#include <bits/stdc++.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using namespace std;
+
+int A[1000][1000];
+int ps[1010][1010];
+
+typedef long long ll;
+
+class PrefixFrequency {
+  struct Slot {
+    int32_t key;
+    uint32_t frequency;
+  };
+
+  vector<Slot> slots;
+  vector<uint32_t> touched;
+  uint32_t mask;
+
+  static uint32_t hash_key(int32_t key) {
+    uint32_t x = static_cast<uint32_t>(key);
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+  }
+
+public:
+  explicit PrefixFrequency(int scan_length) {
+    uint32_t entries = static_cast<uint32_t>(scan_length) + 1;
+    uint32_t capacity = 1;
+    while (capacity < 2U * entries)
+      capacity <<= 1;
+    slots.resize(capacity);
+    touched.reserve(entries);
+    mask = capacity - 1;
+  }
+
+  void clear() {
+    for (uint32_t index : touched)
+      slots[index].frequency = 0;
+    touched.clear();
+  }
+
+  uint32_t get(int32_t key) const {
+    uint32_t index = hash_key(key) & mask;
+    while (slots[index].frequency != 0) {
+      if (slots[index].key == key)
+        return slots[index].frequency;
+      index = (index + 1) & mask;
+    }
+    return 0;
+  }
+
+  void increment(int32_t key) {
+    uint32_t index = hash_key(key) & mask;
+    while (slots[index].frequency != 0) {
+      if (slots[index].key == key) {
+        ++slots[index].frequency;
+        return;
+      }
+      index = (index + 1) & mask;
+    }
+    slots[index].key = key;
+    slots[index].frequency = 1;
+    touched.push_back(index);
+  }
+};
+
+static int available_workers() {
+  int workers = 4;
+#ifdef _OPENMP
+  workers = min(workers, omp_get_max_threads());
+#else
+  const unsigned hardware = thread::hardware_concurrency();
+  if (hardware != 0)
+    workers = min(workers, static_cast<int>(min(hardware, 4U)));
+  for (const char *name : {"OMP_NUM_THREADS", "OMP_THREAD_LIMIT"}) {
+    const char *value = getenv(name);
+    if (value != nullptr) {
+      char *end = nullptr;
+      const long requested = strtol(value, &end, 10);
+      if (end != value && requested > 0 && requested < workers)
+        workers = static_cast<int>(requested);
+    }
+  }
+#endif
+  return max(workers, 1);
+}
+
+ll solve(int m, int n, int k) {
+  for (int i = 1; i <= m; i++) {
+    for (int j = 1; j <= n; j++) {
+      ps[i][j] = A[i - 1][j - 1] + ps[i][j - 1];
+    }
+  }
+
+  const auto count_bands = [&](int first, int stride) -> ll {
+    PrefixFrequency h(m);
+    ll subtotal = 0;
+    for (int j = first; j <= n; j += stride) {
+      for (int l = j; l <= n; l++) {
+        h.clear();
+        h.increment(0);
+        ll s = 0;
+        for (int i = 1; i <= m; i++) {
+          s += ps[i][l] - ps[i][j - 1];
+          subtotal += h.get(static_cast<int32_t>(s - k));
+          h.increment(static_cast<int32_t>(s));
+        }
+      }
+    }
+    return subtotal;
+  };
+
+  const ll estimated_work = ll(m) * n * (n + 1) / 2;
+  int workers = 1;
+  if (estimated_work >= 131072LL)
+    workers = min(n, available_workers());
+  if (workers == 1)
+    return count_bands(1, 1);
+
+  ll ans = 0;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(workers) reduction(+:ans)
+  {
+    ans += count_bands(omp_get_thread_num() + 1, omp_get_num_threads());
+  }
+#else
+  array<ll, 4> partials{};
+  array<thread, 3> threads;
+  for (int t = 1; t < workers; t++) {
+    threads[t - 1] = thread([&, t]() {
+      partials[t] = count_bands(t + 1, workers);
+    });
+  }
+  partials[0] = count_bands(1, workers);
+  for (int t = 1; t < workers; t++)
+    threads[t - 1].join();
+  for (int t = 0; t < workers; t++)
+    ans += partials[t];
+#endif
+  return ans;
+}
+
+int main() {
+  int k, m, n;
+  cin >> k >> m >> n;
+  memset(A, 0, sizeof A);
+  memset(ps, 0, sizeof ps);
+
+  for (int i = 0; i < m; i++)
+    for (int j = 0; j < n; j++)
+      cin >> A[i][j];
+
+  cout << solve(m, n, k) << endl;
+  return 0;
+}

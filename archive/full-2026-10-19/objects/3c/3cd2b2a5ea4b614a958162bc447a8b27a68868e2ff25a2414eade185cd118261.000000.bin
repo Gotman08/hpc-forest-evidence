@@ -1,0 +1,123 @@
+#define _POSIX_C_SOURCE 200112L
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define CONV_THRESHOLD 1.0e-5f
+
+static double *grid;
+static double *new_grid;
+static size_t row_stride;
+static int size;
+static int iter_max_num;
+
+static int allocate_memory(void) {
+    size_t n = (size_t)size;
+    if (n > SIZE_MAX - 7u)
+        return 0;
+
+    row_stride = (n + 7u) & ~(size_t)7u;
+    if (row_stride > SIZE_MAX / n / sizeof(double))
+        return 0;
+
+    size_t bytes = row_stride * n * sizeof(double);
+    void *allocation = NULL;
+    if (posix_memalign(&allocation, 64, bytes) != 0)
+        return 0;
+    grid = (double *)allocation;
+
+    allocation = NULL;
+    if (posix_memalign(&allocation, 64, bytes) != 0) {
+        free(grid);
+        grid = NULL;
+        return 0;
+    }
+    new_grid = (double *)allocation;
+    return 1;
+}
+
+static void initialize_grid(void) {
+    int center = size / 2;
+    int linf = center - (size / 10);
+    int lsup = center + (size / 10);
+
+    for (int i = 0; i < size; i++) {
+        size_t row = (size_t)i * row_stride;
+        for (int j = 0; j < size; j++) {
+            double value = (i >= linf && i <= lsup &&
+                            j >= linf && j <= lsup) ? 100.0 : 0.0;
+            grid[row + (size_t)j] = value;
+            new_grid[row + (size_t)j] = value;
+        }
+    }
+}
+
+static void save_grid(void) {
+    for (int i = 0; i < size; i++) {
+        size_t row = (size_t)i * row_stride;
+        for (int j = 0; j < size; j++)
+            fprintf(stdout, "%lf ", grid[row + (size_t)j]);
+        fprintf(stdout, "\n");
+    }
+}
+
+int main(void) {
+    if (fscanf(stdin, "%d", &size) != 1 ||
+        fscanf(stdin, "%d", &iter_max_num) != 1)
+        return 0;
+
+    if (size <= 0)
+        return 0;
+    if (!allocate_memory())
+        return 1;
+    initialize_grid();
+
+    int hasError = 1;
+
+    /* Keep one team for all timesteps; each worksharing loop completes its
+       reduction before the single thread swaps buffers. */
+    #pragma omp parallel
+    {
+        for (int iter = 0; iter < iter_max_num; iter++) {
+            #pragma omp single
+            {
+                hasError = 0;
+            }
+
+            #pragma omp for schedule(static) reduction(|:hasError)
+            for (int i = 1; i < size - 1; i++) {
+                int row_error = 0;
+                size_t row = (size_t)i * row_stride;
+                const double * restrict current = grid + row;
+                const double * restrict above = current - row_stride;
+                const double * restrict below = current + row_stride;
+                double * restrict next = new_grid + row;
+
+                #pragma omp simd reduction(|:row_error)
+                for (int j = 1; j < size - 1; j++) {
+                    next[j] = 0.25 * (current[j + 1] + current[j - 1] +
+                                      above[j] + below[j]);
+                    double delta = next[j] - current[j];
+                    if (delta > CONV_THRESHOLD || delta < -CONV_THRESHOLD)
+                        row_error |= 1;
+                }
+                hasError |= row_error;
+            }
+
+            #pragma omp single
+            {
+                double *temporary = grid;
+                grid = new_grid;
+                new_grid = temporary;
+            }
+
+            if (!hasError)
+                break;
+        }
+    }
+
+    save_grid();
+    free(grid);
+    free(new_grid);
+    return 0;
+}

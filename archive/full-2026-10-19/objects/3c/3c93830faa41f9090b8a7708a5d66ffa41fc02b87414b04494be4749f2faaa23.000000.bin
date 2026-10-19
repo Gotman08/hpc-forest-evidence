@@ -1,0 +1,227 @@
+#include "knn.h"
+#include <limits.h>
+
+typedef struct {
+    float distance;
+    int group;
+} Candidate;
+
+static char winning_label(const size_t *votes) {
+    char winner = (char)-1;
+    size_t maximum = 0;
+
+    for (int c = 0; c <= UCHAR_MAX; ++c) {
+        if (votes[c] > maximum ||
+            (votes[c] != 0 && votes[c] == maximum && (char)c < winner)) {
+            maximum = votes[c];
+            winner = (char)c;
+        }
+    }
+    return winner;
+}
+
+/* Preserve the original insertion behavior for unordered distances. */
+static char insertion_knn(int n_groups, Group *groups, int k, Point point) {
+    char *labels = (char *)malloc((size_t)k * sizeof(*labels));
+    float *distances = (float *)malloc((size_t)k * sizeof(*distances));
+    if (!labels || !distances) {
+        free(labels);
+        free(distances);
+        abort();
+    }
+
+    for (int i = 0; i < k; ++i) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (int i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ++j) {
+            float d = euclidean_distance_no_sqrt(point, g.points[j]);
+            for (int x = 0; x < k; ++x) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (int y = k - 1; y > x; --y) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    size_t votes[UCHAR_MAX + 1] = {0};
+    for (int i = 0; i < k; ++i)
+        ++votes[(unsigned char)labels[i]];
+    free(labels);
+    free(distances);
+    return winning_label(votes);
+}
+
+static inline int candidate_less(const Candidate *a, const Candidate *b) {
+    return a->distance < b->distance ||
+           (a->distance == b->distance && a->group < b->group);
+}
+
+static int candidate_compare(const void *a, const void *b) {
+    const Candidate *left = (const Candidate *)a;
+    const Candidate *right = (const Candidate *)b;
+    if (candidate_less(left, right)) return -1;
+    if (candidate_less(right, left)) return 1;
+    return 0;
+}
+
+static inline void candidate_swap(Candidate *a, Candidate *b) {
+    Candidate temporary = *a;
+    *a = *b;
+    *b = temporary;
+}
+
+/* Partition the best keep records into the prefix of a reusable buffer. */
+static void retain_best(Candidate *buffer, size_t count, size_t keep) {
+    size_t target = keep - 1;
+    size_t first = 0;
+    size_t last = count;
+    size_t budget = count * 2;
+
+    while (last - first > 24) {
+        size_t length = last - first;
+        if (length > budget) {
+            qsort(buffer + first, length, sizeof(*buffer), candidate_compare);
+            return;
+        }
+        budget -= length;
+
+        size_t middle = first + length / 2;
+        if (candidate_less(buffer + middle, buffer + first))
+            candidate_swap(buffer + middle, buffer + first);
+        if (candidate_less(buffer + last - 1, buffer + middle))
+            candidate_swap(buffer + last - 1, buffer + middle);
+        if (candidate_less(buffer + middle, buffer + first))
+            candidate_swap(buffer + middle, buffer + first);
+        Candidate pivot = buffer[middle];
+
+        size_t lower = first;
+        size_t scan = first;
+        size_t upper = last;
+        while (scan < upper) {
+            if (candidate_less(buffer + scan, &pivot)) {
+                candidate_swap(buffer + lower, buffer + scan);
+                ++lower;
+                ++scan;
+            } else if (candidate_less(&pivot, buffer + scan)) {
+                --upper;
+                candidate_swap(buffer + scan, buffer + upper);
+            } else {
+                ++scan;
+            }
+        }
+
+        if (target < lower)
+            last = lower;
+        else if (target >= upper)
+            first = upper;
+        else
+            return;
+    }
+
+    for (size_t i = first + 1; i < last; ++i) {
+        Candidate value = buffer[i];
+        size_t j = i;
+        while (j > first && candidate_less(&value, buffer + j - 1)) {
+            buffer[j] = buffer[j - 1];
+            --j;
+        }
+        buffer[j] = value;
+    }
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0) return (char)-1;
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t)groups[i].length;
+            if (length > (size_t)-1 - total)
+                return insertion_knn(n_groups, groups, k, to_evaluate);
+            total += length;
+        }
+    }
+
+    size_t votes[UCHAR_MAX + 1] = {0};
+    size_t keep = (size_t)k;
+    if (total <= keep) {
+        for (int i = 0; i < n_groups; ++i) {
+            if (groups[i].length > 0)
+                votes[(unsigned char)groups[i].label] += (size_t)groups[i].length;
+        }
+        votes[(unsigned char)-1] += keep - total;
+        return winning_label(votes);
+    }
+
+    size_t extra = total - keep;
+    if (extra > keep) extra = keep;
+    size_t capacity = keep + extra;
+    if (capacity > (size_t)-1 / sizeof(Candidate))
+        return insertion_knn(n_groups, groups, k, to_evaluate);
+
+    Candidate *buffer = (Candidate *)malloc(capacity * sizeof(*buffer));
+    if (!buffer)
+        return insertion_knn(n_groups, groups, k, to_evaluate);
+
+    size_t used = 0;
+    float cutoff = 0;
+    int have_cutoff = 0;
+
+    for (int i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ++j) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            if (d != d) {
+                free(buffer);
+                return insertion_knn(n_groups, groups, k, to_evaluate);
+            }
+
+            /* Later equal-distance points cannot improve the retained vote. */
+            if (have_cutoff && d >= cutoff) continue;
+
+            buffer[used].distance = d;
+            buffer[used].group = i;
+            ++used;
+            if (used == capacity) {
+                retain_best(buffer, used, keep);
+                used = keep;
+                cutoff = buffer[keep - 1].distance;
+                have_cutoff = 1;
+            }
+        }
+    }
+
+    if (used > keep)
+        retain_best(buffer, used, keep);
+    for (size_t i = 0; i < keep; ++i)
+        ++votes[(unsigned char)groups[buffer[i].group].label];
+
+    free(buffer);
+    return winning_label(votes);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

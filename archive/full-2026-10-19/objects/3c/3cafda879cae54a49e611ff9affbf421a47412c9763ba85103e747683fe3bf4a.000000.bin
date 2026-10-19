@@ -1,0 +1,107 @@
+"""Verify the new editorial build from closed scientific evidence only."""
+import hashlib
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pymupdf
+
+HERE = Path(__file__).resolve().parent
+BASE = next(p for p in HERE.parents if (p / "ID.md").is_file())
+STUDY = BASE / "outputs/HPC-Forest-Etude-2020-2024-r1"
+ED = STUDY / "edition-professionnelle"
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size}
+
+
+def main():
+    out = HERE / "CONSTRUCTION-VERIFIEE-FINALE.json"
+    assert not out.exists(), "Do not overwrite a prior construction receipt"
+    audit = read(ED / "audit-calculs.json")
+    assert audit["verified"]
+    assert audit["registry_count"] == 209
+    assert audit["research_confirmation_rows"] == 193
+    assert audit["checks"]["cohort_exact_token_sums"] == 14
+    assert audit["checks"]["cohort_native_call_sums"] == 14
+    assert audit["cpu_totals"] == {
+        "campaigns": 58, "models": 10, "subjects": 7, "inputs": 47,
+        "points": 2315, "samples": 11575, "unique_combinations": 1865,
+        "repeated_controls": 450,
+    }
+    assert audit["program_executions"] == audit["candidate_edits"] == audit["model_calls"] == 0
+    for name, expected in audit["frozen_data_files"].items():
+        assert sha(ED / "donnees" / name) == expected, name
+    rows = read(ED / "donnees/confirmations-recalculees.json")
+    native = [r for r in rows if r["cohort"] != "deepseek"]
+    assert len(rows) == 193 and len({r["cohort"] for r in native}) == 14
+    assert sum(r["native_calls"] for r in native) == 1701
+    assert sum(r["known_exact_tokens"] for r in native) == 36472761
+    assert sum(r["unmetered_calls"] for r in native) == 154
+    main_text = (STUDY / "ARTICLE.md").read_text(encoding="utf-8")
+    assert "### 3.3. Quatre cohortes source-only" in main_text
+    assert "| Source-only Luna/Astra/Terra/Sol MAX |" in main_text
+    assert "concerne seulement les éventuels groupes suivants" not in main_text
+    quality = read(ED / "controle-qualite.json")
+    assert quality["arithmetic_audit_verified"]
+    assert quality["frozen_inputs_still_match"] and quality["all_pdf_pages_rendered"]
+    assert quality["source_audit_sha256"] == sha(ED / "audit-calculs.json")
+    assert quality["visual_review_completed"] is False
+    assert not quality["duplicated_main_paragraphs"]
+    for doc in quality["documents"]:
+        assert doc["pdf_sha256"] == sha(STUDY / (doc["name"] + ".pdf"))
+        assert len(doc["page_proofs"]) == doc["pages"]
+        assert not any(doc[k] for k in ("glyph_errors", "outside_page", "blank_pages"))
+        with pymupdf.open(STUDY / (doc["name"] + ".pdf")) as pdf:
+            assert len(pdf) == doc["pages"]
+            for page in pdf:
+                assert "18 octobre 2026" in page.get_text()[:200], "Repeated footer date mismatch"
+    preservation_path = HERE / "impl/PRESERVATION-VERIFIEE.json"
+    preservation = read(preservation_path)
+    assert preservation["verified"] and preservation["all_preserved_files"] == 1203
+    old_root = STUDY / "versions/20261018-avant-source-only-sol-max-professionnelle"
+    old = read(old_root / "edition-professionnelle/manifeste-edition.json")
+    assert len(old["files"]) == 1200
+    for name, expected in old["files"].items():
+        assert sha(old_root / name) == expected, name
+    outputs = {name + suffix: ref(STUDY / (name + suffix))
+               for name in ("ARTICLE", "ANNEXES-TECHNIQUES")
+               for suffix in (".md", ".html", ".pdf")}
+    mechanical_snapshot = HERE / "CONTROLE-MECANIQUE-AVANT-REVUE-FINAL.json"
+    assert not mechanical_snapshot.exists()
+    mechanical_snapshot.write_bytes((ED / "controle-qualite.json").read_bytes())
+    assert sha(mechanical_snapshot) == sha(ED / "controle-qualite.json")
+    result = {
+        "schema": "hpc-forest-sol-editorial-build-verification-v1",
+        "verified": True, "observed_utc": datetime.now(UTC).isoformat(),
+        "outputs": outputs, "arithmetic_audit": ref(ED / "audit-calculs.json"),
+        "admissions": ref(ED / "admissions.json"),
+        "mechanical_quality_control": ref(mechanical_snapshot),
+        "preservation": ref(preservation_path),
+        "previous_manifest_members_reverified": 1200,
+        "documents": [{k: d[k] for k in ("name", "pages", "figures", "pdf_sha256")}
+                      for d in quality["documents"]],
+        "contact_sheets": len(quality["contact_sheets"]),
+        "registry_count": 209, "principal_results": 193,
+        "native_closed_cohorts": 14, "native_observed_invocations": 1701,
+        "known_exact_tokens": 36472761, "unmetered_invocations": 154,
+        "total_native_consumption_exact": False,
+        "new_CPU_times": 0, "model_calls": 0, "candidate_executions": 0,
+        "visual_inspection_pending": True,
+    }
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({k: result[k] for k in ("verified", "documents", "contact_sheets")}))
+
+
+if __name__ == "__main__":
+    main()

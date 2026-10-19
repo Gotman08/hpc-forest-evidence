@@ -1,0 +1,126 @@
+#include "knn.h"
+#include <limits.h>
+
+static void insert_candidate(float *distances, char *labels, int *indices,
+                             int k, float d, char label, int idx) {
+    for (int x = 0; x < k; ++x) {
+        if (distances[x] < 0.0f ||
+            d < distances[x] ||
+            (d == distances[x] && idx < indices[x])) {
+            for (int y = k - 1; y > x; --y) {
+                distances[y] = distances[y - 1];
+                labels[y] = labels[y - 1];
+                indices[y] = indices[y - 1];
+            }
+            distances[x] = d;
+            labels[x] = label;
+            indices[x] = idx;
+            return;
+        }
+    }
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    int *offsets = (int *) malloc(sizeof(int) * (n_groups + 1));
+    offsets[0] = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        offsets[i + 1] = offsets[i] + groups[i].length;
+    }
+
+    float *global_distances = (float *) malloc(sizeof(float) * k);
+    char *global_labels = (char *) malloc(sizeof(char) * k);
+    int *global_indices = (int *) malloc(sizeof(int) * k);
+
+    for (int i = 0; i < k; ++i) {
+        global_distances[i] = -1.0f;
+        global_labels[i] = 0;
+        global_indices[i] = INT_MAX;
+    }
+
+#pragma omp parallel
+    {
+        float *local_distances = (float *) malloc(sizeof(float) * k);
+        char *local_labels = (char *) malloc(sizeof(char) * k);
+        int *local_indices = (int *) malloc(sizeof(int) * k);
+
+        for (int i = 0; i < k; ++i) {
+            local_distances[i] = -1.0f;
+            local_labels[i] = 0;
+            local_indices[i] = INT_MAX;
+        }
+
+#pragma omp for schedule(guided)
+        for (int g = 0; g < n_groups; ++g) {
+            Group group = groups[g];
+            int base_index = offsets[g];
+
+            for (int j = 0; j < group.length; ++j) {
+                float d = euclidean_distance_no_sqrt(to_evaluate, group.points[j]);
+                insert_candidate(local_distances, local_labels, local_indices,
+                                 k, d, group.label, base_index + j);
+            }
+        }
+
+#pragma omp critical
+        {
+            for (int i = 0; i < k; ++i) {
+                if (local_distances[i] >= 0.0f) {
+                    insert_candidate(global_distances, global_labels, global_indices,
+                                     k, local_distances[i], local_labels[i],
+                                     local_indices[i]);
+                }
+            }
+        }
+
+        free(local_distances);
+        free(local_labels);
+        free(local_indices);
+    }
+
+    qsort(global_labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = global_labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; ++i) {
+        if (global_labels[i] != global_labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = global_labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            ++current_frequency;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = global_labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(offsets);
+    free(global_distances);
+    free(global_labels);
+    free(global_indices);
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

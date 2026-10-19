@@ -1,0 +1,95 @@
+"""New wrapper helpers only; no actual profile, source tests, C or process run."""
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import tarfile
+import types
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("neutral_lane_q_wrapper", HERE / "qualification-wrapper.py")
+q = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(q)
+
+
+def tar(path, members):
+    with tarfile.open(path, "w:gz") as archive:
+        for name, kind in members:
+            item = tarfile.TarInfo(name)
+            item.type = kind
+            item.linkname = "outside" if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE) else ""
+            item.size = 0
+            archive.addfile(item, io.BytesIO(b""))
+
+
+@pytest.mark.parametrize("name,kind", [("../escape", tarfile.REGTYPE), ("/absolute", tarfile.REGTYPE),
+                                      ("C:/drive", tarfile.REGTYPE), ("one\\two", tarfile.REGTYPE),
+                                      ("link", tarfile.SYMTYPE), ("hard", tarfile.LNKTYPE)])
+def test_unsafe_packet_members_refuse(tmp_path, name, kind):
+    path = tmp_path / "NEUTRAL.tar.gz"
+    tar(path, [(name, kind)])
+    with tarfile.open(path) as archive, pytest.raises(ValueError):
+        q.safe_members(archive)
+
+
+def test_duplicate_members_refuse(tmp_path):
+    path = tmp_path / "NEUTRAL.tar.gz"
+    tar(path, [("same", tarfile.REGTYPE), ("same", tarfile.REGTYPE)])
+    with tarfile.open(path) as archive, pytest.raises(ValueError, match="unique"):
+        q.safe_members(archive)
+
+
+def test_actual_junit_counts_not_fixed(tmp_path):
+    path = tmp_path / "NEUTRAL.xml"
+    path.write_text('<testsuites><testsuite><testcase/><testcase><failure/></testcase>'
+                    '<testcase><skipped/></testcase></testsuite></testsuites>', encoding="utf8")
+    assert q.junit_counts(path)[0] == {"passed": 1, "failed": 1}
+    assert q.junit_counts(path)[1]["skipped"] == 1
+
+
+def test_allocation_guard_fixture_only(monkeypatch):
+    monkeypatch.setattr(q.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(q.os, "sched_getaffinity", lambda _: {10, 11, 12, 13}, raising=False)
+    for key, value in {"SLURM_JOB_ID": "999999", "SLURM_CPUS_PER_TASK": "4", "SLURM_NTASKS": "1",
+                       "SLURM_JOB_NUM_NODES": "1", "SLURM_MEM_PER_NODE": "16384",
+                       "SLURM_JOB_GPUS": "", "SLURM_STEP_GPUS": "", "SLURM_GPUS": "0",
+                       "SLURM_GPUS_ON_NODE": "0"}.items():
+        monkeypatch.setenv(key, value)
+    assert q.allocation_guard(now=q.DEADLINE - 20000)["affinity_cpu_count"] == 4
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "8")
+    with pytest.raises(ValueError, match="allocation"):
+        q.allocation_guard(now=q.DEADLINE - 20000)
+
+
+def test_deadline_and_duplicate_json_refuse(tmp_path):
+    with pytest.raises(ValueError, match="deadline"):
+        q.allocation_guard(now=q.DEADLINE - 11400)
+    p = tmp_path / "NEUTRAL.json"
+    p.write_text('{"a":1,"a":2}', encoding="utf8")
+    with pytest.raises(ValueError, match="Duplicate"):
+        q.read(p)
+    p.write_text(json.dumps({"fixture_only": True}), encoding="utf8")
+    assert q.read(p) == {"fixture_only": True}
+
+
+def test_pytest_argv_excludes_all_conftest_without_process(tmp_path, monkeypatch):
+    calls = []
+
+    def neutral_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        junit = Path(argv[argv.index("--junitxml") + 1])
+        junit.write_text('<testsuites><testsuite><testcase name="NEUTRAL-only"/></testsuite></testsuites>',
+                         encoding="utf8")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(q.subprocess, "run", neutral_run)
+    result = q.run_suite("NEUTRAL-argv", tmp_path / "NEUTRAL-test.py", tmp_path,
+                         tmp_path, tmp_path, q.time.monotonic())
+    assert result[0] == 0 and len(calls) == 1
+    argv = calls[0][0]
+    assert argv.count("--noconftest") == 1 and argv.count("--confcutdir") == 1
+    assert argv[:4] == [q.sys.executable, "-B", "-m", "pytest"]

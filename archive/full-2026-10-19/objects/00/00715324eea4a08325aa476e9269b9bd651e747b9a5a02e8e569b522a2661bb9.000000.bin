@@ -1,0 +1,274 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+enum { PAIR_TILE = 32, PARALLEL_THRESHOLD = 256 };
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+typedef struct { float x, y, z; } Force;
+
+static inline Force force_row(const Body *p, int i, int n) {
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+  const float x = p[i].x;
+  const float y = p[i].y;
+  const float z = p[i].z;
+
+  for (int j = 0; j < n; ++j) {
+    float dx = p[j].x - x;
+    float dy = p[j].y - y;
+    float dz = p[j].z - z;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  Force result = {fx, fy, fz};
+  return result;
+}
+
+/* Compute forces without integrating positions. */
+void body_force(Body *p, float dt, int n) {
+  #pragma omp parallel for schedule(static) if(n >= PARALLEL_THRESHOLD)
+  for (int i = 0; i < n; ++i) {
+    Force f = force_row(p, i, n);
+    p[i].vx += dt*f.x;
+    p[i].vy += dt*f.y;
+    p[i].vz += dt*f.z;
+  }
+}
+
+static void simulate_direct(Body *p, float dt, int n, int steps) {
+  #pragma omp parallel if(n >= PARALLEL_THRESHOLD)
+  {
+    for (int iter = 0; iter < steps; ++iter) {
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        Force f = force_row(p, i, n);
+        p[i].vx += dt*f.x;
+        p[i].vy += dt*f.y;
+        p[i].vz += dt*f.z;
+      }
+
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        p[i].x += p[i].vx * dt;
+        p[i].y += p[i].vy * dt;
+        p[i].z += p[i].vz * dt;
+      }
+    }
+  }
+}
+
+static void simulate(Body *p, float dt, int n, int steps) {
+  if (n <= 0 || steps <= 0) return;
+  if (n < PARALLEL_THRESHOLD) {
+    simulate_direct(p, dt, n, steps);
+    return;
+  }
+
+  const int ntiles = n / PAIR_TILE + (n % PAIR_TILE != 0);
+  Force *partial = (Force *)malloc((size_t)n * sizeof(*partial));
+  float *cache = (float *)malloc((size_t)ntiles * PAIR_TILE * PAIR_TILE * sizeof(*cache));
+  if (partial == NULL || cache == NULL) {
+    free(cache);
+    free(partial);
+    simulate_direct(p, dt, n, steps);
+    return;
+  }
+
+  int nonfinite = 0;
+  #pragma omp parallel
+  {
+    for (int iter = 0; iter < steps; ++iter) {
+      #pragma omp single
+      {
+        nonfinite = 0;
+      }
+
+      #pragma omp for schedule(static) reduction(|:nonfinite)
+      for (int i = 0; i < n; ++i) {
+        partial[i].x = 0.0f;
+        partial[i].y = 0.0f;
+        partial[i].z = 0.0f;
+        if (!isfinite(p[i].x) || !isfinite(p[i].y) || !isfinite(p[i].z)) {
+          nonfinite |= 1;
+        }
+      }
+
+      if (nonfinite) {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          partial[i] = force_row(p, i, n);
+        }
+      } else {
+        /*
+         * Completed source bands form an ordered prefix for every row.
+         * Each off-diagonal tile has one owner. Its inverse distances
+         * are reused when completing the opposite rows after the barrier.
+         */
+        for (int band = 0; band < ntiles; ++band) {
+          const int begin = band * PAIR_TILE;
+          const int end = (n - begin < PAIR_TILE) ? n : begin + PAIR_TILE;
+
+          #pragma omp for schedule(static)
+          for (int tile = band + 1; tile < ntiles; ++tile) {
+            const int target_begin = tile * PAIR_TILE;
+            const int target_end = (n - target_begin < PAIR_TILE)
+                                 ? n : target_begin + PAIR_TILE;
+            float *tile_cache = cache + (size_t)tile * PAIR_TILE * PAIR_TILE;
+
+            for (int j = target_begin; j < target_end; ++j) {
+              const float x = p[j].x;
+              const float y = p[j].y;
+              const float z = p[j].z;
+              float fx = partial[j].x;
+              float fy = partial[j].y;
+              float fz = partial[j].z;
+
+              for (int i = begin; i < end; ++i) {
+                float dx = p[i].x - x;
+                float dy = p[i].y - y;
+                float dz = p[i].z - z;
+                float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+                float inv_dist = 1 / sqrt(sqrd_dist);
+                float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+                fx += dx * inv_dist3;
+                fy += dy * inv_dist3;
+                fz += dz * inv_dist3;
+                tile_cache[(size_t)(i - begin) * PAIR_TILE + (j - target_begin)] = inv_dist3;
+              }
+
+              partial[j].x = fx;
+              partial[j].y = fy;
+              partial[j].z = fz;
+            }
+          }
+
+          #pragma omp for schedule(static)
+          for (int i = begin; i < end; ++i) {
+            const float x = p[i].x;
+            const float y = p[i].y;
+            const float z = p[i].z;
+            float fx = partial[i].x;
+            float fy = partial[i].y;
+            float fz = partial[i].z;
+
+            for (int j = begin; j < end; ++j) {
+              float dx = p[j].x - x;
+              float dy = p[j].y - y;
+              float dz = p[j].z - z;
+              float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+              float inv_dist = 1 / sqrt(sqrd_dist);
+              float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+              fx += dx * inv_dist3;
+              fy += dy * inv_dist3;
+              fz += dz * inv_dist3;
+            }
+
+            /*
+             * Finite positions give identical squared distances in both
+             * directions. Cache only inv_dist3, not rounded products,
+             * retaining the original multiply/add expressions and order.
+             */
+            for (int tile = band + 1; tile < ntiles; ++tile) {
+              const int target_begin = tile * PAIR_TILE;
+              const int target_end = (n - target_begin < PAIR_TILE)
+                                   ? n : target_begin + PAIR_TILE;
+              const float *row_cache = cache + (size_t)tile * PAIR_TILE * PAIR_TILE
+                                     + (size_t)(i - begin) * PAIR_TILE;
+              for (int j = target_begin; j < target_end; ++j) {
+                float dx = p[j].x - x;
+                float dy = p[j].y - y;
+                float dz = p[j].z - z;
+                float inv_dist3 = row_cache[j - target_begin];
+
+                fx += dx * inv_dist3;
+                fy += dy * inv_dist3;
+                fz += dz * inv_dist3;
+              }
+            }
+
+            partial[i].x = fx;
+            partial[i].y = fy;
+            partial[i].z = fz;
+          }
+        }
+      }
+
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        p[i].vx += dt*partial[i].x;
+        p[i].vy += dt*partial[i].y;
+        p[i].vz += dt*partial[i].z;
+        p[i].x += p[i].vx * dt;
+        p[i].y += p[i].vy * dt;
+        p[i].z += p[i].vz * dt;
+      }
+    }
+  }
+
+  free(cache);
+  free(partial);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /* Compute interbody forces and integrate positions at each step. */
+  simulate(bodies, DT, nbodies, N_ITER);
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,352 @@
+"""Local lane-v2 authorization factory; no upload, worker, transport or CLI execution."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+
+INTEGRATION_ROOT = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("lane_r2_reader_bridge", INTEGRATION_ROOT / "reader_bridge.py")
+reader_bridge = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(reader_bridge)
+HERE = INTEGRATION_ROOT / "launcher"
+BASE = INTEGRATION_ROOT.parents[3]
+PREP = INTEGRATION_ROOT.parents[1]
+CACHE_ROOT = PREP / "lancement-modeles-max-r2"
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE = "60db53fb69e014133a9c77ebaea9ae09ae7891c1433070a9af4eae30b0d05e6d"
+PLAN = "b1b39b999cb89374a17191c5b3aef2b4eee255287a4cdbb80ed9c8b5d2ac1e1c"
+REVIEW = "b903ad78f736fbec86faa47cc24bf99670d5093b9e2367a811a1cc50b5a822d6"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+SHARED = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r2-qualification-20261018-60db53fb69e0"
+_selection_spec = importlib.util.spec_from_file_location("lane_r2_cells", HERE / "cell_selection.py")
+cells = importlib.util.module_from_spec(_selection_spec)
+_selection_spec.loader.exec_module(cells)
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def reference(path):
+    return {"path": str(Path(path).resolve(strict=True)), "sha256": sha(path)}
+
+
+def artifact(ref):
+    require(isinstance(ref, dict) and set(ref) == {"path", "sha256"}, "Closed real artifact reference required")
+    path = Path(ref["path"])
+    require(path.is_absolute() and path.is_file() and not path.is_symlink()
+            and re.fullmatch("[0-9a-f]{64}", ref["sha256"]) and sha(path) == ref["sha256"],
+            "Actual evidence missing or changed")
+    return path
+
+
+def read(ref):
+    return json.loads(artifact(ref).read_text(encoding="utf8"))
+
+
+def fresh(instant, *, now=None, ceiling=120):
+    if isinstance(instant, str):
+        parsed = datetime.fromisoformat(instant.replace("Z", "+00:00"))  # noqa: FURB162 - retain frozen Python compatibility
+        require(parsed.tzinfo is not None, "Explicit UTC observation time required")
+        instant = parsed.timestamp()
+    require(type(instant) in (int, float) and 0 <= (time.time() if now is None else now) - instant <= ceiling,
+            "Fresh non-future parent observation required")
+
+
+def full_identity(row):
+    require(isinstance(row, dict) and all(k in row for k in FIELDS), "Complete five-field identity required")
+    require(type(row["ProcessId"]) is int and type(row["ParentProcessId"]) is int
+            and all(isinstance(row[k], str) and row[k] for k in FIELDS[2:]), "Invalid complete process identity")
+    stamp = row["CreationDate"]
+    require(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z", stamp), "UTC creation time required")
+    value = {k: row[k] for k in FIELDS}
+    value["CreationDate"] = stamp[:-1].rstrip("0").rstrip(".") + "Z" if "." in stamp else stamp
+    return value
+
+
+def bind(value, cell):
+    require(all(value.get(k) == v for k, v in cell.items()), "Evidence differs from exact phase/session/job/source/plan")
+
+
+def evidence(value):
+    require(isinstance(value.get("evidence_refs"), list) and value["evidence_refs"], "Real underlying evidence references required")
+    for ref in value["evidence_refs"]:
+        artifact(ref)
+
+
+def check_previous_phases(rows, model, phase, current_job=None):
+    return reader_bridge.check_previous_phases(rows, model, phase, current_job)
+
+
+def check_submission(intent, observed, script, cell, phase):
+    require(intent.get("schema") == "hpc-forest-dynamic-r4b-submit-intent-v1" and intent.get("verified") is True,
+            "Actual exclusive submit intention required")
+    bind(intent, {k: v for k, v in cell.items() if k != "job_id"})
+    require(intent.get("phase") == phase and intent.get("one_submit_only") is True
+            and intent.get("job_id") is None and intent.get("native_model_calls") == 0,
+            "Pre-submit intention must have no guessed job; one actual phase submission only")
+    command = artifact(intent["command"])
+    require(sha(HERE / cells.SLUGS[cell["model"]] / phase / "commande-allouee.sh") == sha(command), "Submission differs from reviewed phase command")
+    actual = observed.get("structuredContent", observed)
+    require(actual.get("ok") is True and actual.get("submitted") is True and actual.get("submission_observed") is True
+            and str(actual.get("job_id")) == cell["job_id"]
+            and actual.get("plan_id") == intent.get("plan_id") and intent.get("plan_id")
+            and actual.get("plan_sha256") == intent.get("scheduler_plan_sha256") and intent.get("scheduler_plan_sha256"),
+            "Actual observed single submission must bind scheduler plan and job")
+    require(script.get("schema") == "hpc-forest-dynamic-r4b-scheduler-script-readback-v1"
+            and script.get("verified") is True and script.get("exact_script_command_verified") is True
+            and script.get("command_sha256") == sha(command)
+            and script.get("plan_id") == intent["plan_id"]
+            and script.get("scheduler_plan_sha256") == intent["scheduler_plan_sha256"],
+            "Actual scheduler script re-read required")
+    evidence(script)
+
+
+def bootstrap_source():
+    return reader_bridge.source_modules()
+
+
+def check_qualification(receipt_ref, admission):
+    return reader_bridge.check_qualification(receipt_ref)
+
+
+def assemble(inputs, output):
+    reader_bridge.integration_review(inputs.get("reader_integration_review"))
+    require(inputs.get("schema") == "hpc-forest-dynamic-r4b-launch-inputs-v1" and inputs.get("verified") is True,
+            "Actual parent observations required; false templates never admit")
+    require(set(inputs) == {"schema", "verified", "scope_id", "phase", "model", "effort", "session_id", "job_id",
+            "source_zip_sha256", "plan_sha256", "real_qualification_reception", "allocation_marker", "request_prepared",
+            "submission_intent", "submission_observed", "script_reread", "parent_observations", "fresh_private_full_cim",
+            "r2_main_closure", "mixed_observer_admission", "oauth_observation", "codex_config", "transport_probe_readback",
+            "factory_review", "reader_integration_review", "native_contract_phase_receipts", "private_lane_inputs", "source_state_binding"}, "Closed complete factory input required")
+    phase = inputs["phase"]
+    model = inputs["model"]
+    session = cells.select(model, phase, effort=inputs["effort"], session_id=inputs["session_id"], job_id=inputs["job_id"])
+    require(inputs["job_id"] is not None, "Actual observed job required")
+    check_previous_phases(inputs["native_contract_phase_receipts"], model, phase, inputs["job_id"])
+    remote_root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session
+    admission_root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + session
+    base = {"scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN}
+    cell = {**base, "model": model, "effort": "max", "session_id": session, "job_id": inputs["job_id"], "remote_root": remote_root}
+    bind(inputs, {k: v for k, v in cell.items() if k != "remote_root"})
+    pins, admission = bootstrap_source()
+    q = check_qualification(inputs["real_qualification_reception"], admission)
+    bind(read(pins["independent_source_review"]), base)
+    marker = read(inputs["allocation_marker"])
+    bind(marker, cell)
+    require(marker.get("schema") == "hpc-forest-dynamic-r4b-allocation-marker-v1" and marker.get("verified") is True
+            and marker.get("phase") == phase and marker.get("admission_root") == admission_root
+            and marker.get("native_model_calls") == 0 and marker.get("native_root_absent_before_stage") is True
+            and marker.get("source_files") == 105, "Actual zero-call allocation staging marker required")
+    fresh(marker["created_at"], ceiling=600)
+    allocation = marker["allocation"]
+    require(all(allocation.get(k) == v for k, v in {"slurm_job_id": cell["job_id"], "architecture": "ARM64", "cpu_cores": 4,
+            "tasks": 1, "nodes": 1, "allocated_memory_mib": 16384, "allocated_gpus": 0}.items())
+            and len(marker["cpu_affinity"]) == len(set(marker["cpu_affinity"])) == 4,
+            "Actual exact4CPU/16Gi/0GPU ARM64 allocation required")
+    request_path = artifact(inputs["request_prepared"])
+    request = read(inputs["request_prepared"])
+    require(sha(request_path) == marker["request_sha256"] and admission.digest(request) == marker["request_digest"]
+            and request["meta_role"] == "mother-dynamic-" + phase and request["session_id"] == session
+            and request["model"] == model and request["reasoning_effort"] == "max"
+            and request["expires_at"] > time.time() and marker["requests_published"] == 0,
+            "Exact staged, unexpired, unpublished synthetic phase request required")
+    intent, observed, script = [read(inputs[k]) for k in ("submission_intent", "submission_observed", "script_reread")]
+    check_submission(intent, observed, script, cell, phase)
+    obs = read(inputs["parent_observations"])
+    require(obs.get("schema") == "hpc-forest-dynamic-r4b-parent-observations-v1" and obs.get("verified") is True,
+            "Actual reviewed parent observations required")
+    bind(obs, cell)
+    fresh(obs["observed_at"])
+    evidence(obs)
+    for key in ("fresh_private_full_cim", "allocation_marker", "request_prepared", "r2_main_closure", "mixed_observer_admission"):
+        require(obs.get(key) == inputs[key], "Parent review is not bound to the exact underlying observation: " + key)
+    require(all(obs.get(k) is True for k in ("full_census_locally_reviewed", "no_unclassified_research_processes",
+            "remote_registry_absent", "prior_session_claims_absent", "local_cache_absent", "local_registry_absent",
+            "existing_transport_only", "no_new_authentication", "CLI_tools_disabled")),
+            "Missing actual freshness/ownership/transport controls")
+    expected_cache = CACHE_ROOT / ("worker-" + session)
+    require(obs.get("proposed_cache") == str(expected_cache) and not expected_cache.exists(), "Exact new cache must be absent")
+    census = read(inputs["fresh_private_full_cim"])
+    require(inputs["r2_main_closure"] == pins["real_r2_main_closure"], "Pinned real R2 closure required")
+    private = inputs["private_lane_inputs"]
+    require(private.get("parent_observations") == inputs["parent_observations"]
+            and private.get("fresh_private_full_cim") == inputs["fresh_private_full_cim"]
+            and private.get("r2_main_closure") == inputs["r2_main_closure"], "Lane source inputs differ from launch inputs")
+    projection = reader_bridge.produce_projection(private, cell, inputs["source_state_binding"])
+    count = projection["active_native_workers_before_start"]
+    live_so = projection["source_only_state"] == "live"
+    policy = read(inputs["mixed_observer_admission"])
+    bind(policy, cell)
+    require(policy.get("schema") == "hpc-forest-dynamic-r4b-mixed-observer-admission-v1" and policy.get("verified") is True
+            and policy.get("maximum_native_workers_total") == 4 and all(policy.get(k) is True for k in (
+                "all_native_sessions_covered", "native_calls_started_zero")),
+            "Actual new mixed observer policy/route admission is required before any worker")
+    require(policy.get("source_only_state") == projection["source_only_state"]
+            and policy.get("source_only_preserved") is live_so
+            and policy.get("source_only_scientifically_closed_and_absent") is (not live_so)
+            and policy.get("observer_code_sha256") == sha(INTEGRATION_ROOT / "observer/observer-mixte.py"),
+            "Current lane-v2 observer admission differs")
+    fresh(policy["observed_at"])
+    evidence(policy)
+    current = {r["ProcessId"]: r for r in census["rows"]}
+    require(policy.get("observer_full_identities") and all(r["ProcessId"] in current
+            and full_identity(current[r["ProcessId"]]) == full_identity(r)
+            for r in policy["observer_full_identities"]), "Actual observer identities must match fresh full CIM")
+    oauth = read(inputs["oauth_observation"])
+    require(oauth.get("schema") == "hpc-forest-dynamic-r4b-existing-oauth-observation-v1" and oauth.get("verified") is True
+            and oauth.get("authentication") == "existing-local-ChatGPT"
+            and oauth.get("executable_sha256") == admission.CLI_SHA256
+            and all(oauth.get(k) is False for k in ("OPENAI_API_KEY_present", "CODEX_API_KEY_present", "OPENAI_BASE_URL_present")),
+            "Fresh existing ChatGPT OAuth without API keys/base override is required")
+    fresh(oauth["observed_at"])
+    evidence(oauth)
+    config = artifact(inputs["codex_config"])
+    transport_obs = read(inputs["transport_probe_readback"])
+    bind(transport_obs, cell)
+    require(transport_obs.get("schema") == "hpc-forest-dynamic-r4b-neutral-transport-observation-v1"
+            and transport_obs.get("verified") is True and transport_obs.get("native_model_calls") == 0
+            and transport_obs.get("configuration_sha256") == sha(config)
+            and transport_obs.get("configuration_path") == str(config)
+            and transport_obs.get("transport_name") == "romeo-mcp"
+            and transport_obs.get("neutral_controls_passed") is True, "Real existing MCP neutral controls/readback required")
+    fresh(transport_obs["observed_at"])
+    evidence(transport_obs)
+    require(inputs["factory_review"] == inputs["reader_integration_review"], "One actual complete integration review must bind factory and reader")
+    factory_review = reader_bridge.integration_review(inputs["factory_review"])
+    bind(factory_review, base)
+    reviewed_files = {"remote_stage.py", "bootstrap_worker.py", "publication.py",
+                      "bind_qualification.py", "cell_selection.py", "render_launch.py", "pins-source-plan.json", "native_worker_detection.py"}
+    require(set(factory_review.get("command_sha256_by_cell", {})) == {m + ":" + p for m in cells.MODELS for p in cells.PHASES},
+            "Exact reviewed launcher modules/nine separate commands required")
+    for name in reviewed_files:
+        require(factory_review["reviewed_files"].get("launcher/" + name) == sha(HERE / name), "Launcher changed after review")
+    require(factory_review["command_sha256_by_cell"].get(model + ":" + phase) == sha(HERE / cells.SLUGS[cell["model"]] / phase / "commande-allouee.sh"), "Phase command not reviewed")
+    output = Path(output).resolve()
+    require(output.parent == INTEGRATION_ROOT and not output.exists(), "Fresh direct child output directory required")
+    output.mkdir()
+    local, remote = output / "local", output / "remote"
+    local.mkdir()
+    remote.mkdir()
+    uploads = []
+
+    def save(folder, name, value):
+        path = folder / name
+        with path.open("x", encoding="utf8", newline="\n") as stream:
+            stream.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+        return reference(path)
+
+    def export(ref, name):
+        src = artifact(ref)
+        dest = remote / name
+        require(dest.parent == remote and not dest.exists(), "Fresh single-level explicit export name required")
+        dest.write_bytes(src.read_bytes())
+        row = {"local": reference(dest), "remote_path": admission_root + "/" + name}
+        uploads.append(row)
+        return {"path": row["remote_path"], "sha256": row["local"]["sha256"]}
+
+    common = {**base, "verified": True}
+    minimal = save(local, "owned-lane-projection.json", projection)
+    minimal_remote = export(minimal, "owned-lane-projection.json")
+    source_refs = {"source_zip": pins["source_zip"], "plan": pins["plan"], "integration_review": inputs["reader_integration_review"]}
+    remote_refs = {"source_zip": {"path": SHARED + "/project.zip", "sha256": SOURCE},
+                   "plan": {"path": SHARED + "/dynamic-plan.json", "sha256": PLAN},
+                   "integration_review": export(inputs["reader_integration_review"], "integration-review-original.json")}
+    source_refs["qualification_reception"] = inputs["real_qualification_reception"]
+    qremote = {**q, "archive": {"path": SHARED + "/qualification-result.tar.gz", "sha256": q["archive"]["sha256"]},
+               "qualification": {"path": SHARED + "/qualification.json", "sha256": q["qualification"]["sha256"]},
+               "independent_audit": export(q["independent_audit"], "qualification-audit-original.json")}
+    remote_refs["qualification_reception"] = export(save(local, "qualification-reception-posix.json", qremote), "qualification-reception.json")
+    cli_files = {}
+    cli_path = Path(pins["copied_cli_executable"])
+    for name, expected_sha in admission.CLI_FILES.items():
+        actual = reference(cli_path.parent / name)
+        require(actual["sha256"] == expected_sha, "Actual copied CLI companion changed")
+        cli_files[name] = actual
+    cli = save(local, "cli-identity.json", {**common, **cell, "schema": "hpc-forest-dynamic-r4b-cli-identity-v1",
+        "executable_path": str(cli_path), "executable_sha256": admission.CLI_SHA256, "files": cli_files,
+        "authentication": "existing-local-ChatGPT", "api_key_present": False, "tools_disabled": True,
+        "oauth_observation_sha256": inputs["oauth_observation"]["sha256"], "configuration_contents_exported": False})
+    lane = save(local, "lane-freshness.json", {**common, **cell,
+        "schema": "hpc-forest-dynamic-r4b-lane-freshness-v2", "maximum_native_workers_total": 4,
+        "active_native_workers_before_start": count, "full_census_locally_verified": True,
+        "source_only_preserved": live_so, "source_only_state": projection["source_only_state"],
+        "source_only_active_workers": projection["source_only_active_workers"],
+        "new_cache_registry_root": True, "native_calls_started": 0, "observed_at": projection["observed_at"],
+        "private_full_census_sha256": inputs["fresh_private_full_cim"]["sha256"], "minimal_owned_observations": minimal})
+    submitted_minimal = save(local, "submission-observed-minimal.json", {**common, **cell,
+        "schema": "hpc-forest-dynamic-r4b-observed-submission-minimal-v1", "phase": phase,
+        "original_submission_sha256": inputs["submission_observed"]["sha256"], "intent_sha256": inputs["submission_intent"]["sha256"],
+        "script_readback_sha256": inputs["script_reread"]["sha256"], "command_sha256": intent["command"]["sha256"],
+        "plan_id": intent["plan_id"], "scheduler_plan_sha256": intent["scheduler_plan_sha256"], "observed_submission_verified": True})
+    submitted_remote = export(submitted_minimal, "submission-observed-minimal.json")
+    transport = save(local, "transport.json", {**common, **cell, "schema": "hpc-forest-dynamic-r4b-transport-v1",
+        "native_model_calls": 0, "cli_identity_sha256": cli["sha256"], "source_execution_allowed": False,
+        "observed_submission_verified": True, "observed_submission": submitted_minimal,
+        "neutral_transport_observation_sha256": inputs["transport_probe_readback"]["sha256"]})
+    for key, item in {"cli_identity": cli, "lane_freshness": lane}.items():
+        source_refs[key] = item
+        value = read(item)
+        if key == "lane_freshness":
+            value["minimal_owned_observations"] = minimal_remote
+            remote_refs[key] = export(save(local, key + "-posix.json", value), key + ".json")
+        else:
+            remote_refs[key] = export(item, key + ".json")
+    source_refs["transport"] = transport
+    remote_refs["transport"] = export(save(local, "transport-posix.json", {**read(transport), "observed_submission": submitted_remote}), "transport.json")
+    source_refs["native_contracts"] = remote_refs["native_contracts"] = None
+    source_refs["pilot_first_start"] = remote_refs["pilot_first_start"] = None
+    auth = {**common, **cell, "schema": "hpc-forest-dynamic-r4b-max-authorization-v1",
+        "purpose": "technical-contract", "expires_at": time.time() + 10800,
+        "canonical_remote_root": remote_root.replace("/scratch_p/", "/gpfs/scratch/", 1), "artifacts": source_refs,
+        "operator_algorithm_advice": False, "old_candidates_imported": False, "automatic_extension": False}
+    auth.update(technical_phase=phase, allowed_request_sha256=marker["request_digest"])
+    draft_auth = save(output, "authorization-local-DRAFT.json", auth)
+    # Actual sealed validator checks all local refs/source/phase gates before a ready can exist.
+    admission.validate_authorization(artifact(draft_auth), {SCOPE})
+    admission.verify_local_cli(auth, str(cli_path))
+    local_auth = save(output, "authorization-local.json", auth)
+    remote_auth = save(output, "authorization-remote.json", {**auth, "artifacts": remote_refs})
+    require(read(local_auth)["artifacts"]["cli_identity"]["sha256"] == read(remote_auth)["artifacts"]["cli_identity"]["sha256"], "Cross-OS CLI bytes differ")
+    for row in uploads:
+        artifact(row["local"])
+    manifest = {"schema": "hpc-forest-dynamic-r4b-upload-manifest-v1", "verified": False, **cell, "phase": phase,
+        "dependencies": uploads, "existing_qualified_files": [remote_refs["source_zip"], remote_refs["plan"], qremote["archive"], qremote["qualification"]],
+        "authorization_publish_after_readback": {"local": remote_auth, "remote_path": admission_root + "/authorization.json"},
+        "ready_publish_last_after_authorization_readback": True, "ready_created": False, "uploaded": False,
+        "full_CIM_config_credentials_or_foreign_processes_exported": False}
+    manifest_ref = save(output, "upload-manifest.json", manifest)
+    publication_spec = importlib.util.spec_from_file_location("r4b_local_publication", HERE / "publication.py")
+    publication = importlib.util.module_from_spec(publication_spec)
+    publication_spec.loader.exec_module(publication)
+    batch = publication.stage_batch(manifest_ref, inputs["allocation_marker"])
+    save(output, "factory-status.json", {"schema": "hpc-forest-dynamic-r4b-factory-status-v1", "verified": False,
+        **cell, "local_authorization_validated": True, "remote_authorization_readback_required": True,
+        "manifest": manifest_ref, "publication_batch": batch, "native_model_calls": 0,
+        "normal_first_start_verified": False, "global_admission_verified": False})
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--input-sha256", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    inputs = read({"path": str(args.input.resolve()), "sha256": args.input_sha256})
+    output = assemble(inputs, args.output)
+    print(json.dumps({"output": str(output), "native_model_calls": 0, "uploaded": False, "worker_started": False}))
+
+
+if __name__ == "__main__":
+    main()

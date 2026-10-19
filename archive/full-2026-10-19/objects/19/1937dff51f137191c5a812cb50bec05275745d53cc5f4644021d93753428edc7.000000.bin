@@ -1,0 +1,84 @@
+param([switch]$Execute)
+$ErrorActionPreference = 'Stop'
+$taskRoot = $PSScriptRoot
+$taskBase = (Resolve-Path -LiteralPath (Join-Path $taskRoot '../../../..')).Path
+$taskPython = Join-Path $taskBase 'work/.venv/Scripts/python.exe'
+$taskGate = Join-Path $taskRoot 'preparer-fermeture-r2.py'
+$taskPlanPath = Join-Path $taskRoot 'plan-fermeture-r2.json'
+$taskPlan = Get-Content -LiteralPath $taskPlanPath -Raw | ConvertFrom-Json -DateKind String
+if ($taskPlan.schema -cne 'hpc-forest-r2c-terminal-owned-main-only-stop-plan-v1' -or $taskPlan.verified -ne $true -or $taskPlan.stop_mcp_ssh_or_wrappers -ne $false -or $taskPlan.recursive_stop -ne $false -or ($taskPlan.target_process_ids -join ',') -cne '43700,13200,51324') {throw 'Wrong exact main-only plan'}
+if (@($taskPlan.targets).Count -ne 3 -or (@($taskPlan.targets | ForEach-Object {[int]$_.identity.ProcessId}) -join ',') -cne '43700,13200,51324') {throw 'Plan targets must contain exactly the three owned main identities in fixed order'}
+function Write-NewTaskJson($value, [string]$path) {
+    $taskBytes = [Text.UTF8Encoding]::new($false).GetBytes(($value | ConvertTo-Json -Depth 60) + "`n")
+    $taskStream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {$taskStream.Write($taskBytes, 0, $taskBytes.Length)} finally {$taskStream.Dispose()}
+}
+function New-TaskCensus {
+    $taskRows = @(Get-CimInstance Win32_Process | ForEach-Object {
+        [ordered]@{ProcessId=[int]$_.ProcessId; ParentProcessId=[int]$_.ParentProcessId; ExecutablePath=$_.ExecutablePath; CommandLine=$_.CommandLine; CreationDate=$(if ($_.CreationDate) {$_.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')} else {$null})}
+    })
+    $taskPath = Join-Path $taskRoot ('cim-fermeture-r2-' + [guid]::NewGuid().ToString('N') + '.json')
+    Write-NewTaskJson @{schema='hpc-forest-primes-r2max-fresh-full-cim-v1';complete_census=$true;captured_at_utc=[DateTime]::UtcNow.ToString('o');rows_count=$taskRows.Count;rows=$taskRows} $taskPath
+    return $taskPath
+}
+function Test-TaskGate {
+    $taskCensus = New-TaskCensus
+    $taskText = & $taskPython -B $taskGate --fresh-cim $taskCensus
+    if ($LASTEXITCODE -ne 0) {throw 'Fresh complete metadata/cache/identity gate refused; no next stop'}
+    $taskCurrent = $taskText | ConvertFrom-Json -DateKind String
+    if (($taskCurrent.target_process_ids -join ',') -cne '43700,13200,51324' -or $taskCurrent.verified -ne $true) {throw 'Fresh selected stop scope differs'}
+    return $taskCurrent
+}
+function Test-TaskIdentity($actual, $expected) {
+    if ($null -eq $actual) {return $false}
+    return ([int]$actual.ProcessId -eq [int]$expected.ProcessId -and [int]$actual.ParentProcessId -eq [int]$expected.ParentProcessId -and [string]$actual.ExecutablePath -ceq [string]$expected.ExecutablePath -and [string]$actual.CommandLine -ceq [string]$expected.CommandLine -and $actual.CreationDate.ToUniversalTime().Ticks -eq ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+}
+function Get-TaskOne([int]$targetId) {
+    return Get-CimInstance Win32_Process -Filter "ProcessId=$targetId"
+}
+$taskFresh = Test-TaskGate
+if (@($taskFresh.targets).Count -ne 3 -or (@($taskFresh.targets | ForEach-Object {[int]$_.identity.ProcessId}) -join ',') -cne '43700,13200,51324') {throw 'Fresh targets differ from the exact three owned main identities'}
+for ($taskIndex=0; $taskIndex -lt 3; $taskIndex++) {
+    $taskExpected = $taskPlan.targets[$taskIndex]
+    $taskActual = $taskFresh.targets[$taskIndex]
+    foreach ($taskKey in @('ProcessId','ParentProcessId','ExecutablePath','CommandLine','CreationDate')) {
+        if ([string]$taskExpected.identity.$taskKey -cne [string]$taskActual.identity.$taskKey) {throw 'Selected five-field identity changed from plan'}
+    }
+    if ($taskExpected.metadata_pre_stop.sha256 -cne $taskActual.metadata_pre_stop.sha256 -or $taskExpected.bounded_terminal_receipt.sha256 -cne $taskActual.bounded_terminal_receipt.sha256) {throw 'Reconciled audit identity changed from plan'}
+}
+$taskInitial = @{schema='hpc-forest-r2c-main-only-stop-preflight-v1';verified=$true;executed=$false;at_utc=[DateTime]::UtcNow.ToString('o');plan_sha256=(Get-FileHash -LiteralPath $taskPlanPath -Algorithm SHA256).Hash.ToLowerInvariant();fresh_cim=$taskFresh.fresh_full_cim;targets=@(43700,13200,51324);native_research_admitted=$false;complete_cache_received=$false;cache_preserved_in_situ=$true;worker_lock_read=$false;scope='Terminal exhaustive metadata only; full cohort/performance flags remain false';source_only_preserved=$true;no_mcp_ssh_or_wrapper_targets=$true;recursive_stop=$false}
+Write-NewTaskJson $taskInitial (Join-Path $taskRoot ('prevol-main-only-' + [guid]::NewGuid().ToString('N') + '.json'))
+if (-not $Execute) {Write-Output 'Fresh main-only stop preflight passed; no process stopped'; return}
+$taskIntent = Join-Path $taskRoot 'fermeture-r2-intention-exclusive.json'
+Write-NewTaskJson $taskInitial $taskIntent
+$taskActions = @()
+try {
+    foreach ($taskTarget in $taskPlan.targets) {
+        $taskCurrentGate = Test-TaskGate
+        $taskExpected = $taskTarget.identity
+        $taskProcessRow = Get-TaskOne ([int]$taskExpected.ProcessId)
+        if ($null -eq $taskProcessRow) {
+            $taskActions += @{job_id=$taskTarget.job_id;identity=$taskExpected;action='already_exited_naturally';at_utc=[DateTime]::UtcNow.ToString('o')}
+        } else {
+            if (-not (Test-TaskIdentity $taskProcessRow $taskExpected)) {throw 'Reused/changed owned process preserved; stop refused'}
+            $taskOwnedProcess = Get-Process -Id ([int]$taskExpected.ProcessId)
+            try {
+                $taskStableHandle = $taskOwnedProcess.Handle
+                $taskDelta = [math]::Abs($taskOwnedProcess.StartTime.ToUniversalTime().Ticks - ([datetime]$taskExpected.CreationDate).ToUniversalTime().Ticks)
+                if ($taskDelta -ge 10) {throw 'Stable handle birth instant differs'}
+                if (-not (Test-TaskIdentity (Get-TaskOne ([int]$taskExpected.ProcessId)) $taskExpected)) {throw 'Full identity changed after stable handle acquisition'}
+                Stop-Process -InputObject $taskOwnedProcess -Force
+                $taskOwnedProcess.WaitForExit(5000) | Out-Null
+                $taskActions += @{job_id=$taskTarget.job_id;identity=$taskExpected;action='owned_main_stopped_individually_after_reconciliation';stable_handle_opened=$true;start_delta_ticks=$taskDelta;at_utc=[DateTime]::UtcNow.ToString('o')}
+            } finally {$taskOwnedProcess.Dispose()}
+        }
+        Write-NewTaskJson @{actions=$taskActions} (Join-Path $taskRoot ('actions-main-only-' + [guid]::NewGuid().ToString('N') + '.json'))
+    }
+    $taskAfter = Test-TaskGate
+    if (@($taskAfter.targets | Where-Object {$_.present}).Count -ne 0) {throw 'An original owned main identity remains; no closure receipt'}
+    Write-NewTaskJson @{schema='hpc-forest-r2c-owned-main-only-stop-receipt-v1';verified=$true;scope='Only three individual owned Python relays stopped after exhaustive terminal metadata audit';actions=$taskActions;all_three_main_identities_absent=$true;source_only_identities_preserved=$true;source_only=$taskAfter.preserve_source_only;final_full_cim=$taskAfter.fresh_full_cim;no_mcp_ssh_or_wrapper_targeted=$true;recursive_stop=$false;stop_by_name=$false;cache_data_preserved_in_situ=$true;worker_lock_read=$false;complete_cache_snapshot_received=$false;native_research_admitted=$false;complete_cohort_or_raw_or_performance_verified=$false;at_utc=[DateTime]::UtcNow.ToString('o')} (Join-Path $taskRoot 'fermeture-r2-main-only-verifiee.json')
+    Write-Output 'Three owned main relays absent; source-only preserved; cache data unchanged; no recursive stop'
+} catch {
+    Write-NewTaskJson @{verified=$false;actions=$taskActions;error=$_.Exception.Message;no_retry_without_reconciliation=$true} (Join-Path $taskRoot ('fermeture-r2-refusee-' + [guid]::NewGuid().ToString('N') + '.json'))
+    throw
+}

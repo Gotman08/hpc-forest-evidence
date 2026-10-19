@@ -1,0 +1,271 @@
+#include "knn.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#include <stdint.h>
+#include <string.h>
+#endif
+
+static char vote_labels(char * labels, int k) {
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+static char knn_serial(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *) malloc(sizeof(char) * k);
+    float * distances = (float *) malloc(sizeof(float) * k);
+
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+
+                    distances[x] = d;
+                    labels[x] = g.label;
+
+                    break;
+                }
+            }
+        }
+    }
+
+    char result = vote_labels(labels, k);
+    free(distances);
+    free(labels);
+    return result;
+}
+
+#ifdef _OPENMP
+
+typedef struct {
+    float * distances;
+    char * labels;
+    int length;
+    int next;
+} KnnRun;
+
+static int distance_is_nan(float distance) {
+    /* ARM64 uses IEEE-754 binary32 floats. Inspect bits without FP comparisons. */
+    uint32_t bits;
+    memcpy(&bits, &distance, sizeof(bits));
+    return (bits & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000);
+}
+
+static void release_runs(KnnRun * runs, int count) {
+    for (int i = 0; i < count; i++) {
+        free(runs[i].distances);
+        free(runs[i].labels);
+    }
+    free(runs);
+}
+
+#endif
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+#ifndef _OPENMP
+    return knn_serial(n_groups, groups, k, to_evaluate);
+#else
+    int max_threads = omp_get_max_threads();
+    if (k <= 0 || n_groups <= 0 || max_threads <= 1 || omp_in_parallel()) {
+        return knn_serial(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        total += (size_t) groups[i].length;
+    }
+
+    /* Require roughly 65536 candidate-slot operations per possible worker. */
+    size_t minimum_points = 1 + (size_t) 65535 / (size_t) k;
+    if (total / (size_t) max_threads < minimum_points) {
+        return knn_serial(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t * offsets = (size_t *) malloc(((size_t) n_groups + 1) * sizeof(size_t));
+    KnnRun * runs = (KnnRun *) malloc((size_t) max_threads * sizeof(KnnRun));
+    if (offsets == NULL || runs == NULL) {
+        free(offsets);
+        free(runs);
+        return knn_serial(n_groups, groups, k, to_evaluate);
+    }
+
+    offsets[0] = 0;
+    for (int i = 0; i < n_groups; i++) {
+        offsets[i + 1] = offsets[i] + (size_t) groups[i].length;
+    }
+
+    int worker_count = 1;
+    int needs_serial = 0;
+
+#pragma omp parallel default(none) shared(runs, offsets, total, n_groups, groups, k, to_evaluate, worker_count) reduction(|:needs_serial)
+    {
+        int thread = omp_get_thread_num();
+        int count = omp_get_num_threads();
+        if (thread == 0) {
+            worker_count = count;
+        }
+
+        /* Contiguous point ranges balance unequal groups and preserve tie order. */
+        size_t quotient = total / (size_t) count;
+        size_t remainder = total % (size_t) count;
+        size_t before = (size_t) thread < remainder ? (size_t) thread : remainder;
+        size_t begin = quotient * (size_t) thread + before;
+        size_t end = begin + quotient + ((size_t) thread < remainder ? 1 : 0);
+        size_t points = end - begin;
+
+        KnnRun run = {0};
+        run.length = points < (size_t) k ? (int) points : k;
+
+        if (run.length > 0) {
+            run.distances = (float *) malloc(sizeof(float) * (size_t) run.length);
+            run.labels = (char *) malloc(sizeof(char) * (size_t) run.length);
+
+            if (run.distances == NULL || run.labels == NULL) {
+                needs_serial |= 1;
+            } else {
+                for (int x = 0; x < run.length; x++) {
+                    run.distances[x] = -1;
+                    run.labels[x] = -1;
+                }
+
+                int low = 0;
+                int high = n_groups;
+                while (low < high) {
+                    int middle = low + (high - low) / 2;
+                    if (offsets[middle + 1] <= begin) {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+
+                for (int g = low; g < n_groups && offsets[g] < end; g++) {
+                    Group group = groups[g];
+                    size_t first = begin > offsets[g] ? begin - offsets[g] : 0;
+                    size_t last = end < offsets[g + 1]
+                        ? end - offsets[g] : (size_t) group.length;
+
+                    for (size_t j = first; j < last; j++) {
+                        float d = euclidean_distance_no_sqrt(to_evaluate, group.points[j]);
+
+                        /* NaNs require the original global encounter-order scan. */
+                        if (distance_is_nan(d)) {
+                            needs_serial |= 1;
+                            continue;
+                        }
+
+                        for (int x = 0; x < run.length; x++) {
+                            if (d < run.distances[x] || run.distances[x] == -1) {
+                                for (int y = run.length - 1; y > x; y--) {
+                                    run.distances[y] = run.distances[y - 1];
+                                    run.labels[y] = run.labels[y - 1];
+                                }
+
+                                run.distances[x] = d;
+                                run.labels[x] = group.label;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        runs[thread] = run;
+    }
+
+    free(offsets);
+    if (needs_serial) {
+        release_runs(runs, worker_count);
+        return knn_serial(n_groups, groups, k, to_evaluate);
+    }
+
+    char * labels = (char *) malloc(sizeof(char) * (size_t) k);
+    if (labels == NULL) {
+        release_runs(runs, worker_count);
+        return knn_serial(n_groups, groups, k, to_evaluate);
+    }
+
+    /* Equal distances favor the earlier contiguous range, then its stable order. */
+    for (int i = 0; i < k; i++) {
+        int best = -1;
+        for (int t = 0; t < worker_count; t++) {
+            if (runs[t].next < runs[t].length &&
+                (best < 0 || runs[t].distances[runs[t].next] <
+                             runs[best].distances[runs[best].next])) {
+                best = t;
+            }
+        }
+
+        if (best < 0) {
+            /* Preserve the reference sentinel labels when k exceeds total. */
+            for (; i < k; i++) {
+                labels[i] = -1;
+            }
+            break;
+        }
+
+        labels[i] = runs[best].labels[runs[best].next];
+        runs[best].next++;
+    }
+
+    release_runs(runs, worker_count);
+    char result = vote_labels(labels, k);
+    free(labels);
+    return result;
+#endif
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

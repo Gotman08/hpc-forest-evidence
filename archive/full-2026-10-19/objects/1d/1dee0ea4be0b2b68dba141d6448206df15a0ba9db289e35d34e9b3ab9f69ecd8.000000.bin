@@ -1,0 +1,541 @@
+diff --git a/README.md b/README.md
+index f848bb6..63e7a4f 100644
+--- a/README.md
++++ b/README.md
+@@ -4,6 +4,12 @@ Orchestrateur local de recherche HPC fondé sur le cahier des charges **« Sous-
+ 
+ Le contrôleur utilise **TreeQuest 0.3.2 / AB-MCTS-A**. Le mode de démonstration transforme un vrai programme **C/OpenMP** sans appel à un LLM. Deux autres moteurs lancent des missions avec **Codex CLI** ou un modèle **Ollama local**, lorsqu'on les sélectionne explicitement.
+ 
++## Préparation opérateur et sujets Marathon
++
++La préparation technique appartient à l’opérateur : matériel, compilation, formats, entrées, oracle, tests et lancement. Le modèle de recherche choisit et écrit les modifications des programmes candidats. Aucun correctif manuel de candidat n’est appliqué. Le module [de contrats d’exécution](docs/execution-contracts.md) conserve notamment les sorties binaires en octets et les références figées.
++
++Le [lanceur Marathon 2022](examples/marathon22/README.md) prépare et traite les quatre sujets officiels sur une allocation CPU ARM64 ROMEO avec modèle local sur GPU. Il fournit les diagnostics automatiques, les mesures, la confirmation indépendante et l’archive. Le mode de démonstration décrit ci-dessous reste un essai distinct avec recettes déterministes.
++
+ ## Démarrer sous Windows
+ 
+ Dans ce dossier, avec Python 3.11 ou plus récent et Git :
+diff --git a/src/hpc_forest/backends.py b/src/hpc_forest/backends.py
+index a072a74..d9aa361 100644
+--- a/src/hpc_forest/backends.py
++++ b/src/hpc_forest/backends.py
+@@ -29,6 +29,8 @@ class Generated:
+     tokens: int | None = 0
+     usage: dict = field(default_factory=dict)
+     error: str | None = None
++    infrastructure_error: bool = False
++    tokens_upper_bound: bool = False
+ 
+ 
+ def read_params(worktree: Path) -> dict[str, int]:
+diff --git a/src/hpc_forest/config.py b/src/hpc_forest/config.py
+index a4b4f40..613c848 100644
+--- a/src/hpc_forest/config.py
++++ b/src/hpc_forest/config.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import copy
+ import json
++import math
+ import re
+ import sys
+ import tomllib
+@@ -88,6 +89,12 @@ def validate(c: dict) -> None:
+                 raise ForestError(f"ollama.{key} must be a positive integer")
+         if not 0 <= c["ollama"]["temperature"] <= 2:
+             raise ForestError("ollama.temperature must be in [0,2]")
++        penalty = c["ollama"].get("repeat_penalty", 1.0)
++        if type(penalty) not in {float, int} or not math.isfinite(penalty) or not 0 < penalty <= 2:
++            raise ForestError("ollama.repeat_penalty must be finite in (0,2]")
++        recent = c["ollama"].get("repeat_last_n", 64)
++        if type(recent) is not int or not -1 <= recent <= c["ollama"]["context_tokens"]:
++            raise ForestError("ollama.repeat_last_n must be an integer in [-1,context_tokens]")
+     if not c["roles"] or any(r not in "ABCDE" for r in c["roles"]):
+         raise ForestError("roles must be a nonempty subset of A..E")
+     if len(set(c["roles"])) != len(c["roles"]):
+diff --git a/src/hpc_forest/controller.py b/src/hpc_forest/controller.py
+index 596d9ec..7634adf 100644
+--- a/src/hpc_forest/controller.py
++++ b/src/hpc_forest/controller.py
+@@ -28,6 +28,7 @@ from .core import (
+ from .evaluator import Evaluator, target_identity
+ from .gitops import commit_candidate, git, initialize_source, make_worktree
+ from .knowledge import Knowledge
++from .observations import measured_observations
+ from .ollama_backend import OllamaBackend, resolve_model
+ from .registry import Registry
+ from .search import Search
+@@ -283,6 +284,10 @@ class Controller:
+         return {
+             "sources": annotations,
+             "interactions": feedback,
++            "automatic_observations": (
++                measured_observations(self.db, self.root, mission)
++                if self.config["method"] != "H-no-feedback" else {}
++            ),
+             "documents_as_data": Knowledge(self.db).query(f"{mission.role} locality SIMD OpenMP"),
+             "deadline": self.db.get("deadline"),
+             "protocol_id": self.db.get("protocol_id"),
+@@ -414,18 +419,23 @@ class Controller:
+                         fatal = None
+                         for (mission, _, slot), generated in zip(batch, generations, strict=True):
+                             settled = False
++                            bounded_generation_abort = False
+                             try:
+                                 if isinstance(generated, Exception):
+                                     raise InfrastructureError(str(generated)) from generated
+-                                self.db.settle_tokens(slot, generated.tokens)
++                                self.db.settle_tokens(slot, generated.tokens, upper_bound=generated.tokens_upper_bound)
+                                 settled = True
++                                bounded_generation_abort = generated.infrastructure_error and generated.tokens_upper_bound
+                                 self.db.event(
+                                     "generation_usage",
+                                     {"experiment_id": mission.id, **generated.usage},
+                                 )
+                                 self.search.update_mission(mission)
+                                 if generated.error:
+-                                    outcome = Outcome("generation_failed", reason=generated.error)
++                                    outcome = Outcome(
++                                        "infrastructure_error" if generated.infrastructure_error else "generation_failed",
++                                        reason=generated.error,
++                                    )
+                                 else:
+                                     outcome = self._evaluate_mission(mission, baseline)
+                                 if generated.tokens is None:
+@@ -446,7 +456,7 @@ class Controller:
+                                     )
+                                 outcome = Outcome("infrastructure_error", reason=str(exc))
+                             self.search.finish(mission, outcome)
+-                            if outcome.status == "infrastructure_error":
++                            if outcome.status == "infrastructure_error" and not bounded_generation_abort:
+                                 fatal = "infrastructure_error"
+                             print(f"{mission.role} {mission.id}: {outcome.status}", flush=True)
+                     cursor += 1
+diff --git a/src/hpc_forest/core.py b/src/hpc_forest/core.py
+index 5db33e7..0184acd 100644
+--- a/src/hpc_forest/core.py
++++ b/src/hpc_forest/core.py
+@@ -8,6 +8,7 @@ import os
+ import signal
+ import socket
+ import subprocess
++import threading
+ import time
+ from dataclasses import asdict, dataclass, field
+ from pathlib import Path
+@@ -101,7 +102,7 @@ class ProcessResult:
+     log: str
+ 
+ 
+-def _terminate_owned(process: subprocess.Popen) -> None:
++def _kill_owned(process: subprocess.Popen) -> None:
+     if process.poll() is not None:
+         return
+     # The still-running process belongs to this Popen handle, never a name match.
+@@ -120,6 +121,10 @@ def _terminate_owned(process: subprocess.Popen) -> None:
+             pass
+     if process.poll() is None:
+         process.kill()
++
++
++def _terminate_owned(process: subprocess.Popen) -> None:
++    _kill_owned(process)
+     process.communicate(timeout=5)
+ 
+ 
+@@ -135,7 +140,7 @@ def run_process(
+         raise BudgetExhausted("Wall-clock deadline reached")
+     log.parent.mkdir(parents=True, exist_ok=True)
+     started = time.perf_counter()
+-    timed_out = False
++    expired = threading.Event()
+     try:
+         with log.open("wb") as out:
+             process = subprocess.Popen(
+@@ -148,18 +153,33 @@ def run_process(
+                 start_new_session=os.name != "nt",
+                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+             )
++            def expire():
++                if process.poll() is None:
++                    expired.set()
++                    try:
++                        _kill_owned(process)
++                    except (OSError, subprocess.SubprocessError):
++                        if process.poll() is None:
++                            process.kill()
++
++            # POSIX communicate(timeout=...) polls waitpid with sleeps up to 50 ms
++            # when stdout/stderr are files. A watchdog enforces the same limit while
++            # the caller observes process completion through a blocking wait.
++            watchdog = threading.Timer(timeout, expire)
++            watchdog.daemon = True
++            watchdog.start()
+             try:
+-                process.communicate(None if stdin is None else stdin.encode(), timeout=timeout)
+-            except subprocess.TimeoutExpired:
+-                timed_out = True
+-                _terminate_owned(process)
++                process.communicate(None if stdin is None else stdin.encode())
+             except BaseException:
+                 _terminate_owned(process)
+                 raise
++            finally:
++                watchdog.cancel()
++                watchdog.join()
+     except OSError as exc:
+         raise InfrastructureError(f"Could not execute {argv[0]}: {exc}") from exc
+     result = ProcessResult(
+-        argv, process.returncode, time.perf_counter() - started, timed_out, str(log)
++        argv, process.returncode, time.perf_counter() - started, expired.is_set(), str(log)
+     )
+     atomic_json(log.with_suffix(log.suffix + ".json"), asdict(result))
+     return result
+diff --git a/src/hpc_forest/ollama_backend.py b/src/hpc_forest/ollama_backend.py
+index 4f78c7f..3636fc5 100644
+--- a/src/hpc_forest/ollama_backend.py
++++ b/src/hpc_forest/ollama_backend.py
+@@ -35,6 +35,10 @@ SOURCE_SCHEMA = {
+ }
+ 
+ 
++class RepetitionAborted(InfrastructureError):
++    """The pinned local engine aborted this one prediction for repeated tokens."""
++
++
+ def local_url(base_url: str) -> str:
+     value = urllib.parse.urlsplit(base_url)
+     if (
+@@ -71,6 +75,21 @@ def request_json(base_url: str, endpoint: str, payload: dict | None, timeout: fl
+         if not isinstance(data, dict) or data.get("error"):
+             raise InfrastructureError("Ollama returned an invalid/error response")
+         return data
++    except urllib.error.HTTPError as exc:
++        # A local server failure is not a bad candidate. Retain its bounded
++        # diagnostic, without replaying a generation whose usage is unknown.
++        try:
++            detail = exc.read(4096).decode("utf-8", errors="replace")
++        except OSError:
++            detail = "Response body unavailable"
++        try:
++            repetition = json.loads(detail).get("error") == "prediction aborted, token repeat limit reached"
++        except (ValueError, AttributeError):
++            repetition = False
++        error_type = RepetitionAborted if exc.code == 500 and endpoint == "/api/chat" and repetition else InfrastructureError
++        raise error_type(
++            f"Local Ollama HTTP {exc.code} at {endpoint}: {detail}"
++        ) from exc
+     except (OSError, ValueError, urllib.error.URLError) as exc:
+         raise InfrastructureError(f"Local Ollama request failed: {exc}") from exc
+ 
+@@ -185,13 +204,17 @@ class OllamaBackend:
+             "All valid sizes, seeds and repeated calls must remain correct. Do not specialize "
+             "to benchmark inputs. The controller alone evaluates correctness and speed. "
+             "Return COMPLETE contents of changed files, with their src/ paths, not patches. "
+-            "Propose one small change relevant to your role. Prefer changing src/params.h "
+-            "alone when the existing switches can express your idea. Preserve all other files. "
++            "Propose one candidate relevant to your role. Choose all program transformations "
++            "yourself. Honor the supplied target and compiler facts. Preserve other files. "
+             "The sources_kept field contains ONLY experiment IDs from integration_source_ids, "
+             "never file paths or documentation IDs. If integration_source_ids is empty, "
+             "sources_kept MUST be []. For integration retain only declared source ideas. "
+-            "JSON-decode file content exactly once: it must contain real source newlines "
+-            "and quotes, not double-escaped backslash sequences."
++            "The controller JSON-decodes file content exactly once, without repairing source. "
++            "Encode line breaks separating source lines as JSON newlines. Preserve backslashes "
++            "belonging to source-language string literals by escaping them at the JSON level. "
++            "Automatic observations include measured baseline/parent results and the original "
++            "measured outcome of duplicates. A duplicate has no new reward; its earlier compiler "
++            "or correctness diagnostic still describes that program."
+         )
+         schema = json.loads(json.dumps(SOURCE_SCHEMA))
+         kept_schema = schema["properties"]["sources_kept"]
+@@ -228,13 +251,27 @@ class OllamaBackend:
+                 "num_ctx": settings["context_tokens"],
+                 "num_predict": settings["max_output_tokens"],
+                 "num_thread": settings["num_threads"],
++                **{key: settings[key] for key in ["repeat_penalty", "repeat_last_n"] if key in settings},
+             },
+         }
+         logs = root / "logs" / mission.id
+         atomic_json(logs / "ollama-request.json", payload)
+         start = time.monotonic()
+         timeout = min(config["budget"]["generation_seconds"], context["deadline"] - time.time())
+-        response = request_json(settings["base_url"], "/api/chat", payload, timeout)
++        try:
++            response = request_json(settings["base_url"], "/api/chat", payload, timeout)
++        except RepetitionAborted as exc:
++            # Prompt evaluation is bounded by num_ctx and prediction by num_predict.
++            # Charge their sum; do not invent exact usage or replay the request.
++            ceiling = settings["context_tokens"] + settings["max_output_tokens"]
++            usage = {
++                "backend": "ollama", "llm_calls": 1, "model": settings["model"],
++                "model_digest": current["model_digest"], "server_version": current["server_version"],
++                "seconds": time.monotonic() - start, "token_accounting": "upper_bound",
++                "exact_tokens": None, "token_ceiling": ceiling, "done_reason": "repetition_abort",
++            }
++            atomic_json(logs / "ollama-error.json", {"error": str(exc), **usage})
++            return Generated(ceiling, usage, str(exc), infrastructure_error=True, tokens_upper_bound=True)
+         atomic_json(logs / "ollama-response.json", response)
+         keys = ["prompt_eval_count", "eval_count"]
+         known = all(type(response.get(k)) is int and response[k] >= 0 for k in keys)
+@@ -271,7 +308,7 @@ class OllamaBackend:
+             # Validate the entire response before applying any source edit.
+             for destination, content in edits:
+                 destination.parent.mkdir(parents=True, exist_ok=True)
+-                destination.write_text(content, encoding="utf-8")
++                destination.write_text(content, encoding="utf-8", newline="")
+             mission.hypothesis = data["hypothesis"][:3000]
+             mission.transformations = {
+                 "retained": data["transformations"],
+diff --git a/src/hpc_forest/registry.py b/src/hpc_forest/registry.py
+index a69b4a0..b49c25b 100644
+--- a/src/hpc_forest/registry.py
++++ b/src/hpc_forest/registry.py
+@@ -6,7 +6,7 @@ import time
+ import uuid
+ from pathlib import Path
+ 
+-from .core import BudgetExhausted, canonical
++from .core import BudgetExhausted, ForestError, canonical
+ 
+ SCHEMA = """
+ CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+@@ -104,12 +104,14 @@ class Registry:
+             )
+         return slot_id
+ 
+-    def settle_tokens(self, slot_id: str, used: int | None) -> None:
++    def settle_tokens(self, slot_id: str, used: int | None, *, upper_bound: bool = False) -> None:
++        if upper_bound and (type(used) is not int or used < 0):
++            raise ForestError("A bounded token charge requires a nonnegative integer ceiling")
+         with self.connection:
+             self.connection.execute(
+                 "UPDATE slots SET tokens_used=coalesce(?,tokens_reserved),tokens_reserved=0,"
+                 "usage_known=? WHERE id=?",
+-                (used, int(used is not None), slot_id),
++                (used, 2 if upper_bound else int(used is not None), slot_id),
+             )
+ 
+     def evaluations(self, phase: str = "search", epoch: int | None = None) -> list[dict]:
+@@ -160,5 +162,7 @@ class Registry:
+         return self.one(
+             "SELECT count(*) AS slots,coalesce(sum(tokens_used),0) AS tokens_used,"
+             "coalesce(sum(tokens_reserved),0) AS tokens_reserved,"
+-            "coalesce(sum(1-usage_known),0) AS unknown_usage_calls FROM slots"
++            "coalesce(sum(CASE WHEN usage_known=0 THEN 1 ELSE 0 END),0) AS unknown_usage_calls,"
++            "coalesce(sum(CASE WHEN usage_known=2 THEN 1 ELSE 0 END),0) AS bounded_usage_calls,"
++            "coalesce(sum(CASE WHEN usage_known=1 THEN tokens_used ELSE 0 END),0) AS exact_tokens_used FROM slots"
+         )
+diff --git a/tests/test_controls.py b/tests/test_controls.py
+index 2957a74..11f74ec 100644
+--- a/tests/test_controls.py
++++ b/tests/test_controls.py
+@@ -51,6 +51,25 @@ def test_tokens_reserve_globally_and_unknown_is_not_zero(db):
+     assert db.costs()["unknown_usage_calls"] == 1
+ 
+ 
++def test_token_ceiling_is_charged_and_distinguished_from_exact_or_unbounded_usage(db):
++    config=db.get("config")
++    config["budget"]["tokens"]=100
++    db.set("config",config)
++    bounded=db.reserve("search","A",80)
++    db.settle_tokens(bounded,80,upper_bound=True)
++    exact=db.reserve("search","B",10)
++    db.settle_tokens(exact,7)
++    unknown=db.reserve("search","C",5)
++    db.settle_tokens(unknown,None)
++    costs=db.costs()
++    assert costs["tokens_used"]==92 and costs["exact_tokens_used"]==7
++    assert costs["bounded_usage_calls"]==1 and costs["unknown_usage_calls"]==1
++    with pytest.raises(BudgetExhausted):
++        db.reserve("search","D",9)
++    with pytest.raises(ForestError,match="ceiling"):
++        db.settle_tokens(bounded,None,upper_bound=True)
++
++
+ def test_target_lock_excludes_another_evaluator(tmp_path):
+     path = tmp_path / "target.lock"
+     with FileLock(path), pytest.raises(InfrastructureError, match="locked"), FileLock(path):
+@@ -72,6 +91,20 @@ def test_timeout_is_a_real_process_timeout(tmp_path):
+     assert json.loads((tmp_path / "timeout.log.json").read_text())["timed_out"]
+ 
+ 
++def test_process_wait_drains_large_stdin_and_stdout_without_timing_poll(tmp_path):
++    payload = "payload" * 100000
++    result = run_process([sys.executable,"-c","import sys; sys.stdout.write(sys.stdin.read())"],
++        tmp_path,tmp_path/"roundtrip.log",10,stdin=payload)
++    assert result.returncode == 0 and not result.timed_out
++    assert (tmp_path/"roundtrip.log").read_text() == payload
++
++
++def test_watchdog_also_stops_a_process_that_never_reads_stdin(tmp_path):
++    result = run_process([sys.executable,"-c","import time; time.sleep(10)"],
++        tmp_path,tmp_path/"blocked-stdin.log",0.2,stdin="x"*1000000)
++    assert result.timed_out and result.returncode != 0 and result.seconds < 4
++
++
+ def test_protected_checker_hash_changes_are_detected(tmp_path):
+     file = tmp_path / "oracle.py"
+     file.write_text("original", encoding="utf-8")
+@@ -125,3 +158,11 @@ def test_invalid_controller_limits_rejected(config, key, value):
+     config["budget"][key] = value
+     with pytest.raises(ForestError):
+         validate(config)
++
++
++@pytest.mark.parametrize("key,value",[("repeat_penalty",0),("repeat_penalty",float("nan")),("repeat_last_n",-2),("repeat_last_n",1.5)])
++def test_invalid_inference_repetition_controls_rejected(config,key,value):
++    config["backend"]="ollama"
++    config["ollama"][key]=value
++    with pytest.raises(ForestError):
++        validate(config)
+diff --git a/tests/test_ollama.py b/tests/test_ollama.py
+index 6db53b5..87c2fa0 100644
+--- a/tests/test_ollama.py
++++ b/tests/test_ollama.py
+@@ -7,7 +7,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ import pytest
+ 
+ from hpc_forest.core import CandidateRejected, InfrastructureError, Mission
+-from hpc_forest.ollama_backend import OllamaBackend, local_url, resolve_model, validate_files
++from hpc_forest.ollama_backend import (
++    OllamaBackend,
++    local_url,
++    request_json,
++    resolve_model,
++    validate_files,
++)
+ 
+ 
+ @pytest.fixture
+@@ -33,6 +39,7 @@ def server():
+             },
+         },
+         "requests": [],
++        "http_status": 200,
+     }
+ 
+     class Handler(BaseHTTPRequestHandler):
+@@ -58,7 +65,7 @@ def server():
+ 
+         def send(self, value):
+             data = json.dumps(value).encode()
+-            self.send_response(200)
++            self.send_response(state.get("chat_http_status",state["http_status"]) if self.command=="POST" else state["http_status"])
+             self.send_header("Content-Type", "application/json")
+             self.send_header("Content-Length", str(len(data)))
+             self.end_headers()
+@@ -104,6 +111,68 @@ def test_real_http_adapter_pins_digest_records_usage_and_applies_source(tmp_path
+     assert (tmp_path / "logs" / "trial" / "ollama-response.json").is_file()
+ 
+ 
++def test_http_failure_preserves_server_diagnostic_and_does_not_replay(server):
++    server["http_status"] = 500
++    server["response"] = {"error": "inference runner rejected response"}
++    with pytest.raises(InfrastructureError, match="HTTP 500 at /api/chat.*runner rejected"):
++        request_json(server["url"], "/api/chat", {"model": "test"}, 3)
++    assert len(server["requests"]) == 1
++
++
++def test_http_failure_diagnostic_is_bounded(server):
++    server["http_status"] = 500
++    server["response"] = {"error": "x" * 10000}
++    with pytest.raises(InfrastructureError) as caught:
++        request_json(server["url"], "/api/chat", {"model": "test"}, 3)
++    assert "HTTP 500" in str(caught.value) and len(str(caught.value)) < 4200
++
++
++def test_repetition_abort_is_bounded_without_applying_source_or_replaying(tmp_path,config,server):
++    mission,config=mission_and_config(tmp_path,config,server)
++    server["chat_http_status"]=500
++    server["response"]={"error":"prediction aborted, token repeat limit reached"}
++    result=OllamaBackend().generate(mission,{"deadline":time.time()+20},config,tmp_path)
++    assert result.infrastructure_error and result.tokens_upper_bound
++    assert result.tokens==8192+4096
++    assert result.usage["exact_tokens"] is None and result.usage["token_accounting"]=="upper_bound"
++    assert len(server["requests"])==1
++    assert (tmp_path/"src/params.h").read_text()=="original"
++    assert not (tmp_path/"logs/trial/agent-result.json").exists()
++    assert json.loads((tmp_path/"logs/trial/ollama-error.json").read_text())["token_ceiling"]==result.tokens
++
++
++def test_other_engine_failures_still_abort_without_claiming_a_bound(tmp_path,config,server):
++    mission,config=mission_and_config(tmp_path,config,server)
++    server["chat_http_status"]=500
++    server["response"]={"error":"unexpected GPU runner failure"}
++    with pytest.raises(InfrastructureError,match="GPU runner failure"):
++        OllamaBackend().generate(mission,{"deadline":time.time()+20},config,tmp_path)
++    assert len(server["requests"])==1 and (tmp_path/"src/params.h").read_text()=="original"
++
++
++def test_source_string_escapes_survive_one_json_decode(tmp_path, config, server):
++    mission, config = mission_and_config(tmp_path, config, server)
++    source = '#include <stdio.h>\nvoid output(void) { puts("line\\nquoted \\\"text\\\""); }\n'
++    data = json.loads(server["response"]["message"]["content"])
++    data["files"] = [{"path": "src/output.c", "content": source}]
++    server["response"]["message"]["content"] = json.dumps(data)
++    result = OllamaBackend().generate(mission, {"deadline": time.time()+20}, config, tmp_path)
++    assert result.error is None
++    assert (tmp_path/"src/output.c").read_bytes() == source.encode("utf-8")
++    system = server["requests"][0]["messages"][0]["content"]
++    assert "src/params.h" not in system
++    assert "Preserve backslashes" in system
++
++
++def test_configured_repetition_controls_reach_the_local_server(tmp_path, config, server):
++    config["ollama"].update(repeat_penalty=1.1, repeat_last_n=64)
++    mission, config = mission_and_config(tmp_path, config, server)
++    result = OllamaBackend().generate(mission, {"deadline": time.time()+20}, config, tmp_path)
++    assert result.error is None
++    assert server["requests"][0]["options"]["repeat_penalty"] == 1.1
++    assert server["requests"][0]["options"]["repeat_last_n"] == 64
++
++
+ @pytest.mark.parametrize(
+     "path",
+     [
+diff --git a/tests/test_retries.py b/tests/test_retries.py
+index 5a76eb9..ecf6384 100644
+--- a/tests/test_retries.py
++++ b/tests/test_retries.py
+@@ -1,6 +1,7 @@
+ import json
+ from pathlib import Path
+ 
++from hpc_forest.backends import Generated
+ from hpc_forest.controller import Controller, create_workspace
+ from hpc_forest.core import ProcessResult
+ from hpc_forest.evaluator import Evaluator
+@@ -36,3 +37,31 @@ def test_transient_infrastructure_retry_preserves_both_logs_and_one_observation(
+         assert len(list(history.glob("attempt-*"))) == 2
+         assert "temporary" in (history / "attempt-001" / "build.log").read_text()
+         assert Path(outcome["logs"][0]).parent.name == "attempt-002"
++
++
++def test_bounded_generation_abort_preserves_no_reward_and_allows_later_mission(tmp_path,config,need_compiler):
++    config["roles"]=["A"]
++    config["schedule"].update(trials_per_role_per_cycle=2,integrations_per_cycle=1)
++    config["budget"].update(search_slots=4,tokens=100)
++    root=create_workspace(tmp_path/"bounded-abort",config)
++    calls=[]
++
++    class Backend:
++        def generate(self,mission,context,settings,folder):
++            if mission.role=="G":
++                return Generated(error="No admissible integration sources")
++            calls.append(mission.id)
++            if len(calls)==1:
++                return Generated(80,{"llm_calls":1,"token_accounting":"upper_bound"},"prediction aborted",True,True)
++            return Generated(15,{"llm_calls":1},"proposal rejected by result contract")
++
++    with Controller(root) as controller:
++        controller.backend=Backend()
++        state=controller.run()
++        assert state["status"]=="search_complete" and len(calls)==2
++        assert state["costs"]["tokens_used"]==95
++        assert state["costs"]["bounded_usage_calls"]==1 and state["costs"]["unknown_usage_calls"]==0
++        row=controller.db.one("SELECT result FROM trials WHERE id=?",(calls[0],))
++        outcome=json.loads(row["result"])
++        assert outcome["status"]=="infrastructure_error" and outcome["score"] is None
++        assert not controller.db.archive(1,"A")

@@ -1,0 +1,159 @@
+"""Prepared neutral checks. Not executed by their author.
+
+The positive is explicitly historical, using the actual frozen R7 receipts.
+Malformed variants exist only in memory. No new job/UUID, clock or live routes.
+"""
+import copy
+import importlib.util
+import json
+from pathlib import Path
+import socket
+import subprocess
+import time
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("pending_routes_R7_prepared", HERE / "preparer-routes-pending-inertes.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+def forbidden(*_args, **_kwargs):
+    raise AssertionError("network/process forbidden in neutral metadata check")
+
+
+@pytest.fixture(autouse=True)
+def effects_forbidden(monkeypatch):
+    class ForbiddenSocket(socket.socket):
+        def __new__(cls, *_args, **_kwargs):
+            return forbidden()
+    class ForbiddenPopen(subprocess.Popen):
+        def __new__(cls, *_args, **_kwargs):
+            return forbidden()
+    monkeypatch.setattr(socket, "socket", ForbiddenSocket)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", ForbiddenPopen)
+    for name in ("run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(subprocess, name, forbidden)
+    monkeypatch.setattr(m.os, "system", forbidden)
+
+
+@pytest.fixture
+def actual_index():
+    return json.loads((HERE / "INDEX-FROID-REEL-R7-NON-ADMIS.json").read_text(encoding="utf8"))
+
+
+def historical_time(index, store):
+    return store.reference(index["full_cim"])["observed_at"]
+
+
+class OverlayStore:
+    """Only malformed fixture variants; never used by the CLI's ColdStore."""
+    def __init__(self):
+        self.base = m.ColdStore()
+        self.values = {}
+
+    def add(self, label, value):
+        path = str(HERE / ("INERT-IN-MEMORY-" + label + ".json"))
+        data = json.dumps(value, ensure_ascii=False).encode()
+        self.values[path] = data
+        return {"path": path, "sha256": m.sha(data)}
+
+    def raw(self, path):
+        return self.values[str(path)] if str(path) in self.values else self.base.raw(path)
+
+    def reference(self, reference):
+        if reference["path"] not in self.values:
+            return self.base.reference(reference)
+        data = self.raw(reference["path"])
+        m.need(m.sha(data) == reference["sha256"], "fixture reference SHA differs")
+        return m.strict_json(data)
+
+    def unchanged(self):
+        self.base.unchanged()
+
+
+def test_actual_historical_complete_routes_call_real_verifier(actual_index):
+    store = m.ColdStore()
+    original_clock = time.time
+    candidate = m.construct(actual_index, store, historical_at=historical_time(actual_index, store))
+    assert time.time is original_clock
+    assert candidate["actual_verify_routes_function_called"] is True
+    assert candidate["native_generation_admitted"] is False
+    assert candidate["whole_parent_orchestrator_validated"] is False
+    assert candidate["schema"] != candidate["routes_bundle"]["schema"]
+    assert candidate["route_counts"] == {"allocated_pending": 3, "absent": 6}
+    pending = [row for row in candidate["routes_bundle"]["routes"] if row["stage"] == "allocated_pending"]
+    assert all(set(row) == {"model", "phase", "effort", "session_id", "stage", "job_id", "submission_observed", "allocation_marker"} for row in pending)
+
+
+@pytest.mark.parametrize("missing", ["submission_observed", "allocation_marker"])
+def test_actual_observer_reproduces_each_original_route_omission(actual_index, missing):
+    store = m.ColdStore()
+    candidate = m.construct(actual_index, store, historical_at=historical_time(actual_index, store))
+    broken = copy.deepcopy(candidate["routes_bundle"])
+    del broken["routes"][0][missing]
+    obs = m.frozen_observer(store)
+    with pytest.raises(KeyError, match=missing):
+        obs["verify_routes"](broken, store.reference(actual_index["policy"]),
+                             store.reference(actual_index["full_cim"])["rows"],
+                             store.reference(actual_index["history_state"])["routes_history"])
+
+
+@pytest.mark.parametrize("missing", ["submission_observed", "allocation_marker"])
+def test_producer_refuses_missing_index_ref_before_candidate(actual_index, missing):
+    broken = copy.deepcopy(actual_index)
+    del broken["cells"][0][missing]
+    store = m.ColdStore()
+    with pytest.raises(ValueError, match="all raw submission/marker/request/review refs required"):
+        m.construct(broken, store, historical_at=historical_time(actual_index, store))
+
+
+def test_root_tracking_wrapper_is_not_actual_mcp_raw(actual_index):
+    store = OverlayStore()
+    broken = copy.deepcopy(actual_index)
+    raw = store.reference(broken["cells"][0]["submission_observed"])
+    broken["cells"][0]["submission_observed"] = store.add("tracking-wrapper", {"observedAt": "2026-10-18T20:07:27Z", "result": raw})
+    with pytest.raises(ValueError, match="actual MCP RAW required"):
+        m.construct(broken, store, historical_at=historical_time(actual_index, store))
+
+
+def test_submission_wrong_existing_job_refused(actual_index):
+    store = OverlayStore()
+    broken = copy.deepcopy(actual_index)
+    raw = copy.deepcopy(store.reference(broken["cells"][0]["submission_observed"]))
+    raw["structuredContent"]["job_id"] = "754550"
+    raw["content"] = [{"type": "text", "text": json.dumps(raw["structuredContent"])}]
+    broken["cells"][0]["submission_observed"] = store.add("wrong-existing-job", raw)
+    with pytest.raises(ValueError, match="wrong scope/source/plan/model/MAX/session/job marker"):
+        m.construct(broken, store, historical_at=historical_time(actual_index, store))
+
+
+def test_wrong_existing_phase_session_refused(actual_index):
+    store = OverlayStore()
+    broken = copy.deepcopy(actual_index)
+    marker = copy.deepcopy(store.reference(broken["cells"][0]["allocation_marker"]))
+    marker["session_id"] = "b86d18fcf35d4031aa2ef0da49397c4e"
+    broken["cells"][0]["allocation_marker"] = store.add("wrong-existing-session", marker)
+    with pytest.raises(ValueError, match="wrong scope/source/plan/model/MAX/session/job marker"):
+        m.construct(broken, store, historical_at=historical_time(actual_index, store))
+
+
+def test_actual_expiration_boundary_refuses_without_clock_change(actual_index):
+    store = m.ColdStore()
+    expires = max(store.reference(row["request_prepared"])["expires_at"] for row in actual_index["cells"])
+    original_clock = time.time
+    with pytest.raises(ValueError, match="request expired"):
+        m.construct(actual_index, store, historical_at=expires + 1)
+    assert time.time is original_clock
+
+
+def test_current_time_cannot_promote_expired_actual_requests(actual_index):
+    with pytest.raises(ValueError, match="request expired"):
+        m.construct(actual_index, m.ColdStore())
+
+
+def test_live_or_escaped_output_is_refused_without_mkdir():
+    with pytest.raises(ValueError, match="new direct INERT output directory"):
+        m.write_inert_proposal({"fixture_only": True, "native_generation_admitted": False}, HERE / ".." / "ROUTES-OBS4.json")

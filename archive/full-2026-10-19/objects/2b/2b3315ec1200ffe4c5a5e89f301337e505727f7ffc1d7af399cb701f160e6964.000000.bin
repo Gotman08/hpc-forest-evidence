@@ -1,0 +1,272 @@
+"""Version the scientific article and consolidate received evidence, never prompts."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import html
+import json
+import re
+import shutil
+from datetime import UTC, datetime
+from pathlib import Path
+
+import markdown
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parent / "HPC-Forest-Etude-2020-2024-r1"
+BATCH = HERE / "serie-01"
+
+
+def read(path): return json.loads(Path(path).read_text(encoding="utf8"))
+def sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def table(headers, rows):
+    return "\n".join(["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers),
+        *["| " + " | ".join(str(v).replace("|", "/") for v in r) + " |" for r in rows]])
+
+
+def main():
+    audited = read(BATCH / "audit.json")
+    extra_roots = sorted({p.parent for folder in [HERE, HERE.parent / "HPC-Forest-Conformite-Coeurs-r3"]
+                          for p in folder.glob("serie-*/audit.json") if p.parent != BATCH}, key=lambda p: p.name)
+    extras = [read(p/"audit.json") for p in extra_roots]
+    if any(not a["evidence_integrity_verified"] for a in extras): raise RuntimeError("Unverified additional batch")
+    if not audited["evidence_integrity_verified"]: raise RuntimeError("Unverified batch")
+    batch_roots = [BATCH, *extra_roots]
+    audits = [audited, *extras]
+    plans = [read(p / "payload/plan.json") for p in batch_roots]
+    all_campaigns = [c for plan in plans for c in plan["campaigns"]]
+    campaign_roots = [c["campaign_root"] for c in all_campaigns]
+    if len(set(campaign_roots)) != len(campaign_roots):
+        raise RuntimeError("A campaign root was replayed across batches")
+    distinct, inputs = set(), set()
+    for plan in plans:
+        for case in plan["cases"]:
+            inputs.add((case["subject"], case["input_sha256"]))
+            for binary in plan["binaries"]:
+                if binary["subject"] == case["subject"]:
+                    for cores in plan["cores"]:
+                        distinct.add((case["subject"], case["input_sha256"], binary["sha256"], cores))
+    total_points = sum(a["configuration_count"] for a in audits)
+    total_samples = sum(a["raw_sample_count"] for a in audits)
+    total_campaigns = len(all_campaigns)
+    model_count = len({c["model"] for c in all_campaigns})
+    summary = {"observed_utc": datetime.now(UTC).isoformat(), "jobs": [a["job_id"] for a in audits],
+        "campaigns": total_campaigns, "models": model_count,
+        "subjects": sorted({c["subject"] for c in all_campaigns}), "distinct_inputs": len(inputs),
+        "measured_configuration_points_across_allocations": total_points,
+        "distinct_binary_input_core_combinations": len(distinct),
+        "repeated_control_configurations": total_points-len(distinct), "timed_runs": total_samples,
+        "incorrect_or_incomplete_points": sum(a["failed_or_incomplete_configurations"] for a in audits),
+        "model_calls": 0, "source_edits": 0, "compilations": 0,
+        "official_contest_compliance_certified": False, "audits": audits}
+    (HERE / "BILAN-CUMULE.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2)+"\n", encoding="utf8")
+    version = STUDY / "versions/20261016-avant-coeurs-r2"
+    if not version.exists():
+        version.mkdir()
+        for name in ["ARTICLE.md", "ARTICLE.html", "ARTICLE.pdf", "article-source.md", "donnees-consolidees.json", "rapport-manifest.json", "controle-pdf.json", "construire-article.py", "construire-pdf.py"]:
+            if (STUDY/name).exists(): shutil.copyfile(STUDY/name, version/name)
+    legacy = (version / "ARTICLE.md").read_text(encoding="utf8")
+    legacy = legacy[legacy.index("## ⚙️ Méthodes"):]
+    now = datetime.now(UTC).isoformat()
+    tokens = read(HERE.parent / "HPC-Forest-Mere-Dynamique-r3/tokens-par-modele.json")
+    aggregates = read(HERE.parent / "HPC-Forest-Mere-Dynamique-r3/tokens-agreges.json")
+    deepseek_complete_path = HERE.parent / "Marathon22-DeepSeek-v11/resultats-verifies-complets.json"
+    deepseek_complete = read(deepseek_complete_path) if deepseek_complete_path.exists() else None
+    if deepseek_complete:
+        if not deepseek_complete["all_deepseek_received_and_audited"]:
+            raise RuntimeError("Incomplete DeepSeek reception")
+        deepseek_accounting_note = f"Les deux campagnes DeepSeek locales reçues et auditées totalisent {deepseek_complete['exact_total_tokens']} jetons exacts. Leur inventaire est distinct des compteurs natifs GPT ; leurs tokenizers et protocoles ne forment pas une unité scientifique universelle de travail."
+    else:
+        deepseek_accounting_note = "Les 5057148 jetons exacts de DeepSeek V4-Flash reçu sont un inventaire local distinct des compteurs natifs GPT ; leurs tokenizers et protocoles ne forment pas une unité scientifique universelle de travail."
+    token_table = table(["Modèle / effort", "Entrée connue", "Sortie connue", "Total connu", "Dont mère", "Appels non mesurés / en cours"],
+        [[r["model"]+" / "+r["effort"],r["input_tokens"],r["output_tokens"],r["exact_total"],r["mother_tokens"],
+          str(r["unmetered_calls"])+" / "+str(r["pending_calls"])] for r in aggregates["models"]])
+    state = read(STUDY / "coordinator-state.json")
+    incident_root = HERE.parent / "Marathon22-GPT61Sol-MAX/harnais-r2/incidents"
+    incidents = []
+    for path in sorted(incident_root.glob("*/incident-verifie.json")):
+        data = read(path)
+        report_path = path.parent / data["report"]
+        if sha(report_path) != data["report_sha256"]:
+            raise RuntimeError("Incident report differs from its receipt")
+        incidents.append((path, data, report_path))
+    verified = []
+    for row in state["queue"]:
+        if row["state"] == "received_and_audited":
+            d = read(row["audit_path"])
+            if d["coverage_and_final_confirmations_verified"]:
+                for p in d["subjects"]:
+                    verified.append({"job_id": row["job_id"], "model":row["model"], "effort":row["effort"], "result":p,
+                                     "audit_sha256":sha(Path(row["audit_path"]))})
+    counts = [(r["model"]+" / "+r["effort"], r["job_id"], r["result"]["subject"],
+        f"{r['result']['best_confirmed']['reference_seconds']:.9f}", f"{r['result']['best_confirmed']['mean_seconds']:.9f}",
+        f"{100*r['result']['confirmed_gain_fraction']:.4f} %", r["result"]["topology"]["scored_nodes"],
+        str(r["result"]["topology"]["max_depth"])+" / "+str(r["result"]["topology"]["max_children"])) for r in verified]
+    text = f'''# Optimisation autonome de programmes HPC par forêt AB-MCTS : preuves, montée en cœurs et orientation par modèle mère
+
+*Article de recherche expérimental local — consolidation du {now}. Version de travail, sans soumission à une revue ou au concours. Les chiffres proviennent des preuves reçues et des comptes explicitement datés.*
+
+## Résumé
+
+Nous étudions la production autonome d’optimisations par des modèles de langage pilotés par une forêt AB-MCTS et un évaluateur indépendant. La distinction entre validité observable, gain algorithmique et exploitation de plusieurs cœurs est centrale. Les {len(audits)} séries post-hoc reçues ont réexécuté, sans édition, compilation ou génération, les artefacts retenus de {total_campaigns} campagnes auditées, issus de {model_count} identités de modèle et de {len(summary['subjects'])} problèmes. Elles comprennent {total_points} points mesurés et {total_samples} durées sur {len(inputs)} entrées et 1, 2, 4, 8 ou 16 cœurs physiques accessibles : {len(distinct)} combinaisons distinctes et {total_points-len(distinct)} contrôles répétés entre allocations. Les séries ne sont pas fusionnées en une moyenne commune. Les points incorrects ou incomplets sont au nombre de {summary['incorrect_or_incomplete_points']} sur ces jeux finis. Cela ne démontre pas une correction universelle ou un rang officiel.
+
+Sur 4096 particules, le programme N-body de DeepSeek V4-Flash passe de 0,615657539 s à un cœur à 0,041389958 s à seize cœurs, soit une montée en cœurs de 14,875. Le programme bucket sort retenu par Qwen 14B passe de 0,415144011 s à 0,049166357 s sur 65536 éléments, facteur 8,444. À l’inverse, le k-NN de DeepSeek reste proche de 0,0215 s malgré son avantage sur une référence proche de 2,05 s. Le gagnant count d’Astra MAX présente un facteur 5,582 sur la plus grande grille ; les courbes des autres programmes sont détaillées ci-dessous. Ces valeurs décrivent des programmes et entrées donnés, pas une hiérarchie générale des modèles.
+
+Une variante dynamique distincte confie à une mère le choix des racines et l’orientation locale des branches, avec récolte globale séparée. Son prévol mécanique ARM64 est validé, mais ses appels natifs et son efficacité de conseil restent à tester. Nous séparons cette architecture du protocole A/B/C/G des résultats reçus. Les consommations exactes, inconnues et en cours, les exclusions de préparation et les limites de conformité aux énoncés sont conservées dans des annexes recalculables.
+
+## État de la preuve et historique éditorial
+
+La partie I décrit les nouvelles mesures reçues et leurs limites, avec les douze rubriques exigées par ID-040. La partie II conserve les méthodes et observations de l’instantané précédent comme archive scientifique datée ; ses mentions « en cours » ne décrivent pas nécessairement l’état présent. Les anciennes versions PDF/HTML/Markdown et leur manifeste restent sous `versions/20261016-avant-coeurs-r2/`. Les courbes de ce complément ne remplacent pas les confirmations finales des recherches d’origine.
+
+Le PDF et le HTML présents sont régénérés à partir de ce Markdown consolidé. Les annexes CSV/JSON complètes se trouvent dans [la série de mesures reçue](../HPC-Forest-Conformite-Coeurs-r2/serie-01/RAPPORT-DETAILLE.md). Les figures montrent des temps enregistrés ; tout schéma de la mère reste conceptuel tant qu’un pilote n’en produit pas les liens réels. Aucun rapport de l’opérateur n’est réinjecté dans une recherche.
+
+## Cellules de recherche R1 reçues au moment de cette consolidation
+
+Ces nombres portent sur les confirmations d’origine à quatre cœurs et leur benchmark, et non sur les grandes entrées de la série post-hoc. La colonne « profondeur / fils » décrit l’arbre archivé, pas les tentatives internes du harnais. Les appels tardifs du worker sont des preuves locales supplémentaires : ils ne doivent pas être perdus par une lecture des seules invocations archivées.
+
+{table(["Modèle / effort", "Job", "Sujet", "Référence (s)", "Retenu (s)", "Réduction", "Sommets", "Profondeur / fils"], counts)}
+
+## Comptabilité courante, séparée des temps d’exécution
+
+L’inventaire natif arrêté à **{tokens['observed_utc']}** contient {tokens['native_unique_calls']} requêtes uniques, **{tokens['native_exact_total']} jetons exacts connus**, {tokens['native_unmetered_calls']} appels non mesurés et {tokens['native_pending_calls']} en cours. Le total connu est un minimum lorsque ces derniers manquent. Il couvre plusieurs campagnes, budgets et sondes, pas seulement la nouvelle série de cœurs. Celle-ci a consommé zéro nouveau jeton de modèle.
+
+{token_table}
+
+Les jetons de cache sont inclus dans l’entrée, ceux de raisonnement dans la sortie ; ils ne sont pas ajoutés une seconde fois. {deepseek_accounting_note} Les autres coûts Ollama et toutes les provenances restent dans [la comptabilité détaillée](../HPC-Forest-Mere-Dynamique-r3/COMPTABILITE-TOKENS.md) et ses CSV. Une réservation budgétaire n’est pas une consommation exacte, et aucun prix API fictif n’est imputé à la connexion ChatGPT.
+
+## Partie I — extension reçue : conformité et montée en cœurs
+
+'''
+    text += "Annexes directement recalculables : [3625 mesures brutes](../HPC-Forest-Conformite-Coeurs-r2/serie-01/mesures-brutes.csv), [840 comparaisons avec provenance](../HPC-Forest-Conformite-Coeurs-r2/serie-01/comparaisons-par-campagne.csv), [conformité par campagne](../HPC-Forest-Conformite-Coeurs-r2/serie-01/conformite-par-campagne.json), [résultats vérifiés](../HPC-Forest-Conformite-Coeurs-r2/serie-01/resultats-verifies.json).\n\n"
+    report = (BATCH / "RAPPORT-DETAILLE.md").read_text(encoding="utf8")
+    report = report[report.index("Version reçue"):]
+    report = re.sub(r"(?m)^(#{2,3}) ", lambda m: "#"+m[0], report)
+    report = re.sub(r"\]\((courbes-[^)]+)\)", r"](../HPC-Forest-Conformite-Coeurs-r2/serie-01/\1)", report)
+    text += report
+    if extras:
+        total_points = audited["configuration_count"]+sum(a["configuration_count"] for a in extras)
+        total_samples = audited["raw_sample_count"]+sum(a["raw_sample_count"] for a in extras)
+        total_campaigns = audited["campaign_count"]+sum(a["campaign_count"] for a in extras)
+        distinct = set()
+        inputs = set()
+        for batch in [BATCH,*extra_roots]:
+            p=read(batch/"payload/plan.json")
+            for case in p["cases"]:
+                inputs.add((case["subject"],case["input_sha256"]))
+                for binary in p["binaries"]:
+                    if binary["subject"]==case["subject"]:
+                        for cores in p["cores"]: distinct.add((case["subject"],case["input_sha256"],binary["sha256"],cores))
+        text += f"\n\n## Compléments reçus après la première série\n\nLa couverture cumulée atteint **{total_campaigns} campagnes, {total_points} points de configuration mesurés et {total_samples} temps**, sur {len(inputs)} entrées distinctes. Il y a {len(distinct)} combinaisons distinctes binaire/entrée/cœurs ; les {total_points-len(distinct)} autres points sont des contrôles répétés dans une autre allocation. Les allocations sont distinctes : leurs durées ne sont pas fusionnées pour fabriquer une moyenne commune. Chaque complément garde sa référence, son ordre de mesure et son hôte ; les comparaisons entre séries portent cette réserve. Les résultats de recherche d’origine ne sont pas rejoués.\n\n"
+        for path, a in zip(extra_roots,extras):
+            batch_summary=read(path/"synthese-plus-grandes-entrees.json")
+            values=[]
+            for r in batch_summary:
+                values.append([r["subject"],r["model"]+" / "+r["effort"]+(" / "+r["arm"] if r.get("arm") else ""),r["job_id"],f"{r['time_1']:.9f}",f"{r['time_16']:.9f}",f"{r['reference_16']:.9f}",f"{r['own_speedup_16']:.3f}"])
+            relative_batch = path.relative_to(HERE.parent).as_posix()
+            text += f"### {path.name} — job {a['job_id']} reçu et audité\n\nArchive SHA-256 `{a['archive_sha256']}` ; {a['configuration_count']} configurations, {a['raw_sample_count']} mesures, {a['failed_or_incomplete_configurations']} points incorrects ou incomplets. Zéro modèle, édition ou compilation. [Rapport et annexes du lot](../{relative_batch}/RAPPORT-DETAILLE.md).\n\n"
+            text += table(["Sujet","Modèle / effort","Recherche d’origine","1 cœur (s)","16 cœurs (s)","Référence à 16 (s)","S(16)"],values)+"\n\n"
+            if path.parent.name == "HPC-Forest-Conformite-Coeurs-r3":
+                if not a.get("allocated_arm64_preflight_verified"):
+                    raise RuntimeError("The new domain extension lacks its allocated ARM64 gate")
+                text += "#### Extension de domaine contrôlée indépendamment\n\nLe chemin tropical et les permutations 2020 sont admis ici sur leurs seules entrées reçues. Deux vrais contrats, quatorze entrées et dix-huit sorties archivées de référence ou de gagnant ont été contrôlés en lecture seule avant soumission. Le vérificateur de chemin contrôle la légalité et l'optimum par exploration exhaustive bornée ; celui des permutations contrôle multiplicités, nombre mathématique, ordre et octets. Les 41 tests locaux puis 41 tests ARM64 alloués passent, ainsi que les quatorze cas du payload transporté avant les mesures. Le lecteur de lignes de préparation a été resserré pour rejeter aussi CRLF ; son ancienne version est préservée, les sorties réelles restent inchangées et l'oracle exact n'est pas assoupli.\n\nLe tropical conserve la référence : ses deux rôles sont une même courbe. Les permutations ont deux exécutables distincts. Les 105 points et 525 temps sont corrects sur les cas finis ; les quatorze sorties d'oracle sont aussi revérifiées sémantiquement à réception. Le plus grand benchmark tropical possède six sommets et neuf arêtes ; l'autre graphe de six sommets n'est pas fusionné avec lui. Le benchmark de permutations possède huit symboles distincts et 40320 lignes, soit 806400 octets. Les multiensembles répétés ne sont pas exercés par les programmes reçus.\n\nLes panneaux A montrent les cinq passages, leur moyenne et leur écart-type ; les panneaux B sont des rapports de moyennes sans test de significativité. Les occupations CPU moyennes des programmes retenus restent sous un CPU pour ces benchmarks. Une variation du temps de lancement ou d'entrées/sorties ne prouve pas une parallélisation : à un cœur, le pilote qui collecte stdout partage aussi l'affinité du sous-processus. Le plafond d'une heure, le prévol et les 14 exécutions d'oracle ne deviennent pas 525 observations supplémentaires. Les huit plans antérieurs et leurs 52 racines complètes sont exclus. Quicksort et les exclusions historiques demeurent hors admission. Le rapport lié applique les douze rubriques ID-040 et conserve les compilateurs d'origine, les contrôles négatifs, le matériel demandé/alloué/utilisé et les empreintes.\n\n"
+            for subject in a["subjects"]:
+                text += f"![Complément {path.name} : {subject}](../{relative_batch}/courbes-{subject}.png)\n\n"
+    if incidents:
+        text += "\n\n## Incidents d'infrastructure observés après les séries de cœurs\n\n"
+        text += "Ces observations documentent des événements d'exécution et leurs limites ; elles ne constituent pas un audit final des recherches encore en cours. Les montants réservés et les consommations réellement reçues restent distincts. Aucun incident n'est effacé pour améliorer le bilan d'un modèle.\n\n"
+        for path, data, report_path in incidents:
+            text += f"### Job {data['job_id']} : {path.parent.name}\n\n"
+            text += report_path.read_text(encoding="utf8").split("\n", 1)[1].replace("\n## ", "\n#### ")
+            relative = report_path.relative_to(HERE.parent).as_posix()
+            text += f"\n\n[Rapport, chronologie et preuves de reprise](../{relative}).\n\n"
+    high_report = STUDY / "BILAN-QUATRE-HIGH.md"
+    if high_report.exists():
+        high = high_report.read_text(encoding="utf8").split("\n", 1)[1]
+        high = re.sub(r"(?m)^## ", "### ", high)
+        text += "\n\n## Cohorte HIGH reçue : comportement, jetons et confirmation\n\n" + high
+    medium_report = STUDY / "BILAN-QUATRE-MEDIUM.md"
+    if medium_report.exists():
+        medium = medium_report.read_text(encoding="utf8").split("\n", 1)[1]
+        medium = re.sub(r"(?m)^## ", "### ", medium)
+        text += "\n\n## Cohorte MEDIUM reçue : coût des reprises et absence de gain conservée\n\n" + medium
+    low_report = STUDY / "BILAN-QUATRE-LOW-ET-VINGT-COUPLES.md"
+    if low_report.exists():
+        low = low_report.read_text(encoding="utf8").split("\n", 1)[1]
+        low = re.sub(r"(?m)^## ", "### ", low)
+        text += "\n\n## Cohorte LOW et première grille des vingt couples reçues\n\n" + low
+    deepseek_report = HERE.parent / "Marathon22-DeepSeek-v11/BILAN-V4-FLASH-0731-747505.md"
+    if deepseek_complete and deepseek_report.exists():
+        deepseek_text = deepseek_report.read_text(encoding="utf8").split("\n", 1)[1]
+        deepseek_text = re.sub(r"(?m)^## ", "### ", deepseek_text)
+        deepseek_text = re.sub(r"\]\((receptions/[^)]+|resultats-verifies-complets\.json)\)",
+                               r"](../Marathon22-DeepSeek-v11/\1)", deepseek_text)
+        text += "\n\n## Deux campagnes DeepSeek reçues : confirmations négatives et bilan final\n\n" + deepseek_text
+    luna_report = STUDY / "BILAN-COUVERTURE-LUNA-MAX.md"
+    comparison_root = HERE.parent / "Marathon22-GPT61Sol-MAX/harnais-r2"
+    comparison_report = comparison_root / "BILAN-COMPARAISON-747885.md"
+    comparison_received = None
+    if luna_report.exists():
+        luna_text = luna_report.read_text(encoding="utf8").split("\n", 1)[1]
+        text += "\n\n## Première couverture des quatorze autres sujets : Luna MAX\n\n" + re.sub(r"(?m)^## ", "### ", luna_text)
+    if comparison_report.exists():
+        comparison_received = read(comparison_root / "resultats-comparaison-recus.json")
+        if not comparison_received["all_arms_received_and_audited"]:
+            raise RuntimeError("The comparison has not been received and audited")
+        comp_text = comparison_report.read_text(encoding="utf8").split("\n", 1)[1]
+        comp_text = re.sub(r"(?m)^## ", "### ", comp_text)
+        comp_text = re.sub(r"\]\(((?!https?://|#)[^)]+)\)",
+            lambda m: "](../Marathon22-GPT61Sol-MAX/harnais-r2/" + m[1] + ")", comp_text)
+        text += "\n\n## Comparaison GPT avec et sans harnais : réception complète\n\n" + comp_text
+    reference_root = HERE.parent / "Marathon22-GPT61Sol-MAX/reference96-r2"
+    launch_path = reference_root / "lancement-reel-verifie.json"
+    if launch_path.exists():
+        launch = read(launch_path)
+        if not launch["native_generation_started"] or launch["harness_enabled"]:
+            raise RuntimeError("Unexpected fresh reference96 launch")
+        text += f"\n\n## Référence GPT96 neuve : lancement vérifié, résultats encore attendus\n\nLe job {launch['job_id']} a démarré après réception auditée des deux DeepSeek et des six bras de comparaison, puis arrêt du relais précédent. Source neuve SHA-256 `{launch['frozen_source_sha256']}` ; même oracle et contrôles de préparation, réserve finale corrigée, harnais explicitement désactivé, gpt-6.1-sol MAX exact. Les 158 tests locaux et 160 tests ARM64 passent ; trois compilations locales et un MCP ARM64 optionnel sont séparément indiqués comme ignorés. La sonde native, sans problème de concours, utilise 5981 jetons exacts ; les premiers appels de recherche sont distincts et leurs preuves de transfert sont conservées.\n\nTrois sujets, 96 possibilités par sujet, quatre cycles, six propositions par rôle A/B/C et six G par cycle, six heures et quatre millions de jetons par sujet sont des plafonds. Ils ne garantissent pas 96 appels ou sommets effectifs. Allocation maximale de vingt heures, quatre cœurs ARM64, 16 GiB et zéro GPU. Le contexte natif de 65536 et la réservation de 196608 par mission ne constituent pas un équivalent exact de num_predict=32768. La référence n'est donc pas une ablation strictement identique aux DeepSeek. Elle ne reçoit aucun ancien candidat, diagnostic ou rapport. Aucun gain final n'est encore déclaré pour cette campagne. [Guide et reprise sans rejeu](../Marathon22-GPT61Sol-MAX/reference96-r2/REPRISE.md).\n\nR1 et cette référence occupent les deux voies natives ; R4 conserve ses contrats et pilote en attente, sans troisième worker. L'échéance exclusive reste le 1 novembre à 00:00 Europe/Paris ; tout nouveau maximum augmenté de trois heures de réception/audit doit finir avant cette limite.\n\n"
+    text += "\n\n## Partie II — méthodes et observations historiques conservées\n\n"
+    text += "**Archive de l’instantané antérieur, produit le 15 octobre vers 22:57 UTC.** Cette partie conserve les détails et les résultats négatifs utiles ; les états vivants et qualifications de conformité sont remplacés par les sections datées de la partie I. R3 préparée n’était pas une campagne native validée. Les mentions historiques des DeepSeek et de la comparaison encore en cours sont remplacées par leurs réceptions audit ées ci-dessus.\n\n".replace("audit ées", "auditées")
+    text += legacy
+    (STUDY / "ARTICLE.md").write_text(text,encoding="utf8")
+    body = markdown.markdown(text, extensions=["tables","fenced_code","footnotes","toc"])
+    def image(match):
+        path = (STUDY / html.unescape(match[1])).resolve()
+        if not path.is_relative_to(HERE.parent.resolve()): raise RuntimeError("Unexpected figure outside outputs")
+        if path.suffix == ".svg": return "<figure>"+path.read_text(encoding="utf8")+"</figure>"
+        return '<figure><img alt="Figure scientifique issue des mesures" src="data:image/png;base64,'+base64.b64encode(path.read_bytes()).decode()+'"></figure>'
+    body = re.sub(r'<p><img[^>]+src="([^"]+)"[^>]*></p>', image, body)
+    css = 'body{margin:0;background:#f2f2ee;color:#23313a;font:17px/1.65 Georgia,serif}main{max-width:1180px;margin:32px auto;padding:58px;background:white;border-top:6px solid #244e6d}h1,h2,h3,h4{font-family:Arial,sans-serif;color:#23435b;line-height:1.25}h1{font-size:36px}h2{margin-top:2em}table{font:12px/1.45 Arial,sans-serif;border-collapse:collapse;display:block;overflow:auto;width:100%;margin:24px 0}td,th{padding:7px;border-bottom:1px solid #dce3e8;text-align:left}th{background:#eaf1f4}figure{margin:28px 0}figure img,svg{max-width:100%;height:auto}pre{white-space:pre-wrap;background:#f3f5f7;padding:16px}a{color:#145b89}blockquote{border-left:4px solid #bd9948;margin-left:0;padding-left:18px}'
+    (STUDY / "ARTICLE.html").write_text('<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>HPC-Forest — recherche, preuves et montée en cœurs</title><style>'+css+'</style><main>'+body+'</main></html>',encoding="utf8")
+    consolidated = read(STUDY / "donnees-consolidees.json")
+    consolidated.update(generated_utc=now, latest_consolidation_source="HPC-Forest-Conformite-Coeurs-r2/actualiser-article.py",
+        research_cells_received_current=verified, native_token_accounting_current={k:tokens[k] for k in ["observed_utc","native_unique_calls","native_exact_total","native_unmetered_calls","native_pending_calls"]},
+        core_scaling_multimodel_received={"audit":audited,"path":str((BATCH/'resultats-verifies.json').resolve()),"sha256":sha(BATCH/'resultats-verifies.json')},
+        core_scaling_additional_batches_received=[{"audit":a,"path":str((p/'resultats-verifies.json').resolve()),"sha256":sha(p/'resultats-verifies.json')} for p,a in zip(extra_roots,extras)],
+        infrastructure_incidents_observed=[{"receipt":data,"path":str(path.resolve()),"sha256":sha(path)} for path,data,_ in incidents],
+        high_cohort_received=read(STUDY/"resultats-quatre-high.json") if high_report.exists() else None,
+        medium_cohort_received=read(STUDY/"resultats-quatre-medium.json") if medium_report.exists() else None,
+        low_cohort_received=read(STUDY/"resultats-quatre-low.json") if low_report.exists() else None,
+        first_twenty_count_cells_received=read(STUDY/"resultats-vingt-couples-count.json") if low_report.exists() else None,
+        both_deepseek_campaigns_received=deepseek_complete,
+        luna_fourteen_subjects_received=read(STUDY/"resultats-couverture-luna-max.json") if luna_report.exists() else None,
+        gpt_harness_six_arm_comparison_received=comparison_received,
+        fresh_gpt_reference96_launch=read(launch_path) if launch_path.exists() else None,
+        current_multibatch_summary=summary,
+        previous_data_fields_are_dated_snapshots=True, official_contest_compliance_certified=False,
+        dynamic_r4_preflight=read(HERE.parent/'HPC-Forest-Mere-Dynamique-r4/validation-prevol.json'))
+    (STUDY / "donnees-consolidees.json").write_text(json.dumps(consolidated,ensure_ascii=False,indent=2)+"\n",encoding="utf8")
+    manifest = read(STUDY / "rapport-manifest.json")
+    for name in ["ARTICLE.md","ARTICLE.html","donnees-consolidees.json"]:manifest["files"][name]=sha(STUDY/name)
+    manifest.update(generated_utc=now, current_pdf_regeneration_pending=True,
+        current_core_scaling_audit=audits[-1], previous_version_preserved=str(version.resolve()))
+    (STUDY / "rapport-manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+"\n",encoding="utf8")
+    (STUDY / "MISE-A-JOUR-ARTICLE.json").write_text(json.dumps({"generated_utc":now,"canonical_update_script":str(Path(__file__).resolve()),
+        "pdf_builder":"construire-pdf.py","source_history_preserved":True,"received_scaling_job":audits[-1]["job_id"],
+        "received_scaling_jobs":[a["job_id"] for a in audits],
+        "note":"Run this consolidator after any historical builder, then PDF renderer; never turn reports into model contexts."},ensure_ascii=False,indent=2)+"\n",encoding="utf8")
+    print(json.dumps({"article_updated":True,"received_matrix_cells":len(verified),"figures_current":len(re.findall(r"(?m)^!\[",text)),"words":len(text.split()),"legacy_version_preserved":True}))
+
+
+if __name__ == "__main__": main()

@@ -1,0 +1,82 @@
+"""Focused in-memory adapter checks: no files/observations/factory are produced."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+
+HERE=Path(__file__).resolve().parent
+path=HERE/"preparer-entree-operationnelle.py"
+d={"__file__":str(path),"__name__":"inert_root_input_adapter"}
+exec(compile(path.read_bytes(),str(path),"exec"),d)
+results=[]
+
+def run_case(name,change,expect_success):
+    store={}
+    encoded=lambda value:json.dumps(value,sort_keys=True).encode()
+    def put(label,value):
+        p=str(HERE/("INERT-NOT-A-RECEIPT-"+label+".json"))
+        store[p]=encoded(value)
+        return {"path":p,"sha256":hashlib.sha256(store[p]).hexdigest()}
+    model="gpt-6.1-sol"
+    cell=d["ns"]["cell_binding"](model,"999999999")
+    common={key:put("common-"+key,{"fixture":True}) for key in d["ns"]["COMMON"]}
+    scripts={model:put("script",{"fixture":True})}
+    names=("marker","request","full-cim","fresh-oauth","transport","obs-admission","submission-intent",
+           "submission-observed","cli-policy","so-absence","descendant-review","observer-release","reviewed-controls","capacity","classification-native")
+    values={key:{"fixture":True} for key in names}
+    full=put("full-cim",values["full-cim"])
+    values["reviewed-controls"]={"schema":"hpc-forest-source110-parent-controls-reviewed-v1","verified":True,
+        **cell,"observed_at":time.time(),"full_cim":full,"evidence_refs":[full],
+        **{key:True for key in d["ns"]["OBS_FLAGS"]}}
+    values["classification-native"]={"schema":"hpc-forest-source110-private-native-capacity-classification-v1","verified":True,
+        "scope_id":d["ns"]["SCOPE"],"source_zip_sha256":d["ns"]["SOURCE"],"plan_sha256":d["ns"]["PLAN"],
+        "all_full_census_rows_checked":True,"conservative_candidate_process_ids":[],"unclassified_native_process_ids":[],
+        "active_native_groups":[],"active_native_workers":0}
+    change(values)
+    refs={key:put(key,value) for key,value in values.items() if key!="capacity"}
+    values["capacity"]={"schema":"hpc-forest-r4b-parent-pre-submit-capacity-v1","verified":True,
+        "scope_id":d["ns"]["SCOPE"],"source_zip_sha256":d["ns"]["SOURCE"],"plan_sha256":d["ns"]["PLAN"],
+        "active_native_workers":0,"private_native_classification":refs["classification-native"]}
+    refs["capacity"]=put("capacity",values["capacity"])
+    writes=[]
+    handoffs=[]
+    class InertOutput:
+        parent=HERE
+        name="INERT-NOT-AN-OPERATION"
+        def exists(self): return False
+        def mkdir(self): writes.append("inert mkdir")
+        def __truediv__(self,name): return HERE/self.name/name
+    output=InertOutput()
+    def save(p,value):
+        writes.append(str(p));store[str(p)]=encoded(value)
+    d["ns"]["held_reads"]=lambda:{"raw":lambda p:store[str(p)],"decode":json.loads,"ordinary":lambda p:output}
+    d["ns"]["main"]=lambda:handoffs.append(list(sys.argv))
+    d["static_refs"]=lambda io:(dict(common),scripts,{}, {})
+    d["save"]=save
+    argv=[str(path),"--model",model,"--job",cell["job_id"],"--codex-config-sha256","0"*64,"--output-directory","INERT"]
+    for key in names:
+        argv += ["--"+key,refs[key]["path"],"--"+key+"-sha256",refs[key]["sha256"]]
+    previous=sys.argv
+    error=None
+    try:
+        sys.argv=argv
+        try: d["main"]()
+        except ValueError as exc: error=str(exc)
+    finally: sys.argv=previous
+    if expect_success:
+        assert error is None and len(handoffs)==1 and len(writes)==3,(name,error,writes)
+        assert "--one-model" in handoffs[0] and "--actual-bundle-sha256" in handoffs[0]
+        assert d["ns"]["ROOTS"][model][1] in json.dumps([json.loads(v) for v in store.values()])
+    else:
+        assert error is not None and not writes and not handoffs,(name,error,writes,handoffs)
+    results.append({"case":name,"passed":True,"expected_refusal":not expect_success,"error":error})
+
+run_case("inert complete observed interface reaches only metadata handoff",lambda v:None,True)
+run_case("false template refuses before any output",lambda v:v["reviewed-controls"].update(verified=False),False)
+run_case("wrong cell controls refuse before any output",lambda v:v["reviewed-controls"].update(job_id="999999998"),False)
+for flag in d["ns"]["OBS_FLAGS"]:
+    run_case("missing actual control "+flag,lambda v,key=flag:v["reviewed-controls"].pop(key),False)
+run_case("opaque group classification refuses before any output",lambda v:v["classification-native"].update(unclassified_native_process_ids=[1]),False)
+print(json.dumps({"schema":"hpc-forest-source110-operational-interface-inert-checks-v1","cases":results,
+    "case_count":len(results),"all_passed":True,"actual_receipts_or_files_created":False,"factory_or_process_executed":False}))

@@ -1,0 +1,283 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static inline float pair_scale(float dx, float dy, float dz) {
+  float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+  float inv_dist = 1 / sqrt(sqrd_dist);
+  return inv_dist * inv_dist * inv_dist;
+}
+
+static void force_one(Body *p, float dt, int n, int i) {
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  for (int j = 0; j < n; ++j) {
+    float dx = p[j].x - p[i].x;
+    float dy = p[j].y - p[i].y;
+    float dz = p[j].z - p[i].z;
+    float inv_dist3 = pair_scale(dx, dy, dz);
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  p[i].vx += dt*fx;
+  p[i].vy += dt*fy;
+  p[i].vz += dt*fz;
+}
+
+void body_force(Body *p, float dt, int n) {
+  #pragma omp parallel for schedule(static) if(n >= 128)
+  for (int i = 0; i < n; ++i) {
+    force_one(p, dt, n, i);
+  }
+}
+
+static inline void integrate_one(Body *p, float dt, int i) {
+  p[i].x += p[i].vx * dt;
+  p[i].y += p[i].vy * dt;
+  p[i].z += p[i].vz * dt;
+}
+
+/* Diagonal tiles retain the ordinary directed, source-ordered loop. */
+static void force_diagonal_tile(const Body *p, float *fx, float *fy,
+                                float *fz, int lo, int hi) {
+  for (int i = lo; i < hi; ++i) {
+    float xi = p[i].x;
+    float yi = p[i].y;
+    float zi = p[i].z;
+    float ax = fx[i];
+    float ay = fy[i];
+    float az = fz[i];
+
+    for (int j = lo; j < hi; ++j) {
+      float dx = p[j].x - xi;
+      float dy = p[j].y - yi;
+      float dz = p[j].z - zi;
+      float inv_dist3 = pair_scale(dx, dy, dz);
+      ax += dx * inv_dist3;
+      ay += dy * inv_dist3;
+      az += dz * inv_dist3;
+    }
+
+    fx[i] = ax;
+    fy[i] = ay;
+    fz[i] = az;
+  }
+}
+
+/* One coefficient serves both directions; neither sum is reassociated. */
+static void force_off_diagonal_tile(const Body *p, float *fx, float *fy,
+                                    float *fz, int a0, int a1,
+                                    int b0, int b1) {
+  for (int i = a0; i < a1; ++i) {
+    float xi = p[i].x;
+    float yi = p[i].y;
+    float zi = p[i].z;
+    float ax = fx[i];
+    float ay = fy[i];
+    float az = fz[i];
+
+    for (int j = b0; j < b1; ++j) {
+      float xj = p[j].x;
+      float yj = p[j].y;
+      float zj = p[j].z;
+      float dx = xj - xi;
+      float dy = yj - yi;
+      float dz = zj - zi;
+      float inv_dist3 = pair_scale(dx, dy, dz);
+      ax += dx * inv_dist3;
+      ay += dy * inv_dist3;
+      az += dz * inv_dist3;
+
+      float rdx = xi - xj;
+      float rdy = yi - yj;
+      float rdz = zi - zj;
+      fx[j] += rdx * inv_dist3;
+      fy[j] += rdy * inv_dist3;
+      fz[j] += rdz * inv_dist3;
+    }
+
+    fx[i] = ax;
+    fy[i] = ay;
+    fz[i] = az;
+  }
+}
+
+static void simulate_direct(Body *p, float dt, int n) {
+  #pragma omp parallel if(n >= 128)
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        force_one(p, dt, n, i);
+      }
+
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        integrate_one(p, dt, i);
+      }
+    }
+  }
+}
+
+static void simulate(Body *p, float dt, int n) {
+  if (n < 512) {
+    simulate_direct(p, dt, n);
+    return;
+  }
+
+  int workers = 1;
+  #ifdef _OPENMP
+  workers = omp_get_max_threads();
+  #endif
+  if (workers < 1) workers = 1;
+
+  int desired = n / workers / 8;
+  int tile = 32;
+  while (tile < 128 && tile * 2 <= desired) tile *= 2;
+  int nblocks = (n - 1) / tile + 1;
+
+  float *forces = (float *)malloc((size_t)n * 3 * sizeof(float));
+  unsigned char *tokens = (unsigned char *)malloc((size_t)nblocks);
+  if (forces == NULL || tokens == NULL) {
+    free(forces);
+    free(tokens);
+    simulate_direct(p, dt, n);
+    return;
+  }
+
+  float *fx = forces;
+  float *fy = forces + n;
+  float *fz = forces + (size_t)n * 2;
+  int finite_positions = 1;
+
+  #pragma omp parallel
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      /* A nonfinite coordinate permanently selects the directed fallback. */
+      #pragma omp for schedule(static) reduction(&:finite_positions)
+      for (int i = 0; i < n; ++i) {
+        fx[i] = 0.0f;
+        fy[i] = 0.0f;
+        fz[i] = 0.0f;
+        finite_positions &= isfinite(p[i].x) && isfinite(p[i].y)
+                            && isfinite(p[i].z);
+      }
+
+      if (finite_positions) {
+        #pragma omp single
+        {
+          int sums = 2 * nblocks - 1;
+          /* Limit outstanding task storage without a barrier at every sum. */
+          for (int first_sum = 0; first_sum < sums; first_sum += 64) {
+            int last_sum = first_sum + 64;
+            if (last_sum > sums) last_sum = sums;
+
+            #pragma omp taskgroup
+            {
+              for (int sum = first_sum; sum < last_sum; ++sum) {
+                int first_a = sum >= nblocks ? sum - nblocks + 1 : 0;
+                int last_a = sum / 2;
+                for (int a = first_a; a <= last_a; ++a) {
+                  int b = sum - a;
+                  int a0 = a * tile;
+                  int b0 = b * tile;
+                  int a1 = n - a0 < tile ? n : a0 + tile;
+                  int b1 = n - b0 < tile ? n : b0 + tile;
+
+                  if (a == b) {
+                    #pragma omp task firstprivate(a0, a1) shared(p, fx, fy, fz, tokens) depend(inout:tokens[a])
+                    {
+                      force_diagonal_tile(p, fx, fy, fz, a0, a1);
+                    }
+                  } else {
+                    #pragma omp task firstprivate(a0, a1, b0, b1) shared(p, fx, fy, fz, tokens) depend(inout:tokens[a], tokens[b])
+                    {
+                      force_off_diagonal_tile(p, fx, fy, fz,
+                                              a0, a1, b0, b1);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          p[i].vx += dt*fx[i];
+          p[i].vy += dt*fy[i];
+          p[i].vz += dt*fz[i];
+          integrate_one(p, dt, i);
+        }
+      } else {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          force_one(p, dt, n, i);
+        }
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          integrate_one(p, dt, i);
+        }
+      }
+    }
+  }
+
+  free(tokens);
+  free(forces);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+
+  simulate(bodies, DT, nbodies);
+
+  write_dataset(nbodies, bodies);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

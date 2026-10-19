@@ -1,0 +1,309 @@
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <utility>
+#include <vector>
+
+struct Edge {
+    int first;
+    int second;
+};
+
+struct Partition {
+    std::vector<Edge> spanning;
+    std::vector<Edge> included;
+    std::vector<Edge> excluded;
+};
+
+class TropicalSolver {
+public:
+    TropicalSolver(int vertices, int colors)
+        : vertexCount(vertices), colorTarget(colors), graph(static_cast<std::size_t>(vertices) * vertices, 0),
+          forbidden(static_cast<std::size_t>(vertices) * vertices, 0), forbidEpoch(0), bestColors(0), activeColors(0) {
+        vertexColors.resize(vertices);
+        colorIndex.resize(vertices);
+        onPath.assign(vertices, 0);
+    }
+
+    void setColor(int vertex, int color) {
+        vertexColors[vertex] = color;
+    }
+
+    void prepareColors() {
+        std::vector<int> distinct = vertexColors;
+        std::sort(distinct.begin(), distinct.end());
+        distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+
+        for (int vertex = 0; vertex < vertexCount; ++vertex) {
+            colorIndex[vertex] = static_cast<int>(
+                std::lower_bound(distinct.begin(), distinct.end(), vertexColors[vertex]) - distinct.begin());
+        }
+        colorOccurrences.assign(distinct.size(), 0);
+    }
+
+    void addEdge(int first, int second) {
+        graph[index(first, second)] = 1;
+        graph[index(second, first)] = 1;
+    }
+
+    int makeSpanningTree(const std::vector<Edge>& included, const std::vector<Edge>& excluded,
+                         std::vector<Edge>& tree) {
+        tree.clear();
+        if (vertexCount == 0) {
+            return -1;
+        }
+
+        if (++forbidEpoch == 0) {
+            std::fill(forbidden.begin(), forbidden.end(), 0);
+            forbidEpoch = 1;
+        }
+        for (const Edge& edge : excluded) {
+            forbidden[index(edge.first, edge.second)] = forbidEpoch;
+            forbidden[index(edge.second, edge.first)] = forbidEpoch;
+        }
+
+        std::vector<int> key(vertexCount, INT_MAX);
+        std::vector<int> parent(vertexCount, vertexCount);
+        std::vector<unsigned char> inTree(vertexCount, 0);
+        std::vector<unsigned char> mustInclude(vertexCount, 0);
+        std::vector<int> includedParent(vertexCount, -1);
+
+        for (const Edge& edge : included) {
+            mustInclude[edge.first] = 1;
+            mustInclude[edge.second] = 1;
+            includedParent[edge.second] = edge.first;
+            includedParent[edge.first] = 100;
+        }
+
+        key[0] = 0;
+        parent[0] = -1;
+
+        for (int count = 0; count < vertexCount; ++count) {
+            int current = -1;
+            int minimum = INT_MAX;
+            for (int vertex = 0; vertex < vertexCount; ++vertex) {
+                if (!inTree[vertex] && key[vertex] < minimum) {
+                    minimum = key[vertex];
+                    current = vertex;
+                }
+            }
+            if (current == -1) {
+                return -1;
+            }
+
+            inTree[current] = 1;
+            const std::size_t row = static_cast<std::size_t>(current) * vertexCount;
+            for (int next = 0; next < vertexCount; ++next) {
+                if (!graph[row + next] || forbidden[row + next] == forbidEpoch || inTree[next] || key[next] <= 1) {
+                    continue;
+                }
+                if (mustInclude[next] && includedParent[next] != 100 && includedParent[next] != current) {
+                    const int requiredParent = includedParent[next];
+                    if (parent[requiredParent] != vertexCount) {
+                        continue;
+                    }
+                }
+                parent[next] = current;
+                key[next] = 1;
+            }
+        }
+
+        tree.reserve(vertexCount > 0 ? vertexCount - 1 : 0);
+        for (int vertex = 1; vertex < vertexCount; ++vertex) {
+            tree.push_back(Edge{parent[vertex], vertex});
+        }
+        return vertexCount - 1;
+    }
+
+    bool findTropicalPath(const std::vector<Edge>& tree) {
+        buildTreeLayout(tree);
+        std::fill(colorOccurrences.begin(), colorOccurrences.end(), 0);
+        activeColors = 0;
+
+        for (int start = 0; start < vertexCount; ++start) {
+            path.clear();
+            addToPath(start);
+
+            for (int position = treeOffsets[start]; position < treeOffsets[start + 1]; ++position) {
+                const int next = treeNeighbors[position];
+                if (!onPath[next] && walkTree(next)) {
+                    return true;
+                }
+            }
+
+            removeFromPath(start);
+        }
+        return false;
+    }
+
+    void printResult(bool complete) const {
+        for (std::size_t position = 0; position < bestPath.size(); ++position) {
+            if (position != 0) {
+                std::putchar('-');
+            }
+            std::printf("%d", bestPath[position]);
+        }
+        std::putchar('\n');
+        if (complete) {
+            std::printf("%d", colorTarget);
+        } else {
+            std::printf("%d\n", bestColors);
+        }
+    }
+
+private:
+    std::size_t index(int first, int second) const {
+        return static_cast<std::size_t>(first) * vertexCount + second;
+    }
+
+    void buildTreeLayout(const std::vector<Edge>& tree) {
+        treeOffsets.assign(vertexCount + 1, 0);
+        for (const Edge& edge : tree) {
+            ++treeOffsets[edge.first + 1];
+            ++treeOffsets[edge.second + 1];
+        }
+        for (int vertex = 0; vertex < vertexCount; ++vertex) {
+            treeOffsets[vertex + 1] += treeOffsets[vertex];
+        }
+
+        std::vector<int> cursor = treeOffsets;
+        treeNeighbors.assign(tree.size() * 2, 0);
+        for (const Edge& edge : tree) {
+            treeNeighbors[cursor[edge.first]++] = edge.second;
+            treeNeighbors[cursor[edge.second]++] = edge.first;
+        }
+    }
+
+    void addToPath(int vertex) {
+        onPath[vertex] = 1;
+        path.push_back(vertex);
+        const int color = colorIndex[vertex];
+        if (colorOccurrences[color]++ == 0) {
+            ++activeColors;
+        }
+    }
+
+    void removeFromPath(int vertex) {
+        const int color = colorIndex[vertex];
+        if (--colorOccurrences[color] == 0) {
+            --activeColors;
+        }
+        path.pop_back();
+        onPath[vertex] = 0;
+    }
+
+    bool walkTree(int vertex) {
+        addToPath(vertex);
+        bool hasChild = false;
+
+        for (int position = treeOffsets[vertex]; position < treeOffsets[vertex + 1]; ++position) {
+            const int next = treeNeighbors[position];
+            if (!onPath[next]) {
+                hasChild = true;
+                if (walkTree(next)) {
+                    return true;
+                }
+            }
+        }
+
+        if (!hasChild) {
+            if (activeColors == colorTarget) {
+                bestPath = path;
+                return true;
+            }
+            if (activeColors > bestColors) {
+                bestColors = activeColors;
+                bestPath = path;
+            }
+        }
+
+        removeFromPath(vertex);
+        return false;
+    }
+
+    int vertexCount;
+    int colorTarget;
+    std::vector<unsigned char> graph;
+    std::vector<unsigned int> forbidden;
+    unsigned int forbidEpoch;
+    std::vector<int> vertexColors;
+    std::vector<int> colorIndex;
+    std::vector<int> colorOccurrences;
+    std::vector<unsigned char> onPath;
+    std::vector<int> path;
+    std::vector<int> bestPath;
+    std::vector<int> treeOffsets;
+    std::vector<int> treeNeighbors;
+    int bestColors;
+    int activeColors;
+};
+
+int main() {
+    int vertices;
+    int colors;
+    if (std::scanf("%i %i", &vertices, &colors) != 2) {
+        return 0;
+    }
+
+    TropicalSolver solver(vertices, colors);
+    for (int vertex = 0; vertex < vertices; ++vertex) {
+        int color;
+        std::scanf("%i", &color);
+        solver.setColor(vertex, color);
+    }
+    solver.prepareColors();
+
+    int edgeCount;
+    std::scanf("%i", &edgeCount);
+    for (int edge = 0; edge < edgeCount; ++edge) {
+        int first;
+        int second;
+        std::scanf("%i %i", &first, &second);
+        solver.addEdge(first, second);
+    }
+
+    std::vector<Edge> empty;
+    std::vector<Edge> initialTree;
+    solver.makeSpanningTree(empty, empty, initialTree);
+
+    std::vector<Partition> partitions;
+    partitions.push_back(Partition{std::move(initialTree), empty, empty});
+
+    bool complete = false;
+    while (!partitions.empty()) {
+        Partition current = std::move(partitions.back());
+        partitions.pop_back();
+
+        if (solver.findTropicalPath(current.spanning)) {
+            complete = true;
+            break;
+        }
+
+        std::vector<Edge> included = current.included;
+        std::size_t firstVariable = 0;
+        while (firstVariable < current.spanning.size() && firstVariable < included.size()) {
+            const Edge& treeEdge = current.spanning[firstVariable];
+            const Edge& includedEdge = included[firstVariable];
+            if (treeEdge.first != includedEdge.first && treeEdge.second != includedEdge.second) {
+                break;
+            }
+            ++firstVariable;
+        }
+
+        for (std::size_t edgeIndex = firstVariable; edgeIndex < current.spanning.size(); ++edgeIndex) {
+            const Edge excludedEdge = current.spanning[edgeIndex];
+            std::vector<Edge> excluded = current.excluded;
+            excluded.push_back(excludedEdge);
+
+            std::vector<Edge> nextTree;
+            if (solver.makeSpanningTree(included, excluded, nextTree) > 0) {
+                partitions.push_back(Partition{std::move(nextTree), included, std::move(excluded)});
+            }
+            included.push_back(excludedEdge);
+        }
+    }
+
+    solver.printResult(complete);
+    return 0;
+}

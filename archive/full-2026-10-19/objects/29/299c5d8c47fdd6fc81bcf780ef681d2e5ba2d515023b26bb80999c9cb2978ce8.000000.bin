@@ -1,0 +1,1201 @@
+"""Assemble a coherent manuscript and an exhaustive technical supplement.
+
+Inputs are the frozen, independently audited exports. No experimental process
+or program is invoked. Tables are generated, never hand-copied.
+"""
+
+import csv
+import hashlib
+import json
+import re
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+OUT = ROOT.parent
+DATA = HERE / "donnees"
+
+
+def load(p):
+    return json.loads(Path(p).read_text(encoding="utf-8-sig"))
+
+
+def n(v, digits=2):
+    return f"{v:,.{digits}f}".replace(",", " ").replace(".", ",")
+
+
+def integer(v):
+    return n(v, 0)
+
+
+def table(headers, rows, caption=None):
+    text = f"*{caption}*\n\n" if caption else ""
+    text += "| " + " | ".join(headers) + " |\n|" + "---|" * len(headers) + "\n"
+    return (
+        text
+        + "\n".join(
+            "| "
+            + " | ".join(str(c).replace("|", "/").replace("\n", " ") for c in row)
+            + " |"
+            for row in rows
+        )
+        + "\n"
+    )
+
+
+def short_model(v):
+    return (
+        v.replace("gpt-", "GPT ")
+        .replace("hpcforest-deepseek-v4flash0731:mxfp4", "DeepSeek V4-Flash-0731")
+        .replace("hpcforest-deepseek-v4flash:mxfp4", "DeepSeek V4-Flash")
+        .replace("qwen2.5-coder:", "Qwen 2.5 Coder ")
+    )
+
+
+def sha(p):
+    with Path(p).open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def main():
+    audit = load(HERE / "audit-calculs.json")
+    assert audit["verified"]
+    for file, digest in audit["frozen_data_files"].items():
+        assert sha(DATA / file) == digest, file
+    rows = load(DATA / "confirmations-recalculees.json")
+    groups = {
+        g: [r for r in rows if r["cohort"] == g]
+        for g in ["count", "luna", "astra", "terra", "sol", "source_only", "comparison", "gpt96", "deepseek"]
+    }
+    count, comp, deep = (
+        groups[g] for g in ["count", "comparison", "deepseek"]
+    )
+    ledger = load(DATA / "couts-natifs.json")
+    batches = load(DATA / "cpu-lots.json")
+    regs = load(DATA / "registres-recalcules.json")
+    corpus = load(DATA / "historique-preserve.json")
+    state = load(DATA / "etat-campagnes.json")
+    cutoff = datetime.fromisoformat(audit["completed_utc"]).strftime(
+        "%d/%m/%Y à %H h %M UTC"
+    )
+    costs = []
+    for g, label in [
+        ("count", "Count : vingt cellules"),
+        ("luna", "Luna : quatorze sujets"),
+        ("astra", "Astra : quatorze sujets"),
+        ("terra", "Terra : quatorze sujets"),
+        ("sol", "Sol : quatorze sujets"),
+        ("comparison", "GPT : six bras"),
+        ("gpt96", "GPT96 : trois sujets"),
+        ("source_only", "Source-only Luna MAX : quinze sujets"),
+    ]:
+        rr = groups[g]
+        costs.append(
+            [
+                label,
+                integer(sum(r["native_calls"] for r in rr)),
+                integer(sum(r["known_exact_tokens"] for r in rr)),
+                integer(sum(r["unmetered_calls"] for r in rr)),
+            ]
+        )
+    substitutions = {
+        "CUTOFF": cutoff,
+        "REGISTRY_COUNT": integer(audit["registry_count"]),
+        "CPU_SAMPLES": integer(audit["cpu_totals"]["samples"]),
+        "CPU_POINTS": integer(audit["cpu_totals"]["points"]),
+        "CPU_CAMPAIGNS": integer(audit["cpu_totals"]["campaigns"]),
+        "CPU_BATCHES": integer(len(batches)),
+        "CPU_UNIQUE": integer(audit["cpu_totals"]["unique_combinations"]),
+        "CPU_REPEATED": integer(audit["cpu_totals"]["repeated_controls"]),
+        "NATIVE_CLOSED_CALLS": integer(sum(r["native_calls"] for r in rows if r["cohort"] != "deepseek")),
+        "NATIVE_CLOSED_EXACT": integer(sum(r["known_exact_tokens"] for r in rows if r["cohort"] != "deepseek")),
+        "NATIVE_CLOSED_UNKNOWN": integer(sum(r["unmetered_calls"] for r in rows if r["cohort"] != "deepseek")),
+        "TABLE_COHORTS": table(
+            ["Ensemble", "Recherches reçues", "Rôle dans l’étude"],
+            [
+                [
+                    "R1 · count 2023",
+                    "20 cellules / une graine chacune",
+                    "Quatre modèles × cinq efforts",
+                ],
+                [
+                    "R1 · couverture Luna MAX",
+                    "14 cellules supplémentaires",
+                    "Autres sujets admis ; mêmes contrats, temps propres",
+                ],
+                [
+                    "R1 · couverture Astra MAX",
+                    "14 cellules supplémentaires",
+                    "Même préparation ; références propres",
+                ],
+                [
+                    "R1 — couverture Terra MAX",
+                    "14 cellules supplémentaires",
+                    "Contrats et références propres",
+                ],
+                [
+                    "R1 · couverture Sol MAX",
+                    "14 cellules supplémentaires",
+                    "76/300 cellules R1 reçues au total",
+                ],
+                [
+                    "DeepSeek local",
+                    "2 campagnes × 3 sujets",
+                    "Résultats et coûts locaux ; deux versions",
+                ],
+                [
+                    "GPT · avec/sans harnais",
+                    "6 bras / 3 paires",
+                    "Comparaison descriptive ; une recherche par bras",
+                ],
+                [
+                    "Diagnostics CPU postérieurs",
+                    f"{audit['cpu_totals']['campaigns']} racines / {len(batches)} allocations",
+                    f"Mêmes exécutables ; {integer(audit['cpu_totals']['points'])} points / {integer(audit['cpu_totals']['samples'])} temps",
+                ],
+                [
+                    "Explorations antérieures",
+                    "42 résumés historiques",
+                    "Provenance et négatifs ; pas un échantillon homogène",
+                ],
+                [
+                    "GPT96 sans harnais",
+                    "3 recherches reçues / planning incomplet",
+                    "177 appels observés ; contrats finis ; budgets atteints",
+                ],
+                [
+                    "Source-only Luna MAX",
+                    "15 recherches reçues / 300 prévues",
+                    "Harnais interne désactivé ; mère et contrôle externe conservés",
+                ],
+                [
+                    "Véritable Codex / R4 / R5",
+                    "Aucun résultat natif admis",
+                    "Barrières et qualifications propres en attente",
+                ],
+            ],
+            "Tableau 1 — Périmètre des données. Les ensembles se recouvrent ; leurs tailles ne s’additionnent pas.",
+        ),
+        "TABLE_PROTOCOLS": table(
+            ["Protocole", "Programmes prévus par recherche", "Plafonds et harnais"],
+            [
+                [
+                    "R1",
+                    "8 programmes + au plus 2 épisodes de mère",
+                    "30 min ; 1,5 M jetons ; harnais ≤ 3 appels/mission",
+                ],
+                [
+                    "Comparaison GPT",
+                    "24 programmes par bras",
+                    "2 h ; 1,5 M jetons ; avec/sans harnais ; pas de mère modèle",
+                ],
+                [
+                    "Source-only Luna MAX",
+                    "8 programmes + 2 épisodes de mère",
+                    "30 min ; 1,5 M jetons ; harnais interne désactivé ; contrôle externe",
+                ],
+                [
+                    "DeepSeek v11",
+                    "96 programmes par sujet",
+                    "4 cycles ; 6 A/B/C et 6 G par cycle ; génération Ollama",
+                ],
+                [
+                    "GPT96 (reçu)",
+                    "96 prévus ; 54 / 54 / 75 missions réalisées",
+                    "6 h ; 4 M jetons ; harnais désactivé ; contexte natif 65 536",
+                ],
+                [
+                    "CPU postérieur",
+                    "Aucune génération",
+                    "1 chauffe + 5 passages à 1/2/4/8/16 cœurs",
+                ],
+            ],
+            "Tableau 2 — Les créneaux prévus sont des maxima de planification, distincts des appels et sommets réalisés.",
+        ),
+        "TABLE_COUNT_SHORT": table(
+            [
+                "Identité",
+                "Appels (5 efforts)",
+                "Jetons exacts connus",
+                "Appels non mesurés",
+            ],
+            [
+                [
+                    short_model(model),
+                    sum(r["native_calls"] for r in count if r["model"] == model),
+                    integer(
+                        sum(
+                            r["known_exact_tokens"]
+                            for r in count
+                            if r["model"] == model
+                        )
+                    ),
+                    sum(r["unmetered_calls"] for r in count if r["model"] == model),
+                ]
+                for model in (
+                    "gpt-6-luna",
+                    "gpt-6-astra",
+                    "gpt-5.6-terra",
+                    "gpt-6.1-sol",
+                )
+            ],
+            "Tableau 3 — Appels et jetons observés sur les cinq efforts de chaque identité, count 2023. Les compteurs incomplets restent des minima connus ; cette somme ne classe pas l’efficacité générale des modèles.",
+        ),
+        "TABLE_SOURCE_ONLY": table(
+            ["Sujet", "Référence (s)", "Retenu (s)", "Réduction (%)"],
+            [[r["subject"], f"{n(r['reference_seconds'], 5)} ± {n(r['reference_sd'], 5)}",
+              f"{n(r['chosen_seconds'], 5)} ± {n(r['chosen_sd'], 5)}", n(r["gain_percent"])]
+             for r in groups["source_only"]],
+            "Tableau 4 — Source-only Luna MAX : quinze racines fraîches, moyenne ± écart-type de cinq confirmations. Une seule graine ; références propres à cette allocation.",
+        ),
+        "TABLE_DEEP": table(
+            ["Version / sujet", "Référence (s)", "Retenu (s)", "Réduction (%)"],
+            [
+                [
+                    ("V4-Flash-0731" if "0731" in r["model"] else "V4-Flash")
+                    + " · "
+                    + r["subject"][5:],
+                    f"{n(r['reference_seconds'], 5)} ± {n(r['reference_sd'], 5)}",
+                    f"{n(r['chosen_seconds'], 5)} ± {n(r['chosen_sd'], 5)}",
+                    n(r["gain_percent"]),
+                ]
+                for r in deep
+            ],
+            "Tableau 5 — DeepSeek, moyenne ± écart-type empirique, cinq temps par programme. La référence est conservée pour k-NN 0731.",
+        ),
+        "TABLE_COMPARISON": table(
+            [
+                "Sujet",
+                "Sans harnais : g (%)",
+                "Avec harnais : g (%)",
+                "Écart (points de %)",
+            ],
+            [
+                [
+                    s,
+                    n(
+                        next(
+                            r["gain_percent"]
+                            for r in comp
+                            if r["subject"] == "2022-" + s and r["arm"] == "reference"
+                        )
+                    ),
+                    n(
+                        next(
+                            r["gain_percent"]
+                            for r in comp
+                            if r["subject"] == "2022-" + s
+                            and r["arm"] == "mixed-harness"
+                        )
+                    ),
+                    n(
+                        next(
+                            r["gain_percent"]
+                            for r in comp
+                            if r["subject"] == "2022-" + s
+                            and r["arm"] == "mixed-harness"
+                        )
+                        - next(
+                            r["gain_percent"]
+                            for r in comp
+                            if r["subject"] == "2022-" + s and r["arm"] == "reference"
+                        ),
+                        3,
+                    ),
+                ]
+                for s in ("knn", "sum", "nbody")
+            ],
+            "Tableau 6 — Réductions normalisées par les références propres aux bras. L’écart descriptif n’est pas un effet causal estimé.",
+        ),
+        "TABLE_COST": table(
+            [
+                "Ensemble natif clos",
+                "Appels",
+                "Jetons exacts connus",
+                "Appels non mesurés",
+            ],
+            costs + [["Total des ensembles ci-dessus",
+                      integer(sum(r["native_calls"] for r in rows if r["cohort"] != "deepseek")),
+                      integer(sum(r["known_exact_tokens"] for r in rows if r["cohort"] != "deepseek")),
+                      integer(sum(r["unmetered_calls"] for r in rows if r["cohort"] != "deepseek"))]],
+            "Tableau 7 — Consommations natives connues. Les bornes budgétaires ne complètent pas les compteurs manquants.",
+        ),
+    }
+    manuscript = (HERE / "manuscrit.md").read_text(encoding="utf-8")
+    for key, value in substitutions.items():
+        manuscript = manuscript.replace("{{" + key + "}}", value)
+    assert not re.search(r"\{\{.+?\}\}", manuscript)
+    (ROOT / "ARTICLE.md").write_text(manuscript, encoding="utf-8")
+    # A second document provides the complete evidence without repeating the narrative.
+    parts = [
+        "# HPC-Forest — Annexes techniques et données vérifiables\n\n**Nicolas Marano · Romain Despoullain**\n\nComplément de l’article de recherche du 17 octobre 2026. Arrêté : "
+        + cutoff
+        + ".\n\nLes résultats ci-dessous sont des observations documentaires. Aucun programme, oracle ou protocole expérimental n’a été modifié pour cette édition. Les exports complets accompagnent le document ; ils ne sont jamais réinjectés dans les recherches.\n"
+    ]
+
+    def add(text):
+        parts.append(text + "\n")
+
+    add(
+        "## A. Sources, domaines et qualifications de conformité\n\nLa comparaison porte sur la cible expérimentale ARM64 préparée. Le passage des contrôles exacts ne certifie pas le domaine universel, les algorithmes exigés ou le paquet d’un concours. Le registre suivant sépare les exclusions de préparation des résultats des modèles."
+    )
+    add(
+        table(
+            ["Sujet / famille", "Statut et limite"],
+            [
+                [
+                    "2020 tropical",
+                    "Admis R1 ; contrôles CPU limités aux vrais contrats Luna MAX reçus. Graphes simples connexes finis de la revue ; optimalité vérifiée indépendamment sur ces cas.",
+                ],
+                [
+                    "2020 permutations",
+                    "Admis ; entrées reçues à symboles distincts. Les essais synthétiques avec répétitions ne certifient pas le candidat sur tous les multiensembles.",
+                ],
+                [
+                    "2020 quicksort",
+                    "Gain observable confirmé ; fidélité algorithmique stricte non certifiée. Candidat introsort hybride : insertion sous 24 éléments, repli heapsort. Aucun lot CPU admis pour ce sujet.",
+                ],
+                [
+                    "2020 Jacobi",
+                    "Exclu : observabilité insuffisante du calcul à certifier.",
+                ],
+                ["2021 Johnson", "Exclu : contrôle checksum non certifié."],
+                [
+                    "2021 graph / metrics / Sokoban / Jacobi",
+                    "Admis dans les contrats préparés ; les noms Jacobi 2020 et 2021 ne sont pas interchangeables.",
+                ],
+                [
+                    "2022 k-NN / sum / bucket sort",
+                    "Contrats et formats reçus ; contrôle exact dans le domaine fini préparé.",
+                ],
+                [
+                    "2022 N-body",
+                    "Compteur entier d’en-tête du programme officiel conservé, puis six float32 par particule ; divergence de présentation entre prose et source.",
+                ],
+                [
+                    "2023 count / sum / npbonacci",
+                    "Admis dans R1 ; les grands jeux supplémentaires count ont un oracle de référence canonique dans les diagnostics CPU.",
+                ],
+                ["2023 path", "Exclu : initialisation non certifiée sous GCC."],
+                [
+                    "2023 primes / supplément R2",
+                    "Retenu avant tout modèle R2 : les fragments décimaux indépendants ne certifient pas l’origine première. Prévol mécanique insuffisant.",
+                ],
+                [
+                    "MPI / SIMD / threads",
+                    "MPI 2023 conditionnel, au plus quatre processus dans les règles examinées ; aucune obligation établie de douze nœuds. Option OpenMP ou trace SIMD statique : aucune preuve isolée de threads/instructions utiles.",
+                ],
+                [
+                    "2024 / 2025",
+                    "Aucun sujet exploitable publié dans les pages examinées ; aucune donnée de problème inventée.",
+                ],
+            ],
+        )
+    )
+    catalogue = load(ROOT / "catalogue-sources.json")
+    add(
+        "### A.1. Archives officielles consultées\n\nLes copies locales du catalogue conservent l’URL, la taille et l’empreinte intégrale. Les noms ci-dessous désignent les fichiers d’origine ; les contrats adaptés sont exportés par campagne en annexe G."
+    )
+    add(
+        table(
+            ["Édition / fichier", "SHA-256"],
+            [
+                [str(x["year"]) + " / " + x["name"], x["sha256"]]
+                for x in catalogue["files"]
+            ],
+        )
+    )
+    add(
+        "### A.2. Revue complémentaire de quicksort\n\nLa revue indépendante vérifie sept vrais cas et douze sorties capturées, avec onze tests du lecteur. Son transport mécanique ARM64 est reçu et audité : le préfixe d’un million de valeurs concorde entre C et Python ; une simplification algébrique modifierait 4 351 valeurs binaires64. Le MD5 est actif. Le job 748578 garde son échec d’archivage après réussite des contrôles ; la livraison corrective 748579 archive les mêmes fichiers sans rejouer les contrôles. L’archive 68d4b6a45528cbf65a8b25bdb3a521e1520be5ff69859474ccff6f72bcfaa5e3 et les inventaires lient 37 fichiers restaurés et 775 fichiers de la campagne Luna inchangés. Aucun candidat n’a été compilé ou exécuté par cette revue et aucun modèle n’a été appelé. La fidélité stricte de l’hybride Luna et son admission CPU restent retenues ; le cas à dix millions et le repli ne sont pas couverts. Cette preuve mécanique ne certifie ni l’algorithme Luna ni automatiquement le programme Astra."
+    )
+    add(
+        "## B. Vingt cellules count 2023\n\nUne recherche/graine 23 par ligne. Moyennes et écarts-types de confirmation en secondes ; cinq temps par programme. Le pourcentage décrit la réduction par rapport à la référence de la même cellule, sans fusion d’allocations."
+    )
+    add(
+        table(
+            [
+                "Modèle / effort",
+                "T₀ ± s₀ (s)",
+                "T ± s (s)",
+                "g (%)",
+                "Appels / inconnus",
+                "Jetons connus",
+            ],
+            [
+                [
+                    short_model(r["model"]) + " / " + r["effort"],
+                    f"{n(r['reference_seconds'], 6)} ± {n(r['reference_sd'], 6)}",
+                    f"{n(r['chosen_seconds'], 6)} ± {n(r['chosen_sd'], 6)}",
+                    n(r["gain_percent"], 4),
+                    f"{r['native_calls']} / {r['unmetered_calls']}",
+                    integer(r["known_exact_tokens"]),
+                ]
+                for r in count
+            ],
+        )
+    )
+    add(
+        "Les cinq mesures brutes de chaque référence et de chaque gagnant sont exportées dans registres-recalcules.json. La comparabilité des vingt contrats est documentée séparément dans comparabilite-max-xhigh-high-medium-low.json. Les références conservées, les doublons et les appels interrompus restent identifiés."
+    )
+    add(
+        "## C. Couvertures MAX et première cohorte source-only\n\nChaque modèle fournit quatorze recherches supplémentaires, une par sujet, en plus de count. Luna, Astra et Sol conservent les références tropical et Sokoban ; Terra conserve cinq références. Les quatorze contrats sont comparables après exclusion du seul temps de calibration propre à chaque allocation ; comparabilite-couvertures-luna-astra-terra-sol-max.json conserve les empreintes. Les temps ne sont pas fusionnés et aucune variabilité entre graines n’est estimée."
+    )
+    for section_no, (name, label) in enumerate([("luna", "Luna MAX"), ("astra", "Astra MAX"), ("terra", "Terra MAX"), ("sol", "Sol MAX")], 1):
+        add(f"### C.{section_no}. " + label)
+        add(table(["Sujet", "T₀ ± s₀ (s)", "T ± s (s)", "g (%)", "Appels / inconnus", "Jetons connus"],
+                  [[r["subject"], f"{n(r['reference_seconds'], 6)} ± {n(r['reference_sd'], 6)}",
+                    f"{n(r['chosen_seconds'], 6)} ± {n(r['chosen_sd'], 6)}", n(r["gain_percent"], 4),
+                    f"{r['native_calls']} / {r['unmetered_calls']}", integer(r["known_exact_tokens"])]
+                   for r in groups[name]]))
+        details = load(DATA / (name + ".json"))
+        add(table(["Sujet", "Statuts de programmes", "Sommets", "Réparations autonomes réussies"],
+                  [[r["subject"], json.dumps(r["statuses"], ensure_ascii=False),
+                    r["topology"]["scored_nodes"], r.get("harness_repaired_proposals", "non agrégé dans ce reçu")]
+                   for r in details["rows"]]))
+    add("Terra MAX : archive bc0db2c61712a9fc09ee950a957ae1e4d2b98bb9fc8eeaa48e6cd42a111f56df ; "
+        "4 178 fichiers restaurés inchangés avant/après audit, manifeste inclus. Neuf programmes modifiés sont confirmés ; "
+        "tropical, metrics 2021, Sokoban, somme 2023 et npbonacci gardent la référence. "
+        "Les 47 missions comptent 17 programmes valides, un incorrect et 29 interruptions d’infrastructure ; 18 sommets sont mesurés. "
+        "La réconciliation distingue 63 requêtes publiées, 62 livraisons, 58 invocations observées, 980 971 jetons exacts connus "
+        "et 24 invocations non mesurées. Une requête expirée sans réponse n’a pas de preuve d’invocation ni de consommation connue. "
+        "Elle n’est pas ajoutée artificiellement aux 58 appels, ni comptée comme une consommation nulle. "
+        "La réponse tardive 98718e2212264ce18607f60d15f40b9c est retransmise à l’identique sans nouvelle génération ; "
+        "les premiers refus de réception et la panne de transfert sont conservés. "
+        "couts-terra.json déduplique session/nonce et attribue les appels à leurs sujets et rôles enregistrés. "
+        "Aucune mesure CPU postérieure Terra n’est admise par cette mise à jour ; la revue algorithmique Luna ne certifie pas Terra.")
+    add("Sol MAX : archive fbd141c36a7b9f56da683abbeb007227dee456ec9339b573d698e48758cf2434 ; "
+        "9 268 fichiers restaurés inchangés, manifeste inclus, et 90 sources R1 vérifiées. Douze programmes modifiés sont confirmés ; tropical et Sokoban gardent leur référence. "
+        "Les 92 missions comptent 81 valides et onze infrastructure_error, pour 81 sommets notés. Les 113 requêtes sont livrées et réconciliées : "
+        "110 invocations, 2 502 330 jetons exacts connus, huit invocations non mesurées et trois expirations prouvées avant invocation. "
+        "Les parents, sources, sorties et cinq confirmations sont revérifiés indépendamment. Aucun résultat négatif n’est rejoué et aucun résultat CPU postérieur Sol n’est ajouté. "
+        "La conformité algorithmique quicksort doit être qualifiée séparément pour ce modèle.")
+    add("Astra MAX : archive 25b9767378516f1066c3ba4989b1d98dbacc3698ff6204baaf4a29512d5795e6 ; "
+        "6 155 fichiers revérifiés avant/après audit, 71 appels dont 17 sans mesure exacte finale, "
+        "1 144 204 jetons exacts connus. Les 67 missions enregistrées comprennent 40 programmes valides "
+        "et 27 interruptions d’infrastructure ; 40 sommets sont notés, de profondeur maximale un et deux fils au plus. "
+        "Les 14 requêtes de mère publiées et l’absence de réparation réussie diffèrent des réalisations Luna. "
+        "Les plafonds n’ont pas garanti huit programmes par cellule ; ces écarts et les compteurs manquants "
+        "limitent la comparaison. Aucun candidat n’est relancé ou réparé par l’opérateur.")
+    add("### C.5. Première cohorte source-only : Luna MAX\n\nQuinze racines fraîches sont reçues et auditées sous 749843, "
+        "avec la session bb7a58941e74486ba24267f2f526de8f et la source 9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb. "
+        "Quatorze programmes modifiés sont confirmés et Sokoban conserve la référence. Le harnais interne est désactivé ; "
+        "la mère, les arbres A/B/C, les intégrations G et l’évaluation externe restent présents. Ce bras n’est pas l’agent Codex à outils. "
+        "L’archive 4ed34c905e42c51f318538d7d09cf60a9f627d1588cf5607ff860235be13d672 est restaurée deux fois avec les sources officielles ; "
+        "7 433 fichiers restent identiques avant et après les audits natifs. Les quinze contrats correspondent aux références R1 "
+        "après exclusion du seul benchmark.reference_seconds ; les temps des allocations ne sont pas fusionnés.")
+    add(substitutions["TABLE_SOURCE_ONLY"].replace("Tableau 4", "Tableau C.5"))
+    add("Les 120 missions comprennent 112 valides, cinq build_failed, deux incorrectes et un doublon. "
+        "Les 119 sommets notés incluent les compilations et sorties rejetées : ils ne représentent pas 119 programmes chronométrés. "
+        "Chaque recherche possède la graine 23, au plus huit programmes et deux épisodes de mère, 1800 secondes et 1,5 million de jetons ; "
+        "trois mesures de recherche et cinq confirmations sont vérifiées. Les 150 requêtes sont livrées et réconciliées, "
+        "avec 3 564 823 jetons exacts et aucun compteur manquant dans ce groupe. L’allocation de quatre CPU ARM64, 16 GiB et zéro GPU "
+        "dure 3 h 48 min 1 s ; 241,2 secondes CPU et 229,9 MiB RSS sont les compteurs du job, sans CPU d’inférence ni nombre exact de threads. "
+        "Les journaux, parents, sources, finalistes et sorties sont liés dans le reçu indépendant et les exports. "
+        "Une seule graine, l’ordre temporel et R1 partiellement historique empêchent un avantage causal général du harnais. "
+        "Aucune conformité algorithmique stricte de quicksort ni nouvelle mesure CPU postérieure n’est admise.")
+    add(
+        "## D. Six bras GPT : confirmation, incidents et coûts\n\nLes trois paires possèdent les mêmes empreintes d’entrées. La source de recherche figée est bca04e1e52f8287c4ce547e6692c98e8928874debd1d2080db620e1bc514e030. L’archive reçue est 276fc2879fed70fc240185394ce330ebd3c0a1ffdeb9fbc365bf265c771ebcde ; 8 328 fichiers ont été revérifiés avant et après audit."
+    )
+    add(
+        table(
+            [
+                "Sujet / bras",
+                "T₀ ± s₀ (s)",
+                "T ± s (s)",
+                "g (%)",
+                "Appels / inconnus",
+                "Jetons connus",
+            ],
+            [
+                [
+                    r["subject"][5:]
+                    + " / "
+                    + ("sans" if r["arm"] == "reference" else "avec"),
+                    f"{n(r['reference_seconds'], 6)} ± {n(r['reference_sd'], 6)}",
+                    f"{n(r['chosen_seconds'], 6)} ± {n(r['chosen_sd'], 6)}",
+                    n(r["gain_percent"], 4),
+                    f"{r['native_calls']} / {r['unmetered_calls']}",
+                    integer(r["known_exact_tokens"]),
+                ]
+                for r in comp
+            ],
+        )
+    )
+    add(
+        "La panne de transfert a expiré trois intégrations G de somme avec harnais ; l’une n’a pas déclenché d’appel natif et une autre ne possède pas de compteur exact. Le candidat déjà produit d94576ad89f34d258d56a7dd9e37e3c0, 37 924 jetons exacts, a été livré depuis le cache sans réinjection tardive ni régénération. Une récupération ultérieure de la réponse 45b27… a également conservé ses 25 294 jetons exacts. Les expirations du témoin somme sont conservées comme telles. Le relais possédé a été arrêté après réconciliation des 126 requêtes et vérification complète de l’identité CIM. Les preuves d’incident restent dans harnais-r2/incidents/20261016-transfert-r1 et dans l’audit de comparaison. Aucun gain causal général n’est établi."
+    )
+    add("### D.1. GPT96 reçu : planning borné et résultats propres\n\nLe job 748383 est reçu, restauré neuf et audité avec le lecteur natif attendu pour trois sujets. "
+        "L’archive 165995d287d70f2e3f929c504fd5ff9bd69a03f22d527805bec5e108909fa874 possède les mêmes empreintes annoncée, distante et locale ; "
+        "les 7 365 fichiers restaurés et les 548 sources figées sont inchangés. Les trois pipelines ont achevé leurs confirmations, "
+        "mais chaque recherche a atteint son budget avant de compléter les 96 créneaux prévus. Le code retour Slurm FAILED 1:0 est conservé : "
+        "le lanceur figé renvoie 1 lorsque le planning est incomplet. Il n’invalide pas les confirmations reçues et ne déclenche aucun rejeu.")
+    add(table(["Sujet", "T₀ ± s₀ (s)", "T ± s (s)", "g (%)", "Essais / notés", "Appels / inconnus", "Jetons connus"],
+              [[r["subject"][5:], f"{n(r['reference_seconds'], 6)} ± {n(r['reference_sd'], 6)}",
+                f"{n(r['chosen_seconds'], 6)} ± {n(r['chosen_sd'], 6)}", n(r["gain_percent"], 4),
+                f"{next(x['trials'] for x in load(DATA / 'gpt96.json')['rows'] if x['subject'] == r['subject'])} / {r['nodes']}",
+                f"{r['native_calls']} / {r['unmetered_calls']}", integer(r["known_exact_tokens"])] for r in groups["gpt96"]],
+              "Tableau D.1 — GPT96 : cinq confirmations par référence et programme retenu ; aucune fusion avec les autres allocations."))
+    add("Les 183 missions comprennent 153 valides, 23 erreurs d’infrastructure, quatre échecs de génération, deux échecs de compilation et une annulation au budget. "
+        "Les 155 sommets notés incluent les deux échecs de compilation ; ils ne sont donc pas tous des programmes chronométrés. La profondeur maximale observée est trois. "
+        "Les 179 requêtes sont livrées et réconciliées : 177 invocations natives, 5 126 918 jetons exacts connus, 17 invocations sans compteur, "
+        "et deux expirations établies avant toute invocation native. Ces deux dernières ont une consommation native nulle prouvée ; les 17 inconnues ne l’ont pas. "
+        "Les rôles réalisés A/B/C/G sont 14/14/14/12 sur k-NN et somme, puis 19/19/19/18 sur N-body. Aucun épisode de mère modèle ni assistance interne n’est activé. "
+        "Les incidents de transfert et retransmissions identiques sont conservés. Le relais possédé est arrêté après audit et réconciliation. "
+        "Le contexte 65 536 et la réservation 196 608 par mission diffèrent des DeepSeek ; ce résultat n’est ni une ablation identique, ni une cellule du nouveau bras source-only.")
+    add(
+        "## E. Deux campagnes DeepSeek locales\n\nLes deux jeux de poids locaux restent distincts des identités natives. L’inférence réserve deux GPU ; les candidats s’exécutent sur quatre cœurs CPU sans GPU. Les consommations ci-dessous sont exactes selon Ollama ; elles ne sont pas ajoutées aux jetons natifs pour produire un coût universel."
+    )
+    add(substitutions["TABLE_DEEP"].replace("Tableau 5", "Tableau E.1"))
+    deep_data = load(DATA / "deepseek.json")
+    add(
+        table(
+            [
+                "Job / identité",
+                "Appels locaux",
+                "Jetons exacts",
+                "Fichiers revérifiés",
+                "Archive SHA-256",
+            ],
+            [
+                [
+                    j["job_id"] + " / " + j["model"],
+                    sum(x["model_calls"] for x in j["problems"]),
+                    integer(j["exact_total_tokens"]),
+                    j["integrity_after"]["verified_files"],
+                    j["archive_sha256"],
+                ]
+                for j in deep_data["verified_jobs"]
+            ],
+        )
+    )
+    rejected = []
+    for r in regs:
+        for e in r["confirmations"]:
+            if not e.get("correct"):
+                rejected.append(
+                    [
+                        r["campaign_root"].split("results-")[-1].replace("\\", "/"),
+                        e["id"],
+                        e.get("status"),
+                        e.get("score"),
+                        len(e.get("times", [])),
+                        e.get("reason", ""),
+                    ]
+                )
+    add(
+        "### E.1. Finalistes rejetés et correction de l’auditeur\n\nLe premier lecteur 0731 supposait à tort que tous les finalistes étaient corrects. Son échec reste dans audits-747505. Le lecteur indépendant R2 et ses neuf tests imposent une exclusion des rejets, un score nul sans temps et cinq mesures pour tout finaliste valide. Le tableau suivant provient directement des registres immuables."
+    )
+    add(
+        table(
+            [
+                "Campagne",
+                "Programme",
+                "Statut",
+                "Score",
+                "Temps conservés",
+                "Cause enregistrée",
+            ],
+            rejected,
+        )
+    )
+    add(
+        "## F. Coûts par appel, rôle et provenance\n\nUn compteur absent est inconnu. Une réponse expirée peut être imputée au budget sans consommation exacte connue. Les jetons de cache sont un sous-ensemble de l’entrée et ceux de raisonnement un sous-ensemble de la sortie. Les identifiants session/nonce assurent la déduplication des copies locales et archivées."
+    )
+    add(substitutions["TABLE_COST"].replace("Tableau 7", "Tableau F.1"))
+    add(
+        f"L’inventaire natif global du {ledger['observed_utc']} contient {integer(ledger['native_unique_calls'])} appels uniques : {integer(ledger['native_unique_calls'] - ledger['native_unmetered_calls'] - ledger['native_pending_calls'])} avec mesure exacte, {integer(ledger['native_unmetered_calls'])} sans compteur final et {integer(ledger['native_pending_calls'])} en cours. Il comprend les pilotes, sondes et recherches en cours ; ses {integer(ledger['native_exact_total'])} jetons exacts connus ne sont pas tous ceux des cohortes finales. Le fichier couts-natifs.json conserve chaque appel, son rôle, son état et ses empreintes de requête/réponse."
+    )
+    add("Cet inventaire global est un instantané historique antérieur aux réceptions Terra, GPT96 et Sol ; ses états en cours ne décrivent pas l’état actuel. "
+        "Le tableau F.1 et la figure 7 utilisent leurs reçus clos, via couts-terra.json, couts-gpt96.json et couts-sol.json, en remplacement de leurs entrées historiques. "
+        "Les inventaires ne sont jamais additionnés : leurs clés session/nonce se recouvrent. Les 24 invocations Terra et les 17 GPT96 sans compteur "
+        "restent inconnues ; la requête Terra sans réponse et les deux expirations GPT96 établies avant invocation restent distinctes.")
+    terra_calls = load(DATA / "couts-terra.json")["native_calls"]
+    add(table(["Rôle Terra", "Invocations observées", "Sans compteur", "Jetons exacts connus"],
+              [[label,
+                sum(c["native_invocation_observed"] for c in terra_calls if c["kind"] == role),
+                sum(c["native_invocation_observed"] and not c["usage_measured"] for c in terra_calls if c["kind"] == role),
+                integer(sum(c["exact_total"] or 0 for c in terra_calls if c["kind"] == role))]
+               for role, label in [("enfant", "Enfants"), ("intégration", "Intégrations G"), ("mère", "Mère modèle")]],
+              "Tableau F.2 — Appels Terra reçus, dédupliqués par session/nonce ; la requête sans réponse est exclue du nombre d’invocations observées."))
+    gpt96_calls = load(DATA / "couts-gpt96.json")["native_calls"]
+    add(table(["Rôle GPT96", "Invocations observées", "Sans compteur", "Jetons exacts connus"],
+              [[label, sum(c["native_invocation_observed"] for c in gpt96_calls if c["kind"] == role),
+                sum(c["native_invocation_observed"] and not c["usage_measured"] for c in gpt96_calls if c["kind"] == role),
+                integer(sum(c["exact_total"] or 0 for c in gpt96_calls if c["kind"] == role))]
+               for role, label in [("enfant", "Enfants A/B/C"), ("intégration", "Intégrations G"), ("mère", "Mère modèle")]],
+              "Tableau F.3 — GPT96 reçu : deux expirations avant invocation sont exclues des 177 appels observés."))
+    sol_calls = load(DATA / "couts-sol.json")["native_calls"]
+    add(table(["Rôle Sol MAX", "Invocations observées", "Sans compteur", "Jetons exacts connus"],
+              [[label, sum(c["native_invocation_observed"] for c in sol_calls if c["kind"] == role),
+                sum(c["native_invocation_observed"] and not c["usage_measured"] for c in sol_calls if c["kind"] == role),
+                integer(sum(c["exact_total"] or 0 for c in sol_calls if c["kind"] == role))]
+               for role, label in [("enfant", "Enfants A/B/C"), ("intégration", "Intégrations G"), ("mère", "Mère modèle")]],
+              "Tableau F.4 — Sol MAX reçu : trois expirations établies avant invocation sont exclues des 110 invocations ; huit invocations conservent leur consommation inconnue."))
+    source_only_calls = load(DATA / "couts-source-only.json")["native_calls"]
+    add(table(["Rôle source-only Luna MAX", "Invocations observées", "Sans compteur", "Jetons exacts"],
+              [[label, sum(c["native_invocation_observed"] for c in source_only_calls if c["kind"] == role), 0,
+                integer(sum(c["exact_total"] for c in source_only_calls if c["kind"] == role))]
+               for role, label in [("enfant", "Enfants A/B/C"), ("intégration", "Intégrations G"), ("mère", "Mère modèle")]],
+              "Tableau F.5 — Première cohorte source-only : les 150 invocations ont toutes un compteur ; cache et raisonnement sont déjà inclus."))
+    add(
+        table(
+            [
+                "Campagne / effort",
+                "Appels exacts / inconnus / en cours",
+                "Entrée",
+                "Sortie",
+                "Mère",
+                "G",
+                "Enfants",
+            ],
+            [
+                [
+                    x["campaign"] + " / " + x["effort"],
+                    f"{x['exact_calls']} / {x['unmetered_calls']} / {x['pending_calls']}",
+                    str(x["input_tokens"]),
+                    str(x["output_tokens"]),
+                    str(x["mother_tokens"]),
+                    str(x["integration_tokens"]),
+                    str(x["child_tokens"]),
+                ]
+                for x in ledger["native_campaigns"]
+            ],
+        )
+    )
+    add(
+        "## G. Fiches des campagnes et vrais arbres\n\nChaque fiche documente l’identité, le contrat, les plafonds, le programme retenu et les vrais parents/sources. Les racines structurelles sont distinctes des programmes notés. Les programmes sans score ne sont pas ajoutés artificiellement au MCTS ; leur nombre et leur statut restent visibles. Les hypothèses et transformations textuelles complètes sont dans l’export registres-recalcules.json et les archives sources. Les traits pleins représentent les parents MCTS ; les pointillés des petits arbres représentent les sources G. Dans les grandes forêts, la liste complète des sources G reste dans figures-sources.json pour garder la figure lisible. Les labels A1/B1/etc. sont des identifiants de lecture, associés aux identifiants complets dans ce même fichier ; ils ne remplacent pas les ordinaux de mission archivés. Le code déclaré, ses identifiants, ses temps, les diagnostics et les entrées permettent l’inspection ; aucune pensée interne n’est inférée."
+    )
+    registry_index = []
+    displayed_contracts = {}
+
+    def without_reference_times(value):
+        if isinstance(value, dict):
+            return {
+                k: without_reference_times(v)
+                for k, v in value.items()
+                if k != "reference_seconds"
+            }
+        if isinstance(value, list):
+            return [without_reference_times(v) for v in value]
+        return value
+
+    for i, r in enumerate(regs, 1):
+        cfg = r["config"] or {}
+        b = r["best_confirmed"]
+        ident = cfg.get(cfg.get("backend", "codex"), {})
+        model = ident.get("model") or cfg.get("model") or "voir configuration"
+        effort = ident.get("reasoning_effort", "local")
+        subject = cfg.get("problem", "voir contrat")
+        rel = Path(r["campaign_root"]).relative_to(OUT).as_posix()
+        registry_index.append(
+            {
+                "id": f"C{i:02d}",
+                "root": r["campaign_root"],
+                "registry_sha256": r["registry_sha256"],
+                "model": model,
+                "effort": effort,
+                "subject": subject,
+            }
+        )
+        add(
+            f"### G.{i}. C{i:02d} — {subject} · {short_model(model)} · {effort}\n\nRacine complète : `{rel}`. Registre SHA-256 : `{r['registry_sha256']}`."
+        )
+        schedule = cfg.get("schedule", {})
+        bud = cfg.get("budget", {})
+        proto = cfg.get("protocol", {})
+        add(
+            table(
+                [f"C{i:02d} · champ", "Valeur enregistrée"],
+                [
+                    [
+                        "Programme confirmé",
+                        b["experiment_id"] + " ; commit " + b["commit"],
+                    ],
+                    [
+                        "Résultat",
+                        (
+                            "Référence conservée"
+                            if b["is_baseline"]
+                            else "Programme modifié confirmé"
+                        )
+                        + f" ; g = {n(100 * r['gain_fraction'], 4)} % ; S = {n(r['speedup'], 4)}",
+                    ],
+                    [
+                        "T₀ / T (s)",
+                        n(b["reference_seconds"], 7) + " / " + n(b["mean_seconds"], 7),
+                    ],
+                    [
+                        "Cinq temps T₀ (s)",
+                        "; ".join(n(x, 7) for x in r["reference_samples"]),
+                    ],
+                    [
+                        "Cinq temps T (s)",
+                        "; ".join(n(x, 7) for x in r["chosen_samples"]),
+                    ],
+                    [
+                        "Statuts des missions",
+                        json.dumps(
+                            dict(
+                                Counter(
+                                    (x["result"] or {}).get("status", x["state"])
+                                    for x in r["trials"]
+                                )
+                            ),
+                            ensure_ascii=False,
+                        ),
+                    ],
+                    [
+                        "Plafonds",
+                        f"wall={bud.get('wall_seconds')} s ; jetons={bud.get('tokens')} ; profondeur={bud.get('max_depth')} ; mission={bud.get('generation_seconds')} s",
+                    ],
+                    ["Planning", json.dumps(schedule, ensure_ascii=False)],
+                    ["Harnais", json.dumps(cfg.get("harness", {}), ensure_ascii=False)],
+                    [
+                        "Mesures de recherche / confirmation",
+                        f"{proto.get('repetitions')} / {proto.get('confirmation_repetitions')} ; chauffe={proto.get('warmups')} ; graine={cfg.get('seed')}",
+                    ],
+                    [
+                        "Machine / cible",
+                        str((r["identity"] or {}).get("machine"))
+                        + " ; "
+                        + str(cfg.get("target_id")),
+                    ],
+                    [
+                        "Compilateur",
+                        json.dumps(cfg.get("compiler", {}), ensure_ascii=False),
+                    ],
+                    [
+                        "Environnement",
+                        json.dumps(proto.get("environment", {}), ensure_ascii=False),
+                    ],
+                ],
+            )
+        )
+        contract = r["contract"] or {}
+        contract_text = table(
+            ["Contrat", "Valeur"],
+            [
+                [
+                    "Langage / fichiers",
+                    str(contract.get("language"))
+                    + " / "
+                    + str(contract.get("source_files")),
+                ],
+                ["Options", " ".join(contract.get("compiler_flags", []))],
+                [
+                    "Comparaison",
+                    json.dumps(contract.get("comparison", {}), ensure_ascii=False),
+                ],
+            ],
+        )
+        cases = [*contract.get("search", []), *contract.get("confirmation", [])]
+        if contract.get("benchmark"):
+            cases.append(contract["benchmark"])
+        case_text = table(
+            [
+                "Cas",
+                "Entrée (empreinte du contrat)",
+                "Octets stdin",
+                "Sortie attendue SHA-256",
+            ],
+            [
+                [
+                    c["name"],
+                    c.get("input_fingerprint", "non indiqué"),
+                    c.get("stdin_bytes", "non indiqué"),
+                    c.get("expected", {})
+                    .get("stdout", {})
+                    .get("sha256", "voir fichiers capturés"),
+                ]
+                for c in cases
+            ],
+        )
+        signature = hashlib.sha256(
+            json.dumps(
+                without_reference_times(contract), sort_keys=True, ensure_ascii=False
+            ).encode()
+        ).hexdigest()
+        if signature in displayed_contracts:
+            shared = displayed_contracts[signature]
+            add(
+                f"Contrat partagé **{shared['id']}** : champs hors chronométrages identiques à ceux présentés en **G.{shared['first_section']}**. Les temps et paramètres propres à cette campagne restent distincts ; sa version intégrale est conservée dans le registre exporté."
+            )
+        else:
+            shared = {
+                "id": f"K{len(displayed_contracts) + 1:02d}",
+                "first_section": i,
+                "signature_without_reference_times": signature,
+            }
+            displayed_contracts[signature] = shared
+            add(
+                f"Contrat **{shared['id']}** — Première présentation. Les empreintes et les champs de format sont communs seulement aux fiches qui renvoient explicitement à cette clé ; les chronométrages ne sont pas mutualisés."
+            )
+            add(contract_text)
+            add(case_text)
+        registry_index[-1]["display_contract"] = shared
+        add(
+            f"![Figure G.{i} — Forêt C{i:02d}, liens enregistrés. Statuts de recherche ; programme confirmé encadré. Identifiants complets et toutes les sources G : figures-sources.json.](edition-professionnelle/figures/arbres/C{i:02d}.png)"
+        )
+    (DATA / "index-campagnes.json").write_text(
+        json.dumps(registry_index, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    add(
+        "## H. Historique, explorations et résultats non confirmés\n\nLes 42 résumés historiques ci-dessous conservent leur qualification d’origine. Une ligne de résumé n’est pas forcément une recherche indépendante, ni un résultat réaudité au niveau des cohortes principales. Les ensembles peuvent se recouvrir. Le JSON historique complet est conservé ; aucun gain de recherche non confirmé n’est substitué à un gain final."
+    )
+    add(
+        table(
+            [
+                "N°",
+                "Modèle / sujet / job",
+                "Gain enregistré (%)",
+                "Statut de provenance",
+            ],
+            [
+                [
+                    i + 1,
+                    r["model"]
+                    + " / "
+                    + r["problem"]
+                    + " / "
+                    + str(r.get("job_id", "")),
+                    n(100 * r["best_confirmed_as_recorded"]["improvement_fraction"], 4)
+                    if r.get("best_confirmed_as_recorded")
+                    else "non disponible",
+                    r["interpretation"],
+                ]
+                for i, r in enumerate(corpus["rows"])
+            ],
+        )
+    )
+    small = corpus["legacy_consolidation"]["small_models"]
+    add(
+        "### H.1. Petits modèles avec harnais\n\nLes deux sondes documentaires imposées, quatre appels et 1 074 jetons au total, sont séparées des 54 requêtes d’optimisation et 447 778 jetons. Les dix contrôles de développement n’ont donné aucune réparation autonome réussie ; aucune lecture spontanée n’est enregistrée. Les six programmes finaux sont des références conservées."
+    )
+    add(
+        table(
+            ["Modèle / sujet", "Appels", "Jetons", "Statuts", "Sommets"],
+            [
+                [
+                    r["model"] + " / " + r["problem"],
+                    r["model_calls"],
+                    integer(r["tokens"]),
+                    json.dumps(r["statuses"], ensure_ascii=False),
+                    r["topology"]["scored_nodes"],
+                ]
+                for r in small["problems"]
+            ],
+        )
+    )
+    add(
+        "### H.2. Sélections historiques corrigées\n\nLes sélections ci-dessous restent des comparaisons diagnostiques. Les séries 14B proviennent de plusieurs campagnes ; aucune moyenne ni hiérarchie générale n’est calculée."
+    )
+    add(
+        table(
+            [
+                "Modèle / sujet / job",
+                "Référence (s)",
+                "Retenu (s)",
+                "Gain (%)",
+                "Créneaux / sommets",
+            ],
+            [
+                [
+                    r["model"] + " / " + r["problem"] + " / " + r["job_id"],
+                    n(r["reference"], 6),
+                    n(r["candidate"], 6),
+                    n(100 * r["gain"], 4),
+                    f"{r['trials']} / {r['nodes']}",
+                ]
+                for r in corpus["legacy_consolidation"]["corrected_comparisons"]
+            ],
+        )
+    )
+    pilot = corpus["legacy_consolidation"]["gpt_pilot"]
+    add(
+        f"### H.3. Pilote GPT 747664\n\nL’archive de recherche {pilot['archive_sha256']} a {pilot['restored_files_verified']} fichiers revérifiés. Les traces de recherche sont disponibles, mais final_confirmation_verified vaut false. Le minimum de recherche et ses hypothèses déclarées restent exportés comme observations de recherche uniquement ; aucun gain final n’est attribué. Les {integer(pilot['tokens_known_archived'])} jetons connus et {pilot['unmetered_native_invocations']} invocations sans mesure restent distincts de la réserve budgétaire."
+    )
+    add(
+        f"## I. {len(batches)} lots CPU : résultats complets et alias\n\nLes lots ne sont pas fusionnés. Chaque campagne apparaît une seule fois dans les plans de montée en cœurs ; les références binaires identiques sont partagées à l’intérieur d’un lot. Un triplet binaire/entrée/cœurs répété dans une autre allocation est un contrôle répété. Les {integer(audit['cpu_totals']['samples'])} temps bruts, leurs rapports CPU/mural et les empreintes de sortie sont dans cpu-mesures-brutes.csv ; tous les temps de référence, gains, secondes économisées et efficacités sont dans cpu-comparaisons.csv. Pour chaque campagne, le tableau donne le cas nommé benchmark ou, à défaut, une entrée de plus grande taille explicitement identifiée. La figure garde toutes les entrées séparément, y compris des graphes de même nombre de sommets. Les valeurs numériques de chaque courbe restent dans le CSV."
+    )
+    add(
+        table(
+            ["Lot / job", "Campagnes", "Points", "Temps", "Archive SHA-256"],
+            [
+                [
+                    f"{b['batch']:02d} / {b['job_id']}",
+                    b["campaigns"],
+                    b["points"],
+                    b["samples"],
+                    b["archive_sha256"],
+                ]
+                for b in batches
+            ],
+        )
+    )
+    with (DATA / "cpu-comparaisons.csv").open(encoding="utf-8-sig") as f:
+        cpu = list(csv.DictReader(f))
+    cpu_campaigns = load(DATA / "cpu-campagnes.json")
+    for i, c in enumerate(cpu_campaigns, 1):
+        rr = [r for r in cpu if r["campaign_root"] == c["campaign_root"]]
+        benchmark = [r for r in rr if r["case_name"] == "benchmark"]
+        if not benchmark:
+            illustrative = max(rr, key=lambda r: (int(r["size"]), r["input_sha256"]))
+            benchmark = [
+                r for r in rr if r["input_sha256"] == illustrative["input_sha256"]
+            ]
+        assert len(benchmark) == 5 and {int(r["cores"]) for r in benchmark} == {
+            1,
+            2,
+            4,
+            8,
+            16,
+        }
+        add(
+            f"### I.{i}. Lot {c['batch']:02d} — {c['subject']} · {short_model(c['model'])} · {c.get('effort') or 'local'} {c.get('arm') or ''}\n\nLe programme retenu "
+            + (
+                "est la référence inchangée"
+                if c["chosen_is_unchanged_baseline"]
+                else "est un programme modifié confirmé"
+            )
+            + f". Clé binaire : `{c['keys']['chosen']}`. Référence : `{c['keys']['original_reference']}`."
+        )
+        add(
+            f"Cas du tableau : **{benchmark[0]['case_name']}**, taille {benchmark[0]['size']} ; entrée SHA-256 `{benchmark[0]['input_sha256']}`. Les cinq lignes sont les cinq affinités de cette seule entrée."
+        )
+        add(
+            table(
+                [
+                    "Cœurs",
+                    "Référence ± s (s)",
+                    "Retenu ± s (s)",
+                    "Gain (%)",
+                    "Sₚ",
+                    "Eₚ (%)",
+                    "CPU/mural",
+                ],
+                [
+                    [
+                        r["cores"],
+                        n(float(r["reference_seconds"]), 6)
+                        + " ± "
+                        + n(float(r["reference_sd"]), 6),
+                        n(float(r["chosen_seconds"]), 6)
+                        + " ± "
+                        + n(float(r["chosen_sd"]), 6),
+                        n(100 * float(r["gain_fraction"])),
+                        n(float(r["scaling_speedup"]), 3),
+                        n(100 * float(r["scaling_efficiency"]), 2),
+                        n(float(r["mean_used_cores"]), 2),
+                    ]
+                    for r in benchmark
+                ],
+            )
+        )
+        add(
+            f"![Figure I.{i} — Temps absolus du programme retenu dans le lot {c['batch']:02d}, pour chaque entrée identifiée par son nom et son empreinte courte. Moyenne ± écart-type de cinq temps ; échelle logarithmique. Aucune fusion entre entrées ou allocations.](edition-professionnelle/figures/cpu/P{i:02d}.png)"
+        )
+    add(
+        "## J. Protocoles actifs, extension dynamique et registre des idées\n\nLes statuts en cours sont des observations datées et ne deviennent pas des gains finaux. R1 et source-only Astra MAX occupent les deux voies natives après réception du premier groupe direct ; aucune troisième voie n’est créée pour l’article. La réception auditée, et non un champ complete de planification, déclenche l’intégration d’un nouveau bilan."
+    )
+    add(
+        "R1 : source figée cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18 ; 24 groupes et 76 cellules reçus dans cet instantané ; Terra MAX / 748782 et Sol MAX / 749415 clos et audités, Luna xhigh en cours sous 749940. Les reprises d’interface conservent la session et les caches de chaque recherche commencée, sans rejeu ; le nouveau groupe Luna xhigh utilise sa session déjà planifiée et une racine fraîche. GPT96 clos et reçu : source 2f71b0b6fa50c45b29d9fa9484aaf7507c321ea58f9cac54227185c2e23c1809, payload f62d01f2a3084e8a89645a22ed27a61276861a2a62430a3a71152f1bf2bc6485 ; job 748383, harnais désactivé, contexte 65 536, réservation de 196 608 jetons par mission. Cette réservation n’équivaut pas à num_predict=32768. Les dépendances DeepSeek et comparaison sont reçues/auditées ; aucun ancien candidat n’amorce GPT96."
+    )
+    add("### J.1. Comparaison étendue des harnais — quinze issues directes reçues\n\nLa demande humaine porte sur "
+        "les quinze sujets, les modèles exacts gpt-6-luna, gpt-6-astra, gpt-6.1-sol et gpt-5.6-terra, "
+        "et max/xhigh/high/medium/low. Elle prévoit 300 cellules fraîches en génération directe puis 300 "
+        "avec le véritable agent Codex. La référence R1 n’est pas relancée. Chaque cellule possède une "
+        "racine, une session, un contexte et un registre neufs, sans candidat hérité. Les huit missions, "
+        "deux épisodes de mère, 1800 secondes, 1,5 million de jetons et 600 secondes par mission sont "
+        "des plafonds comparables recherchés, non des réalisations annoncées. La phase directe garde "
+        "TreeQuest, la mère, les oracles et la confirmation externe ; seule l’assistance interne change. "
+        "Le premier groupe direct Luna MAX 749843 est reçu et audité sur quinze sujets : quatorze programmes modifiés confirmés, une référence conservée, "
+        "150 invocations et 3 564 823 jetons exacts. Les 94 sources et les 609 fichiers officiels de préparation sont vérifiés sans candidat hérité. "
+        "La même file poursuit Astra MAX sous 750122 ; 285 issues directes restent non reçues. "
+        "Les 239 tests Windows de la révision Codex r7 exercent un RPC générique bidirectionnel sur des pairs Python neutres et des journaux locaux. "
+        "Ils ne prouvent pas les outils ARM64, l’identité par inférence, l’isolation matérielle, "
+        "les instructions effectives ou la borne exacte de jetons ; aucun reçu natif positif n’est délivré. "
+        "Les authentifications restent sur le PC et les instructions intégrées doivent être conservées. "
+        "Une voie ne devient disponible qu’après réception/audit et réconciliation du relais possédé ; "
+        "Codex attend aussi les 300 issues directes. Le plan séquentiel et R1 en partie historique "
+        "restent des facteurs de confusion. Les seuls résultats reçus sont ceux du premier groupe direct ; aucun classement causal ni résultat Codex natif "
+        "n’en découle.")
+    add(
+        "R4 : source 2512ae10bb7ad920a5ba7d6bf5ffd76ffb57e94cb23875715249a4437a8ca6ff, payload 557fb364e1beee593592ff0318b5e162828f8f44a286bc244c030b75d0eceeb5. Prévol reçu, 262 tests ARM64 réussis et un MCP optionnel ignoré. Les contrats natifs roots/advice/harvest, puis les quatre cellules pilotes count Luna/Sol MAX/low restent requis. Les chemins de recherche native ne sont pas exercés. La mère doit choisir ses axes et orienter les branches sur leur seule histoire ; la récolte globale produit un programme neuf et ne recopie pas les scores de ses sources."
+    )
+    add(
+        "![Figure J.1 — Extension R4 : schéma conceptuel du protocole préparé, sans recherche native validée. Le conseil local ne reçoit que l’histoire de sa branche ; la récolte globale est un canal distinct. Cette figure ne représente pas un arbre observé.](edition-professionnelle/figures/r4-concept.png)"
+    )
+    id_text = load(DATA / "source-cr-ID.md")["text"]
+    (DATA / "ID-snapshot.md").write_text(id_text, encoding="utf-8")
+    id_rows = []
+    for line in id_text.splitlines():
+        if re.match(r"\| ID-\d{3} \|", line):
+            cells = [x.strip() for x in line.strip("|").split("|")]
+            id_rows.append(cells[:3])
+    assert len(id_rows) == 40
+    add(
+        "### J.2. État des quarante idées\n\nLe registre est repris à sa date, avec ses jalons et causes de non-clôture. ID-017/040 sont complétés ici par la nouvelle édition et son audit ; les autres états restent ceux des preuves reçues. L’échéance exclusive est le 1er novembre 2026 à 00:00 Europe/Paris, soit le 31 octobre à 23:00 UTC. Les réplications, la couverture complète, les validations natives R4 et la conformité universelle ne sont pas déclarées terminées."
+    )
+    add(table(["ID", "Idée", "État enregistré"], id_rows))
+    add(
+        "## K. Calculs, provenance et couverture documentaire\n\nLes formules de réduction, d’accélération, d’efficacité et d’écart-type utilisent les échantillons individuels sans arrondir les données d’entrée. Les arrondis sont réservés à l’affichage. Les rapports sont recalculés par allocation. La présente édition ne publie ni tests de significativité ni intervalles de confiance entre recherches à partir des répétitions de temps."
+    )
+    add(
+        table(
+            ["Vérification", "Nombre de contrôles"],
+            [[k, integer(v)] for k, v in audit["checks"].items()],
+        )
+    )
+    add(
+        table(
+            ["Rubrique ID-040", "Localisation et preuve"],
+            [
+                [
+                    "Exigences et sources",
+                    "A, contrats G, catalogue officiel et empreintes",
+                ],
+                ["Identités réelles", "B–G ; arguments natifs et registres JSON"],
+                [
+                    "Préparation et oracles",
+                    f"A, G, audits des {len(batches)} lots et sorties capturées",
+                ],
+                [
+                    "Matériel demandé/alloué/utilisé",
+                    "Méthodes, G, I ; ressources Slurm et CPU/mural, inconnues explicites",
+                ],
+                [
+                    "Budgets et chronologie",
+                    "G, J, historiques, journaux de requêtes et événements",
+                ],
+                [
+                    "Vrais arbres et liens",
+                    "G ; parenté, rôle et sources séparés, figures générées depuis les registres",
+                ],
+                [
+                    "Mère et harnais",
+                    "Méthodes, C/D/J ; épisodes et contrôles internes conservés",
+                ],
+                [
+                    "Appels et jetons par rôle",
+                    "F ; couts-natifs.json et compléments Ollama E",
+                ],
+                [
+                    "Données brutes et dispersion",
+                    "B–I ; cinq temps, CSV bruts et comparaisons, formules K",
+                ],
+                [
+                    "Négatifs et incidents",
+                    "A/C/D/E/H ; rejets protégés, exclusions, expirations, références conservées",
+                ],
+                [
+                    "Interprétation",
+                    "Discussion de l’article ; aucune causalité ou généralisation non mesurée",
+                ],
+                [
+                    "Provenance",
+                    "audit-calculs.json, index des sources, archives et manifestes de réception",
+                ],
+            ],
+        )
+    )
+    add(
+        "### K.1. Index des fichiers de cette édition\n\nLes fichiers ci-dessous accompagnent les PDF. Les fichiers JSON de registres contiennent les contrats, les finalistes, les missions, les sources d’intégration, les résultats et les paramètres ; le CSV brut contient chacune des répétitions CPU. Les chemins locaux des archives originales sont conservés dans index-campagnes.json et audit-calculs.json. Les compléments Luna d’origine sont details-missions-couverture-luna-max.json, episodes-harnais-couverture-luna-max.json et arbres-couverture-luna-max.json. Les fichiers Astra correspondants emploient le suffixe couverture-astra-max ; les appels sans compteur et interruptions restent explicitement identifiés. Leurs hypothèses déclarées restent des données de modèle. L’article n’affirme pas qu’un dépôt public existe."
+    )
+    add(
+        table(
+            ["Fichier relatif", "Contenu"],
+            [
+                [
+                    "edition-professionnelle/audit-calculs.json",
+                    "Contrôles indépendants, SHA des sources, chiffres d’audit",
+                ],
+                [
+                    "edition-professionnelle/donnees/confirmations.csv",
+                    f"{len(rows)} résultats des cohortes principales avec moyenne, SD, gain, coût",
+                ],
+                [
+                    "edition-professionnelle/donnees/registres-recalcules.json",
+                    f"{len(regs)} campagnes uniques ; temps, candidats, parents, contrats, configurations",
+                ],
+                [
+                    "edition-professionnelle/donnees/cpu-mesures-brutes.csv",
+                    f"{integer(audit['cpu_totals']['samples'])} chronométrages individuels avec identité et sortie",
+                ],
+                [
+                    "edition-professionnelle/donnees/cpu-comparaisons.csv",
+                    "Toutes les campagnes/entrées/cœurs, références, gains et efficacités",
+                ],
+                [
+                    "edition-professionnelle/donnees/cpu-points.json",
+                    f"Chauffes, échantillons et statistiques des {integer(audit['cpu_totals']['points'])} points",
+                ],
+                [
+                    "edition-professionnelle/donnees/couts-natifs.json",
+                    "Appels dédupliqués, compteurs exacts/inconnus/en cours et provenance",
+                ],
+                [
+                    "edition-professionnelle/donnees/historique-preserve.json",
+                    "42 résumés et ancienne consolidation entière",
+                ],
+                [
+                    "edition-professionnelle/figures/",
+                    "PNG et SVG des figures principales, vrais arbres et courbes complètes",
+                ],
+                [
+                    "versions/20261016-avant-refonte-professionnelle/",
+                    "Article antérieur et ses preuves de rendu conservés",
+                ],
+                [
+                    "edition-professionnelle/manifeste-edition.json",
+                    "Empreintes de l’édition livrée ; absence de modification scientifique",
+                ],
+                [
+                    "edition-professionnelle/controle-qualite.json",
+                    "Contrôle final du texte, des calculs, figures et PDF",
+                ],
+            ],
+        )
+    )
+    add(
+        "La réception d’origine contrôle l’archive annoncée, son empreinte distante et locale, sa restauration dans un dossier neuf, puis l’inventaire avant/après audit en lecture seule. La réanalyse éditoriale s’appuie sur ces reçus positifs et relit les registres immuables ; elle ne prétend pas avoir réexécuté tous les programmes. Les archives originales, les erreurs de lecteurs et les premières versions ne sont pas effacées."
+    )
+    supplement = "\n".join(parts)
+    (ROOT / "ANNEXES-TECHNIQUES.md").write_text(supplement, encoding="utf-8")
+    consolidated = {
+        "schema": "hpc-forest-professional-edition-v1",
+        "authors": ["Nicolas Marano", "Romain Despoullain"],
+        "data_cutoff_utc": audit["completed_utc"],
+        "received_research_results": rows,
+        "cpu_totals": audit["cpu_totals"],
+        "native_accounting": audit["native_accounting"],
+        "registry_count": len(regs),
+        "historical_summaries_preserved": len(corpus["rows"]),
+        "current_state_snapshot": state,
+        "sources": audit["sources"],
+        "historical_data": "edition-professionnelle/donnees/historique-preserve.json",
+        "operator_report_is_never_model_input": True,
+        "general_model_ranking_proved": False,
+        "causal_harness_advantage_proved": False,
+        "official_contest_compliance_certified": False,
+    }
+    (ROOT / "donnees-consolidees.json").write_text(
+        json.dumps(consolidated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                "main_words": len(manuscript.split()),
+                "main_figures": len(re.findall(r"!\[", manuscript)),
+                "supplement_words": len(supplement.split()),
+                "supplement_figures": len(re.findall(r"!\[", supplement)),
+                "registry_count": len(regs),
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

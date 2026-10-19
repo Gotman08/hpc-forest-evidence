@@ -1,0 +1,75 @@
+"""Freeze an isolated preparation-only correction; never generate a candidate."""
+import hashlib
+import json
+import shutil
+import tarfile
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PARENT = ROOT.parent / "HPC-Forest-Etude-2020-2024-r1"
+WORK = ROOT.parents[1] / "work/marathon-archive-mother-r2/project"
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    if (ROOT / "livraison-verifiee.json").exists():
+        raise RuntimeError("Frozen supplement: create a new version for changes")
+    files = {p.relative_to(WORK).as_posix(): digest(p) for p in WORK.rglob("*")
+             if p.is_file() and not any(x in p.parts for x in ["__pycache__", ".pytest_cache", ".ruff_cache", ".git"])
+             and p.name != "FILES.sha256.json"}
+    with zipfile.ZipFile(PARENT / "HPC-Forest-Archives-Modele-Mere-r1.zip") as z:
+        previous = json.loads(z.read("HPC-Forest/FILES.sha256.json"))
+    changed = {name: {"before": previous.get(name), "after": sha}
+               for name, sha in files.items() if previous.get(name) != sha}
+    assert set(changed) == {"src/hpc_forest/contracts.py", "src/hpc_forest/native_matrix.py",
+                            "examples/marathon22/archive_preparation.py", "tests/test_contracts.py"}
+    write(ROOT / "diff-empreintes.json", changed)
+    write(WORK / "FILES.sha256.json", files)
+    source = ROOT / "HPC-Forest-Archives-Modele-Mere-r2.zip"
+    with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for name in sorted([*files, "FILES.sha256.json"]):
+            z.write(WORK / name, "HPC-Forest/" + name)
+    plan = json.loads((PARENT / "matrix-plan.json").read_text(encoding="utf-8"))
+    plan.update(scope_id="hpc-forest-archives-2020-2024-mother-r2",
+                subjects={"2020-primes": plan["subjects"]["2020-primes"]},
+                first_subject="2020-primes", first_phase="twenty identities on corrected preparation",
+                second_phase="none", parent_r1_exclusions_preserved=True,
+                change="Explicit legitimate empty individual output, observable output in every checked phase")
+    write(ROOT / "matrix-plan.json", plan)
+    delivery = ROOT / "livraison-r2"
+    shutil.copytree(PARENT / "livraison-legere-r1", delivery,
+                    ignore=shutil.ignore_patterns("payload-manifest.json", "__pycache__"))
+    shutil.copyfile(source, delivery / "project.zip")
+    shutil.copyfile(ROOT / "matrix-plan.json", delivery / "matrix-plan.json")
+    write(delivery / "runtime-manifest.json", {**files, "FILES.sha256.json": digest(WORK / "FILES.sha256.json")})
+    manifest = {p.relative_to(delivery).as_posix(): digest(p) for p in delivery.rglob("*") if p.is_file()}
+    write(delivery / "payload-manifest.json", manifest)
+    payload = ROOT / "hpc-forest-native-matrix-r2-light.tar.gz"
+    with tarfile.open(payload, "w:gz") as t:
+        t.add(delivery, arcname="payload", filter=lambda item: item if item.isfile() or item.isdir() else None)
+    shutil.copytree(PARENT / "sources-officielles-restauration", ROOT / "sources-officielles-restauration")
+    command = (PARENT / "commande-prevol-launchfix1.sh").read_text(encoding="utf-8")
+    command = command.replace("hpc-forest-native-matrix-r1-light-rpc.tar.gz", "hpc-forest-native-matrix-r2-light-rpc.tar.gz")
+    command = command.replace("hpc-forest-native-matrix-20261015-r1-launchfix1", "hpc-forest-native-matrix-20261016-r2")
+    command = command.replace("ee70362a5d1fbd195f1420971fba96d44524e58f82a334983632c3fcd95a0bcb", digest(payload))
+    (ROOT / "commande-prevol.sh").write_text(command, encoding="utf-8")
+    write(ROOT / "livraison-verifiee.json", {
+        "source_zip": {"path": str(source.resolve()), "sha256": digest(source)},
+        "payload": {"path": str(payload.resolve()), "sha256": digest(payload), "bytes": payload.stat().st_size},
+        "plan": {"path": str((ROOT / "matrix-plan.json").resolve()), "sha256": digest(ROOT / "matrix-plan.json")},
+        "source_files": len(files), "changed_files": sorted(changed), "candidate_algorithm_changes": 0,
+        "official_sources_changed": False, "current_campaigns_modified": False})
+    print(json.dumps({"source_zip_sha256": digest(source), "payload_sha256": digest(payload),
+                      "payload_bytes": payload.stat().st_size}))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,189 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  Node* data = NULL;
+  FILE *fl = NULL;
+
+  if (fname == NULL)
+    fl = stdin;
+  else
+    fl = fopen(fname, "r");
+
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  if (fscanf(fl, "%d", n) != 1) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  list[0] = '\0';
+  int ch = fgetc(fl);
+  if (ch != EOF && ch != '\n') {
+    ungetc(ch, fl);
+    if (fgets(list, MAX, fl) == NULL)
+      list[0] = '\0';
+    size_t used = strcspn(list, "\r\n");
+    if (list[used] != '\0') {
+      list[used] = '\0';
+    } else {
+      while ((ch = fgetc(fl)) != EOF && ch != '\n')
+        ;
+    }
+  }
+
+  if (*n > 0) {
+    data = (Node*) malloc((size_t)(*n) * sizeof(Node));
+    if (data == NULL) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  for (int i = 0; i < *n; i++) {
+    data[i].neighbors[0] = '\0';
+    if (fscanf(fl, "%d %f", &data[i].id, &data[i].value) != 2) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+
+    ch = fgetc(fl);
+    if (ch != EOF && ch != '\n') {
+      ungetc(ch, fl);
+      if (fgets(data[i].neighbors, MAX, fl) != NULL) {
+        size_t used = strcspn(data[i].neighbors, "\r\n");
+        if (data[i].neighbors[used] != '\0') {
+          data[i].neighbors[used] = '\0';
+        } else {
+          while ((ch = fgetc(fl)) != EOF && ch != '\n')
+            ;
+        }
+      }
+    }
+  }
+
+  fclose(fl);
+  return data;
+}
+
+/* Returns the index of the first node with the given id or -1 if not found. */
+static int find_by_id(Node g[], int id, int size) {
+  int first = size;
+
+  /* Each equality test is independent; the min reduction preserves first-match semantics. */
+  #pragma omp simd reduction(min:first)
+  for (int i = 0; i < size; i++) {
+    int candidate = (g[i].id == id) ? i : size;
+    if (candidate < first)
+      first = candidate;
+  }
+
+  return first < size ? first : -1;
+}
+
+/* Selects the first neighbor having the greatest strictly positive node value. */
+static int find_best_neighbor(Node *g, int nd, int size) {
+  char aux[MAX];
+  char *saveptr = NULL;
+  int best = -1;
+  float max = 0.0f;
+
+  strcpy(aux, g[nd].neighbors);
+  char *t = strtok_r(aux, " ", &saveptr);
+  while (t != NULL) {
+    int d = find_by_id(g, atoi(t), size);
+    if (d >= 0 && max < g[d].value) {
+      max = g[d].value;
+      best = d;
+    }
+    t = strtok_r(NULL, " ", &saveptr);
+  }
+
+  return best;
+}
+
+/* Computes and caches path sums by walking a dependency chain iteratively. */
+static float get_costly(Node *g, int id, int size, float *memo,
+                        unsigned char *computed, int *successor, int *path) {
+  int start = find_by_id(g, id, size);
+  if (start < 0)
+    return 0.0f;
+
+  int current = start;
+  int depth = 0;
+  while (current >= 0 && !computed[current] && depth < size) {
+    path[depth++] = current;
+    if (successor[current] == -2)
+      successor[current] = find_best_neighbor(g, current, size);
+    current = successor[current];
+  }
+
+  /* A valid input is a DAG; this guard also keeps malformed cycles in-bounds. */
+  if (current >= 0 && !computed[current])
+    return 0.0f;
+
+  float total = current >= 0 ? memo[current] : 0.0f;
+  while (depth > 0) {
+    int nd = path[--depth];
+    total = g[nd].value + total;
+    memo[nd] = total;
+    computed[nd] = 1;
+  }
+
+  return memo[start];
+}
+
+/* Main program - calls read input, computes sum for each node in the list, prints output. */
+int main(void) {
+  char *fileN = NULL;
+  char computelist[MAX] = {0};
+  int n = -1;
+  Node* input = read_input(fileN, &n, computelist);
+  float *memo = NULL;
+  unsigned char *computed = NULL;
+  int *successor = NULL;
+  int *path = NULL;
+
+  if (n > 0) {
+    memo = (float*) calloc((size_t)n, sizeof(*memo));
+    computed = (unsigned char*) calloc((size_t)n, sizeof(*computed));
+    successor = (int*) malloc((size_t)n * sizeof(*successor));
+    path = (int*) malloc((size_t)n * sizeof(*path));
+    if (memo == NULL || computed == NULL || successor == NULL || path == NULL) {
+      fprintf(stderr, "Error!\n");
+      free(input);
+      free(memo);
+      free(computed);
+      free(successor);
+      free(path);
+      return 1;
+    }
+    for (int i = 0; i < n; i++)
+      successor[i] = -2;
+  }
+
+  for (char *c = strtok(computelist, " "); c != NULL; c = strtok(NULL, " "))
+    printf("%s: %f\n", c,
+           get_costly(input, atoi(c), n, memo, computed, successor, path));
+
+  free(input);
+  free(memo);
+  free(computed);
+  free(successor);
+  free(path);
+  return 0;
+}

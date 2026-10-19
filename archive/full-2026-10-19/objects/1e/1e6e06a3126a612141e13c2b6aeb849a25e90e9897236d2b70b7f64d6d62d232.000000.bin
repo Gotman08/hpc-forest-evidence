@@ -1,0 +1,205 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+int main() {
+    int n, s;
+    if (std::scanf("%d%d", &n, &s) != 2)
+        return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t element_count = static_cast<std::size_t>(n) * n;
+    std::unique_ptr<int[]> matrix_storage(new int[element_count]);
+    int* const matrix = matrix_storage.get();
+
+    const std::size_t input_capacity = 1u << 20;
+    std::unique_ptr<unsigned char[]> input_storage(
+        new unsigned char[2 * (input_capacity + 1)]);
+    unsigned char* input_buffers[2] = {
+        input_storage.get(),
+        input_storage.get() + input_capacity + 1
+    };
+
+    int thread_limit = 1;
+#ifdef _OPENMP
+    if (element_count >= 262144)
+        thread_limit = std::min(omp_get_max_threads(), n);
+#endif
+    std::vector<std::size_t> token_counts(thread_limit, 0);
+    std::size_t ready_size = 0;
+    std::size_t carry_size = 0;
+    std::size_t carry_start = 0;
+    bool final_input = false;
+
+    const int window_rows = n - s + 1;
+    long long mxSum = std::numeric_limits<long long>::lowest();
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(thread_limit) if(thread_limit > 1) reduction(max:mxSum)
+#endif
+    {
+        int thread_id = 0;
+        int thread_count = 1;
+#ifdef _OPENMP
+        thread_id = omp_get_thread_num();
+        thread_count = omp_get_num_threads();
+#endif
+        std::size_t parsed = 0;
+        int buffer_id = 0;
+
+        while (parsed < element_count) {
+            unsigned char* const text = input_buffers[buffer_id];
+#ifdef _OPENMP
+#pragma omp master
+#endif
+            {
+                if (carry_size != 0) {
+                    std::memcpy(text,
+                                input_buffers[buffer_id ^ 1] + carry_start,
+                                carry_size);
+                }
+                const std::size_t requested = input_capacity - carry_size;
+                const std::size_t bytes =
+                    std::fread(text + carry_size, 1, requested, stdin);
+                const std::size_t used = carry_size + bytes;
+                final_input = bytes < requested;
+                ready_size = used;
+                if (!final_input) {
+                    while (ready_size > 0 && text[ready_size - 1] > ' ')
+                        --ready_size;
+                }
+                carry_size = used - ready_size;
+                carry_start = ready_size;
+                text[used] = ' ';
+            }
+#ifdef _OPENMP
+#pragma omp barrier
+#endif
+            const std::size_t byte_count = ready_size;
+            const bool final_chunk = final_input;
+            if (byte_count == 0)
+                break;
+
+            std::size_t begin = byte_count * thread_id / thread_count;
+            std::size_t end = byte_count * (thread_id + 1) / thread_count;
+            if (thread_id != 0) {
+                while (begin < byte_count && text[begin] > ' ')
+                    ++begin;
+            }
+            if (thread_id + 1 != thread_count) {
+                while (end < byte_count && text[end] > ' ')
+                    ++end;
+            }
+
+            std::size_t output_index = parsed;
+            std::size_t chunk_tokens = 0;
+            if (thread_count > 1) {
+                std::size_t local_tokens = 0;
+                if (begin < end) {
+                    local_tokens = text[begin] > ' ' ? 1 : 0;
+#ifdef _OPENMP
+#pragma omp simd reduction(+:local_tokens)
+#endif
+                    for (std::size_t pos = begin + 1; pos < end; ++pos) {
+                        local_tokens += static_cast<std::size_t>(
+                            text[pos] > ' ' && text[pos - 1] <= ' ');
+                    }
+                }
+                token_counts[thread_id] = local_tokens;
+#ifdef _OPENMP
+#pragma omp barrier
+#endif
+                for (int t = 0; t < thread_count; ++t) {
+                    if (t < thread_id)
+                        output_index += token_counts[t];
+                    chunk_tokens += token_counts[t];
+                }
+            }
+
+            std::size_t pos = begin;
+            while (pos < end) {
+                while (pos < end && text[pos] <= ' ')
+                    ++pos;
+                if (pos == end)
+                    break;
+
+                bool negative = false;
+                if (text[pos] == '-' || text[pos] == '+') {
+                    negative = text[pos] == '-';
+                    ++pos;
+                }
+                unsigned int value = 0;
+                while (text[pos] >= '0' && text[pos] <= '9') {
+                    value = value * 10u + static_cast<unsigned int>(text[pos] - '0');
+                    ++pos;
+                }
+                const long long signed_value = negative
+                    ? -static_cast<long long>(value)
+                    : static_cast<long long>(value);
+                matrix[output_index++] = static_cast<int>(signed_value);
+            }
+
+            if (thread_count == 1)
+                parsed = output_index;
+            else
+                parsed += chunk_tokens;
+            if (final_chunk)
+                break;
+
+            // The next read uses the other buffer while workers finish conversion.
+            buffer_id ^= 1;
+        }
+
+        assert(parsed == element_count);
+#ifdef _OPENMP
+#pragma omp barrier
+#endif
+        const int first = static_cast<int>(
+            static_cast<long long>(window_rows) * thread_id / thread_count);
+        const int last = static_cast<int>(
+            static_cast<long long>(window_rows) * (thread_id + 1) / thread_count);
+
+        if (first < last) {
+            std::vector<long long> column_sums(n, 0);
+            for (int row = first; row < first + s; ++row) {
+                const int* values = matrix + static_cast<std::size_t>(row) * n;
+                for (int col = 0; col < n; ++col)
+                    column_sums[col] += values[col];
+            }
+
+            for (int row = first; row < last; ++row) {
+                if (row != first) {
+                    const int* exiting = matrix + static_cast<std::size_t>(row - 1) * n;
+                    const int* entering = matrix + static_cast<std::size_t>(row + s - 1) * n;
+                    for (int col = 0; col < n; ++col)
+                        column_sums[col] += static_cast<long long>(entering[col]) - exiting[col];
+                }
+
+                long long sum = 0;
+                for (int col = 0; col < s; ++col)
+                    sum += column_sums[col];
+                mxSum = std::max(mxSum, sum);
+
+                for (int col = s; col < n; ++col) {
+                    sum += column_sums[col] - column_sums[col - s];
+                    mxSum = std::max(mxSum, sum);
+                }
+            }
+        }
+    }
+
+    std::printf("%lld\n", mxSum);
+    return 0;
+}

@@ -1,0 +1,149 @@
+#include "knn.h"
+#include <omp.h>
+
+typedef struct {
+    float d;
+    long idx;
+    char label;
+} Candidate;
+
+static inline int candidate_less(Candidate a, Candidate b) {
+    if (a.d != b.d) return a.d < b.d;
+    return a.idx < b.idx;
+}
+
+static inline void insert_candidate(Candidate *arr, int *cnt, int k,
+                                    float d, long idx, char label) {
+    Candidate c = {d, idx, label};
+    if (*cnt < k) {
+        int lo = 0, hi = *cnt;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (candidate_less(c, arr[mid])) hi = mid;
+            else lo = mid + 1;
+        }
+        for (int j = *cnt; j > lo; --j) arr[j] = arr[j - 1];
+        arr[lo] = c;
+        ++(*cnt);
+    } else if (*cnt == k && candidate_less(c, arr[k - 1])) {
+        int lo = 0, hi = k - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (candidate_less(c, arr[mid])) hi = mid;
+            else lo = mid + 1;
+        }
+        for (int j = k - 1; j > lo; --j) arr[j] = arr[j - 1];
+        arr[lo] = c;
+    }
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    long total = 0;
+    for (int i = 0; i < n_groups; ++i) total += groups[i].length;
+
+    char *flat_labels = (char *) malloc(total > 0 ? total : 1);
+    float *xs = (float *) malloc((total > 0 ? total : 1) * sizeof(float));
+    float *ys = (float *) malloc((total > 0 ? total : 1) * sizeof(float));
+
+    long idx = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ++j) {
+            flat_labels[idx] = g.label;
+            xs[idx] = g.points[j].x;
+            ys[idx] = g.points[j].y;
+            ++idx;
+        }
+    }
+
+    int nt = omp_get_max_threads();
+    if (nt < 1) nt = 1;
+    Candidate **thread_best = (Candidate **) calloc(nt, sizeof(Candidate *));
+    int *counts = (int *) calloc(nt, sizeof(int));
+    for (int t = 0; t < nt; ++t) {
+        thread_best[t] = (Candidate *) malloc((k > 0 ? k : 1) * sizeof(Candidate));
+        counts[t] = 0;
+    }
+
+#pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        Candidate *local = thread_best[tid];
+        int cnt = 0;
+
+#pragma omp for schedule(static)
+        for (long i = 0; i < total; ++i) {
+            float dx = xs[i] - to_evaluate.x;
+            float dy = ys[i] - to_evaluate.y;
+            float d = dx * dx + dy * dy;
+            insert_candidate(local, &cnt, k, d, i, flat_labels[i]);
+        }
+
+        counts[tid] = cnt;
+    }
+
+    Candidate *merged = (Candidate *) malloc((k > 0 ? k : 1) * sizeof(Candidate));
+    int mc = 0;
+    for (int t = 0; t < nt; ++t) {
+        for (int j = 0; j < counts[t]; ++j) {
+            Candidate c = thread_best[t][j];
+            insert_candidate(merged, &mc, k, c.d, c.idx, c.label);
+        }
+    }
+
+    char *labels = (char *) malloc(k > 0 ? k : 1);
+    for (int i = 0; i < k; ++i) labels[i] = -1;
+    for (int i = 0; i < mc && i < k; ++i) labels[i] = merged[i].label;
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; ++i) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            ++current_frequency;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(flat_labels);
+    free(xs);
+    free(ys);
+    for (int t = 0; t < nt; ++t) free(thread_best[t]);
+    free(thread_best);
+    free(counts);
+    free(merged);
+    free(labels);
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+    return 0;
+}

@@ -1,0 +1,44 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <iostream>\n#include <vector>\n#include <cstdio>\n#include <cassert>\n#include <limits>\n#include <cstdint>\n#if defined(__aarch64__)\n#include <arm_neon.h>\n#endif\n\nusing Sum = std::int64_t;\n\n#if defined(__aarch64__)\nstatic inline int64x2_t pair_max(int64x2_t a, int64x2_t b) {\n    return vbslq_s64(vcgtq_s64(a, b), a, b);\n}\n\nstatic inline int64x2_t pair_delta(const Sum* paired, int c, int s) {\n    return vsubq_s64(vld1q_s64(paired + 2 * c),\n                     vld1q_s64(paired + 2 * (c - s)));\n}\n#endif\n\nstatic Sum maximum_of_pair(const Sum* paired, int n, int s) {\n#if defined(__aarch64__)\n    int64x2_t acc0 = vdupq_n_s64(0);\n    int64x2_t acc1 = vdupq_n_s64(0);\n    int64x2_t acc2 = vdupq_n_s64(0);\n    int64x2_t acc3 = vdupq_n_s64(0);\n    int c = 0;\n    for (; c + 3 < s; c += 4) {\n        acc0 = vaddq_s64(acc0, vld1q_s64(paired + 2 * c));\n        acc1 = vaddq_s64(acc1, vld1q_s64(paired + 2 * (c + 1)));\n        acc2 = vaddq_s64(acc2, vld1q_s64(paired + 2 * (c + 2)));\n        acc3 = vaddq_s64(acc3, vld1q_s64(paired + 2 * (c + 3)));\n    }\n    int64x2_t window = vaddq_s64(vaddq_s64(acc0, acc1),\n                                vaddq_s64(acc2, acc3));\n    for (; c < s; ++c)\n        window = vaddq_s64(window, vld1q_s64(paired + 2 * c));\n\n    int64x2_t best = window;\n    c = s;\n    for (; c + 3 < n; c += 4) {\n        const int64x2_t d0 = pair_delta(paired, c, s);\n        const int64x2_t d1 = pair_delta(paired, c + 1, s);\n        const int64x2_t d2 = pair_delta(paired, c + 2, s);\n        const int64x2_t d3 = pair_delta(paired, c + 3, s);\n\n        // Summarize all four prefixes independently of the incoming window.\n        const int64x2_t leftTotal = vaddq_s64(d0, d1);\n        const int64x2_t rightTotal = vaddq_s64(d2, d3);\n        const int64x2_t leftMaximum = pair_max(d0, leftTotal);\n        const int64x2_t rightMaximum = pair_max(d2, rightTotal);\n        const int64x2_t prefixMaximum = pair_max(\n            leftMaximum, vaddq_s64(leftTotal, rightMaximum));\n        const int64x2_t total = vaddq_s64(leftTotal, rightTotal);\n\n        best = pair_max(best, vaddq_s64(window, prefixMaximum));\n        window = vaddq_s64(window, total);\n    }\n    for (; c < n; ++c) {\n        window = vaddq_s64(window, pair_delta(paired, c, s));\n        best = pair_max(best, window);\n    }\n    const Sum first = vgetq_lane_s64(best, 0);\n    const Sum second = vgetq_lane_s64(best, 1);\n    return first > second ? first : second;\n#else\n    Sum first = 0;\n    Sum second = 0;\n    for (int c = 0; c < s; ++c) {\n        first += paired[2 * c];\n        second += paired[2 * c + 1];\n    }\n    Sum best = first > second ? first : second;\n    for (int c = s; c < n; ++c) {\n        first += paired[2 * c] - paired[2 * (c - s)];\n        second += paired[2 * c + 1] - paired[2 * (c - s) + 1];\n        if (first > best)\n            best = first;\n        if (second > best)\n            best = second;\n    }\n    return best;\n#endif\n}\n\nint main() {\n    int n, s;\n    std::cin >> n >> s;\n    std::vector<std::vector<int> > matrix(n, std::vector<int>(n));\n    for (int i = 0; i < n; ++i)\n        for (int j = 0; j < n; ++j)\n            scanf(\"%d\", &matrix[i][j]);\n\n    assert(s < n);\n    assert(n < 8000);\n    assert(s > 0);\n    assert(n > 0);\n\n    std::vector<Sum> columns(n, 0);\n    Sum* const column = columns.data();\n    for (int rowIndex = 0; rowIndex < s; ++rowIndex) {\n        const int* const row = matrix[rowIndex].data();\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC ivdep\n#endif\n        for (int c = 0; c < n; ++c)\n            column[c] += static_cast<Sum>(row[c]);\n    }\n\n    std::vector<Sum> pairedColumns(2 * n);\n    Sum* const paired = pairedColumns.data();\n    const int* const firstEntering = matrix[s].data();\n    const int* const firstLeaving = matrix[0].data();\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC ivdep\n#endif\n    for (int c = 0; c < n; ++c) {\n        paired[2 * c] = column[c];\n        paired[2 * c + 1] = column[c]\n            + static_cast<Sum>(firstEntering[c]) - firstLeaving[c];\n    }\n\n    Sum maximum = maximum_of_pair(paired, n, s);\n    const int lastTop = n - s;\n    for (int top = 2; top <= lastTop; top += 2) {\n        const int* const entering0 = matrix[top + s - 1].data();\n        const int* const leaving0 = matrix[top - 1].data();\n        if (top < lastTop) {\n            const int* const entering1 = matrix[top + s].data();\n            const int* const leaving1 = matrix[top].data();\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC ivdep\n#endif\n            for (int c = 0; c < n; ++c) {\n                const Sum first = paired[2 * c + 1]\n                    + static_cast<Sum>(entering0[c]) - leaving0[c];\n                paired[2 * c] = first;\n                paired[2 * c + 1] = first\n                    + static_cast<Sum>(entering1[c]) - leaving1[c];\n            }\n        } else {\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC ivdep\n#endif\n            for (int c = 0; c < n; ++c) {\n                const Sum first = paired[2 * c + 1]\n                    + static_cast<Sum>(entering0[c]) - leaving0[c];\n                paired[2 * c] = first;\n                paired[2 * c + 1] = first;\n            }\n        }\n        const Sum candidate = maximum_of_pair(paired, n, s);\n        if (candidate > maximum)\n            maximum = candidate;\n    }\n\n    printf(\"%d\\n\", static_cast<int>(maximum));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Four-column total/max-prefix summaries should shorten the horizontal SIMD loop-carried sum dependency from four additions to one per block.",
+    "notes": "Preserves 64-bit arithmetic, every window, scalar fallback, input handling, and vertical updates. Not executed.",
+    "sources_kept": [],
+    "transformations": [
+      "Compute each four-delta block's total and maximum prefix using independent two-column summaries.",
+      "Apply the incoming window only to the block maximum and total, replacing four sequential window updates with one carry update."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "6a5931a7c80f49a69a62c8986bcaaad3",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "d4bf1d35ef1199bacef4ff72218ba07cf6830a450416b83e671311f1c9a5ff44",
+  "session_id": "e102a585de23492ca9019858dac5af4d",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "229618a576d7a85118478801795c25b92c4a65eed93106f78e30a03c0ed48ed9",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 17029,
+        "output_tokens": 7243,
+        "reasoning_output_tokens": 5178
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 24272,
+    "tool_events": []
+  }
+}

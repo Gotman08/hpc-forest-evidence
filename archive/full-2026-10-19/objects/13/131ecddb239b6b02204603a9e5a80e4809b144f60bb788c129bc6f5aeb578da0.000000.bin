@@ -1,0 +1,244 @@
+"""Full neutral policy/route mutations, private temporary fixtures, no real worker/job."""
+import copy
+import importlib.util
+import json
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("full_route_neutral", HERE / "observer-max4-r5.py")
+d = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(d)
+
+
+def write(path, value):
+    path.write_text(json.dumps(value), encoding="utf8")
+    return {"path": str(path), "sha256": d.digest(path)}
+
+
+class FullRoute(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=HERE)
+        self.root = Path(self.temp.name)
+        self.source = self.root / "NEUTRAL-source.zip"
+        self.source.write_bytes(b"NEUTRAL ONLY, NO EXECUTABLE SOURCE")
+        self.cli = self.root / "NEUTRAL-python.exe"
+        self.cli.write_bytes(b"NEUTRAL ONLY, NEVER EXECUTED")
+        self.cli_patch = patch.object(d, "CLI_SHA", d.digest(self.cli)); self.cli_patch.start()
+        self.scope = "hpc-forest-primes-native-max-NEUTRAL"
+        self.plan = {"scope_id": self.scope, "source_zip_sha256": d.digest(self.source), "cells": d.R2_CELLS,
+                     "maximum_native_workers_total": 4, "maximum_cells_per_authorization": 1,
+                     "efforts": ["max"], "automatic_extension": False}
+        self.plan_ref = write(self.root / "plan.json", self.plan)
+        self.common = {"scope_id": self.scope, "source_zip_sha256": d.digest(self.source),
+                       "plan_sha256": self.plan_ref["sha256"], "preparation_manifest_sha256": d.PREPARATION_SHA}
+        self.q = {**self.common, "schema": "hpc-forest-primes-r2max-allocated-contract-qualification-v1",
+                  "verified": True, "native_model_calls": 0}
+        self.qref = write(self.root / "qualification.json", self.q)
+        archive = self.root / "NEUTRAL-archive.tar.gz"; archive.write_bytes(b"NEUTRAL ONLY, NOT A REAL ARCHIVE")
+        self.archive_ref = {"path": str(archive), "sha256": d.digest(archive)}
+        self.audit = {**self.common, "verified": True, "native_model_calls": 0,
+                      "qualification_sha256": self.qref["sha256"], "archive_sha256": self.archive_ref["sha256"]}
+        self.audit_ref = write(self.root / "audit.json", self.audit)
+        self.received = {**self.common, "schema": "hpc-forest-primes-r2max-allocated-contract-reception-v1",
+                         "verified": True, "qualification_sha256": self.qref["sha256"],
+                         "audit": self.audit_ref, "archive": self.archive_ref}
+        self.received_ref = write(self.root / "reception.json", self.received)
+        self.evidence = write(self.root / "NEUTRAL-evidence.json", {"NEUTRAL_ONLY": True})
+        delivery = {"bundle": self.archive_ref}
+        self.delivery_ref = write(self.root / "delivery.json", delivery)
+        self.review = {"schema": "hpc-forest-r2c-independent-static-cap4-review-v1", "verified": True,
+                       "source_zip_sha256": self.common["source_zip_sha256"], "plan_sha256": self.common["plan_sha256"],
+                       "blocking_findings": [], "delivery_sha256": self.delivery_ref["sha256"],
+                       "bundle_sha256": self.archive_ref["sha256"], "native_research_admitted": False,
+                       "arm64_qualification_admitted": False}
+        self.review_ref = write(self.root / "review.json", self.review)
+        self.policy = {"schema": "hpc-forest-max4-observer-policy-v1", "verified": True,
+                       "maximum_total_workers": 4, "maximum_r2_workers": 3, "model_sessions": d.R2_CELLS,
+                       "source_zip": {"path": str(self.source), "sha256": d.digest(self.source)},
+                       "plan": self.plan_ref, "qualification_reception": self.received_ref,
+                       "qualification": self.qref, "source_review": self.review_ref, "source_delivery": self.delivery_ref}
+        self.admission = {"r2_policy": write(self.root / "policy.json", self.policy)}
+        self.extra_patches = [patch.object(d, key, value) for key, value in {
+            "R2_SCOPE": self.scope, "R2_SOURCE_SHA": self.common["source_zip_sha256"],
+            "R2_PLAN_SHA": self.plan_ref["sha256"], "R2_REVIEW_SHA": self.review_ref["sha256"],
+            "R2_DELIVERY_SHA": self.delivery_ref["sha256"]}.items()]
+        for item in self.extra_patches:
+            item.start()
+        self.policy_result = d.verify_policy(self.admission)
+        self.model = "gpt-6-astra"; self.session = d.R2_CELLS[self.model]; self.job = "800001"
+        self.remote = "/scratch_p/nimarano/" + self.scope + "-" + self.session
+        self.binding = {"scope_id": self.scope, "model": self.model, "effort": "max", "session_id": self.session,
+                        "job_id": self.job, "remote_root": self.remote, "source_zip_sha256": self.common["source_zip_sha256"],
+                        "plan_sha256": self.common["plan_sha256"]}
+        self.cache = self.root / "NEUTRAL cache"; self.cache.mkdir()
+        binding_ref = write(self.cache / "CELL-BINDING.json", self.binding)
+        cli_ref = write(self.root / "cli.json", {"executable_path": str(self.cli), "executable_sha256": d.CLI_SHA,
+                        "version": d.shared.CLI_VERSION, "source_execution_allowed": False})
+        refs = {key: self.evidence for key in d.R2_ARTIFACTS}
+        refs.update(source_zip=self.policy["source_zip"], plan=self.plan_ref, cli_identity=cli_ref,
+                    allocated_contract_qualification=self.qref, allocated_contract_reception=self.received_ref)
+        self.authorization = {"schema": "hpc-forest-primes-r2max-authorization-v2", "verified": True,
+                              **{k: self.binding[k] for k in ("scope_id", "job_id", "session_id", "model", "effort", "remote_root")},
+                              "artifacts": refs}
+        auth_ref = write(self.root / "authorization.json", self.authorization)
+        command = (f'python.exe -m hpc_forest.r2max_worker --session-id {self.session} '
+                   f'--channel {self.remote}/results-{self.job}/mailbox --output "{self.cache}" '
+                   f'--dependency-receipt "{auth_ref["path"]}" --required-jobs {self.scope} --executable "{self.cli}"')
+        self.rows = [{"ProcessId": 101, "ParentProcessId": 0, "ExecutablePath": "C:/python.exe",
+                      "CommandLine": command, "CreationDate": "2026-10-17T21:00:00Z"},
+                     {"ProcessId": 102, "ParentProcessId": 101, "ExecutablePath": "C:/python.exe",
+                      "CommandLine": command, "CreationDate": "2026-10-17T21:00:00Z"}]
+        self.ready = {**self.binding, "reasoning_effort": "max", "codex_executable_sha256": d.CLI_SHA,
+                      "codex_cli_version": d.shared.CLI_VERSION, "codex_executable": str(self.cli), "pid": 102,
+                      "started_at": datetime.fromisoformat("2026-10-17T21:00:01Z").timestamp()}
+        ready_ref = write(self.cache / "worker-ready.json", self.ready)
+        submit_ref = write(self.root / "submission.json", {"structuredContent": {
+                            "ok": True, "submitted": True, "submission_observed": True, "job_id": self.job}})
+        self.route = {**self.binding, "schema": "hpc-forest-r2-max-observed-route-v1", "role": "R2-MAX",
+                      "relay_identities": copy.deepcopy(self.rows), "admission_receipt": auth_ref,
+                      "cell_binding": binding_ref, "worker_ready": ready_ref, "submission_observed": submit_ref}
+        self.path = self.root / "route.json"; write(self.path, self.route)
+
+    def tearDown(self):
+        for item in reversed(self.extra_patches):
+            item.stop()
+        self.cli_patch.stop(); self.temp.cleanup()
+
+    def verify(self):
+        write(self.path, self.route)
+        return d.verify_r2_route(self.path, self.policy_result, {self.session: self.rows}, self.rows)
+
+    def test_all_windows_arguments_quoted_route_is_same_full_binding(self):
+        argv = d.windows_argv(self.rows[0]["CommandLine"])
+        command = " ".join('"' + arg + '"' for arg in argv)
+        for row in self.rows:
+            row["CommandLine"] = command
+        self.route["relay_identities"] = copy.deepcopy(self.rows)
+        self.assertEqual(self.verify()["job_id"], self.job)
+
+    def test_quoted_actual_python_flags_before_exact_module(self):
+        argv = d.windows_argv(self.rows[0]["CommandLine"])
+        argv[1:1] = ["-B", "-u"]
+        command = " ".join('"' + arg + '"' for arg in argv)
+        for row in self.rows:
+            row["CommandLine"] = command
+        self.route["relay_identities"] = copy.deepcopy(self.rows)
+        self.assertEqual(self.verify()["session_id"], self.session)
+
+    def test_quoted_duplicate_altered_module_and_critical_flags_refused(self):
+        original = d.windows_argv(self.rows[0]["CommandLine"])
+        mutations = [
+            original + ["--session-id", self.session],
+            original + ["--channel", self.remote + "/other"],
+            original + ["-m", "hpc_forest.r2max_worker"],
+            [*original[:2], "hpc_forest.codex_worker", *original[3:]],
+            [original[0], "foreign.py", *original[1:]],
+            original + ["--session-id=" + self.session],
+            original + ["--transport-smoke"],
+        ]
+        for argv in mutations:
+            command = " ".join('"' + arg + '"' for arg in argv)
+            for row in self.rows:
+                row["CommandLine"] = command
+            self.route["relay_identities"] = copy.deepcopy(self.rows)
+            with self.subTest(argv=argv), self.assertRaises(RuntimeError):
+                self.verify()
+
+    def test_full_hashed_neutral_route(self):
+        self.assertEqual(self.verify()["job_id"], self.job)
+
+    def test_unknown_source_plan_scope_model_session_effort_job_refused(self):
+        original = copy.deepcopy(self.route)
+        for key, value in (("source_zip_sha256", "a"*64), ("plan_sha256", "b"*64), ("scope_id", "unknown"),
+                           ("model", "gpt-6-luna"), ("session_id", "f"*32), ("effort", "xhigh"), ("job_id", "future")):
+            self.route = {**original, key: value}
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                self.verify()
+
+    def test_original_max2_plan_refused(self):
+        self.plan["maximum_native_workers_total"] = 2
+        self.policy["plan"] = write(self.root / "plan.json", self.plan)
+        self.admission["r2_policy"] = write(self.root / "policy.json", self.policy)
+        with self.assertRaises(RuntimeError):
+            d.verify_policy(self.admission)
+
+    def test_source_bytes_changed_refused(self):
+        self.source.write_bytes(b"CHANGED NEUTRAL")
+        with self.assertRaises(RuntimeError):
+            d.verify_policy(self.admission)
+
+    def test_review_false_or_unrelated_source_refused(self):
+        for key, value in (("verified", False), ("source_zip_sha256", "f"*64), ("blocking_findings", ["neutral issue"])):
+            changed = {**self.review, key: value}
+            self.policy["source_review"] = write(self.root / "review.json", changed)
+            self.admission["r2_policy"] = write(self.root / "policy.json", self.policy)
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                d.verify_policy(self.admission)
+
+    def test_qualification_source_or_inference_not_accepted(self):
+        for key, value in (("source_zip_sha256", "f"*64), ("native_model_calls", 1), ("verified", False)):
+            self.qref = write(self.root / "qualification.json", {**self.q, key: value})
+            self.received["qualification_sha256"] = self.qref["sha256"]
+            self.policy["qualification_reception"] = write(self.root / "reception.json", self.received)
+            self.policy["qualification"] = self.qref
+            self.admission["r2_policy"] = write(self.root / "policy.json", self.policy)
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                d.verify_policy(self.admission)
+
+    def test_actual_authorization_ref_changed_or_unverified(self):
+        auth_path = Path(self.route["admission_receipt"]["path"])
+        auth_path.write_text(json.dumps({**self.authorization, "verified": False}))
+        with self.assertRaises(RuntimeError):
+            self.verify()
+        self.route["admission_receipt"] = write(auth_path, {**self.authorization, "verified": False})
+        with self.assertRaises(RuntimeError):
+            self.verify()
+
+    def test_incomplete_fourteen_proofs_refused(self):
+        changed = copy.deepcopy(self.authorization); del changed["artifacts"]["transport_admission"]
+        self.route["admission_receipt"] = write(Path(self.route["admission_receipt"]["path"]), changed)
+        with self.assertRaises(RuntimeError):
+            self.verify()
+
+    def test_cell_binding_cannot_switch_job(self):
+        self.route["cell_binding"] = write(Path(self.route["cell_binding"]["path"]), {**self.binding, "job_id": "800002"})
+        with self.assertRaises(RuntimeError):
+            self.verify()
+
+    def test_readiness_model_effort_cli_pid_or_start_is_not_synthetic(self):
+        original = self.ready
+        for key, value in (("model", "gpt-6-luna"), ("reasoning_effort", "xhigh"),
+                           ("codex_executable_sha256", "f"*64), ("pid", 999), ("started_at", 0)):
+            self.route["worker_ready"] = write(Path(self.route["worker_ready"]["path"]), {**original, key: value})
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                self.verify()
+
+    def test_full_process_identity_reuse_refused(self):
+        self.rows[1]["CreationDate"] = "2026-10-18T00:00:00Z"
+        with self.assertRaises(RuntimeError):
+            self.verify()
+
+    def test_wrong_channel_or_cache_command_refused(self):
+        original = self.rows[0]["CommandLine"]
+        for changed in (original.replace("/mailbox", "/other"), original.replace(self.scope + " --executable", "unknown --executable")):
+            for r in self.rows:
+                r["CommandLine"] = changed
+            self.route["relay_identities"] = copy.deepcopy(self.rows)
+            with self.subTest(command=changed), self.assertRaises(RuntimeError):
+                self.verify()
+
+    def test_unobserved_or_wrong_job_submission_refused(self):
+        path = Path(self.route["submission_observed"]["path"])
+        for data in ({"ok": True, "submitted": True, "submission_observed": False, "job_id": self.job},
+                     {"ok": True, "submitted": True, "submission_observed": True, "job_id": "800002"}):
+            self.route["submission_observed"] = write(path, data)
+            with self.subTest(data=data), self.assertRaises(RuntimeError):
+                self.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

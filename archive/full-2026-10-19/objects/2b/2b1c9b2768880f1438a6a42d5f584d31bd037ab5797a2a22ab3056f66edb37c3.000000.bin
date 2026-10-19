@@ -1,0 +1,218 @@
+#include <vector>
+#include <cstdio>
+#include <cassert>
+#include <algorithm>
+#include <cstdint>
+#include <cstddef>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using Sum = std::int64_t;
+
+class FastInput {
+    unsigned char buffer_[1 << 16];
+    std::size_t position_ = 0;
+    std::size_t length_ = 0;
+
+    inline int next() {
+        if (position_ == length_) {
+            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (length_ == 0)
+                return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    inline bool readInt(int& result) {
+        int c;
+        do {
+            c = next();
+            if (c == EOF)
+                return false;
+        } while (c <= ' ');
+
+        const bool negative = c == '-';
+        if (negative || c == '+')
+            c = next();
+
+        std::uint32_t value = 0;
+        while (static_cast<unsigned>(c - '0') < 10U) {
+            value = value * 10U + static_cast<unsigned>(c - '0');
+            c = next();
+        }
+        result = negative
+               ? static_cast<int>(-static_cast<Sum>(value))
+               : static_cast<int>(value);
+        return true;
+    }
+};
+
+template<bool Accumulate>
+static inline Sum update_range(Sum* column, const int* incoming,
+                               const int* outgoing, int begin, int end) {
+#if defined(__aarch64__)
+    int col = begin;
+    int64x2_t total0 = vdupq_n_s64(0);
+    int64x2_t total1 = vdupq_n_s64(0);
+    for (; col + 4 <= end; col += 4) {
+        const int32x4_t in = vld1q_s32(incoming + col);
+        const int32x4_t out = vld1q_s32(outgoing + col);
+        const int64x2_t delta0 = vsubl_s32(vget_low_s32(in), vget_low_s32(out));
+        const int64x2_t delta1 = vsubl_s32(vget_high_s32(in), vget_high_s32(out));
+        vst1q_s64(column + col, vaddq_s64(vld1q_s64(column + col), delta0));
+        vst1q_s64(column + col + 2,
+                  vaddq_s64(vld1q_s64(column + col + 2), delta1));
+        if (Accumulate) {
+            total0 = vaddq_s64(total0, delta0);
+            total1 = vaddq_s64(total1, delta1);
+        }
+    }
+    Sum total = 0;
+    if (Accumulate)
+        total = vaddvq_s64(vaddq_s64(total0, total1));
+    for (; col < end; ++col) {
+        const Sum delta = static_cast<Sum>(incoming[col])
+                        - static_cast<Sum>(outgoing[col]);
+        column[col] += delta;
+        if (Accumulate)
+            total += delta;
+    }
+    return total;
+#else
+    Sum total = 0;
+    #pragma omp simd reduction(+:total)
+    for (int col = begin; col < end; ++col) {
+        const Sum delta = static_cast<Sum>(incoming[col])
+                        - static_cast<Sum>(outgoing[col]);
+        column[col] += delta;
+        if (Accumulate)
+            total += delta;
+    }
+    return total;
+#endif
+}
+
+#if defined(__aarch64__)
+static inline int64x2_t maximum64(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+static inline Sum horizontal_max(const Sum* column, int n, int s,
+                                 Sum first, Sum last_sum) {
+#if defined(__aarch64__)
+    int left = 0;
+    int right = n - s;
+    int64x2_t sums = vdupq_n_s64(first);
+    sums = vsetq_lane_s64(last_sum, sums, 1);
+    int64x2_t maxima0 = sums;
+    int64x2_t maxima1 = sums;
+
+    // The lanes follow independent windows from opposite ends of the row.
+    while (right - left >= 4) {
+        const int64x2_t forward = vsubq_s64(
+            vld1q_s64(column + left + s), vld1q_s64(column + left));
+        const int64x2_t backward = vsubq_s64(
+            vld1q_s64(column + right - 2),
+            vld1q_s64(column + right + s - 2));
+        const int64x2_t reversed = vextq_s64(backward, backward, 1);
+
+        sums = vaddq_s64(sums, vzip1q_s64(forward, reversed));
+        maxima0 = maximum64(maxima0, sums);
+        sums = vaddq_s64(sums, vzip2q_s64(forward, reversed));
+        maxima1 = maximum64(maxima1, sums);
+        left += 2;
+        right -= 2;
+    }
+
+    const int64x2_t maxima = maximum64(maxima0, maxima1);
+    Sum best = std::max(vgetq_lane_s64(maxima, 0),
+                        vgetq_lane_s64(maxima, 1));
+    if (right - left >= 2) {
+        const Sum value = vgetq_lane_s64(sums, 0)
+                        + column[left + s] - column[left];
+        best = std::max(best, value);
+    }
+    if (right - left >= 3) {
+        const Sum value = vgetq_lane_s64(sums, 1)
+                        + column[right - 1] - column[right + s - 1];
+        best = std::max(best, value);
+    }
+    return best;
+#else
+    Sum sum = first;
+    Sum best = std::max(first, last_sum);
+    for (int col = s; col < n; ++col) {
+        sum += column[col] - column[col - s];
+        best = std::max(best, sum);
+    }
+    return best;
+#endif
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.readInt(n) || !input.readInt(s))
+        return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::vector<std::vector<int> > matrix(n, std::vector<int>(n));
+    for (int row = 0; row < n; ++row)
+        for (int col = 0; col < n; ++col)
+            input.readInt(matrix[row][col]);
+
+    std::vector<Sum> columns(n, 0);
+    Sum* column = columns.data();
+    for (int row = 0; row < s; ++row) {
+        const int* values = matrix[row].data();
+        #pragma omp simd
+        for (int col = 0; col < n; ++col)
+            column[col] += static_cast<Sum>(values[col]);
+    }
+
+    const int last = n - s;
+    Sum first = 0;
+    Sum last_sum = 0;
+    #pragma omp simd reduction(+:first,last_sum)
+    for (int col = 0; col < s; ++col) {
+        first += column[col];
+        last_sum += column[last + col];
+    }
+
+    Sum best = first;
+    for (int top = 0; top <= last; ++top) {
+        best = std::max(best, horizontal_max(column, n, s, first, last_sum));
+        if (top == last)
+            break;
+
+        const int* outgoing = matrix[top].data();
+        const int* incoming = matrix[top + s].data();
+        Sum first_delta;
+        Sum last_delta;
+        if (s <= last) {
+            first_delta = update_range<true>(column, incoming, outgoing, 0, s);
+            update_range<false>(column, incoming, outgoing, s, last);
+            last_delta = update_range<true>(column, incoming, outgoing, last, n);
+        } else {
+            first_delta = update_range<true>(column, incoming, outgoing, 0, last);
+            const Sum overlap = update_range<true>(column, incoming, outgoing, last, s);
+            first_delta += overlap;
+            last_delta = overlap
+                       + update_range<true>(column, incoming, outgoing, s, n);
+        }
+        first += first_delta;
+        last_sum += last_delta;
+    }
+
+    std::printf("%d\n", static_cast<int>(best));
+    return 0;
+}

@@ -1,0 +1,110 @@
+import asyncio
+import importlib.util
+import json
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+spec = importlib.util.spec_from_file_location("resume_owned_worker", Path(__file__).with_name("reprendre-worker.py"))
+resume = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(resume)
+from hpc_forest import codex_process, codex_worker
+from hpc_forest.codex_mailbox import json_bytes, response_envelope, sha256
+from hpc_forest.core import InfrastructureError
+
+NONCE = "a" * 32
+REQUEST = {"protocol": "hpc-forest-codex-mailbox-v1", "kind": "source-proposal",
+           "nonce": NONCE, "session_id": resume.SESSION, "model": "gpt-6.1-sol",
+           "reasoning_effort": "max", "expires_at": time.time() + 60}
+
+
+class Files:
+    def __init__(self, request=REQUEST, fail_ready=False):
+        self.request = request
+        self.fail_ready = fail_ready
+        self.uploads = {}
+
+    async def download(self, remote, local):
+        raw = json_bytes(self.request)
+        local.write_bytes(raw)
+        return {"verifie": True, "remote_sha256": sha256(raw)}
+
+    async def upload(self, local, remote):
+        if self.fail_ready and remote.endswith(".ready.json"):
+            raise InfrastructureError("Fictitious failed upload after completed generation")
+        self.uploads[remote] = local.read_bytes()
+        return {"verifie": True}
+
+
+def worker(files, output):
+    return codex_worker.Worker(files, resume.CHANNEL, resume.SESSION, output, None, set())
+
+
+def fake_response(request, request_sha, *args):
+    return response_envelope(request, request_sha, data={"technical_ack": True}, error=None,
+                             infrastructure_error=False,
+                             usage={"tokens": 5, "token_accounting": "exact", "llm_calls": 1})
+
+
+def test_ready_failure_resumes_byte_identically_without_regeneration(tmp_path):
+    first = worker(Files(fail_ready=True), tmp_path)
+    with patch.object(codex_worker, "run_codex", side_effect=fake_response) as generate:
+        with pytest.raises(InfrastructureError):
+            asyncio.run(first.handle(NONCE + ".request.json"))
+        before = (tmp_path / NONCE / "response.json").read_bytes()
+        second = worker(Files(), tmp_path)
+        asyncio.run(second.handle(NONCE + ".request.json"))
+        assert generate.call_count == 1
+    assert (tmp_path / NONCE / "response.json").read_bytes() == before
+    assert resume.delivered_cache(tmp_path) == {NONCE}
+    assert second.transfer.uploads[resume.CHANNEL + f"/responses/{NONCE}.response.json"] == before
+
+
+def test_delivered_cache_skips_previously_verified_responses(tmp_path):
+    with patch.object(codex_worker, "run_codex", side_effect=fake_response):
+        asyncio.run(worker(Files(), tmp_path).handle(NONCE + ".request.json"))
+    second = worker(Files(), tmp_path)
+    second.completed.update(resume.delivered_cache(tmp_path))
+    with patch.object(codex_worker, "run_codex", side_effect=AssertionError("No replay")):
+        assert asyncio.run(second.handle(NONCE + ".request.json")) is False
+
+
+def test_cache_corruption_refuses_resume(tmp_path):
+    with patch.object(codex_worker, "run_codex", side_effect=fake_response):
+        asyncio.run(worker(Files(), tmp_path).handle(NONCE + ".request.json"))
+    (tmp_path / NONCE / "response.json").write_text("{}", encoding="utf8")
+    with pytest.raises(InfrastructureError):
+        resume.delivered_cache(tmp_path)
+
+
+def test_started_request_without_response_is_not_replayed(tmp_path):
+    folder = tmp_path / NONCE
+    folder.mkdir()
+    (folder / "generation-claimed.json").write_text("{}", encoding="utf8")
+    with patch.object(codex_worker, "run_codex", side_effect=AssertionError("No replay")):
+        asyncio.run(worker(Files(), tmp_path).handle(NONCE + ".request.json"))
+    data = json.loads((folder / "response.json").read_text(encoding="utf8"))
+    assert data["infrastructure_error"] is True
+    assert data["usage"]["token_accounting"] == "upper_bound"
+
+
+def test_expired_request_has_zero_native_invocations(tmp_path):
+    request = {**REQUEST, "expires_at": time.time() - 10}
+    with patch.object(codex_process, "check_dependencies", return_value={}), \
+            patch.object(codex_process, "command_for", side_effect=AssertionError("No native call")):
+        data = codex_process.run_codex(request, "test-digest", tmp_path, tmp_path / "receipt", set())
+    assert data["usage"] == {"tokens": 0, "token_accounting": "exact", "llm_calls": 0}
+
+
+def test_wrong_session_refuses_cached_response(tmp_path):
+    with patch.object(codex_worker, "run_codex", side_effect=fake_response):
+        asyncio.run(worker(Files(), tmp_path).handle(NONCE + ".request.json"))
+    with pytest.raises(InfrastructureError):
+        resume.delivered_cache(tmp_path, session="b" * 32)
+
+
+def test_frozen_source_and_real_delivery_cache_still_valid():
+    assert resume.verify_frozen_source() >= 500
+    assert len(resume.delivered_cache()) >= 51

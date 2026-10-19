@@ -1,0 +1,59 @@
+"""Two-phase preservation: one source-backed owned operational lock, never raw model evidence."""
+from __future__ import annotations
+
+import json
+import zipfile
+from pathlib import PureWindowsPath
+
+import audit_context as context
+from audit_common import PREPARATION_SHA, artifact, inventory, need, read_json, sha
+
+
+def verify_owned_lock_exception(ref):
+    value = read_json(artifact(ref))
+    need(value.get('schema') == 'hpc-forest-primes-r2max-owned-operational-lock-v1' and value.get('verified') is True and (value.get('scope_id') == context.SCOPE) and (value.get('session_id') == context.SESSION) and (value.get('job_id') == context.JOB) and (value.get('model') == context.MODEL) and (value.get('effort') == 'max') and (value.get('source_zip_sha256') == context.SOURCE_SHA) and (value.get('plan_sha256') == context.PLAN_SHA) and (value.get('preparation_manifest_sha256') == PREPARATION_SHA), 'Owned lock exception identity/source not verified')
+    need(value.get('relative_path') == 'worker.lock' and PureWindowsPath(value.get('source_path', '')).as_posix() == context.SOURCE_LOCK and (value.get('bytes') == 1) and (value.get('read_errno') == 13) and (value.get('sha256_before') is None), 'Only the exact one-byte owned worker.lock may remain unread before stop')
+    stat = read_json(artifact(value.get('stat_ref')))
+    need(PureWindowsPath(stat.get('path', '')).as_posix() == context.SOURCE_LOCK and stat.get('st_size') == 1, 'Owned lock full stat binding missing')
+    owner_ref = value.get('owner_identity_ref')
+    owner = read_json(artifact(owner_ref))
+    need(owner.get('verified') is True and owner.get('session_id') == context.SESSION and (owner.get('job_id') == context.JOB) and (type(owner.get('pid')) is int) and (owner['pid'] > 0) and isinstance(owner.get('executable'), str) and isinstance(owner.get('command_line'), str) and owner['command_line'] and isinstance(owner.get('creation_time_utc'), str) and owner['creation_time_utc'], 'Complete owned worker process identity missing')
+    source_ref = value.get('source_zip_ref')
+    source = artifact(source_ref)
+    need(source_ref['sha256'] == context.SOURCE_SHA, 'Lock mechanism not bound to the exact frozen runtime')
+    with zipfile.ZipFile(source) as archive:
+        raw = archive.read('HPC-Forest/src/hpc_forest/core.py')
+    need(value.get('lock_source_member') == 'HPC-Forest/src/hpc_forest/core.py' and value.get('lock_source_member_sha256') == sha(raw) and (b'msvcrt.locking' in raw), 'One-byte lock mechanism source evidence missing')
+    return value
+
+def cache_preservation(receipt, cache):
+    phase = receipt.get('preservation_phase')
+    need(phase in {'pre_stop_owned_lock_pending', 'complete_after_owned_stop'}, 'Explicit two-phase cache preservation receipt required')
+    exception = verify_owned_lock_exception(receipt.get('owned_operational_lock_exception'))
+    before = read_json(artifact(receipt.get('source_inventory_before')))
+    after = read_json(artifact(receipt.get('source_inventory_after')))
+    metadata = [read_json(artifact(receipt.get(key))) for key in ('source_full_metadata_before', 'source_full_metadata_after')]
+    for value in metadata:
+        lock = value.get('worker.lock', {})
+        need(lock.get('bytes') == 1 and lock.get('bytes_read') is False and (lock.get('sha256') is None) and (PureWindowsPath(lock.get('path', '')).as_posix() == context.SOURCE_LOCK), 'Pre-stop lock must record unread bytes, never an invented before-SHA')
+        need(set(value) == set(before) | {'worker.lock'}, 'Full metadata inventory does not cover exactly all readable files plus owned lock')
+        declared = {k: {'sha256': v.get('sha256'), 'bytes': v.get('bytes')} for k, v in value.items() if k != 'worker.lock'}
+        need(declared == before, 'Full metadata/readable artifact hashes differ')
+    snapshot = inventory(cache)
+    readable_snapshot = {k: v for k, v in snapshot.items() if k != 'worker.lock'}
+    need(before and before == after == readable_snapshot and 'CELL-BINDING.json' in before, 'All actual readable cache artifacts must be preserved stably, including CELL-BINDING')
+    need(receipt.get('files') == snapshot and receipt.get('source_files_observed') == len(before) + 1, 'Cache receipt does not describe its actual snapshot/observed total')
+    complete = phase == 'complete_after_owned_stop'
+    if complete:
+        need(receipt.get('verified') is True and receipt.get('source_cache_complete') is True, 'Complete cache receipt cannot remain partial')
+        post = read_json(artifact(receipt.get('post_stop_lock_preservation')))
+        need(post.get('schema') == 'hpc-forest-primes-r2max-post-stop-lock-preservation-v1' and post.get('verified') is True and (post.get('session_id') == context.SESSION) and (post.get('job_id') == context.JOB) and (post.get('owner_identity_sha256') == exception['owner_identity_ref']['sha256']) and (post.get('sha256_before') is None), 'Post-stop lock preservation is not separately linked to its owned process')
+        prior = read_json(artifact(post.get('pre_stop_audit_ref')))
+        need(prior.get('schema') == 'hpc-forest-primes-r2max-readonly-audit-v1' and (not prior.get('audit_error')) and (prior.get('session_id') == context.SESSION) and (prior.get('job_id') == context.JOB) and (prior.get('source_zip_sha256') == context.SOURCE_SHA) and (prior.get('received_model_artifacts_audited_with_owned_lock_pending') is True) and (prior.get('cache_preservation', {}).get('phase') == 'pre_stop_owned_lock_pending') and (prior.get('transport_cost_reconciliation', {}).get('unresolved_nonces') == []) and (prior.get('inventory_sha256', {}).get('cache') == sha(json.dumps(readable_snapshot, sort_keys=True).encode())), 'Post-stop closure lacks the actual successful pre-stop artifact reconciliation')
+        stopped = read_json(artifact(post.get('owned_stop_receipt')))
+        need(stopped.get('verified') is True and stopped.get('owned_stop_verified') is True and (stopped.get('owner_identity_sha256') == exception['owner_identity_ref']['sha256']) and (stopped.get('session_id') == context.SESSION) and (stopped.get('job_id') == context.JOB) and (stopped.get('pre_stop_audit_sha256') == post['pre_stop_audit_ref']['sha256']), 'Owned individual stop receipt missing')
+        lock = artifact(post.get('lock_ref'))
+        need(lock.resolve() == (cache / 'worker.lock').resolve() and lock.stat().st_size == 1 and (snapshot.get('worker.lock', {}).get('sha256') == post['lock_ref']['sha256']), 'Post-stop one-byte lock was not actually preserved')
+    else:
+        need('worker.lock' not in snapshot and receipt.get('post_stop_lock_preservation') is None, 'Pending owned lock must not have fabricated preserved bytes or post-stop proof')
+    return {'phase': phase, 'source_files_observed': len(before) + 1, 'readable_files_verified_before_stop': len(before), 'snapshot_files_verified': len(snapshot), 'all_model_artifacts_preserved': True, 'total_cache_bytes_preservation_complete': complete, 'owned_operational_lock_pending': not complete, 'worker_lock_sha256_before': None, 'lock_exception_ref': receipt['owned_operational_lock_exception']}

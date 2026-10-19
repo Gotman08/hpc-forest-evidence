@@ -1,0 +1,126 @@
+param(
+    [Parameter(Mandatory=$true)][Alias('receipt-path')][string]$ReceiptPath,
+    [Parameter(Mandatory=$true)][Alias('receipt-sha256')][ValidatePattern('^[0-9a-f]{64}$')][string]$ReceiptSha256,
+    [Parameter(Mandatory=$true)][string]$PlanPath,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$PlanSha256,
+    [Parameter(Mandatory=$true)][string]$ReviewPath,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ReviewSha256,
+    [switch]$Preflight,
+    [switch]$Execute
+)
+$ErrorActionPreference = 'Stop'
+$receiptRoot = $PSScriptRoot
+$baseRoot = (Resolve-Path -LiteralPath (Join-Path $receiptRoot '../../../../..')).Path
+$pythonPath = Join-Path $baseRoot 'work/.venv/Scripts/python.exe'
+$preparerPath = Join-Path $receiptRoot 'preparer-arret.py'
+$identitiesPath = Join-Path $receiptRoot 'IDENTITES-PROPOSEES.json'
+$requiredOwned = @(37848,35960,37900,35792,38444,42212,8568,58728,14648)
+$requiredPreserved = @(36356,55304,57996,35880,41724)
+$env:PYTHONUTF8 = '1'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+function Hash-File([string]$path) { return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+function Bound-Json([string]$path,[string]$hash) {
+    if ((Hash-File $path) -cne $hash) { throw 'Bound artifact changed' }
+    return Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
+}
+function Write-NewJson($value,[string]$path) {
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($value | ConvertTo-Json -Depth 70) + "`n")
+    $stream = [System.IO.File]::Open($path,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+}
+function File-Ref([string]$path) { return @{path=(Resolve-Path -LiteralPath $path).Path;sha256=(Hash-File $path)} }
+function Same-Identity($actual,$expected) {
+    if ($null -eq $actual) { return $false }
+    return ([int]$actual.ProcessId -eq [int]$expected.ProcessId -and
+        [int]$actual.ParentProcessId -eq [int]$expected.ParentProcessId -and
+        [string]$actual.ExecutablePath -ceq [string]$expected.ExecutablePath -and
+        [string]$actual.CommandLine -ceq [string]$expected.CommandLine -and
+        ([datetime]$actual.CreationDate).ToUniversalTime().Ticks -eq ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+}
+function Exact-Partition($selected,$trusted,[int[]]$order,[string]$label) {
+    $a=@($selected);$b=@($trusted)
+    if ($a.Count -ne $order.Count -or $b.Count -ne $order.Count) { throw ('Wrong exact partition count: '+$label) }
+    for ($i=0;$i -lt $order.Count;$i++) {
+        if ([int]$a[$i].ProcessId -ne $order[$i] -or [int]$b[$i].ProcessId -ne $order[$i] -or -not (Same-Identity $a[$i] $b[$i])) {
+            throw ('Wrong ordered full-identity partition: '+$label)
+        }
+    }
+}
+function Fresh-One([int]$targetPid) {
+    return Get-CimInstance Win32_Process -Filter "ProcessId=$targetPid" | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate
+}
+function Fresh-Census {
+    $rows=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{Name='CreationDate';Expression={if($null -eq $_.CreationDate){$null}else{$_.CreationDate.ToUniversalTime().ToString('o')}}})
+    $path=Join-Path $receiptRoot ('cim-prive-'+[guid]::NewGuid().ToString('N')+'.json')
+    Write-NewJson @{schema='hpc-forest-source-only-stop-full-cim-v1';complete_census=$true;strict_utf8_decoding=$true;captured_at_utc=[DateTime]::UtcNow.ToString('o');rows_count=$rows.Count;rows=$rows} $path
+    return $path
+}
+if ($Preflight -and $Execute) { throw 'Choose one explicit effect mode' }
+if ((Hash-File $identitiesPath) -cne 'a128dbe05b05d348f2b5eced0b0f11cc18959f25b7f9485187697fc0d200cead') { throw 'Pinned identity proposal changed' }
+$trusted=Get-Content -LiteralPath $identitiesPath -Raw -Encoding utf8 | ConvertFrom-Json
+$plan=Bound-Json $PlanPath $PlanSha256
+$review=Bound-Json $ReviewPath $ReviewSha256
+if ($review.schema -cne 'hpc-forest-source-only-owned-stop-independent-review-v1' -or ($review.verified -isnot [bool] -or $review.verified -ne $true) -or @($review.blocking_findings).Count -ne 0 -or [string]$review.job_id -cne '751592' -or $review.session_id -cne '665743a02b824021a697b6a4884a667c') { throw 'Actual independent stop-helper review required' }
+foreach ($name in @('preparer-arret.py','arreter-individuellement.ps1','IDENTITES-PROPOSEES.json')) {
+    if ($review.reviewed_files.$name -cne (Hash-File (Join-Path $receiptRoot $name))) { throw 'Code or identity partition differs from independent review' }
+}
+if ($plan.schema -cne 'hpc-forest-source-only-owned-individual-stop-plan-v1' -or ($plan.verified -isnot [bool] -or $plan.verified -ne $true) -or ($plan.stop_executed -isnot [bool] -or $plan.stop_executed -ne $false) -or $plan.job_id -cne '751592' -or $plan.session_id -cne '665743a02b824021a697b6a4884a667c' -or $plan.model -cne 'gpt-6.1-sol' -or $plan.effort -cne 'max' -or $plan.scope_id -cne 'hpc-forest-harness-comparison-20261016-r1' -or $plan.source_zip_sha256 -cne '9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb') { throw 'Actual exact reviewed stop plan required; false template cannot run' }
+if ($plan.final_reception.sha256 -cne $ReceiptSha256 -or $plan.final_reception.path -cne (Resolve-Path -LiteralPath $ReceiptPath).Path) { throw 'Final reception differs from reviewed plan' }
+Exact-Partition $plan.owned_targets_in_stop_order $trusted.owned_targets_in_stop_order $requiredOwned 'nine-targets-only'
+Exact-Partition $plan.preserved_observer_transport_identities $trusted.preserved_observer_transport_identities $requiredPreserved 'observer-five-never-targeted'
+$null=Bound-Json $ReceiptPath $ReceiptSha256
+if (-not $Execute -and -not $Preflight) {
+    @{schema='hpc-forest-source-only-stop-static-inspection-v1';verified=$false;mode='static bound files only';CIM_collected=$false;process_handles_opened=$false;stop_executed=$false;plan_sha256=$PlanSha256} | ConvertTo-Json
+    return
+}
+function Validate-Current {
+    $fresh=Fresh-Census
+    $arguments=@('-I','-B',$preparerPath,'--receipt-path',$ReceiptPath,'--receipt-sha256',$ReceiptSha256,'--fresh-cim',$fresh,'--fresh-cim-sha256',(Hash-File $fresh),'--baseline-cim',$plan.baseline_cim.path,'--baseline-cim-sha256',$plan.baseline_cim.sha256,'--operator-process-id',[string]$PID)
+    $text=& $pythonPath @arguments
+    if ($LASTEXITCODE -ne 0) { throw 'Final audit/cache/full fresh census gate refused; no stop allowed' }
+    $prepared=$text | ConvertFrom-Json
+    Exact-Partition $plan.owned_targets_in_stop_order $prepared.owned_targets_in_stop_order $requiredOwned 'prepared-nine-only'
+    Exact-Partition $plan.preserved_observer_transport_identities $prepared.preserved_observer_transport_identities $requiredPreserved 'prepared-preserved-five'
+    if ($prepared.final_reception.sha256 -cne $ReceiptSha256 -or $prepared.stop_executed -ne $false) { throw 'Reprepared scope differs' }
+    return $prepared
+}
+$prepared=Validate-Current
+$preflightReceipt=@{schema='hpc-forest-source-only-owned-stop-preflight-v1';verified=$true;job_id='751592';session_id=$plan.session_id;at_utc=[DateTime]::UtcNow.ToString('o');final_receipt=(File-Ref $ReceiptPath);plan=(File-Ref $PlanPath);review=(File-Ref $ReviewPath);classification=$prepared.classification;executed=$false;worker_lock_read=$false;complete_live_cache_snapshot=$false}
+Write-NewJson $preflightReceipt (Join-Path $receiptRoot ('prevol-'+[guid]::NewGuid().ToString('N')+'.json'))
+if (-not $Execute) { $preflightReceipt | ConvertTo-Json -Depth 20; return }
+$intentPath=Join-Path $receiptRoot 'INTENTION-ARRET-EXCLUSIVE.json'
+Write-NewJson $preflightReceipt $intentPath
+$actions=@()
+try {
+    for ($i=0;$i -lt $requiredOwned.Count;$i++) {
+        if ($i -eq 2) { Start-Sleep -Seconds 10 }
+        $currentGate=Validate-Current
+        $expected=$plan.owned_targets_in_stop_order[$i]
+        $current=Fresh-One ([int]$expected.ProcessId)
+        if ($null -eq $current) {
+            $action=@{ProcessId=$expected.ProcessId;action='natural_exit_observed_no_stop';full_identity=$expected;at_utc=[DateTime]::UtcNow.ToString('o')}
+        } else {
+            if (-not (Same-Identity $current $expected)) { throw 'Changed/reused identity must remain untouched' }
+            $ownedProcess=Get-Process -Id ([int]$expected.ProcessId)
+            try {
+                $stableHandle=$ownedProcess.Handle
+                $delta=[math]::Abs($ownedProcess.StartTime.ToUniversalTime().Ticks-([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+                if ($delta -ge 10) { throw 'Stable handle creation differs by >=10ticks' }
+                if (-not (Same-Identity (Fresh-One ([int]$expected.ProcessId)) $expected)) { throw 'Full identity changed after stable handle open' }
+                Write-NewJson @{ProcessId=$expected.ProcessId;full_identity=$expected;at_utc=[DateTime]::UtcNow.ToString('o');action='individual_stop_about_to_be_issued';intent=(File-Ref $intentPath)} (Join-Path $receiptRoot ('action-'+[string]$expected.ProcessId+'-started.json'))
+                Stop-Process -InputObject $ownedProcess -Force
+                $action=@{ProcessId=$expected.ProcessId;action='individual_stop_issued_after_exact_identity_and_handle';full_identity=$expected;at_utc=[DateTime]::UtcNow.ToString('o');stable_handle_opened=$true;start_delta_ticks=$delta}
+            } finally { $ownedProcess.Dispose() }
+        }
+        $actions += $action
+        Write-NewJson $action (Join-Path $receiptRoot ('action-'+[string]$expected.ProcessId+'-finished.json'))
+    }
+    $after=Validate-Current
+    if (@($after.classification.present_owned).Count -ne 0) { throw 'An original owned identity remains; no positive closure' }
+    $result=@{schema='hpc-forest-source-only-owned-individual-stop-receipt-v1';verified=$true;owned_stop_verified=$true;job_id='751592';session_id=$plan.session_id;source_zip_sha256=$plan.source_zip_sha256;final_reception=(File-Ref $ReceiptPath);plan=(File-Ref $PlanPath);review=(File-Ref $ReviewPath);intent=(File-Ref $intentPath);actions=$actions;all_nine_target_identities_absent=$true;preserved_observer_transport_state=$after.classification;preserved_observer_transport_never_targeted=$true;full_cim_ref=$after.fresh_cim;stop_by_name=$false;recursive_stop=$false;foreign_processes_targeted=$false;worker_lock_read=$false;complete_live_cache_preservation_claimed=$false;unknown_consumption_remains_null=$true;routes_modified=$false;routes_may_only_be_cleared_by_parent_after_verified_absence=$true;native_calls_replayed=0}
+    Write-NewJson $result (Join-Path $receiptRoot 'ARRET-INDIVIDUEL-VERIFIE.json')
+    $result | ConvertTo-Json -Depth 30
+} catch {
+    Write-NewJson @{schema='hpc-forest-source-only-owned-stop-refusal-v1';verified=$false;owned_stop_verified=$false;actions=$actions;error=$_.Exception.Message;intent_present=$true;no_retry_without_reconciliation=$true} (Join-Path $receiptRoot ('REFUS-ARRET-'+[guid]::NewGuid().ToString('N')+'.json'))
+    throw
+}

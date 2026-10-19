@@ -1,0 +1,186 @@
+/*
+    This program solves Laplace's equation on a regular 2D grid using simple Jacobi iteration.
+
+    The stencil calculation stops when  ( err >= CONV_THRESHOLD OR  iter > ITER_MAX )
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+#include <sys/time.h>
+
+#define CONV_THRESHOLD 1.0e-5f // threshold of convergence
+
+// Logical rows of the matrix to be solved.
+double **grid;
+
+// Contiguous backing storage and one recyclable row.
+static double *grid_storage;
+static double *spare_row;
+
+// size of each side of the grid
+int size;
+int iter_max_num;
+
+// return the absolute value of a number
+double absolute(double num){
+    if(num < 0)
+        return -1.0 * num;
+    return num;
+}
+
+// allocate memory for the grid and one spare row
+void allocate_memory(){
+    if(size <= 0){
+        grid = NULL;
+        grid_storage = NULL;
+        spare_row = NULL;
+        return;
+    }
+
+    size_t n = (size_t)size;
+    if(n > SIZE_MAX / sizeof(*grid) ||
+       n > SIZE_MAX / sizeof(*grid_storage) / (n + 1)){
+        exit(EXIT_FAILURE);
+    }
+
+    grid = (double **)malloc(n * sizeof(*grid));
+    grid_storage = (double *)malloc(n * (n + 1) * sizeof(*grid_storage));
+    if(grid == NULL || grid_storage == NULL){
+        free(grid);
+        free(grid_storage);
+        exit(EXIT_FAILURE);
+    }
+
+    for(int i = 0; i < size; i++){
+        grid[i] = grid_storage + (size_t)i * n;
+    }
+    spare_row = grid_storage + n * n;
+}
+
+// initialize the grid
+void initialize_grid(){
+    int center = size / 2;
+    int linf = center - (size / 10);
+    int lsup = center + (size / 10);
+    for(int i = 0; i < size; i++){
+        for(int j = 0; j < size; j++){
+            // inicializa região de calor no centro do grid
+            if(i >= linf && i <= lsup && j >= linf && j <= lsup)
+                grid[i][j] = 100;
+            else
+                grid[i][j] = 0;
+        }
+    }
+}
+
+// The fixed top boundary cannot be recycled, so the first output uses the spare.
+static int relax_first_row(double *restrict dst,
+                           const double *restrict current,
+                           const double *restrict north,
+                           const double *restrict south,
+                           int n){
+    int changed = 0;
+    dst[0] = current[0];
+    dst[n - 1] = current[n - 1];
+    for(int j = 1; j < n - 1; j++){
+        double value = 0.25 * (current[j + 1] + current[j - 1] +
+                               north[j] + south[j]);
+        dst[j] = value;
+        double errorCurrent = absolute(value - current[j]);
+        if(errorCurrent > CONV_THRESHOLD){
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
+// Each old north value has its last use at the same column being overwritten.
+static int relax_recycled_row(double *restrict north,
+                              const double *restrict current,
+                              const double *restrict south,
+                              int n){
+    int changed = 0;
+    north[0] = current[0];
+    north[n - 1] = current[n - 1];
+    for(int j = 1; j < n - 1; j++){
+        double value = 0.25 * (current[j + 1] + current[j - 1] +
+                               north[j] + south[j]);
+        north[j] = value;
+        double errorCurrent = absolute(value - current[j]);
+        if(errorCurrent > CONV_THRESHOLD){
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
+// save the grid in a file
+void save_grid(){
+    for(int i = 0; i < size; i++){
+        for(int j = 0; j < size; j++){
+            fprintf(stdout, "%lf ", grid[i][j]);
+        }
+        fprintf(stdout, "\n");
+    }
+}
+
+int main(int argc, char *argv[]){
+    fscanf(stdin, "%d", &size);
+    fscanf(stdin, "%d", &iter_max_num);
+
+    int hasError = 1;
+    int iter = 0;
+
+    struct timeval time_start;
+    struct timeval time_end;
+
+    // allocate memory to the grid (matrix)
+    allocate_memory();
+
+    // set grid initial conditions
+    initialize_grid();
+
+    //printf("Jacobi relaxation calculation: %d x %d grid\n", size, size);
+
+    // get the start time
+    //gettimeofday(&time_start, NULL);
+
+    // Commit a complete Jacobi sweep before checking convergence again.
+    while(hasError && iter < iter_max_num){
+        hasError = 0;
+        if(size > 2){
+            double *old_north = grid[1];
+            hasError = relax_first_row(spare_row, old_north,
+                                       grid[0], grid[2], size);
+            grid[1] = spare_row;
+
+            for(int i = 2; i < size - 1; i++){
+                double *current = grid[i];
+                hasError |= relax_recycled_row(old_north, current,
+                                               grid[i + 1], size);
+                grid[i] = old_north;
+                old_north = current;
+            }
+
+            // The last old interior row is now unused by every logical row.
+            spare_row = old_north;
+        }
+        iter++;
+    }
+
+    // get the end time
+    //gettimeofday(&time_end, NULL);
+
+    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +
+    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;
+
+    //save the final grid in file
+    save_grid();
+
+    //printf("\nKernel executed in %lf seconds with %d iterations.\n", exec_time, iter);
+
+    free(grid_storage);
+    free(grid);
+    return 0;
+}

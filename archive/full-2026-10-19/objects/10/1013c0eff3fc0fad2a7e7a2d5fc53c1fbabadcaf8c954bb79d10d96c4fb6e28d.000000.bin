@@ -1,0 +1,175 @@
+"""Local metadata-only policy preparation; no discovery, CLI, transport or inference."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[4]
+REL = BASE / "outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3"
+PROJECT = BASE / "work/hpc-forest-mere-dynamique-r4b-lane-r3/project"
+METADATA = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g/operations-parent/SKILLS-CHEMINS-CANDIDATS.json"
+META_SHA = "34164b26e1c86da6e30d9d72a2b2587aa5c4d061fb9b4f116b9dac335a83e47a"
+PLAN = REL / "revision-source-cli-r1/dynamic-plan-r4b-lane-r3-max.json"
+PLAN_SHA = "d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27"
+ZIP = REL / "revision-source-cli-r1/HPC-Forest-Mere-Dynamique-R4b-Lane-R3-CLI.zip"
+ZIP_SHA = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+LOADER = PROJECT / "src/hpc_forest/codex_process.py"
+LOADER_SHA = "c2d227ca8e8d964df8813146bec983312142e15b80a39eb4a8e57e13810f5428"
+CLI_SHA = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+CELLS = {'gpt-6.1-sol': {'roots': '3b1de5658e4641149b15a3bea4850239', 'advice': 'b86d18fcf35d4031aa2ef0da49397c4e', 'harvest': '7c8bc0c5ae22467da05600fb735fc017'}, 'gpt-6-astra': {'roots': '7b6c29c0e329400bb2be145b0e2dbe0a', 'advice': '7be16898433e49f4b481045079abbbe8', 'harvest': 'b6fc9cf3951d46d787f319b51905251b'}, 'gpt-5.6-terra': {'roots': 'bd2b3153a7544c909afbc19fe69902b4', 'advice': '7516e40883c64ab8af8a38637d74de3f', 'harvest': '7d6f357d4e5741bb8349835f358563b2'}}
+FIELDS = {"scope_id", "model", "effort", "session_id", "job_id", "remote_root",
+          "source_zip_sha256", "plan_sha256"}
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def ordinary(path: Path) -> None:
+    if (not path.is_absolute() or ".." in path.parts or not path.is_file()
+            or any(p.is_symlink() or getattr(p, "is_junction", lambda: False)()
+                   for p in (path, *path.parents))):
+        raise ValueError("Exact ordinary absolute metadata file required")
+
+
+def read_pinned(path: Path, checksum: str, limit: int = 262144) -> bytes:
+    ordinary(path)
+    data = path.read_bytes()
+    if len(data) > limit or digest(data) != checksum:
+        raise ValueError("Metadata/source pin or byte limit differs")
+    return data
+
+
+def write_exclusive(path: Path, value: dict) -> dict:
+    data = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if path.parent != HERE or path.exists() or path.is_symlink():
+        raise ValueError("Only a new exact policy artifact in this directory is allowed")
+    with path.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return {"path": str(path), "sha256": digest(data), "bytes": len(data)}
+
+
+def inputs() -> list[str]:
+    metadata = json.loads(read_pinned(METADATA, META_SHA))
+    plan = json.loads(read_pinned(PLAN, PLAN_SHA))
+    read_pinned(ZIP, ZIP_SHA, 8 * 1024 * 1024)
+    read_pinned(LOADER, LOADER_SHA)
+    paths = metadata.get("candidate_directories")
+    if (metadata.get("candidate_count") != 236 or not isinstance(paths, list)
+            or len(paths) != 236 or len(set(paths)) != 236
+            or metadata.get("instruction_or_SKILL_body_read") is not False
+            or metadata.get("is_actual_CLI_discovery_receipt") is not False
+            or plan.get("scope_id") != SCOPE or plan.get("contract_cells") != CELLS
+            or plan.get("source_zip_sha256") != ZIP_SHA):
+        raise ValueError("Exact local filesystem metadata and new plan required")
+    if any(not isinstance(p, str) or not re.match(r"^[A-Za-z]:[/\\]", p)
+           or ".." in p.replace("\\", "/").split("/")
+           or any(c in p for c in ("\0", "\r", "\n")) for p in paths):
+        raise ValueError("Only the already received ordinary path strings are allowed")
+    return paths
+
+
+def binding_for(model: str, job_id: str | None, *, phase=None, session_id=None) -> dict:
+    if model not in CELLS:
+        raise ValueError("Only three planned MAX models")
+    phases=[p for p,s in CELLS[model].items() if (phase is None or p==phase) and (session_id is None or s==session_id)]
+    if len(phases)!=1:
+        raise ValueError("One exact existing R4b phase session required")
+    session=CELLS[model][phases[0]]
+    return {"scope_id":SCOPE,"model":model,"effort":"max","session_id":session,"job_id":job_id,
+        "remote_root":"/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-"+session,
+        "source_zip_sha256":ZIP_SHA,"plan_sha256":PLAN_SHA}
+
+
+def policy_for(binding: dict, paths: list[str]) -> dict:
+    constants = pinned_loader_namespace()
+    return {"schema": constants["TASK_CLI_POLICY_SCHEMA"], **binding,
+            "cli_executable_sha256": CLI_SHA, "skill_candidate_directories": paths,
+            "filesystem_metadata_sha256": META_SHA,
+            "is_actual_CLI_discovery_receipt": False, "instruction_or_SKILL_body_read": False,
+            "cli_feature_overrides": dict(constants["TASK_CLI_FEATURES"]),
+            "code_mode_host_executable_sha256": constants["CODE_MODE_HOST_SHA256"]}
+
+
+def pinned_loader_namespace() -> dict:
+    # Closed three-constant and one-function AST from exact reviewed G source, not a module import.
+    tree = ast.parse(read_pinned(LOADER, LOADER_SHA).decode("utf-8"))
+    constants = {"TASK_CLI_POLICY_SCHEMA", "TASK_CLI_FEATURES", "CODE_MODE_HOST_SHA256"}
+    selected = [node for node in tree.body if (
+        isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id in constants)
+        or (isinstance(node, ast.FunctionDef) and node.name == "load_task_cli_policy")]
+    if len(selected) != 4:
+        raise ValueError("Exact versioned G loader closure required")
+    namespace = {"Path": Path, "re": re, "InfrastructureError": ValueError,
+                 "sha256": digest,
+                 "bounded_json": lambda p, limit: json.loads(p.read_bytes())
+                 if p.stat().st_size <= limit else (_ for _ in ()).throw(ValueError("Too large"))}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(LOADER), "exec"), namespace)  # noqa: S102 -- exact SHA-bound pure closure only
+    features = namespace["TASK_CLI_FEATURES"]
+    if (namespace["TASK_CLI_POLICY_SCHEMA"] != "hpc-forest-r2g-local-cli-policy-v1"
+            or namespace["CODE_MODE_HOST_SHA256"] != "3b6a9179a4da17fa5fc6948219cd61486dc3b534c683838076d8c61bd311c68e"
+            or len(features) != 22 or features.get("code_mode_host") is not True
+            or any(type(value) is not bool or (name != "code_mode_host" and value is not False)
+                   for name, value in features.items())):
+        raise ValueError("Exact G host infrastructure candidate and 21 false features required")
+    return namespace
+
+
+def validate_with_pinned_loader(path: Path, checksum: str, binding: dict) -> None:
+    pinned_loader_namespace()["load_task_cli_policy"](path, checksum, binding, CLI_SHA)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binding", type=Path)
+    parser.add_argument("--binding-sha256")
+    args = parser.parse_args()
+    paths = inputs()
+    if (args.binding is None) != (args.binding_sha256 is None):
+        raise ValueError("Actual eight-field cell binding and SHA are required together")
+    if args.binding is None:
+        refs = []
+        for model, phase, session in ((m,p,s) for m,phases in CELLS.items() for p,s in phases.items()):
+            value = {"schema": "hpc-forest-r2g-local-cli-policy-template-NON-ADMIS-v1",
+                     "worker_acceptable": False, "native_research_admitted": False,
+                     "missing_actual_binding_fields": ["job_id"],
+                     "policy_payload_not_yet_acceptable": policy_for(binding_for(model, None, phase=phase), paths)}
+            refs.append(write_exclusive(HERE / ("GABARIT-NON-ADMIS-" + session + ".json"), value))
+        receipt = {"schema": "hpc-forest-r2g-local-cli-policy-templates-receipt-v1",
+                   "templates": refs, "candidate_count": len(paths),
+                   "filesystem_metadata": {"path": str(METADATA), "sha256": META_SHA},
+                   "plan_sha256": PLAN_SHA, "source_zip_sha256": ZIP_SHA,
+                   "native_research_admitted": False, "jobs_created": 0,
+                   "actual_cli_discovery_or_grammar_verified": False,
+                   "skill_bodies_read": False, "raw_skill_paths_exported_to_ARM": False}
+        ref = write_exclusive(HERE / "GABARITS-LOCAUX-NON-ADMIS.json", receipt)
+        print(json.dumps({"templates": len(refs), "receipt": ref, "native_research_admitted": False}))
+        return
+    if not re.fullmatch(r"[0-9a-f]{64}", args.binding_sha256):
+        raise ValueError("Exact binding SHA required")
+    binding = json.loads(read_pinned(args.binding, args.binding_sha256))
+    if (not isinstance(binding, dict) or set(binding) != FIELDS or binding.get("model") not in CELLS
+            or not isinstance(binding.get("job_id"), str)
+            or not re.fullmatch(r"[1-9][0-9]*", binding["job_id"])
+            or binding != binding_for(binding["model"], binding["job_id"], session_id=binding["session_id"])):
+        raise ValueError("Exact actual eight-field new R4b source110 cell binding required")
+    path = HERE / ("cli-policy-" + binding["session_id"] + ".json")
+    ref = write_exclusive(path, policy_for(binding, paths))
+    validate_with_pinned_loader(path, ref["sha256"], binding)
+    print(json.dumps({"policy": ref, "caller_binding_sha256": args.binding_sha256,
+                      "mechanical_loader_verified": True, "job_existence_verified_here": False,
+                      "native_research_admitted": False}))
+
+
+if __name__ == "__main__":
+    main()

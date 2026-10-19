@@ -1,0 +1,188 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+namespace {
+using Residue = std::uint32_t;
+using Wide = std::uint64_t;
+constexpr Wide MOD = 1000000007ULL;
+
+// Coefficients are stored in ascending degree:
+// x^n = coefficients[0] + ... + coefficients[n-1] * x^(n-1).
+void square_mod(std::vector<Residue>& polynomial, int& length,
+                const std::vector<Residue>& coefficients,
+                std::vector<Residue>& scratch) {
+    const int n = static_cast<int>(coefficients.size());
+    const int width = 2 * length - 1;
+    std::fill(scratch.begin(), scratch.begin() + width, Residue(0));
+
+    // Symmetric convolution, with contiguous reads and destination updates.
+    for (int i = 0; i < length; ++i) {
+        const Wide value = polynomial[i];
+        if (value == 0) {
+            continue;
+        }
+        scratch[2 * i] = static_cast<Residue>(
+            (scratch[2 * i] + value * value) % MOD);
+        const Wide twice = value + value;
+        Residue* const row = scratch.data() + i;
+        for (int j = i + 1; j < length; ++j) {
+            row[j] = static_cast<Residue>(
+                (row[j] + twice * polynomial[j]) % MOD);
+        }
+    }
+
+    // Descending elimination only updates coefficients of lower degree.
+    for (int degree = width - 1; degree >= n; --degree) {
+        const Wide factor = scratch[degree];
+        if (factor == 0) {
+            continue;
+        }
+        Residue* const row = scratch.data() + degree - n;
+        for (int j = 0; j < n; ++j) {
+            row[j] = static_cast<Residue>(
+                (row[j] + factor * coefficients[j]) % MOD);
+        }
+    }
+
+    length = std::min(n, width);
+    std::copy_n(scratch.begin(), length, polynomial.begin());
+}
+
+void multiply_by_x(std::vector<Residue>& polynomial, int& length,
+                   const std::vector<Residue>& coefficients) {
+    const int n = static_cast<int>(coefficients.size());
+    if (length < n) {
+        for (int i = length; i > 0; --i) {
+            polynomial[i] = polynomial[i - 1];
+        }
+        polynomial[0] = 0;
+        ++length;
+        return;
+    }
+
+    const Wide top = polynomial[n - 1];
+    for (int i = n - 1; i > 0; --i) {
+        polynomial[i] = static_cast<Residue>(
+            (polynomial[i - 1] + top * coefficients[i]) % MOD);
+    }
+    polynomial[0] = static_cast<Residue>(top * coefficients[0] % MOD);
+}
+
+// Estimate modular products using the same active-length bounds as the solver.
+Wide polynomial_work(int n, Wide exponent, int bits) {
+    Wide work = 0;
+    int length = 1;
+    for (int bit = bits - 1; bit >= 0; --bit) {
+        work += static_cast<Wide>(length) * (length + 1) / 2;
+        const int width = 2 * length - 1;
+        if (width > n) {
+            work += static_cast<Wide>(width - n) * n;
+        }
+        length = std::min(n, width);
+        if ((exponent >> bit) & 1ULL) {
+            if (length == n) {
+                work += n;
+            } else {
+                ++length;
+            }
+        }
+    }
+    return work + length;
+}
+
+Residue direct_term(const std::vector<Residue>& initial,
+                    const std::vector<Residue>& coefficients, Wide steps) {
+    std::vector<Residue> history(initial);
+    const int n = static_cast<int>(history.size());
+    int oldest = 0;
+    Residue result = history[n - 1];
+
+    for (Wide step = 0; step < steps; ++step) {
+        Wide sum = 0;
+        const int tail = n - oldest;
+        // Traverse the chronological window as two contiguous spans.
+        for (int j = 0; j < tail; ++j) {
+            sum = (sum + static_cast<Wide>(history[oldest + j]) *
+                         coefficients[j]) % MOD;
+        }
+        for (int j = 0; j < oldest; ++j) {
+            sum = (sum + static_cast<Wide>(history[j]) *
+                         coefficients[tail + j]) % MOD;
+        }
+        result = static_cast<Residue>(sum);
+        history[oldest] = result;
+        if (++oldest == n) {
+            oldest = 0;
+        }
+    }
+    return result;
+}
+
+Residue recurrence_term(const std::vector<Residue>& initial,
+                        const std::vector<Residue>& coefficients, Wide h) {
+    const int n = static_cast<int>(initial.size());
+    if (h <= static_cast<Wide>(n)) {
+        return initial[static_cast<std::size_t>(h - 1)];
+    }
+
+    const Wide exponent = h - 1;
+    int bits = 0;
+    for (Wide value = exponent; value != 0; value >>= 1) {
+        ++bits;
+    }
+
+    const Wide steps = h - static_cast<Wide>(n);
+    const Wide estimated_work = polynomial_work(n, exponent, bits);
+    if (steps <= estimated_work / static_cast<Wide>(n)) {
+        return direct_term(initial, coefficients, steps);
+    }
+
+    std::vector<Residue> polynomial(n, 0);
+    std::vector<Residue> scratch(2 * n - 1);
+    polynomial[0] = 1;
+    int length = 1;
+
+    // Left-to-right exponentiation of x^(h-1) modulo the characteristic polynomial.
+    for (int bit = bits - 1; bit >= 0; --bit) {
+        square_mod(polynomial, length, coefficients, scratch);
+        if ((exponent >> bit) & 1ULL) {
+            multiply_by_x(polynomial, length, coefficients);
+        }
+    }
+
+    Wide answer = 0;
+    for (int i = 0; i < length; ++i) {
+        answer = (answer + static_cast<Wide>(polynomial[i]) * initial[i]) % MOD;
+    }
+    return static_cast<Residue>(answer);
+}
+} // namespace
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n;
+    Wide h;
+    if (!(std::cin >> n >> h)) {
+        return 0;
+    }
+
+    std::vector<Residue> initial(n);
+    std::vector<Residue> coefficients(n);
+    for (int i = 0; i < n; ++i) {
+        Wide value;
+        std::cin >> value;
+        initial[i] = static_cast<Residue>(value % MOD);
+    }
+    for (int i = 0; i < n; ++i) {
+        Wide value;
+        std::cin >> value;
+        coefficients[n - 1 - i] = static_cast<Residue>(value % MOD);
+    }
+
+    std::cout << recurrence_term(initial, coefficients, h) << '\n';
+    return 0;
+}

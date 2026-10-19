@@ -1,0 +1,37 @@
+$ErrorActionPreference='Stop'
+$root = (Resolve-Path -LiteralPath 'outputs/HPC-Forest-Harnais-Comparaison-r1/reprises/bascule-max-r2-20261017/fermeture-observateur-encodage').Path
+$plan = Get-Content -LiteralPath (Join-Path $root 'plan.json') -Raw | ConvertFrom-Json
+function Same($a,$b) { return ($null -ne $a -and [int]$a.ProcessId -eq [int]$b.ProcessId -and [int]$a.ParentProcessId -eq [int]$b.ParentProcessId -and [string]$a.ExecutablePath -ieq [string]$b.ExecutablePath -and [string]$a.CommandLine -ceq [string]$b.CommandLine -and ([datetime]$a.CreationDate).ToUniversalTime().Ticks -eq ([datetime]$b.CreationDate).ToUniversalTime().Ticks) }
+function One([int]$targetPid) { return Get-CimInstance Win32_Process -Filter "ProcessId=$targetPid" | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine }
+if ($plan.schema -ne 'hpc-forest-owned-read-only-observer-replacement-v1' -or $plan.only_local_read_only_observer -ne $true -or $plan.model_calls -ne 0) { throw 'Wrong read-only observer plan' }
+if ((Get-FileHash -LiteralPath (Join-Path $root 'plan.json') -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'f7d19d43a24a9dc6a92f63a14029d648c08cdcedf723902ecd4a31579ba425d6') { throw 'Plan changed' }
+foreach ($r in @($plan.targets)+@($plan.preserve_source_only)) { if (-not(Same (One ([int]$r.ProcessId)) $r)) { throw 'Full identity changed before action' } }
+$intent = Join-Path $root 'intent.json'
+if (Test-Path -LiteralPath $intent) { throw 'Existing intent, reconcile before any repetition' }
+Copy-Item -LiteralPath (Join-Path (Split-Path $root) 'observer.stderr.log') -Destination (Join-Path $root 'stderr-avant.log')
+@{at_utc=[DateTime]::UtcNow.ToString('o');plan_sha256='f7d19d43a24a9dc6a92f63a14029d648c08cdcedf723902ecd4a31579ba425d6';only_read_only_observer=$true;native_worker_preserved=$true;no_recursive_or_name_stop=$true} | ConvertTo-Json | Set-Content -LiteralPath $intent -Encoding UTF8
+$actions=@()
+foreach ($r in $plan.targets) {
+ $c=One ([int]$r.ProcessId)
+ if ($null -eq $c) { $actions+=@{pid=$r.ProcessId;action='natural_exit_before_individual_stop'} }
+ else {
+  if (-not(Same $c $r)) { throw 'Identity changed, preserve new process' }
+  $h=Get-Process -Id ([int]$r.ProcessId) -ErrorAction SilentlyContinue
+  if ($null -eq $h) { $actions+=@{pid=$r.ProcessId;action='natural_exit_before_handle_open'} }
+  else {
+   $openedHandle=$h.Handle
+   if ([math]::Abs($h.StartTime.ToUniversalTime().Ticks-([datetime]$r.CreationDate).ToUniversalTime().Ticks) -ge 10) { throw 'Opened handle differs' }
+   if (-not(Same (One ([int]$r.ProcessId)) $r)) { throw 'Identity changed after handle open' }
+   Stop-Process -InputObject $h -Force
+   $actions+=@{pid=$r.ProcessId;action='owned_individual_stop_after_full_identity_handle_check'}
+  }
+ }
+ $actions | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'actions.json') -Encoding UTF8
+}
+Start-Sleep -Milliseconds 500
+$after=Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine
+$after | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'cim-apres.json') -Encoding UTF8
+foreach ($r in $plan.targets) { if (Same ($after | Where-Object { $_.ProcessId -eq $r.ProcessId }) $r) { throw 'Owned observer component remains' } }
+foreach ($r in $plan.preserve_source_only) { if (-not(Same ($after | Where-Object { $_.ProcessId -eq $r.ProcessId }) $r)) { throw 'Native source-only worker changed' } }
+@{schema='hpc-forest-owned-read-only-observer-stop-receipt-v1';verified=$true;at_utc=[DateTime]::UtcNow.ToString('o');job_id='751592';session_id=$plan.session_id;all_previous_passive_observer_identities_absent=$true;only_local_read_only_observer_stopped=$true;native_source_only_pair_preserved=$true;new_model_calls=0;remote_job_cancelled=$false;recursive_stop=$false;stop_by_name=$false;targets=$plan.targets;actions=$actions} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $root 'absence-verifiee.json') -Encoding UTF8
+Get-Content -LiteralPath (Join-Path $root 'absence-verifiee.json') -Raw | ConvertFrom-Json | Select-Object verified,only_local_read_only_observer_stopped,native_source_only_pair_preserved,new_model_calls,remote_job_cancelled | ConvertTo-Json

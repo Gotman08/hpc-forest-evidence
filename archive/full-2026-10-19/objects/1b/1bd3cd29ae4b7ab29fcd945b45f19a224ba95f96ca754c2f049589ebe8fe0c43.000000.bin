@@ -1,0 +1,225 @@
+"""Write a local twelve-part report; never publish remotely or feed a model."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = Path(__file__).resolve().parent
+NAMES = {"2020-tropical": "Chemin tropical 2020", "2020-permutations": "Permutations 2020"}
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def table(headers, rows):
+    def cell(value):
+        return str(value).replace("|", "/")
+    return "\n".join(["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers),
+                      *["| " + " | ".join(map(cell, row)) + " |" for row in rows]])
+
+
+def main(root):
+    data = read(root / "resultats-verifies.json")
+    audit = data["audit"]
+    if not (audit["evidence_integrity_verified"] and audit["all_cases_and_physical_core_counts_received"]
+            and audit["allocated_arm64_preflight_verified"]):
+        raise RuntimeError("Only a complete received and independently audited lot can be reported")
+    plan = read(root / "payload/plan.json")
+    raw = read(root / "preuves/results/results.json")
+    actual_review = read(root / "payload/validation-contrats-recus.json")
+    efficiency = read(root / "efficacite.json")
+    points = {(p["case_key"], p["program_key"], p["cores"]): p for p in raw["points"]}
+    summaries, conformities, compiler_records = [], [], []
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 13,
+                         "axes.spines.top": False, "axes.spines.right": False,
+                         "savefig.bbox": "tight", "svg.fonttype": "none"})
+    for campaign in plan["campaigns"]:
+        subject = campaign["subject"]
+        # Tropical has two size-six graphs. Select the explicitly named benchmark
+        # rather than merging distinct inputs or duplicating five-core curves.
+        case = next(c for c in plan["cases"] if c["subject"] == subject and c["phase"] == "benchmark")
+        curve = sorted([r for r in data["rows"] if r["campaign_root"] == campaign["campaign_root"]
+                        and r["input_sha256"] == case["input_sha256"]], key=lambda r: r["cores"])
+        if [r["cores"] for r in curve] != [1, 2, 4, 8, 16]:
+            raise RuntimeError("Five distinct physical-core counts required for one exact input")
+        selected = []
+        for role, key, color, marker, style in [
+                ("Référence inchangée", campaign["keys"]["original_reference"], "#0072B2", "s", "--"),
+                ("Programme retenu par Luna MAX", campaign["keys"]["chosen"], "#D55E00", "o", "-")]:
+            if any(p[1] == key for p in selected):
+                continue
+            selected.append((role, key, color, marker, style))
+        fig, axes = plt.subplots(1, 2, figsize=(11.2, 6.2))
+        for role, key, color, marker, style in selected:
+            p = [points[case["key"], key, cores] for cores in plan["cores"]]
+            if not all(v["full_valid_measurement"] for v in p):
+                continue
+            means = [v["mean_seconds"] for v in p]
+            axes[0].errorbar(plan["cores"], means, yerr=[v["stdev_seconds"] for v in p],
+                             color=color, marker=marker, linestyle=style, capsize=3, label=role)
+            for cores, point in zip(plan["cores"], p):
+                axes[0].scatter([cores] * 5, [v["seconds"] for v in point["samples"]],
+                                s=14, color=color, marker=marker, alpha=.45)
+            axes[1].plot(plan["cores"], [means[0] / value for value in means],
+                         color=color, marker=marker, linestyle=style, label=role)
+        for ax in axes:
+            ax.set_xticks(plan["cores"])
+            ax.set_xlabel("Cœurs physiques accessibles")
+            ax.grid(alpha=.2)
+        axes[0].set_yscale("log")
+        axes[0].set_ylabel("Temps mural complet (s, échelle log)")
+        axes[0].set_title("A  Moyenne et écart-type\n5 passages intercalés", loc="left", fontsize=13)
+        axes[1].set_ylabel("T(même programme, 1) / T(programme, p)")
+        axes[1].set_title("B  Rapport des moyennes\naucun test de significativité", loc="left", fontsize=13)
+        axes[1].axhline(1, color="#666666", lw=1, linestyle=":")
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=12, bbox_to_anchor=(.5, .01))
+        fig.suptitle(f"{NAMES[subject]} - entrée benchmark, taille {case['input_domain_review']['size']}\n"
+                     f"Exécutables reçus inchangés - allocation {audit['job_id']}", fontsize=15)
+        fig.tight_layout(rect=(0, .12, 1, .91))
+        stem = "courbes-" + subject
+        fig.savefig(root / (stem + ".png"), dpi=330)
+        fig.savefig(root / (stem + ".svg"))
+        plt.close(fig)
+        a, b = curve[0], curve[-1]
+        summaries.append({"subject": subject, "job_id": campaign["job_id"], "model": campaign["model"],
+                          "effort": campaign["effort"], "campaign_root": campaign["campaign_root"],
+                          "retained_baseline": campaign["chosen_is_unchanged_baseline"],
+                          "case": case["name"], "input_sha256": case["input_sha256"], "size": a["size"],
+                          "time_1": a["chosen_seconds"], "time_16": b["chosen_seconds"],
+                          "reference_16": b["reference_seconds"], "own_speedup_16": b["own_speedup_vs_one_core"],
+                          "reduction_16": b["time_reduction_fraction"], "saved_16": b["seconds_saved"],
+                          "cpu_utilization_16": b["mean_average_used_cores"],
+                          "full_valid": all(r["full_valid_measurement"] for r in curve)})
+        source = Path(campaign["campaign_root"])
+        dbpath = source / "registry.sqlite3"
+        before = sha(dbpath)
+        with sqlite3.connect(dbpath.resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+            identity = json.loads(db.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
+        if sha(dbpath) != before:
+            raise RuntimeError("Read-only compiler inventory changed the registry")
+        contract = read(source / "trusted/contract.json")
+        compiler_records.append({"campaign_root": campaign["campaign_root"],
+                                 "compiler_as_recorded": identity.get("compiler"),
+                                 "target_as_recorded": identity.get("target"),
+                                 "configured_flags": contract["compiler_flags"],
+                                 "language": contract["language"], "recompiled_for_this_lot": False})
+        conformities.append({"campaign_root": campaign["campaign_root"], "subject": subject,
+                             "model": campaign["model"], "effort": campaign["effort"],
+                             "retained_baseline": campaign["chosen_is_unchanged_baseline"],
+                             "finite_exact_outputs_verified": all(r["full_valid_measurement"] for r in curve),
+                             "independent_semantic_checks_on_received_inputs": True,
+                             "complete_mathematical_domain_verified": False,
+                             "multicore_cpu_work_observed_at_benchmark": b["mean_average_used_cores"] > 1.2,
+                             "average_used_cpu_at_16": b["mean_average_used_cores"],
+                             "cpu_ratio_is_not_exact_thread_count": True,
+                             "static_parallelism_evidence": campaign["static_parallelism_evidence"],
+                             "simd_machine_code_verified": False, "official_hardware_reproduced": False,
+                             "official_submission_package_certified": False})
+    write(root / "synthese-plus-grandes-entrees.json", summaries)
+    write(root / "conformite-par-campagne.json", conformities)
+    write(root / "compilations-origine.json", compiler_records)
+    rows = [[NAMES[s["subject"]], "référence conservée" if s["retained_baseline"] else "programme retenu",
+             f"{s['time_1']:.9f}", f"{s['time_16']:.9f}", f"{s['reference_16']:.9f}",
+             f"{s['own_speedup_16']:.3f}", f"{s['cpu_utilization_16']:.3f}"] for s in summaries]
+    cases_table = table(["Sujet / cas", "Taille", "Paramètres", "Sortie (octets)"],
+                        [[c["subject"] + " / " + c["name"], c["input_domain_review"]["size"],
+                          json.dumps(c["input_domain_review"]["parameters"]), c["expected_stdout_bytes"]]
+                         for c in plan["cases"]])
+    result_table = table(["Sujet", "Statut", "1 cœur (s)", "16 cœurs (s)", "Référence à 16 (s)", "S(16)", "CPU moyens à 16"], rows)
+    text = f'''# Extension indépendante : chemin tropical et permutations 2020
+
+Version reçue et recalculée le **{datetime.now(UTC).isoformat()}**, allocation **{audit['job_id']}**. Archive annoncée, distante et recalculée localement : SHA-256 **{audit['archive_sha256']}**. Les {audit['files_verified_before_and_after']} fichiers de mesure sont revérifiés avant et après audit en lecture seule. Ce rapport reste hors des contextes de génération.
+
+## 1. Exigences et domaine effectivement contrôlé
+
+Les pages physiques 4 et 7 du PDF officiel 2020 décrivent respectivement un chemin simple maximisant les couleurs visitées et les permutations distinctes d'un multiensemble en ordre lexicographique. Le sous-domaine de revue du premier impose ici un graphe simple connexe de 2 à 10 sommets et toutes les couleurs déclarées présentes ; ces bornes conservatrices sont celles du contrôle, sans inventer de bornes du concours. Pour les permutations, les six caractères d'espacement du code sont ignorés ; les symboles restants sont ASCII imprimables, de 1 à 10, avec au plus 100000 permutations distinctes pour borner le vérificateur.
+
+Les sept entrées reçues de chaque sujet respectent ces contraintes. Le plus grand benchmark tropical a six sommets et neuf arêtes ; une autre entrée de six sommets possède sept arêtes et reste une courbe distincte. Le benchmark de permutations a huit symboles distincts, 40320 lignes et 806400 octets de sortie. Les vrais programmes ne sont pas ici testés sur des multiensembles avec répétitions ; les exemples répétés des tests unitaires contrôlent seulement le vérificateur indépendant.
+
+## 2. Identités, octets et références
+
+Les deux racines de campagne proviennent de Luna, identité exacte gpt-6-luna et effort max, dans la couverture 748259 reçue et auditée. Le registre SQLite est ouvert avec mode=ro&immutable=1. Les exécutables retenus et leurs références originales sont copiés seulement si leur SHA correspond à une confirmation valide de cinq temps. Trois exécutables uniques sont mesurés : le tropical conserve la référence, tandis que les permutations ont une référence et un programme retenu différents. La référence tropicale n'est pas une optimisation trouvée ; ses deux rôles sont un alias d'une même courbe, sans doubler les exécutions. Les commits, sources exportées, manifestes et identités de compilateur restent dans le plan et les annexes.
+
+## 3. Préparation isolée et contrôles indépendants
+
+La version r3 des outils est séparée de r2 et des sources figées R1, R4 et GPT96. Avant soumission, **{actual_review['actual_received_contracts_reviewed']} vrais contrats, {actual_review['actual_received_input_cases_reviewed']} entrées et {actual_review['actual_captured_outputs_reviewed']} sorties capturées** de référence ou gagnant sont revus indépendamment. Pour le tropical, le vérificateur contrôle sommets, arêtes, unicité du chemin, couleurs imprimées et optimum par exploration exhaustive bornée, comparée dans les tests à une énumération indépendante. Pour les permutations, il contrôle multiplicités, nombre mathématique, ordre strict et format des octets.
+
+Le lecteur de préparation a été resserré pour refuser aussi CRLF : splitlines normalisait ce séparateur ; l'ancienne version est conservée et un contrôle négatif couvre ce cas. Les sorties réelles contrôlées utilisent LF et aucun résultat antérieur n'est modifié. L'oracle exact d'origine est conservé en plus des nouveaux contrôles sémantiques. **41 tests locaux puis 41 tests ARM64 alloués** réussissent, ainsi que les 14 contrôles d'entrée/sortie du payload transporté ; la porte ARM64 précède toute mesure. Aucune compilation, édition de candidat ou génération n'a lieu.
+
+## 4. Matériel demandé, alloué et utilisation observable
+
+Une allocation ARM64 de **16 cœurs physiques distincts, 16 GiB et zéro GPU** est demandée et vérifiée sur {raw['host']}. Le reçu garde les identifiants package/core et les affinités ; les sous-processus héritent des sous-ensembles physiques de 1, 2, 4, 8 ou 16 cœurs. Les variables OpenMP plafonnent les threads mais ne prouvent pas qu'un programme en crée. getrusage mesure les secondes CPU des enfants ; leur rapport au temps mural est une occupation moyenne, pas un nombre exact de threads. Le maximum mémoire n'est pas disponible dans ce reçu et n'est pas inventé.
+
+## 5. Chronologie et budgets
+
+L'ordonnanceur indique {efficiency['elapsed']} pour l'allocation, avec {efficiency['cpu_seconds_used']} secondes CPU utilisées sur {efficiency['cpu_seconds_reserved']} réservées. Le budget maximal d'allocation est une heure ; celui de mesure est de 3000 secondes, avec 20 secondes par exécution et une réserve avant l'échéance finale. Ces maxima ne sont pas des consommations. Les dates UTC du prévol alloué, du début des mesures et de la réception restent dans les JSON. Les huit plans antérieurs sont exclus par les **52 racines complètes** qu'ils contiennent ; deux bras d'un même job/sujet gardent des racines distinctes. Aucun programme déjà mesuré n'est rejoué dans ce lot.
+
+## 6. Arbres réels et relation aux recherches antérieures
+
+Aucun nouvel arbre de recherche n'est produit. Les arbres réels d'origine figurent dans le bilan de couverture Luna MAX et son registre ; les confirmations d'origine à quatre cœurs restent distinctes de ces diagnostics. Le tropical avait gardé la référence et les permutations leur programme confirmé. Les nouvelles courbes ne remplacent pas leurs scores, parents ou confirmations. Aucun ancien candidat ne réamorce une racine.
+
+## 7. Mère et harnais
+
+La mère, les enfants et le harnais de la recherche R1 ne sont pas rappelés pour ce post-hoc. Les contrôleurs locaux analysent les fichiers reçus sans instruction algorithmique de l'opérateur ni réparation de candidat. Les nouveaux diagnostics, même négatifs, ne sont pas transmis aux modèles ni à une branche sœur. Les deux voies natives continuent indépendamment ; une allocation CPU de mesure ne crée pas de troisième voie native.
+
+## 8. Appels et jetons
+
+Ce lot consomme **zéro appel et zéro nouveau jeton de modèle**. Les coûts natifs des recherches d'origine restent dans leur comptabilité, séparés des secondes CPU et des jetons Ollama. Aucun débit de décodage natif, prix API, coût mémoire ou consommation exacte inconnue n'est estimé à partir de réservations.
+
+## 9. Mesures, calculs et dispersion
+
+Le lot contient **{audit['configuration_count']} points et {audit['raw_sample_count']} temps** : 35 points pour le tropical et 70 pour les deux binaires de permutations. Chaque point a une chauffe exclue de la moyenne puis cinq passages intercalés ; 84 ordres sont recalculés avec graine 23. Les 14 exécutions d'oracle et les contrôles de prévol ne gonflent pas ces 525 temps. Le temps mural inclut lancement et entrées/sorties du sous-processus. Moyennes, médianes, écarts-types, occupation CPU et rapports sont recalculés à partir des échantillons, sans fusion avec une autre allocation.
+
+{result_table}
+
+Les figures utilisent seulement l'entrée explicitement nommée benchmark. Le panneau A montre les cinq passages et leur moyenne avec écart-type, le panneau B le rapport des moyennes du même exécutable ; il ne s'agit pas d'un intervalle de confiance ni d'un test de significativité. Les formats SVG et PNG sont conservés, avec styles et marqueurs distincts pour une lecture en niveaux de gris.
+
+![Chemin tropical : référence retenue, entrée benchmark](courbes-2020-tropical.png)
+
+![Permutations : référence et programme retenu, entrée benchmark](courbes-2020-permutations.png)
+
+## 10. Négatifs et limites conservés
+
+Les 105 points sont corrects sur les entrées finies et complets. Les tests du vérificateur refusent omissions, doublons, mauvais ordre, mauvais multiensemble, sommet répété, arête absente, chemin sous-optimal, sortie altérée, oracle manquant, plan exclu altéré et rejeu de racine. Ces contrôles négatifs ne sont pas des échecs de modèle. Quicksort attend sa revue de fidélité et de checksum ; primes, Jacobi 2020, Johnson 2021 et path 2023 conservent leurs exclusions de préparation.
+
+## 11. Interprétation
+
+La réduction contre la référence de permutations est observée à chaque nombre de cœurs, mais elle n'est pas une nouvelle recherche. Son rapport entre un et seize cœurs vaut {summaries[1]['own_speedup_16']:.3f} ; la référence tropicale vaut {summaries[0]['own_speedup_16']:.3f}. Les occupations moyennes restent inférieures à un CPU sur ces benchmarks, sans indice OpenMP parallèle dans les sources exportées. Le rapport varie avec le lancement, les entrées/sorties et l'ordonnancement : à un cœur, le pilote qui collecte stdout partage aussi l'affinité avec le processus mesuré. Une variation du temps mural, y compris pour la référence séquentielle, ne prouve donc pas une parallélisation de son algorithme. L'indice GCC ivdep dans les permutations est un indice de code, pas une preuve d'instructions SIMD exécutées. Ni correction universelle, ni classement général de modèles, ni conformité du paquet de concours ne sont certifiés.
+
+## 12. Provenance et recalcul
+
+Le plan, le payload et la réception portent leurs SHA-256. Le contrôle avant/après porte sur l'inventaire exact des {audit['files_verified_before_and_after']} fichiers de résultat ; les sorties d'oracle sont également vérifiées sémantiquement contre les entrées transportées et par empreinte contre les sorties archivées. Les preuves des contrats et les anciennes versions sont préservées. Les annexes sont [525 mesures brutes](mesures-brutes.csv), [70 comparaisons par racine](comparaisons-par-campagne.csv), [105 points uniques](configurations-executables-uniques.csv), [résultats vérifiés](resultats-verifies.json), [conformité par campagne](conformite-par-campagne.json), [compilateurs d'origine](compilations-origine.json), [audit](audit.json) et [porte ARM64](preuves/results/preflight.json). Le vérificateur et le collecteur sont conservés dans le dossier parent ; aucun changement d'oracle ou de source n'est requis pour recalculer les tableaux.
+
+{cases_table}
+'''
+    (root / "RAPPORT-DETAILLE.md").write_text(text, encoding="utf-8")
+    write(root / "MANIFEST-RAPPORT.json", {"observed_utc": datetime.now(UTC).isoformat(),
+          "files": {p.relative_to(root).as_posix(): sha(p) for p in root.iterdir()
+                    if p.is_file() and p.name != "MANIFEST-RAPPORT.json"}})
+    print(json.dumps({"local_report_written": True, "figures": 2, "points": audit["configuration_count"],
+                      "times": audit["raw_sample_count"], "model_calls": 0}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path)
+    main(parser.parse_args().root.resolve(strict=True))

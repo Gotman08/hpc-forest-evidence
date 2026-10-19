@@ -1,0 +1,177 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <string.h>
+
+#define SHARDS 4
+#define PARALLEL_THRESHOLD 4096
+
+typedef struct {
+	long int *data;
+	int length;
+	long int total;
+} bucket;
+
+static char *sort_strings;
+static int sort_length;
+
+static int compare_indices(const void *left, const void *right) {
+	long int a = *(const long int *)left;
+	long int b = *(const long int *)right;
+	return strcmp(sort_strings + a * sort_length,
+	              sort_strings + b * sort_length);
+}
+
+long int* bucket_sort(char *a, int length, long int size, int offset, int nbuckets) {
+	long int *returns = (long int *)malloc(sizeof(long int) * size);
+	bucket *buckets = (bucket *)malloc(sizeof(bucket) * nbuckets);
+	long int *counts = (long int *)calloc((size_t)SHARDS * (size_t)nbuckets,
+	                                      sizeof(long int));
+	long int *next = (long int *)malloc(sizeof(long int) *
+	                                    (size_t)SHARDS * (size_t)nbuckets);
+	int shard_count = size >= PARALLEL_THRESHOLD ? SHARDS : 1;
+	long int i;
+
+	for (i = 0; i < nbuckets; i++) {
+		buckets[i].data = NULL;
+		buckets[i].length = length;
+		buckets[i].total = 0;
+	}
+
+	/* Count keys in disjoint input shards. */
+	#pragma omp parallel for schedule(static) num_threads(SHARDS) if(shard_count > 1)
+	for (int t = 0; t < shard_count; t++) {
+		long int begin = size * t / shard_count;
+		long int end = size * (t + 1) / shard_count;
+		for (i = begin; i < end; i++) {
+			int b = a[i * length] - offset;
+			counts[(size_t)t * nbuckets + b]++;
+		}
+	}
+
+	/* Give each shard a non-overlapping range within every bucket. */
+	long int base = 0;
+	for (int b = 0; b < nbuckets; b++) {
+		long int bucket_total = 0;
+		for (int t = 0; t < SHARDS; t++) {
+			size_t slot = (size_t)t * nbuckets + b;
+			next[slot] = base + bucket_total;
+			bucket_total += counts[slot];
+		}
+		buckets[b].total = bucket_total;
+		buckets[b].data = size > 0 ? returns + base : NULL;
+		base += bucket_total;
+	}
+
+	/* Scatter each shard into its private ranges without synchronization. */
+	#pragma omp parallel for schedule(static) num_threads(SHARDS) if(shard_count > 1)
+	for (int t = 0; t < shard_count; t++) {
+		long int begin = size * t / shard_count;
+		long int end = size * (t + 1) / shard_count;
+		for (i = begin; i < end; i++) {
+			int b = a[i * length] - offset;
+			size_t slot = (size_t)t * nbuckets + b;
+			returns[next[slot]++] = i;
+		}
+	}
+
+	/* Bucket sorts are independent; dynamic scheduling handles skewed buckets. */
+	sort_strings = a;
+	sort_length = length;
+	#pragma omp parallel for schedule(dynamic, 1) num_threads(SHARDS) if(shard_count > 1)
+	for (int b = 0; b < nbuckets; b++) {
+		if (buckets[b].total > 1) {
+			qsort(buckets[b].data, (size_t)buckets[b].total,
+			      sizeof(long int), compare_indices);
+		}
+	}
+
+	free(next);
+	free(counts);
+	free(buckets);
+	return returns;
+}
+
+void load(char **vString, long int *N, int *l, int *os, int *nb){
+   char *strings = NULL;
+   int      len,
+            offset,
+            nbucket;
+   long int n;
+
+   if (!fscanf(stdin, "%d", &len)) {
+      printf ("ERROR len\n");
+      exit (1);
+   }
+
+   if (!fscanf(stdin, "%ld", &n)) {
+      printf ("ERROR n\n");
+      exit (1);
+   }
+
+   if (!fscanf(stdin, "%d", &offset)) {
+      printf ("ERROR offset\n");
+      exit (1);
+   }
+
+   if (!fscanf(stdin, "%d", &nbucket)) {
+      printf ("ERROR nbucket\n");
+      exit (1);
+   }
+
+   nbucket = nbucket + 1;
+   len = len + 1;
+
+   strings = (char*) malloc(n * len);
+
+   for (int i = 0; i < n; i++){
+      if (!fscanf(stdin, "%s", strings + (i * len))) {
+      printf ("ERROR %d\n",i);
+      exit (1);
+      }
+   }
+
+   *vString = strings;
+   *N = n;
+   *l = len;
+   *os = offset;
+   *nb = nbucket;
+}
+
+void print(char *strings, long int *index, long int n, int len){
+
+   for (int i = 0; i < n; i++){
+      printf("%d -> %s\n", i, strings + (index[i] * len));
+   }
+}
+
+void save(char *strings, long int *index, long int n, int len){
+   for (int i = 0; i < n; i++){
+      printf("%s\n", strings + (index[i] * len));
+   }
+}
+
+int main(int ac, char **av) {
+
+   char     *strings = NULL;
+   long int N        = 0;
+   long int *index   = NULL;
+   int      len      = 0,
+            save2File = 0,
+            offset,
+            nbuckets;
+
+   load(&strings, &N, &len, &offset, &nbuckets);
+
+   index = bucket_sort(strings, len, N, offset, nbuckets);
+
+   save(strings, index, N, len);
+
+   if (strings != NULL)
+      free(strings);
+
+   if (index != NULL)
+      free(index);
+
+   return EXIT_SUCCESS;
+}

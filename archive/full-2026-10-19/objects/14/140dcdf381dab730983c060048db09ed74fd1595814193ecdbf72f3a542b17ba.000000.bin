@@ -1,0 +1,55 @@
+"""Run a fresh dynamic forest with an already prepared oracle and native mailbox.
+
+This does not install software, submit an allocation, create credentials or supply
+an algorithm. The caller owns resource preparation, worker identity and receipt.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+from hpc_forest.config import load_config
+from hpc_forest.controller import create_workspace
+from hpc_forest.core import atomic_json
+from hpc_forest.dynamic_controller import DynamicController
+
+
+def main(args):
+    if os.name != "nt" and not os.environ.get("SLURM_JOB_ID"):
+        raise RuntimeError("Compile and measure only inside an allocation")
+    config = load_config(args.config)
+    if not config.get("dynamic_mother", {}).get("enabled"):
+        raise RuntimeError("The new protocol must be explicitly enabled")
+    if args.root.exists() and not args.resume:
+        raise RuntimeError("Existing campaign preserved: only an explicit --resume can reopen it")
+    if not args.root.exists():
+        create_workspace(args.root, config, args.source, args.validation)
+    started = time.monotonic()
+    result = {"protocol_variant": "dynamic-independent-roots-r3", "old_candidates_imported": False,
+              "operator_algorithm_advice": False, "cross_branch_advice": False}
+    with DynamicController(args.root, args.statement.read_text(encoding="utf-8")) as controller:
+        if controller.config != config:
+            # create_workspace adds immutable target/compiler facts.
+            for key in config:
+                if config[key] != controller.config.get(key):
+                    raise RuntimeError("Resume configuration differs from the frozen campaign")
+        try:
+            result["search"] = controller.run()
+            result["best_confirmed"] = controller.confirm()
+            result["pipeline_complete"] = True
+        finally:
+            result["costs"] = controller.db.costs()
+            result["elapsed_seconds"] = time.monotonic() - started
+            atomic_json(args.root / "dynamic-summary.json", result)
+    print(json.dumps(result, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ["root", "config", "source", "validation", "statement"]:
+        parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--resume", action="store_true")
+    main(parser.parse_args())

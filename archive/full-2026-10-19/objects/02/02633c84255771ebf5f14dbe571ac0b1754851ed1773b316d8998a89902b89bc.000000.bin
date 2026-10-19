@@ -1,0 +1,102 @@
+"""Receive and audit the source-only software preflight plus its isolated lint complement."""
+import hashlib
+import json
+import re
+import tarfile
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): sha(p) for p in root.rglob("*") if p.is_file()}
+
+
+def restore(archive, folder):
+    folder.mkdir(exist_ok=False)
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = bundle.getmembers()
+        assert len(members) < 2000 and sum(m.size for m in members) < 20_000_000
+        for member in members:
+            name = Path(member.name)
+            assert not name.is_absolute() and ".." not in name.parts
+            assert member.isfile() or member.isdir()
+            assert not member.issym() and not member.islnk()
+        bundle.extractall(folder, filter="data")
+
+
+def main():
+    source = read(ROOT / "manifest-source-derivee.json")
+    first = ROOT / "prevol-result-748584.tar.gz"
+    second = ROOT / "ruff-complement-result-748587.tar.gz"
+    advertised = re.findall(r"([a-f0-9]{64})  /scratch", read(ROOT / "prevol-journal-748584.json")["content"])
+    assert len(advertised) == 1
+    assert sha(first) == read(ROOT / "prevol-reception-748584.json")["remote_sha256"] == advertised[0]
+    assert sha(second) == read(ROOT / "ruff-reception.json")["remote_sha256"] \
+        == read(ROOT / "ruff-sha-annonce.json")["content"].split()[0]
+    received = ROOT / "reception-prevol-neuve"
+    lint = ROOT / "reception-ruff-neuve"
+    restore(first, received)
+    restore(second, lint)
+    before, before_lint = inventory(received), inventory(lint)
+    assert (received / "proofs/exit-code.txt").read_text().strip() == "1"
+    assert "No module named ruff" in (received / "proofs/ruff.log").read_text()
+    assert (lint / "proofs/exit-code.txt").read_text().strip() == "0"
+    assert (lint / "proofs/ruff.log").read_text().strip() == "All checks passed!"
+    assert (lint / "proofs/ruff-version.txt").read_text().strip() == "ruff 0.17.0"
+    original_files = inventory(received / "project")
+    assert all(original_files[name] == wanted for name, wanted in source["files"].items())
+    before_source, after_source = read(lint / "proofs/before.json"), read(lint / "proofs/after.json")
+    assert before_source == after_source
+    assert before_source["files"] == source["files"] and before_source["architecture"] == "aarch64"
+    cases = list(ET.parse(received / "proofs/tests.xml").getroot().iter("testcase"))
+    skipped = [case for case in cases if case.find("skipped") is not None]
+    assert len(cases) == 212 and len(skipped) == 1
+    assert "mcp" in skipped[0].get("classname", "")
+    assert not any(case.find("failure") is not None or case.find("error") is not None for case in cases)
+    compiler = [case for case in cases if case.get("name", "").startswith(
+        ("test_shared_cases_do_not_block_and_binary_checker_rejects_wrong_program",
+         "test_frozen_build_rejects_uninitialized_openmp_reduction"))]
+    assert len(compiler) == 3 and all(case.find("skipped") is None for case in compiler)
+    assert "gcc" in (received / "proofs/gcc.txt").read_text().lower()
+    assert "g++" in (received / "proofs/gpp.txt").read_text().lower()
+    assert inventory(received) == before and inventory(lint) == before_lint
+    result = {
+        "schema": "hpc-forest-harness-comparison-preflight-audit-v1",
+        "scope_id": "hpc-forest-harness-comparison-20261016-r1",
+        "observed_utc": datetime.now(UTC).isoformat(), "audit_passed": True,
+        "architecture": "aarch64", "source_zip_sha256": source["new_source_zip_sha256"],
+        "tests_passed": len(cases) - len(skipped), "optional_mcp_test_skipped": 1,
+        "compiler_tests_executed": True, "native_compiler_checks_passed": len(compiler),
+        "ruff_native_version": "0.17.0", "ruff_native_passed": True,
+        "source_files_verified_before_after": len(source["files"]),
+        "restored_files_verified_before_after": len(before) + len(before_lint),
+        "protected_bytes_verified_before_after": True,
+        "original_job": "748584", "original_scheduler_state": "FAILED",
+        "original_tests_passed_before_missing_lint_dependency": True,
+        "complement_job": "748587", "complement_scheduler_state": "COMPLETED",
+        "tests_or_search_replayed_by_complement": False,
+        "model_calls": 0, "research_cells_started": 0,
+        "native_codex_adapter_validated": False,
+        "source_only_coordinator_and_launch_admission_still_required": True,
+        "archives": {"748584": sha(first), "748587": sha(second)},
+    }
+    (ROOT / "audit-prevol-arm64.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    (ROOT / "inventaires-prevol-audites.json").write_text(json.dumps(
+        {"original": before, "complement": before_lint}, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

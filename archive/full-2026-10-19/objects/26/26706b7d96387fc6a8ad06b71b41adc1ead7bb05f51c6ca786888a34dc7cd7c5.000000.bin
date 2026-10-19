@@ -1,0 +1,139 @@
+#include "knn.h"
+#include <omp.h>
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    long total = 0;
+    for (int i = 0; i < n_groups; i++) total += groups[i].length;
+
+    float *xs = (float *) malloc((size_t)total * sizeof(float));
+    float *ys = (float *) malloc((size_t)total * sizeof(float));
+    char *labs = (char *) malloc((size_t)total * sizeof(char));
+    if (!xs || !ys || !labs) on_error();
+
+    long idx = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            xs[idx] = g.points[j].x;
+            ys[idx] = g.points[j].y;
+            labs[idx] = g.label;
+            idx++;
+        }
+    }
+
+    int nthreads = omp_get_max_threads();
+    if (nthreads < 1) nthreads = 1;
+
+    size_t per = (size_t)nthreads * (size_t)k;
+    float *tdist = (float *) malloc(per * sizeof(float));
+    char *tlab = (char *) malloc(per * sizeof(char));
+    long *tidx = (long *) malloc(per * sizeof(long));
+    if (!tdist || !tlab || !tidx) on_error();
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        size_t base = (size_t)tid * (size_t)k;
+
+        for (int j = 0; j < k; j++) tdist[base + j] = -1.0f;
+
+        #pragma omp for schedule(static)
+        for (long i = 0; i < total; i++) {
+            float dx = to_evaluate.x - xs[i];
+            float dy = to_evaluate.y - ys[i];
+            float d = (dx * dx) + (dy * dy);
+
+            int lo = 0, hi = k;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (tdist[base + mid] == -1.0f || d < tdist[base + mid]) hi = mid;
+                else lo = mid + 1;
+            }
+
+            if (lo < k) {
+                for (int y = k - 1; y > lo; y--) {
+                    tdist[base + y] = tdist[base + y - 1];
+                    tlab[base + y] = tlab[base + y - 1];
+                    tidx[base + y] = tidx[base + y - 1];
+                }
+
+                tdist[base + lo] = d;
+                tlab[base + lo] = labs[i];
+                tidx[base + lo] = (long)i;
+            }
+        }
+    }
+
+    char *final_labels = (char *) malloc((size_t)k * sizeof(char));
+    int *ptr = (int *) calloc((size_t)nthreads, sizeof(int));
+    if (!final_labels || !ptr) on_error();
+
+    for (int r = 0; r < k; r++) {
+        int best = -1;
+
+        for (int t = 0; t < nthreads; t++) {
+            if (ptr[t] >= k) continue;
+
+            size_t base = (size_t)t * (size_t)k + (size_t)ptr[t];
+            if (tdist[base] == -1.0f) continue;
+
+            if (best == -1) {
+                best = t;
+                continue;
+            }
+
+            size_t bbase = (size_t)best * (size_t)k + (size_t)ptr[best];
+            float db = tdist[bbase];
+            float dt = tdist[base];
+
+            if (dt < db || (dt == db && tidx[base] < tidx[bbase])) best = t;
+        }
+
+        if (best == -1) on_error();
+
+        size_t bbase = (size_t)best * (size_t)k + (size_t)ptr[best];
+        final_labels[r] = tlab[bbase];
+        ptr[best]++;
+    }
+
+    qsort(final_labels, (size_t)k, sizeof(char), compare_for_sort);
+
+    char most_frequent = final_labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (final_labels[i] != final_labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = final_labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = final_labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

@@ -1,0 +1,180 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <omp.h>
+#include <vector>
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+constexpr uint32_t MOD = 1000000007U;
+
+static inline uint32_t add_mod(uint32_t a, uint32_t b) {
+    const uint32_t sum = a + b;
+    return sum >= MOD ? sum - MOD : sum;
+}
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+static inline uint32x4_t add_mod(uint32x4_t a, uint32x4_t b) {
+    const uint32x4_t sum = vaddq_u32(a, b);
+    const uint32x4_t ge = vcgeq_u32(sum, vdupq_n_u32(MOD));
+    return vsubq_u32(sum, vandq_u32(ge, vdupq_n_u32(MOD)));
+}
+#endif
+
+static int solve_sparse(int n, vector<uint64_t>& blocked) {
+    sort(blocked.begin(), blocked.end());
+    blocked.erase(unique(blocked.begin(), blocked.end()), blocked.end());
+
+    vector<uint32_t> dp(n, 0);
+    dp[0] = 1;
+    size_t blocked_index = 0;
+
+    for (int y = 0; y < n; ++y) {
+        const uint64_t row_begin = static_cast<uint64_t>(y) * static_cast<uint64_t>(n);
+        const uint64_t row_end = row_begin + static_cast<uint64_t>(n);
+        int segment_begin = 0;
+
+        while (blocked_index < blocked.size() && blocked[blocked_index] < row_end) {
+            const int blocked_x = static_cast<int>(blocked[blocked_index] - row_begin);
+            uint32_t carry = segment_begin == 0 ? 0 : dp[segment_begin - 1];
+            int x = segment_begin;
+#if defined(__aarch64__) || defined(__ARM_NEON)
+            const uint32x4_t zero = vdupq_n_u32(0);
+            for (; x + 4 <= blocked_x; x += 4) {
+                uint32x4_t values = vld1q_u32(dp.data() + x);
+                values = add_mod(values, vextq_u32(zero, values, 3));
+                values = add_mod(values, vextq_u32(zero, values, 2));
+                values = add_mod(values, vdupq_n_u32(carry));
+                vst1q_u32(dp.data() + x, values);
+                carry = vgetq_lane_u32(values, 3);
+            }
+#endif
+            for (; x < blocked_x; ++x) {
+                dp[x] = add_mod(dp[x], carry);
+                carry = dp[x];
+            }
+            dp[blocked_x] = 0;
+            segment_begin = blocked_x + 1;
+            ++blocked_index;
+        }
+
+        uint32_t carry = segment_begin == 0 ? 0 : dp[segment_begin - 1];
+        int x = segment_begin;
+#if defined(__aarch64__) || defined(__ARM_NEON)
+        const uint32x4_t zero = vdupq_n_u32(0);
+        for (; x + 4 <= n; x += 4) {
+            uint32x4_t values = vld1q_u32(dp.data() + x);
+            values = add_mod(values, vextq_u32(zero, values, 3));
+            values = add_mod(values, vextq_u32(zero, values, 2));
+            values = add_mod(values, vdupq_n_u32(carry));
+            vst1q_u32(dp.data() + x, values);
+            carry = vgetq_lane_u32(values, 3);
+        }
+#endif
+        for (; x < n; ++x) {
+            dp[x] = add_mod(dp[x], carry);
+            carry = dp[x];
+        }
+    }
+    return static_cast<int>(dp[n - 1]);
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n;
+    size_t m;
+    if (!(cin >> n >> m)) return 0;
+
+    vector<uint64_t> coordinates;
+    coordinates.reserve(m);
+    for (size_t i = 0; i < m; ++i) {
+        int y, x;
+        cin >> y >> x;
+        coordinates.push_back(static_cast<uint64_t>(static_cast<uint32_t>(y)) *
+                              static_cast<uint64_t>(n) + static_cast<uint32_t>(x));
+    }
+
+    const uint64_t cells = static_cast<uint64_t>(n) * static_cast<uint64_t>(n);
+    if (cells > (uint64_t{1} << 30)) {
+        cout << solve_sparse(n, coordinates) << '\n';
+        return 0;
+    }
+
+    vector<vector<bool>> blocked(n, vector<bool>(n, false));
+    for (uint64_t p : coordinates) {
+        blocked[static_cast<size_t>(p / static_cast<uint64_t>(n))]
+               [static_cast<size_t>(p % static_cast<uint64_t>(n))] = true;
+    }
+
+    vector<int> dp(n, 0);
+    if (!blocked[0][0]) dp[0] = 1;
+    for (int x = 1; x < n; ++x)
+        dp[x] = blocked[0][x] ? 0 : dp[x - 1];
+
+    if (n > 1) {
+        vector<int> tails;
+        vector<int> first_blocked;
+        vector<int> offsets;
+#pragma omp parallel
+        {
+            const int threads = omp_get_num_threads();
+            const int tid = omp_get_thread_num();
+            const int begin = static_cast<int>(static_cast<long long>(n) * tid / threads);
+            const int end = static_cast<int>(static_cast<long long>(n) * (tid + 1) / threads);
+#pragma omp single
+            {
+                tails.resize(threads);
+                first_blocked.resize(threads);
+                offsets.resize(threads);
+            }
+            for (int y = 1; y < n; ++y) {
+                int value = 0;
+                int first = end;
+                for (int x = begin; x < end; ++x) {
+                    if (blocked[y][x]) {
+                        value = 0;
+                        if (first == end) first = x;
+                    } else {
+                        value += dp[x];
+                        if (value >= static_cast<int>(MOD)) value -= MOD;
+                    }
+                    dp[x] = value;
+                }
+                tails[tid] = value;
+                first_blocked[tid] = first;
+#pragma omp barrier
+#pragma omp single
+                {
+                    int carry = 0;
+                    for (int t = 0; t < threads; ++t) {
+                        offsets[t] = carry;
+                        const int segment_end = static_cast<int>(static_cast<long long>(n) * (t + 1) / threads);
+                        if (first_blocked[t] == segment_end) {
+                            carry += tails[t];
+                            if (carry >= static_cast<int>(MOD)) carry -= MOD;
+                        } else {
+                            carry = tails[t];
+                        }
+                    }
+                }
+                const int offset = offsets[tid];
+                if (offset != 0) {
+                    for (int x = begin; x < first_blocked[tid]; ++x) {
+                        const int with_offset = dp[x] + offset;
+                        dp[x] = with_offset >= static_cast<int>(MOD) ? with_offset - MOD : with_offset;
+                    }
+                }
+#pragma omp barrier
+            }
+        }
+    }
+
+    cout << dp[n - 1] << '\n';
+    return 0;
+}

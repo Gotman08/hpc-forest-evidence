@@ -1,0 +1,154 @@
+"""Pure parent-data derivation from received jobs, markers, CURRENT and path checks."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+COMMON_SHA = 'e493f92c3324a0831fa05aeea146f4de13ce64c780207b7dd046ed4f770da86f'
+if hashlib.sha256((HERE / 'commun.py').read_bytes()).hexdigest() != COMMON_SHA:
+    raise ValueError('Changed exact pure common metadata module before import')
+spec = importlib.util.spec_from_file_location('r2e_parent_metadata_common_observations', HERE / 'commun.py')
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+
+
+def cohort_from_received(factory, refs):
+    cohort = {'schema': 'hpc-forest-max-cell-cap4-cohort-reservation-v1', 'verified': True,
+        'scope_id': c.SCOPE, 'source_zip_sha256': c.SOURCE, 'plan_sha256': c.PLAN,
+        'maximum_native_workers': 4, 'source_only_preserved': False, 'source_only_state': 'received_absent',
+        'luna_not_replayed': True, 'one_submit_per_cell': True, 'cells': {}, 'evidence_refs': refs}
+    for slug, (model, session) in c.MODELS.items():
+        directory = c.OPS / slug
+        submitted = c.actual_submission(c.read(directory / 'submission-observed.json'))
+        cohort['cells'][model] = {'session_id': session, 'effort': 'max', 'job_id': submitted['job_id'],
+            'submission_intent': c.ref(directory / 'submission-intent.json'),
+            'submission_observed': c.ref(directory / 'submission-observed.json'),
+            'allocation_ready': c.ref(directory / 'allocation-ready.json')}
+    factory.check_cohort(cohort, cohort['cells'][factory.m.MODEL]['job_id'], c.read(c.REVIEW))
+    return cohort
+
+
+def cell_binding(model, session, job):
+    return {'scope_id': c.SCOPE, 'model': model, 'effort': 'max', 'session_id': session, 'job_id': job,
+        'remote_root': c.native_root(session), 'source_zip_sha256': c.SOURCE, 'plan_sha256': c.PLAN}
+
+
+def write_policy_bindings():
+    """Write actual eight-field bindings only; the separate local finalizer owns policies."""
+    c.deadline()
+    factory = c.load_factory()
+    refs = [*c.role_and_human_refs(), c.ref(c.REVIEW), c.ref(c.SCRIPT_REVIEW), c.ref(c.BINDINGS)]
+    cohort = cohort_from_received(factory, refs)
+    pending = []
+    for slug, (model, session) in c.MODELS.items():
+        path = c.OPS / slug / 'cli-policy-cell-binding.json'
+        c.need(not path.exists(), 'Actual policy binding already exists; do not overwrite or regenerate')
+        pending.append((path, cell_binding(model, session, cohort['cells'][model]['job_id'])))
+    return [c.save(path, value) for path, value in pending]
+
+
+def prepare(census_path, census_sha, remote_path, remote_sha, source_state_directory):
+    c.deadline()
+    factory = c.load_factory()
+    c.pinned(census_path, census_sha)
+    c.pinned(remote_path, remote_sha)
+    census, remote = c.read(census_path), c.read(remote_path)
+    c.fresh(census, 'captured_at_utc')
+    c.remote_rows(remote)
+    source_only = c.source_only_inputs(source_state_directory)
+    status = factory.check_census(census, source_only, running_cells=[], census_ref=c.ref(census_path))
+    c.need(status.get('active_native_workers') == status.get('source_only_active_workers') == 0,
+           'Actual CURRENT must show no native relay before the initial three-worker start')
+    refs = [*c.role_and_human_refs(), c.ref(c.REVIEW), c.ref(c.SCRIPT_REVIEW), c.ref(c.BINDINGS), c.ref(census_path), c.ref(remote_path),
+        source_only['current_verification'], source_only['source_only_absence'], source_only['observer_release']]
+    cohort = cohort_from_received(factory, refs)
+    # Validate all three real policies before any positive observation output.
+    policies = {}
+    for slug, (model, session) in c.MODELS.items():
+        factory.m.configure(c.ref(c.BINDINGS), model)
+        policy = factory.m.POLICY_DIRECTORY / ('cli-policy-' + session + '.json')
+        policies[model] = c.ref(policy)
+        factory.m.checked_task_cli_policy(policies[model], cohort['cells'][model]['job_id'])
+        c.need(not (factory.m.LAUNCH / ('worker-' + session)).exists(), 'Existing fresh-session worker cache blocks start')
+        for name in ('remote-freshness.json', 'transport.json', 'human-scope.json', 'parent-observations.json', 'factory-input.json'):
+            c.need(not (c.OPS / slug / name).exists(), 'Prior parent output exists; preserve and reconcile')
+    c.need(not (c.OPS / 'cohort-reservation-reelle.json').exists()
+        and not (c.OPS / 'factories-arguments-seulement.json').exists(), 'Prior cohort output exists; never overwrite')
+    c.deadline()
+    c.fresh(census, 'captured_at_utc')
+    c.fresh(remote)
+    cohort_ref = c.save(c.OPS / 'cohort-reservation-reelle.json', cohort)
+    outputs = []
+    for slug, (model, session) in c.MODELS.items():
+        factory.m.configure(c.ref(c.BINDINGS), model)
+        directory = c.OPS / slug
+        job = cohort['cells'][model]['job_id']
+        identity = {'scope_id': c.SCOPE, 'source_zip_sha256': c.SOURCE, 'plan_sha256': c.PLAN,
+            'model': model, 'session_id': session, 'effort': 'max', 'job_id': job, 'verified': True}
+        root, admission = c.native_root(session), '/scratch_p/nimarano/' + c.SCOPE + '-admission-' + session
+        rf = c.save(directory / 'remote-freshness.json', {**identity,
+            'schema': 'hpc-forest-max-cell-remote-freshness-observation-v1', 'observed_at': remote['observed_at'],
+            'remote_root': root, 'admission_root': admission, 'native_root_absent': True,
+            'registry_absent': True, 'channel_absent': True, 'prior_session_claims_absent': True,
+            'parent_actual_observation_reviewed': True,
+            'evidence_refs': [*refs, c.ref(directory / 'allocation-ready.json')]})
+        tr = c.save(directory / 'transport.json', {**identity,
+            'schema': 'hpc-forest-max-cell-existing-transport-observation-v1', 'observed_at': remote['observed_at'],
+            'transport_name': 'romeo-mcp', 'configuration_path': str(factory.m.CONFIG),
+            'configuration_sha256': factory.m.sha(factory.m.CONFIG), 'existing_transport_only': True,
+            'no_new_authentication': True, 'cli_tools_disabled': True, 'neutral_controls_passed': True,
+            'parent_actual_observation_reviewed': True, 'authentication_checked_by_this_builder': False,
+            'limits': 'Actual new received R2f Q (bound qualification ID from reviewed data), current readonly MCP path check, exact source no-tools argv and neutral factory controls only; CLI key recognition, OAuth readiness, clean NORMAL and private argv audit still require the actual worker and first-batch reception.',
+            'evidence_refs': [*refs, factory.m.BINDING['qualification_reception']]})
+        human = c.save(directory / 'human-scope.json', {**identity,
+            'schema': 'hpc-forest-max-cell-human-scope-attestation-v1', 'observed_at': datetime.now(UTC).isoformat(),
+            'max_only': True, 'one_cell_only': True, 'automatic_extension': False,
+            'user_messages': ['Recorrige essaye le plus possible', 'toujours en max', 'lance tous en meme temps stp'],
+            'evidence_refs': c.role_and_human_refs()})
+        obs = c.save(directory / 'parent-observations.json', {**identity,
+            'schema': 'hpc-forest-max-cell-parent-observations-v1', 'observed_at': census['captured_at_utc'],
+            'complete_utf8_cim': c.ref(census_path), 'allocation_ready': c.ref(directory / 'allocation-ready.json'),
+            'remote_freshness': rf, 'transport': tr, 'source_only': source_only, 'running_cells': [],
+            'task_cli_policy': policies[model], 'evidence_refs': refs})
+        factory_input = c.save(directory / 'factory-input.json', {'schema': 'hpc-forest-max-cell-factory-input-v1',
+            'job_id': job, 'submission_intent': c.ref(directory / 'submission-intent.json'),
+            'submission_observed': c.ref(directory / 'submission-observed.json'), 'observations': obs,
+            'factory_review': c.ref(c.REVIEW), 'human_scope': human, 'cohort_reservation': cohort_ref})
+        argv = [str(factory.m.PYTHON_LOCAL), '-I', '-B', str(c.FACTORY / 'assembler-admissions-cellule.py'),
+            '--bindings', str(c.BINDINGS), '--bindings-sha256', c.BINDINGS_SHA, '--model', model,
+            '--input', factory_input['path'], '--input-sha256', factory_input['sha256'],
+            '--output-name', 'admissions-' + slug + '-reelles']
+        outputs.append({'model': model, 'factory_input': factory_input, 'argv': argv})
+    return c.save(c.OPS / 'factories-arguments-seulement.json', {'schema': 'hpc-forest-r2e-parent-derived-factory-arguments-v1',
+        'outputs': outputs, 'performed': False, 'models_started': 0, 'processes_started': 0, 'remote_actions': 0})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=['policy-bindings', 'observations'])
+    for flag in ('census', 'remote-check', 'source-state-directory'):
+        parser.add_argument('--' + flag, type=Path)
+    for flag in ('census-sha256', 'remote-check-sha256'):
+        parser.add_argument('--' + flag)
+    args = parser.parse_args()
+    if args.mode == 'policy-bindings':
+        c.need(all(getattr(args, k) is None for k in ('census', 'census_sha256', 'remote_check', 'remote_check_sha256', 'source_state_directory')),
+               'Policy-binding mode takes actual already received jobs/markers only')
+        print(json.dumps({'actual_policy_bindings': write_policy_bindings(), 'policies_created': 0,
+            'research_or_transport_started': False}))
+        return 0
+    c.need(all(getattr(args, k) is not None for k in ('census', 'census_sha256', 'remote_check', 'remote_check_sha256', 'source_state_directory')),
+           'Actual current census, remote observation, hashes and source-state directory required')
+    report = prepare(args.census.absolute(), args.census_sha256, args.remote_check.absolute(), args.remote_check_sha256,
+        args.source_state_directory)
+    print(json.dumps({'factory_arguments': report, 'factories_executed': 0, 'native_calls': 0, 'remote_actions': 0}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

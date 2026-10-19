@@ -1,0 +1,63 @@
+"""Hash only actual transferred bytes; never execute shared/received code."""
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+
+HERE=Path(__file__).resolve().parent
+OP=HERE.parent
+def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
+def ref(p):return {'path':str(p),'sha256':sha(p)}
+def save(p,v):
+    with p.open('x',encoding='utf-8',newline='\n') as f:
+        json.dump(v,f,ensure_ascii=False,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+def result(name):
+    d=read(HERE/(name+'.json'))['result'];s=d['structuredContent']
+    assert d.get('isError') is not True and s['ok'] is True
+    t=[x['text'] for x in d.get('content',[]) if x['type']=='text']
+    assert len(t)==1 and json.loads(t[0])==s
+    return s
+manifest=OP/'preparation-parents-R8-bout-en-bout-r1/partage-R8-reel-root-01/SHARED-117-LOCAL-PRET-POUR-TRANSFERT.json'
+assert sha(manifest)=='d0ef81aa13db3f00a7e4f4ae59cf3ccf54429ad36d543f3dade2ac7538a8e16d'
+m=read(manifest)
+upload=result('UPLOAD-117-REEL');download=result('READBACK-117')
+assert upload['sent']==m['local_group'] and upload['to']==m['remote_group'] and upload['verifie'] is False
+root=HERE/'readback-117'
+assert download['downloaded']==m['remote_group'] and download['to']==str(root) and download['verifie'] is False
+def inventory():
+    rows={}
+    for p in [root,*root.rglob('*')]:
+        s=p.lstat()
+        assert not stat.S_ISLNK(s.st_mode) and not getattr(s,'st_file_attributes',0)&1024
+        if stat.S_ISDIR(s.st_mode):continue
+        assert stat.S_ISREG(s.st_mode) and s.st_nlink==1
+        rows[p.relative_to(root).as_posix()]={'sha256':sha(p),'bytes':s.st_size}
+    return rows
+before=inventory()
+assert len(before)==117 and before==m['inventory']
+rows=[]
+for i,name in enumerate(['project.zip','dynamic-plan.json','qualification-result.tar.gz','qualification.json']):
+    path=HERE/'sha-reels-quatre'/name
+    r=result('SHA-REEL-'+str(i));expected=m['inventory'][name]['sha256']
+    remote=m['remote_group']+'/'+name
+    assert r['verifie'] is True and r['downloaded']==remote and r['to']==str(path)
+    assert r['bytes']==path.stat().st_size==m['inventory'][name]['bytes']
+    assert sha(path)==r['empreinte_locale']==r['empreinte_distante']==r['remote_sha256']==expected
+    rows.append({'remote_path':remote,'sha256':expected,'actual_remote_checksum_verified':True,
+                 'evidence_refs':[ref(HERE/('SHA-REEL-'+str(i)+'.json')),ref(path)]})
+stage=result('STAGE-ARCHIVE-UPLOAD')
+assert stage['verifie'] is True and stage['remote_sha256']==stage['empreinte_locale']==stage['empreinte_distante']=='3287f059793ef9861b4dbeacc66706611c0ca3d355b4ec990d6754e7c4d07f9b'
+after=inventory()
+assert before==after
+save(HERE/'INVENTAIRE-117-AVANT.json',before);save(HERE/'INVENTAIRE-117-APRES.json',after)
+proof={'schema':'hpc-forest-source110-shared-qualified-checks-v1','verified_received_checks_only':True,
+ 'existing_qualified_files':rows,'all117_filewise_readback_equal':True,'files':117,'source_files':110,
+ 'inventory_before':ref(HERE/'INVENTAIRE-117-AVANT.json'),'inventory_after':ref(HERE/'INVENTAIRE-117-APRES.json'),
+ 'local_payload_receipt':ref(manifest),'actual_directory_upload':ref(HERE/'UPLOAD-117-REEL.json'),
+ 'actual_directory_readback':ref(HERE/'READBACK-117.json'),'actual_separate_stage_transfer':ref(HERE/'STAGE-ARCHIVE-UPLOAD.json'),
+ 'directory_hash_claimed':False,'native_generation_admitted':False,'observed_at_utc':dt.datetime.now(dt.timezone.utc).isoformat()}
+path=HERE/'QUALIFIED-CHECKS-R8-REELS.json';save(path,proof)
+print(json.dumps({'qualified_checks':ref(path),'files':117,'four_actual_SHA':True,'stage_SHA':stage['remote_sha256']}))

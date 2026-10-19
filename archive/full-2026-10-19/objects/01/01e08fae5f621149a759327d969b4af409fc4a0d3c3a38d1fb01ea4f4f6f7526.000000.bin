@@ -1,0 +1,149 @@
+#include "knn.h"
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+
+/* Called only for a vector containing at least one matching lane. */
+static inline int knn_first_matching_lane(uint32x4_t matches) {
+    if (vgetq_lane_u32(matches, 0) != 0) return 0;
+    if (vgetq_lane_u32(matches, 1) != 0) return 1;
+    if (vgetq_lane_u32(matches, 2) != 0) return 2;
+    return 3;
+}
+#endif
+
+static inline int knn_find_insertion_slot(const float *distances, int k, float d) {
+    int x = 0;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const float32x4_t candidate = vdupq_n_f32(d);
+    const float32x4_t empty = vdupq_n_f32(-1.0f);
+
+    /* Check sixteen independent slots with one no-match reduction. */
+    for (; x <= k - 16; x += 16) {
+        const float32x4_t slots0 = vld1q_f32(distances + x);
+        const float32x4_t slots1 = vld1q_f32(distances + x + 4);
+        const float32x4_t slots2 = vld1q_f32(distances + x + 8);
+        const float32x4_t slots3 = vld1q_f32(distances + x + 12);
+        const uint32x4_t matches0 = vorrq_u32(
+            vcltq_f32(candidate, slots0), vceqq_f32(slots0, empty));
+        const uint32x4_t matches1 = vorrq_u32(
+            vcltq_f32(candidate, slots1), vceqq_f32(slots1, empty));
+        const uint32x4_t matches2 = vorrq_u32(
+            vcltq_f32(candidate, slots2), vceqq_f32(slots2, empty));
+        const uint32x4_t matches3 = vorrq_u32(
+            vcltq_f32(candidate, slots3), vceqq_f32(slots3, empty));
+        const uint32x4_t matches01 = vorrq_u32(matches0, matches1);
+        const uint32x4_t matches23 = vorrq_u32(matches2, matches3);
+
+        if (vmaxvq_u32(vorrq_u32(matches01, matches23)) != 0) {
+            /* Resolve the first matching vector before its first lane. */
+            if (vmaxvq_u32(matches01) != 0) {
+                if (vmaxvq_u32(matches0) != 0)
+                    return x + knn_first_matching_lane(matches0);
+                return x + 4 + knn_first_matching_lane(matches1);
+            }
+            if (vmaxvq_u32(matches2) != 0)
+                return x + 8 + knn_first_matching_lane(matches2);
+            return x + 12 + knn_first_matching_lane(matches3);
+        }
+    }
+
+    /* Slot predicates are independent; the earliest matching slot wins. */
+    for (; x <= k - 4; x += 4) {
+        const float32x4_t slots = vld1q_f32(distances + x);
+        const uint32x4_t matches = vorrq_u32(
+            vcltq_f32(candidate, slots), vceqq_f32(slots, empty));
+
+        if (vmaxvq_u32(matches) != 0) {
+            if (vgetq_lane_u32(matches, 0) != 0) return x;
+            if (vgetq_lane_u32(matches, 1) != 0) return x + 1;
+            if (vgetq_lane_u32(matches, 2) != 0) return x + 2;
+            return x + 3;
+        }
+    }
+#endif
+
+    for (; x < k; x++) {
+        if (d < distances[x] || distances[x] == -1) {
+            return x;
+        }
+    }
+
+    return k;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *) malloc(sizeof(char) * k);
+    float * distances = (float *) malloc(sizeof(float) * k);
+
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            x = knn_find_insertion_slot(distances, k, d);
+            if (x < k) {
+                /* Preserve the backward order of overlapping shifts. */
+                for (y = k - 1; y > x; y--) {
+                    distances[y] = distances[y - 1];
+                    labels[y] = labels[y - 1];
+                }
+
+                distances[x] = d;
+                labels[x] = g.label;
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

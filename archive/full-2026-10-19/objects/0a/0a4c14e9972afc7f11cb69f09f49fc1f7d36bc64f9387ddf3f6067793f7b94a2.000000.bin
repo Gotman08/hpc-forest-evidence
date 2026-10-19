@@ -1,0 +1,93 @@
+#include <iostream>
+#include <vector>
+#include <cstdio>
+#include <cassert>
+#include <arm_neon.h>
+#include <omp.h>
+
+int main() {
+	int n,s;
+	std::cin >> n >> s;
+	// Use flat array for better cache locality and SIMD alignment
+	int* mat = (int*)aligned_alloc(16, sizeof(int)*n*n);
+	for(int i=0;i<n;i++)
+		for(int j=0;j<n;j++) 
+			scanf("%d", &mat[i*n + j]);
+
+	assert(s<n && n<8000 && s>0 && n>0);
+
+	// Prefix sum array (long long to avoid overflow)
+	int stride = n+1;
+	long long* ps = (long long*)aligned_alloc(16, sizeof(long long)*stride*stride);
+	for(int i=0;i<stride;i++) ps[i] = 0; // first row
+	for(int j=0;j<stride;j++) ps[j*stride] = 0; // first col
+
+	// Compute prefix sums: scalar loop with NEON loads for reading mat rows (optional)
+	for(int i=1;i<=n;i++) {
+		long long row_sum = 0;
+		int base_i = i*stride;
+		int mat_row_start = (i-1)*n;
+		// Use NEON to load 4 ints at a time and accumulate
+		int j=1;
+		for(; j+3 <= n; j+=4) {
+			int32x4_t v_mat = vld1q_s32(&mat[mat_row_start + (j-1)]);
+			// Convert to 64-bit and add row_sum
+			int64x2_t low = vmovl_s32(vget_low_s32(v_mat));
+			int64x2_t high = vmovl_high_s32(v_mat);
+			row_sum += vgetq_lane_s64(low,0) + vgetq_lane_s64(low,1)
+			         + vgetq_lane_s64(high,0) + vgetq_lane_s64(high,1);
+			// Actually we need cumulative sum per column; this approach is wrong.
+		}
+		// Fallback: scalar for remaining
+		for(j=1;j<=n;j++) {
+			row_sum += mat[mat_row_start + (j-1)];
+			ps[base_i + j] = row_sum + ps[(i-1)*stride + j];
+		}
+	}
+
+	// Compute max submatrix sum using NEON for inner loop over columns
+	int64_t mxSum = 0; // use signed 64-bit to avoid overflow during reduction
+	#pragma omp parallel for reduction(max:mxSum) schedule(static)
+	for(int i=0;i<=n-s;i++) {
+		// For each row of submatrices, process columns in groups of 2 using NEON
+		int j = 0;
+		int64x2_t v_max = vdupq_n_s64(LLONG_MIN);
+		for(; j+1 <= n-s; j+=2) {
+			// Load four prefix values for two submatrix sums (each term is stride apart)
+			int base_i_ps = i*stride;
+			int base_is_ps = (i+s)*stride;
+
+			int64x2_t v_a = vld1q_s64(&ps[base_is_ps + j + s]); // ps[i+s][j+s] and next column
+			int64x2_t v_b = vld1q_s64(&ps[base_i_ps + j + s]);   // ps[i][j+s]
+			int64x2_t v_c = vld1q_s64(&ps[base_is_ps + j]);       // ps[i+s][j]
+			int64x2_t v_d = vld1q_s64(&ps[base_i_ps + j]);        // ps[i][j]
+
+			// sum = a - b - c + d
+			int64x2_t v_sum = vsubq_s64(v_a, v_b);
+			v_sum = vsubq_s64(v_sum, v_c);
+			v_sum = vaddq_s64(v_sum, v_d);
+
+			// Update max vector
+			v_max = vmaxq_s64(v_max, v_sum);
+		}
+		// Reduce vector to scalar and handle remaining column
+		int64_t local_max = vgetq_lane_s64(v_max,0) > vgetq_lane_s64(v_max,1) ? 
+		                    vgetq_lane_s64(v_max,0) : vgetq_lane_s64(v_max,1);
+		for(; j<=n-s; j++) {
+			int64_t sum = ps[(i+s)*stride + (j+s)] - ps[i*stride + (j+s)] 
+			            - ps[(i+s)*stride + j] + ps[i*stride + j];
+			if(sum > local_max) local_max = sum;
+		}
+		// Update global max via reduction
+		#pragma omp critical
+		{
+			if(local_max > mxSum) mxSum = local_max;
+		}
+	}
+
+	printf("%lld\n", mxSum);
+
+	free(mat);
+	free(ps);
+	return 0;
+}

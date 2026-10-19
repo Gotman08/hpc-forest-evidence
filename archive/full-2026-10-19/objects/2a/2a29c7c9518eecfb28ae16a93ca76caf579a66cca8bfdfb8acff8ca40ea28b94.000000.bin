@@ -1,0 +1,301 @@
+"""Receive and audit existing mechanical evidence; never execute archived code."""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import sys
+import tarfile
+import zipfile
+from collections import Counter
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
+
+BASE = Path(r"C:/Users/nicol/Documents/Codex/2026-10-15/cr")
+HERE = Path(__file__).resolve().parent
+REVISION = BASE / "outputs/HPC-Forest-Primes-Natif-MAX-r1/revision-r1b"
+PROJECT = BASE / "work/hpc-forest-primes-native-max-r1/project"
+SCOPE = "hpc-forest-primes-native-max-r1"
+SOURCE_SHA = "3e290f835570a8746be3c52144932b8c6866564980fd858cf4c0495a7b1e68c5"
+PLAN_SHA = "54ffd49f4dc868085d22208f773c4b4883590b25251b5992232509a1dc197024"
+PREPARATION_SHA = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+REFERENCE_SHA = "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d"
+MODULE_SHA = "71fa95561f57fd7739bae82e0c2dfec2a8932925e648c7742620b0c17ac27a5d"
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def check(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": sha(path.read_bytes())}
+
+
+def canonical(name):
+    check(isinstance(name, str) and name, "Missing archive member")
+    relative = PurePosixPath(name)
+    check(not relative.is_absolute() and str(relative) == name
+          and ".." not in relative.parts and "\\" not in name and ":" not in name
+          and not any(ord(c) < 32 for c in name), "Unsafe archive member")
+    return relative
+
+
+def material(path, expected_root):
+    files = {}
+    total = 0
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive.getmembers():
+            relative = canonical(member.name)
+            check(member.isfile() and not member.issym() and not member.islnk()
+                  and len(relative.parts) > 1 and relative.parts[0] == expected_root,
+                  "Archive contains a non-regular or out-of-root member")
+            key = relative.relative_to(expected_root).as_posix()
+            total += member.size
+            check(key not in files and len(files) < 1000
+                  and 0 <= member.size <= 8 * 1024**2 and total <= 64 * 1024**2,
+                  "Duplicate, oversized or excessive archive material")
+            stream = archive.extractfile(member)
+            check(stream is not None, "Unreadable member")
+            raw = stream.read(8 * 1024**2 + 1)
+            check(len(raw) == member.size, "Member size mismatch")
+            files[key] = raw
+    return files
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        check(not path.is_symlink(), "Linked restored input")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = sha(path.read_bytes())
+    return result
+
+
+def restore(root, files):
+    check(root.parent == HERE and not root.exists(), "Restoration must be new and owned")
+    root.mkdir()
+    for name, raw in files.items():
+        relative = canonical(name)
+        path = root.joinpath(*relative.parts)
+        check(path.resolve().is_relative_to(root.resolve()), "Restoration escaped owned root")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(raw)
+    check(inventory(root) == {name: sha(raw) for name, raw in files.items()},
+          "Restored bytes do not equal archive")
+
+
+def main():
+    observed = json.loads((HERE / "observations-terminales.json").read_bytes())
+    status = observed["first_status"]["value"]["structuredContent"]
+    efficiency = observed["terminal_efficiency"]["value"]["structuredContent"]
+    check(status["job_id"] == "751975" and status["state"] == "FAILED"
+          and status["exit_code"] == "1:0" and status["finished"] is True,
+          "Original scheduler failure must remain explicit")
+    transfers = json.loads((HERE / "telechargements-verifies.json").read_bytes())["downloads"]
+    transfers_by_file = {}
+    for transfer in transfers:
+        check(transfer["status"] == "fulfilled", "Transfer did not complete")
+        value = transfer["value"]["structuredContent"]
+        path = Path(value["to"])
+        digest = sha(path.read_bytes())
+        check(path.parent == HERE and value["ok"] is True and value["verifie"] is True
+              and digest == value["remote_sha256"] == value["empreinte_locale"]
+              == value["empreinte_distante"], "Remote/local verified transfer mismatch")
+        transfers_by_file[path.name] = value
+    envelopes = material(HERE / "envelope-results-751975.tar.gz", "qualification-envelope")
+    qualified = material(HERE / "Q.tar.gz", "qualification")
+    check(len(envelopes) == 294 and len(qualified) == 100, "Unexpected received inventory")
+    sidecar = json.loads((HERE / "Q-archive.json").read_bytes())
+    envelope_sidecar = json.loads((HERE / "envelope-archive.json").read_bytes())
+    check(sidecar["sha256"] == sha((HERE / "Q.tar.gz").read_bytes())
+          and envelope_sidecar["sha256"] == sha((HERE / "envelope-results-751975.tar.gz").read_bytes())
+          and envelope_sidecar["bytes"] == (HERE / "envelope-results-751975.tar.gz").stat().st_size,
+          "Sidecar/remote/local archive SHA mismatch")
+    check(envelopes["Q.tar.gz"] == (HERE / "Q.tar.gz").read_bytes()
+          and envelopes["Q-archive.json"] == (HERE / "Q-archive.json").read_bytes(),
+          "Envelope and independent downloads differ")
+    for name, raw in qualified.items():
+        check(envelopes["Q/" + name] == raw, "Envelope and inner qualification differ")
+    restore(HERE / "restauration-enveloppe", envelopes)
+    restore(HERE / "restauration-Q", qualified)
+    before = {name: inventory(HERE / name)
+              for name in ("restauration-enveloppe", "restauration-Q")}
+    save("inventaires-restauration-avant.json", before)
+    envelope = json.loads(envelopes["envelope-receipt.json"])
+    qualification = json.loads(qualified["qualification.json"])
+    check(sha(qualified["qualification.json"]) == envelope["qualification_sha256"],
+          "Original qualification SHA mismatch")
+    check(envelope["passed"] is False and envelope["qualification_returncode"] == 0
+          and envelope["qualification_launched_count"] == 1
+          and envelope["error"] == "Inner qualification archive proof differs"
+          and envelope["input_files_unchanged"] is True
+          and envelope["native_model_calls"] == 0
+          and envelope["native_research_admitted"] is False, "Unexpected original failure")
+    check(qualification["verified"] is True and qualification["native_model_calls"] == 0
+          and qualification["native_research_admitted"] is False
+          and qualification["scope_id"] == SCOPE
+          and qualification["source_zip_sha256"] == SOURCE_SHA
+          and qualification["plan_sha256"] == PLAN_SHA
+          and qualification["preparation_manifest_sha256"] == PREPARATION_SHA,
+          "Unrelated or failed inner qualification")
+    check(sidecar["native_model_calls"] == 0
+          and sidecar["sha256"] == sha((HERE / "Q.tar.gz").read_bytes()),
+          "Non-path inner archive predicate failed")
+    expected_path = envelope["bindings"]["remote_root"] + "/Q.tar.gz"
+    check(sidecar["path"] != expected_path, "The original literal path refusal is not reproduced")
+    check(qualification["prepared_root"] == str(PurePosixPath(sidecar["path"]).parent / "Q/prepared"),
+          "Original canonical qualification path does not link the sidecar")
+    allocation = envelope["allocation"]
+    check(allocation == qualification["allocation"] and allocation["job_id"] == "751975"
+          and allocation["architecture"] == "aarch64"
+          and all(allocation[k] == v for k, v in
+                  {"nodes": 1, "tasks": 1, "cpus_per_task": 4, "memory_mib": 16384,
+                   "gpus": 0, "affinity_cpu_count": 4}.items())
+          and len(set(allocation["affinity_cpu_ids"])) == 4, "Allocation/affinity mismatch")
+    inputs_before = json.loads(envelopes["input-inventory-before.json"])
+    inputs_after = json.loads(envelopes["input-inventory-after.json"])["files"]
+    restored_inputs = {name.removeprefix("extraction/"): sha(raw)
+                       for name, raw in envelopes.items() if name.startswith("extraction/")}
+    check(inputs_before == inputs_after == restored_inputs and len(inputs_before) == 185,
+          "Allocated inputs changed or are missing")
+    source_zip = envelopes["extraction/HPC-Forest-Primes-Natif-MAX-r1.zip"]
+    check(sha(source_zip) == SOURCE_SHA
+          and sha(envelopes["extraction/native-max-plan.json"]) == PLAN_SHA,
+          "Source/plan bindings mismatch")
+    with zipfile.ZipFile(io.BytesIO(source_zip)) as archive:
+        source_files = {canonical(i.filename).relative_to("HPC-Forest").as_posix(): archive.read(i)
+                        for i in archive.infolist() if not i.is_dir()}
+        check(len(archive.infolist()) == len(source_files) == 99, "Source ZIP membership mismatch")
+    runtime = json.loads(envelopes["extraction/runtime-manifest-r2max.json"])
+    check({name: sha(raw) for name, raw in source_files.items()} == runtime,
+          "Admitted runtime manifest differs")
+    for name, raw in source_files.items():
+        check(envelopes["extraction/HPC-Forest/" + name] == raw
+              and (PROJECT / name).read_bytes() == raw, "Extracted/source runtime bytes changed")
+    package = HERE / "restauration-enveloppe/extraction/certified-preparation"
+    check(sha((package / "prototype-manifest.json").read_bytes()) == PREPARATION_SHA,
+          "Certified preparation manifest changed")
+    manifest = json.loads((package / "prototype-manifest.json").read_bytes())
+    package_inventory = inventory(package)
+    check(set(package_inventory) == set(manifest) | {"prototype-manifest.json"}
+          and len(package_inventory) == 67, "Certified package count changed")
+    for name, value in manifest.items():
+        raw = (package / name).read_bytes()
+        check(sha(raw) == value["sha256"] and len(raw) == value["bytes"],
+              "Certified package bytes changed")
+    check(sha((PROJECT / "src/hpc_forest/native_r2max.py").read_bytes()) == MODULE_SHA,
+          "Reviewed pure verification module changed")
+    sys.path.insert(0, str(PROJECT / "src"))
+    from hpc_forest.native_r2max import verify_qualification_members
+    from hpc_forest.primes_contract import verify_preparation
+    # These functions only read/compare existing members. No qualifier/controller is invoked.
+    verify_qualification_members(qualification, lambda name: qualified["prepared/" + name],
+                                 verify_preparation(package))
+    expected_files = {"qualification.json"} | {"prepared/" + name for name in qualification["prepared_files"]}
+    check(set(qualified) == expected_files, "Qualification has extra or missing files")
+    for name, digest in qualification["prepared_files"].items():
+        check(sha(qualified["prepared/" + name]) == digest, "Qualified member SHA mismatch")
+    case_rows = qualification["certified_expected_rows"]
+    expected_cases = {row["case"]: row["origin"] for row in case_rows if row["case"] != "benchmark-case-1"}
+    check(len(expected_cases) == 12, "Missing unique cases")
+    execution_counts = Counter()
+    execution_refs = []
+    for name, raw in qualified.items():
+        if name.startswith("prepared/private-audit/executions/") and name.endswith("/execution.json"):
+            execution = json.loads(raw)
+            case = execution["case"]
+            prefix = name.removesuffix("execution.json")
+            check(case in expected_cases and execution["returncode"] == 0
+                  and execution["timed_out"] is False and execution["never_model_input"] is True,
+                  "Failed or unlinked reference execution")
+            expected = package / "data/private-audit-fixtures" / expected_cases[case] / "expected.txt"
+            check(qualified[prefix + "stderr.bin"] == b""
+                  and qualified[prefix + "stdout.bin"] == expected.read_bytes(),
+                  "Actual output/stderr differs from certified expected bytes")
+            execution_counts[case] += 1
+            execution_refs.append({"case": case, "metadata_member": name, "sha256": sha(raw),
+                                   "stdout_sha256": sha(qualified[prefix + "stdout.bin"]),
+                                   "stderr_bytes": 0, "returncode": 0})
+    check(set(execution_counts) == set(expected_cases)
+          and set(execution_counts.values()) == {2}, "Expected two actual probes for each certified case")
+    check(envelopes["qualification-launch.stderr"] == b""
+          and envelopes["qualification-launch.stdout"] ==
+          b"Loading aarch64 (arm, gpus available) environment\nEnvironment loaded. Spack available.\n"
+          and qualified["prepared/reference-build/compiler.stderr"] == b""
+          and qualified["prepared/reference-build/compiler.stdout"] == b"", "Unexpected launch/compiler output")
+    binary = qualified["prepared/reference-build/solution"]
+    check(binary[:6] == b"\x7fELF\x02\x01" and binary[18:20] == b"\xb7\x00"
+          and sha(binary) == qualification["reference_binary_sha256"], "Wrong ELF/architecture")
+    started = datetime.fromisoformat(envelope["started_utc"])
+    finished = datetime.fromisoformat(envelope["finished_utc"])
+    check(started < finished and finished + timedelta(hours=3)
+          < datetime(2026, 10, 31, 23, tzinfo=UTC), "Exclusive reception reserve violated")
+    after = {name: inventory(HERE / name) for name in before}
+    save("inventaires-restauration-apres.json", after)
+    check(before == after, "Reader modified restored evidence")
+    audit = {
+        "schema": "hpc-forest-primes-r2max-allocated-contract-reception-audit-v1",
+        "scope_id": SCOPE, "verified": False,
+        "mechanical_evidence_verified": True,
+        "verification_scope": "received immutable mechanical evidence only; original failed envelope preserved",
+        "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+        "preparation_manifest_sha256": PREPARATION_SHA,
+        "qualification_sha256": sha(qualified["qualification.json"]),
+        "archive_sha256": sha((HERE / "Q.tar.gz").read_bytes()),
+        "envelope_archive_sha256": sha((HERE / "envelope-results-751975.tar.gz").read_bytes()),
+        "all_members_regular_unique": True, "restored_files_byte_identical": True,
+        "actual_compiler_command_verified": True, "certified_twelve_case_contract_verified": True,
+        "native_model_calls": 0, "native_research_admitted": False,
+        "scheduler_state": status["state"], "scheduler_exit_code": status["exit_code"],
+        "original_envelope_passed": False, "inner_qualification_returncode": 0,
+        "original_qualification_verified": True, "original_bytes_unchanged": True,
+        "blocking_findings": ["Original envelope rejected literal /gpfs/scratch vs /scratch_p archive path; operator disposition pending"],
+        "path_refusal": {"actual_sidecar_path": sidecar["path"], "expected_literal_path": expected_path,
+                         "other_inner_archive_predicates_verified": True,
+                         "remote_filesystem_inode_alias_identity_proved": False,
+                         "qualified_prepared_root_original": qualification["prepared_root"]},
+        "counts": {"envelope_files": len(envelopes), "qualification_files": len(qualified),
+                   "immutable_source_files": len(source_files), "immutable_preparation_files": len(package_inventory),
+                   "allocated_input_files_before_after": len(inputs_before), "unique_certified_cases": 12,
+                   "actual_official_reference_executions": len(execution_refs)},
+        "allocation": allocation, "efficiency": efficiency,
+        "compiler_command": qualification["compiler_command"],
+        "official_reference_sha256": REFERENCE_SHA,
+        "elf": {"class": 64, "endianness": "little", "e_machine": 183, "architecture": "AArch64",
+                "sha256": sha(binary), "inspected_as_bytes_never_executed_locally": True},
+        "execution_proofs": execution_refs,
+        "unexpected_launch_stdout_or_stderr": False, "unexpected_compiler_stdout_or_stderr": False,
+        "execution_stderr_all_empty": True,
+        "evidence_refs": {name: ref(HERE / name) for name in
+                          ("observations-terminales.json", "telechargements-verifies.json",
+                           "Q-archive.json", "envelope-archive.json",
+                           "inventaires-restauration-avant.json", "inventaires-restauration-apres.json",
+                           "auditer-reception.py")},
+        "limitations": ["No normal Luna model call or native first evaluation observed.",
+                        "No hardware/process isolation proved.",
+                        "Qualification timings are not native-allocation reference timings.",
+                        "Original scheduler/envelope failure is not relabeled as success.",
+                        "No new job, repair, candidate execution, model or CLI invocation was performed."]
+    }
+    save("audit-reception-initial.json", audit)
+    print(json.dumps({"mechanical_evidence_verified": True, "verified": False,
+                      "audit": ref(HERE / "audit-reception-initial.json"),
+                      "counts": audit["counts"], "path_refusal": audit["path_refusal"]}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

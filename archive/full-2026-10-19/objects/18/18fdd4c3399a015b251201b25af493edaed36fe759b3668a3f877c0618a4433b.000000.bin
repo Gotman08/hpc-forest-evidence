@@ -1,0 +1,158 @@
+"""Independent cold metadata review only. No candidate or process API calls."""
+import ast
+import hashlib
+import json
+import os
+import re
+import stat
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+
+BASE=Path('C:/Users/nicol/Documents/Codex/2026-10-15/cr')
+P=BASE/'outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3'
+O=P/'operations-parent-premier-roots-source110-r1'
+LIVE=O/'preparation-parcours-vivant-R8-r1'
+R1=LIVE/'fermeture-passive-R8-preparee-r1'
+R2=R1/'revision-r2-dossier-INERT-connu'
+RUN=R1/'execution-effet-root-01'
+OUT=RUN/'revue-froide-independante-r1'
+CHAIN=P/'adaptateurs-source110-r1/revision-r8-racines-techniques-neuves'
+KNOWN=CHAIN/'observer/INERT-WHOLE-R8-ROOT-01-observer'
+RAW=P/'qualification-allouee-source110-G-recu-r1/revue-resultats-Q753709-r1/lecteur-r4b/auditer-restauration-existante-r4b.py'
+FIELDS={'ProcessId','ParentProcessId','ExecutablePath','CommandLine','CreationDate'}
+IDS={9192,14840,19968,47844,40556,22368}
+def need(ok,message):
+    if not ok:raise ValueError(message)
+def sha(data):return hashlib.sha256(data).hexdigest()
+primitive=RAW.read_bytes();need(sha(primitive)=='5c1e1784574566a585e2d9cc50f85b52337d10d3109e449a4112581eae68f8d5','Cold IO pin')
+names={'need','ordinary','metadata','open_nofollow_read','cross_identity','validate_windows_mode_views','native_basic_info','raw'}
+nodes=[n for n in ast.parse(primitive).body if isinstance(n,ast.FunctionDef) and n.name in names]
+need({n.name for n in nodes}==names,'Exact own cold reader definitions')
+ns={'Path':Path,'os':os,'stat':stat,'Q':BASE}
+exec(compile(ast.Module(body=nodes,type_ignores=[]),str(RAW),'exec'),ns)
+before={}
+def read(path,expected=None):
+    p=Path(path);need(p.is_absolute() and p.is_relative_to(BASE) and '..' not in p.parts,'Cold boundary')
+    need(p!=KNOWN and not p.is_relative_to(KNOWN),'No INERT directory/child access')
+    need(p.name.rstrip(' .').casefold() not in {'observer-state.json','observer.lock','worker.lock','stdout.log','stderr.log'},'No live state/log/lock input')
+    raw=ns['raw'](p);need(expected is None or sha(raw)==expected,'Cold SHA mismatch '+str(p))
+    record={'path':str(p),'sha256':sha(raw),'bytes':len(raw),'metadata':list(ns['metadata'](p.lstat()))}
+    need(str(p) not in before or before[str(p)]==record,'Input changed during review')
+    before[str(p)]=record;return raw
+def doc(path,expected=None):return json.loads(read(path,expected))
+def pinned(ref):return doc(ref['path'],ref['sha256'])
+def ref(path):return {'path':str(path),'sha256':sha(read(path))}
+def ticks(text):
+    need(isinstance(text,str),'UTC date text')
+    match=re.fullmatch(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,7}))?(?:Z|\+00:00)',text)
+    need(match is not None,'Exact UTC date')
+    dt=datetime.fromisoformat(match[1]).replace(tzinfo=UTC)-datetime(1,1,1,tzinfo=UTC)
+    return (dt.days*86400+dt.seconds)*10_000_000+int((match[2] or '').ljust(7,'0'))
+EPOCH=ticks('1970-01-01T00:00:00Z')
+def age(census,when):
+    now=ticks(when);a=Decimal(now-EPOCH)/10_000_000-Decimal(str(census['observed_at']));b=Decimal(now-ticks(census['captured_at_utc']))/10_000_000
+    need(0<=a<=45 and 0<=b<=45,'Historical captured/observed ages both <=45s')
+    return {'at_utc':when,'age_observed_seconds':str(a),'age_captured_seconds':str(b)}
+def census_checks(value):
+    need(set(value)=={'schema','observed_at','captured_at_utc','complete_census','strict_utf8_decoding','rows_count','rows'},'Closed CIM schema')
+    need(value['schema']=='hpc-forest-dynamic-r4b-full-cim-v1' and value['complete_census'] is True and value['strict_utf8_decoding'] is True,'Actual strict complete CIM')
+    need(type(value['rows_count']) is int and value['rows_count']==len(value['rows']) and value['rows'],'CIM count')
+    ids=set()
+    for row in value['rows']:
+        need(set(row)==FIELDS and all(type(row[k]) is int and row[k]>=0 for k in ('ProcessId','ParentProcessId')),'Exact CIM rows')
+        need(row['ProcessId'] not in ids,'Unique CIM PID');ids.add(row['ProcessId'])
+        need(all(row[k] is None or isinstance(row[k],str) for k in ('ExecutablePath','CommandLine','CreationDate')),'CIM metadata types')
+        if row['CreationDate'] is not None:need(ticks(row['CreationDate'])<=ticks(value['captured_at_utc']),'Creation/capture chronology')
+    candidates=[row['ProcessId'] for row in value['rows'] if 'bootstrap_worker.py' in (row['CommandLine'] or '').casefold() or re.search(r'hpc_forest(?:\.|[/\\])',row['CommandLine'] or '',re.I)]
+    opaque=[row['ProcessId'] for row in value['rows'] if Path(row['ExecutablePath'] or '').name.casefold() in {'python.exe','pythonw.exe'} and not row['CommandLine']]
+    need(not candidates and not opaque,'Independent conservative native scan/opaque Python refusal')
+    return {'rows':len(ids),'conservative_native_candidates':candidates,'opaque_python_rows':opaque}
+closure_ref={'path':str(RUN/'FERMETURE-OBSERVATEUR-PASSIF-R8-VERIFIEE.json'),'sha256':'c91d5d5ea1115b4c152211bc3d89565dad668be50214229f82f53b58b17dabb7'}
+closed=pinned(closure_ref)
+need(closed['schema']=='hpc-forest-r8-obs4-main-only-owned-passive-closure-v1' and closed['verified_metadata_only'] is True and closed['verified_owned_observer_absence'] is True,'Actual completed closure receipt')
+plan=pinned(closed['plan']);review=pinned(closed['review']);action=pinned(closed['action']);final=pinned(closed['final_full_cim'])
+anchors=pinned(plan['cold_anchors']);intent=pinned(action['intent']);prevol=pinned(intent['fresh_gate'])
+initial=pinned(plan['fresh_full_cim']);held=pinned(prevol['fresh_full_cim'])
+need(closed['plan']==action['plan']==intent['plan']==prevol['plan'] and closed['review']==plan['review']==intent['review'],'Exact actual plan/review chain')
+need(closed['review']['sha256']=='5a962e5f2d6ed1667018b68644ed314f8a61b508ce4787f4e8aefb586377cb95','Actual reviewed R2 bytes')
+for name,expected in review['reviewed_files'].items():read((R1 if name.endswith('.json') else R2)/name,expected)
+need(plan['effect_targets']==intent['effect_targets']==[19968] and review['permitted_effect_ids']==[19968],'Sole target scope')
+main=next(row for row in anchors['contextual_identities'] if row['ProcessId']==19968)
+need(action['identity']==intent['identity']==plan['main_identity']==main and main['ParentProcessId']==9192,'Full original five-field target identity')
+need(type(action['native_call_count']) is int and action['native_call_count']==1 and action['termination_issued'] is True and action['held_handle_identity_verified'] is True,'One ROOT held-handle native effect')
+need(action['outcome']=='single_held_handle_termination_returned_and_exit_observed' and action['automatic_retry_allowed'] is False,'Known exit outcome, never UNKNOWN/retry')
+need(action['image_file_sha256']=='5ef72c30ca3b82df7c7e186c9220bde665be9a335edbd4a371a4b19d0ac76644','Recorded exact image file pin')
+need(Path(action['intent']['path'])==R1/'INTENTION-UNIQUE-OBS4-R8-19968.json' and intent['stable_native_handle_verified'] is True and intent['automatic_retry_allowed'] is False and intent['services_or_foreign_stop_permitted'] is False,'Canonical durable no-followup intent')
+native=intent['native_birth_ticks'];need(type(native) is int and native==action['native_birth_ticks'] and native-native%10==ticks(main['CreationDate'])==intent['cim_birth_projection_ticks'] and intent['cim_creation_quantum_100ns_ticks']==10,'Exact native100ns to CIMmicrosecond projection')
+need(ticks(intent['at_utc'])<=ticks(action['at_utc'])<ticks(final['captured_at_utc'])<=ticks(closed['observed_at_utc']),'Intent/action/final chronology')
+need(ticks(final['captured_at_utc'])-ticks(action['at_utc'])>=100_000_000,'At least10s natural grace before final census')
+census_results=[census_checks(value) for value in (initial,held,final)]
+for value in (initial,held):
+    rows={row['ProcessId']:row for row in value['rows']}
+    need(all(rows.get(row['ProcessId'])==row for row in anchors['contextual_identities']),'All six exact identities before effect')
+    need(not any(row['ParentProcessId'] in IDS and row['ProcessId'] not in IDS for row in value['rows']),'No unattributed child before effect')
+need(not any(row['ProcessId'] in IDS or row['ParentProcessId'] in IDS for row in final['rows']),'All six absent without reused PID or ambiguous child in final census')
+observer=str(CHAIN/'observer/observer-mixte.py').replace('/','\\').casefold()
+need(not any(observer in (row['CommandLine'] or '').replace('/','\\').casefold() for row in final['rows']),'No equivalent final observer command')
+graph=closed['graph_state']
+need(graph['all_six_original_identities_absent'] is True and graph['pair_absent'] is True and graph['unresolved_context'] is False and set(graph['exact_absent_ids'])==IDS and not graph['exact_present_ids'],'Final graph equality')
+ages={'initial_at_plan':age(initial,plan['created_at_utc']),'held_at_prevol':age(held,prevol['created_at_utc']),'held_at_intent':age(held,intent['at_utc']),'held_at_action_receipt':age(held,action['at_utc']),'final_at_closure':age(final,closed['observed_at_utc'])}
+copies=[]
+for phase in ('before','after'):
+    snap=closed['metadata_preservation_'+phase]
+    need(snap['ordinary_files']==len(snap['files'])==13 and snap['source_parent_handles_persist_between_reads'] is False and snap['checkpoint_stability_only_no_continuity_or_ABA_claim'] is True,'Exact bounded snapshot semantics')
+    need(len({item['source'] for item in snap['files']})==13,'Distinct named sources')
+    for item in snap['files']:
+        p=Path(item['received']);need(p.parent==RUN/('preservation-avant' if phase=='before' else 'preservation-apres') and re.fullmatch(r'opaque-\d{3}\.bin',p.name),'Opaque cold copies only')
+        raw=read(p,item['sha256']);need(len(raw)==item['bytes'],'Copy byte count')
+        checkpoint=item['source_native_checkpoint'];m=checkpoint['metadata']
+        need(checkpoint['path']==item['source'] and checkpoint['sha256']==item['sha256'] and m['bytes']==len(raw) and m['links']==1 and m['directory'] is False and m['delete_pending'] is False and not m['attributes']&1024,'Recorded ordinary native source checkpoint')
+        if Path(item['source']).name=='observer-state.json':
+            state=json.loads(raw);need(state['schema']=='hpc-forest-r4b-passive-state-v1' and state['passive_only'] is True and type(state['active_native_workers']) is int and state['active_native_workers']==0 and state['scientific_admission'] is False,'Cold copied passive state0')
+            need(len(state['routes_history'])==9 and all(v['stage']=='absent' and v['cell']['job_id'] is None for v in state['routes_history'].values()),'Cold state routes9 all absent')
+        copies.append({'phase':phase,'received':str(p),'bytes':len(raw),'sha256':item['sha256']})
+    for lock in snap['locks_stat_only']:
+        need(lock['bytes_read'] is False and lock['read_attempted'] is False and lock['read_errno'] is None and lock['sha256'] is None,'Unread operational lock remains unknown')
+    need(len(snap['known_inert_directories_stat_only'])==1,'One known opaque directory')
+    opaque=snap['known_inert_directories_stat_only'][0]
+    need(opaque['before']==opaque['after'] and opaque['checkpoint_identity_and_metadata_unchanged'] is True and Path(opaque['before']['path'])==KNOWN and opaque['before']['recursive_enumeration'] is False and opaque['before']['bytes_read'] is False and opaque['before']['payload_sha256'] is None,'Known directory stat-only checkpoint proof')
+    for evidence in snap['known_inert_provenance']['evidence_refs']:pinned(evidence)
+need(plan['metadata_preservation']==closed['metadata_preservation_before'],'Actual pre-effect copied inventory linked')
+sessions=['277b1e33ea5e4af6af1c9144ce970ac4','5033baf5d38042efb8ab834a59437d19','d5007804188a4fc793582a26e47c556c']
+for receipt in (plan,prevol,closed):
+    need({v['path'] for v in receipt['cache_absence']}=={str(P/('lancement-modeles-max-r3/worker-'+s)) for s in sessions} and all(v['exists'] is False and v['observation']=='ordinary_ancestor_lstat_only' for v in receipt['cache_absence']),'Root-recorded exact cache lstat0')
+registry=pinned(closed['frozen62']);need(closed['frozen62']==plan['frozen62'] and len(registry['code_pins'])==62,'Frozen62 manifest exact')
+for name,expected in registry['code_pins'].items():read(CHAIN/name,expected)
+root4=doc(R2/'execution-neutre-root-01/CONTROLES-ROOT-QUATRE-DELTA-ET-PARSE.json','eda60d1c35c6e5daa2be716cf955fe432d134e4d413fb7f194493476b3dbb4ce')
+need(root4['actual_new_cases']==4 and root4['passed'] is True and root4['exit_code']==0 and root4['parse_errors']==0 and root4['pins_before_after_equal'] is True,'Actual ROOT4/PS before effect')
+for path,expected in root4['pins'].items():read(path,expected)
+finally_ref=ref(LIVE/'activation-passive-reelle-root-01/EXECUTION-SEQUENCE-PASSIVE-ROOT.json')
+need(finally_ref['sha256']=='dc9b4fb057c9a9356875efe29df8e46d0b2ae7face8abbfc9ad4a9b2040a251f','Separate original finally bytes')
+old_final=pinned(finally_ref)
+need(old_final['schema']=='hpc-forest-r8-root-one-passive-sequence-execution-v1' and old_final['last_stage']=='cold_copy_four' and old_final['no_retry_performed'] is True and old_final['native_generation_admitted'] is False,'Original expired copy failure retained separately')
+for k in ('native_generation_admitted','current_state_after_observation_promised','new_watcher_started','observer_lock_read','automatic_retry_or_followup_effect_allowed'):need(closed[k] is False,'No future admission hidden')
+after={}
+for path,record in before.items():
+    raw=ns['raw'](Path(path));after[path]={'path':path,'sha256':sha(raw),'bytes':len(raw),'metadata':list(ns['metadata'](Path(path).lstat()))};need(after[path]==record,'Final cold-input mutation')
+def save(name,value):
+    p=OUT/name;raw=(json.dumps(value,ensure_ascii=False,indent=2)+'\n').encode('utf8')
+    with p.open('xb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+    need(ns['raw'](p)==raw,'Own output reread');return {'path':str(p),'sha256':sha(raw),'bytes':len(raw)}
+inv=save('INVENTAIRES-REVUE-CLOTURE-REELLE-AVANT-APRES.json',{'schema':'hpc-forest-r8-passive-closure-independent-actual-cold-review-inventories-v1','before':list(before.values()),'after':list(after.values()),'count':len(before),'all_bytes_and_full_metadata_unchanged':True})
+review={'schema':'hpc-forest-r8-obs4-main-only-owned-passive-actual-closure-cold-review-v1','verified_metadata_only':True,'verified_owned_observer_absence':True,'blocking_findings':[],
+ 'closure':closure_ref,'final_full_cim':closed['final_full_cim'],'observed_at_utc':final['captured_at_utc'],'historical_closure_completed_at_utc':closed['observed_at_utc'],
+ 'all_six_original_identities_absent':True,'only_main19968_effect':True,'services_naturally_absent':True,'no_future_state_promised':True,
+ 'effect_ids':[19968],'native_call_count_recorded':1,'native_birth_ticks':native,'cim_projection_ticks':native-native%10,
+ 'ROOT_action':closed['action'],'durable_intent':action['intent'],'freshness_at_historical_boundaries':ages,'independent_frozen_census_checks':census_results,
+ 'actual_ROOT4_and_PS':ref(R2/'execution-neutre-root-01/CONTROLES-ROOT-QUATRE-DELTA-ET-PARSE.json'),
+ 'opaque_regular_copies_verified':copies,'regular_copies_total':26,'known_INERT_directory_stat_only':True,'lock_payload_never_opened_by_reviewer':True,'lock_payload_SHA_remains_unknown':True,
+ 'root_cache_lstat_absence_receipts_reconciled_not_reobserved':True,'source62_manifest':closed['frozen62'],'all62_current_code_bytes_rehashed':True,
+ 'separate_original_sequence_finally':finally_ref,'original_terminal_tool_return_independently_audited_by_this_review':False,
+ 'independent_inventory':inv,'author_disclosure':{'reviewer':'A /root/cli_role_loader_evidence','current_gate_wrapper_author_B':True,'effect_operator_ROOT':True,'reviewer_authored_code_preparation_reviews_and_ancestor_open_log_delta':True,'reviewer_did_not_execute_effect_or_capture_CIM':True},
+ 'limits':['Historical observations only: final frozen CIM at stated UTC, no current/future absence, PID authority or freshness.','Five other contexts have no target/action in this ROOT protocol; they were absent after its natural grace. No blanket audit of external processes or causes.','Recorded held-process native facts and action are ROOT evidence, rechecked here as cold metadata, no process API repeated.','Copy/source stability means supplied checkpoints only; no live re-read, continuous or ABA guarantee; opaque directory children never read.','Original tool33705 terminal reception is separate; original finally is not relabelled as the required new terminal-reception schema.','No watcher restart, pair admission,600s/model/scientific/performance admission; scoped zero is not global OAuth/remote zero.'],
+ 'actions_by_reviewer':{'candidate_import_main_test_or_process_CIM_RPC_CLI_model_API_calls':0,'live_source_state_logs_cache_lock_or_INERT_children_reads':0,'qualified_cold_file_IO_used':True,'existing_inputs_modified':False},
+ 'native_generation_admitted':False,'scientific_or_performance_admission':False,'new_stop_or_retry_or_restart_authorized':False}
+review_ref=save('REVUE-FERMETURE-PASSIVE-R8-REELLE.json',review)
+handoff=save('LIVRAISON-REVUE-FERMETURE-PASSIVE-R8-REELLE.json',{'schema':'hpc-forest-r8-passive-closure-actual-independent-review-delivery-v1','review':review_ref,'inventory':inv,'auditor_source':{'path':str(Path(__file__)),'sha256':sha(ns['raw'](Path(__file__)))},'native_generation_admitted':False,'future_absence_or_restart_authorized':False})
+print(json.dumps({'review':review_ref,'delivery':handoff,'cold_inputs':len(after),'copies':26,'final_rows':final['rows_count'],'observed_at_utc':final['captured_at_utc']}))

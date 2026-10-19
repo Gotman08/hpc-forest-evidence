@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <iostream>\n#include <vector>\n#include <utility>\n#include <cstddef>\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\nusing namespace std;\n\nstruct adjacency_matrix {\n    size_t vertices;\n    size_t stride;\n    vector<unsigned char> entries;\n\n    explicit adjacency_matrix(int count)\n        : vertices(static_cast<size_t>(count)),\n          stride(((vertices + 15) / 16) * 16),\n          entries(vertices * stride, 0) {}\n\n    size_t size() const {\n        return vertices;\n    }\n\n    unsigned char *operator[](size_t row) {\n        return entries.data() + row * stride;\n    }\n\n    const unsigned char *operator[](size_t row) const {\n        return entries.data() + row * stride;\n    }\n};\n\nadjacency_matrix readGraph();\nbool testIsomorphism(adjacency_matrix &g1, adjacency_matrix &g2);\n\nint main(){\n    adjacency_matrix g1 = readGraph();\n    adjacency_matrix g2 = readGraph();\n\n    if(!testIsomorphism(g1, g2))\n        cout << \"The graphs are not isomorphic\" << endl;\n\n    return 0;\n}\n\nadjacency_matrix readGraph(){\n    int vertices, edges, source, destination;\n\n    cin >> vertices;\n    adjacency_matrix read(vertices);\n\n    cin >> edges;\n    for (int i = 0; i < edges; i++) {\n        cin >> source >> destination;\n        read[destination][source] = read[source][destination] = 1;\n    }\n\n    return read;\n}\n\nbool verifyPermutation(const adjacency_matrix &g1,\n                       const adjacency_matrix &g2,\n                       const vector<int> &equivalence,\n                       size_t &mismatch_row,\n                       size_t &mismatch_column){\n    for (size_t i = g1.size(); i > 0; --i) {\n        const size_t row = i - 1;\n        const unsigned char *row1 = g1[row];\n        const unsigned char *row2 = g2[equivalence[row]];\n        for (size_t j = i; j > 0; --j) {\n            const size_t column = j - 1;\n            if (row1[column] != row2[equivalence[column]]) {\n                mismatch_row = row;\n                mismatch_column = column;\n                return false;\n            }\n        }\n    }\n    return true;\n}\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\nbool verifyPermutation(const adjacency_matrix &g1,\n                       const adjacency_matrix &g2,\n                       const vector<unsigned char> &equivalence,\n                       size_t &mismatch_row,\n                       size_t &mismatch_column){\n    static const unsigned char column_labels[16] = {\n        1, 2, 3, 4, 5, 6, 7, 8,\n        9, 10, 11, 12, 13, 14, 15, 16\n    };\n    const uint8x16_t labels = vld1q_u8(column_labels);\n    const uint8x16_t indices = vld1q_u8(equivalence.data());\n    for (size_t i = g1.size(); i > 0; --i) {\n        const size_t row = i - 1;\n        const uint8x16_t expected = vld1q_u8(g1[row]);\n        const uint8x16_t source = vld1q_u8(g2[equivalence[row]]);\n        const uint8x16_t actual = vqtbl1q_u8(source, indices);\n        const uint8x16_t mismatch_labels =\n            vbicq_u8(labels, vceqq_u8(expected, actual));\n        const unsigned int last_mismatch = vmaxvq_u8(mismatch_labels);\n        if (last_mismatch != 0) {\n            mismatch_row = row;\n            mismatch_column = static_cast<size_t>(last_mismatch - 1);\n            return false;\n        }\n    }\n    return true;\n}\n#endif\n\ntemplate <typename Index>\ninline void printPermutation(const vector<Index> &equivalence, size_t vertices){\n    for (size_t i = 0; i < vertices; ++i)\n        cout << static_cast<int>(equivalence[i]) << \" \";\n    cout << endl;\n}\n\ntemplate <typename Index>\nbool enumeratePermutations(const adjacency_matrix &g1,\n                           const adjacency_matrix &g2){\n    const size_t vertices = g1.size();\n    // TBL returns zero for the inactive lanes, matching the zero row padding.\n    vector<Index> equivalence(vertices < 16 ? 16 : vertices,\n                              static_cast<Index>(255));\n    vector<size_t> exchange_counter(vertices, 0);\n    size_t exchange_index = 1;\n    bool isomorphism_found = false;\n    size_t mismatch_row = 0;\n    size_t mismatch_column = 0;\n\n    for (size_t i = 0; i < vertices; ++i)\n        equivalence[i] = static_cast<Index>(i);\n\n    if (verifyPermutation(g1, g2, equivalence,\n                          mismatch_row, mismatch_column)) {\n        printPermutation(equivalence, vertices);\n        return true;\n    }\n    bool witness_valid = true;\n\n    /* Preserve Heap's permutation sequence and print every nonidentity match. */\n    while (exchange_index < vertices) {\n        if (exchange_counter[exchange_index] < exchange_index) {\n            const size_t partner = exchange_index % 2 == 0\n                ? 0 : exchange_counter[exchange_index];\n            swap(equivalence[partner], equivalence[exchange_index]);\n\n            // A mismatched pair remains mismatched if neither image changes.\n            const bool witness_touched =\n                mismatch_row == partner ||\n                mismatch_row == exchange_index ||\n                mismatch_column == partner ||\n                mismatch_column == exchange_index;\n\n            if (!witness_valid || witness_touched) {\n                witness_valid =\n                    g1[mismatch_row][mismatch_column] !=\n                    g2[equivalence[mismatch_row]][equivalence[mismatch_column]];\n                if (!witness_valid) {\n                    witness_valid = !verifyPermutation(\n                        g1, g2, equivalence, mismatch_row, mismatch_column);\n                    if (!witness_valid) {\n                        printPermutation(equivalence, vertices);\n                        isomorphism_found = true;\n                    }\n                }\n            }\n\n            ++exchange_counter[exchange_index];\n            exchange_index = 1;\n        } else {\n            exchange_counter[exchange_index] = 0;\n            ++exchange_index;\n        }\n    }\n    return isomorphism_found;\n}\n\nbool testIsomorphism(adjacency_matrix &g1, adjacency_matrix &g2){\n    if (g1.size() != g2.size()) return false;\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n    // One NEON table covers up to 16 vertices. Symmetry makes full-row\n    // comparisons equivalent to checking the original lower triangle.\n    if (g1.size() <= 16)\n        return enumeratePermutations<unsigned char>(g1, g2);\n#endif\n\n    return enumeratePermutations<int>(g1, g2);\n}\n",
+        "path": "src/brute_isomorphism.cpp"
+      }
+    ],
+    "hypothesis": "Caching a high-index mismatched vertex pair can eliminate redundant verification after Heap swaps that leave its endpoints unchanged. NEON locates replacement witnesses when necessary, while every permutation and output remains in the original order.",
+    "notes": "No commands or measurements performed. Preserves identity early return, every nonidentity match, self-loops, padding safety, and the scalar fallback. Witness state is local to each enumeration.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Search descending vertex indices for a mismatch; use NEON equality masks and a maximum reduction to identify its highest column.",
+      "Cache the mismatched pair and skip verification when neither endpoint participates in the next swap.",
+      "Recheck affected witnesses and run full verification only when necessary; invalidate the witness after each successful match."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "717bed6582734da38f442f0110e71d26",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "xhigh",
+  "request_sha256": "aa133ee57bbf813e9239828bf90905909cbe1dce42ca566c493eac6bfdd148f8",
+  "session_id": "2bd8b683b45b41c8b48ec38708f46bab",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "f5ef80da3e28f78c9f1cdf34e5604f2bbe53402d5f28511c618270fe92c1acd7",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 14529,
+        "output_tokens": 6090,
+        "reasoning_output_tokens": 4134
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "xhigh",
+    "token_accounting": "exact",
+    "tokens": 20619,
+    "tool_events": []
+  }
+}

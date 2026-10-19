@@ -1,0 +1,70 @@
+"""Read-only audit of a received, restored model/effort group."""
+import argparse
+import json
+import math
+import sqlite3
+from pathlib import Path
+
+from audit_native_base import audit_campaign, digest, load, sha, source_at, verify_restored
+
+
+def main(args):
+    root = args.root.resolve(strict=True)
+    manifest = verify_restored(args.archive, root)
+    results = load(root / "results.json")
+    plan = load(root / "matrix-plan.json")
+    assert results["model"] in plan["models"] and results["reasoning_effort"] in plan["efforts"]
+    subjects = results["admitted_subjects"]
+    assert set(subjects) <= set(plan["subjects"])
+    expected = set(results["requested_subjects"] or plan["subjects"])
+    prepared = load(root / "prepared-manifest.json")
+    assert set(subjects) == {k for k in expected if prepared["records"][k]["status"] == "ready"}
+    audited = []
+    for entry in results["problems"]:
+        summary = {"problem": entry["subject"]}
+        item = audit_campaign(root, summary, args.source_zip, results["model"], results["reasoning_effort"])
+        if item["evidence_verified"] and item["final_confirmation_verified"]:
+            campaign = root / entry["subject"]
+            database = sqlite3.connect((campaign / "registry.sqlite3").as_uri() + "?mode=ro&immutable=1", uri=True)
+            try:
+                metadata = {key: json.loads(value) for key, value in database.execute("SELECT key,value FROM metadata")}
+                winner = metadata["best_confirmed"]
+                confirmation = next(json.loads(value) for exp, phase, value in database.execute("SELECT experiment_id,phase,payload FROM evaluations") if exp == winner["experiment_id"] and phase == "confirmation")
+                assert math.isclose(winner["mean_seconds"], confirmation["mean_seconds"], rel_tol=1e-12)
+                assert winner["evaluation_digest"] == digest(confirmation)
+                ratio = 1 - winner["mean_seconds"] / winner["reference_seconds"]
+                assert math.isclose(ratio, winner["improvement_fraction"], abs_tol=1e-12)
+                assert winner["is_baseline"] or winner["improvement_fraction"] >= .03
+                trials = [(json.loads(m), json.loads(r)) for m, r in database.execute("SELECT mission,result FROM trials ORDER BY created,id")]
+                earlier = {}
+                for mission, outcome in trials:
+                    parent = mission["parent_id"]
+                    assert mission["depth"] == (earlier[parent][0]["depth"] + 1 if parent else 1)
+                    for source in mission["sources"]:
+                        assert source in earlier and earlier[source][1]["correct"] is True
+                    earlier[mission["id"]] = mission, outcome
+                item["parent_depths_and_integration_order_verified"] = True
+                item["mother_ledger_slots"] = database.execute("SELECT count(*) FROM slots WHERE purpose LIKE 'mother:%'").fetchone()[0]
+                assert item["published_mother_requests"] <= item["mother_ledger_slots"] <= 2
+            finally:
+                database.close()
+        audited.append({"subject": entry["subject"], **item})
+    verified = bool(subjects) and len(audited) == len(subjects) and all(x["evidence_verified"] and x["final_confirmation_verified"] for x in audited)
+    verify_restored(args.archive, root)
+    output = {"schema": "hpc-forest-native-matrix-audit-v1", "model": results["model"],
+              "effort": results["reasoning_effort"], "expected_subjects": subjects,
+              "coverage_and_final_confirmations_verified": verified,
+              "read_only_file_verification_before_and_after": True,
+              "subjects": audited, "exclusions": results["unprepared"]}
+    args.output.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    print(json.dumps({"verified": verified, "subjects": len(audited), "model": results["model"], "effort": results["reasoning_effort"]}))
+    return 0 if verified else 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--source-zip", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, required=True)
+    raise SystemExit(main(parser.parse_args()))

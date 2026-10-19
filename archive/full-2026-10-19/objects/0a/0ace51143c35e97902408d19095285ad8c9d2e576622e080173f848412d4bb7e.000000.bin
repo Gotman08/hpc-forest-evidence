@@ -1,0 +1,93 @@
+--- observateur-r4/observer-max4-r4.py
++++ observateur-r5/observer-max4-r5.py
+@@ -204,11 +204,53 @@
+     return state, cell
+ 
+ 
++def windows_argv(command):
++    """Use Windows' actual argv grammar; never invoke a shell or process."""
++    require(isinstance(command, str) and bool(command) and not command[0].isspace()
++            and not any(c in command for c in ("\x00", "\r", "\n")),
++            "Missing or malformed Windows command line")
++    import ctypes
++    from ctypes import wintypes
++
++    shell = ctypes.WinDLL("shell32", use_last_error=True)
++    parse = shell.CommandLineToArgvW
++    parse.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
++    parse.restype = ctypes.POINTER(wintypes.LPWSTR)
++    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
++    free = kernel.LocalFree
++    free.argtypes = [ctypes.c_void_p]
++    free.restype = ctypes.c_void_p
++    count = ctypes.c_int()
++    pointer = parse(command, ctypes.byref(count))
++    require(bool(pointer), "Windows CommandLineToArgvW refused command")
++    try:
++        argv = [pointer[i] for i in range(count.value)]
++    finally:
++        free(ctypes.cast(pointer, ctypes.c_void_p))
++    require(bool(argv) and bool(argv[0]), "Missing Windows executable argv")
++    return argv
++
++
+ def flag(command, name):
+-    pattern = r"(?:^|\s)" + re.escape(name) + r"\s+(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))(?=\s|$)"
+-    values = re.findall(pattern, command)
+-    require(len(values) == 1, "Missing/duplicate exact worker flag: " + name)
+-    return next(x for x in values[0] if x)
++    argv = windows_argv(command) if isinstance(command, str) else command
++    require(isinstance(argv, (list, tuple)) and all(isinstance(x, str) for x in argv),
++            "Actual parsed Windows argv required")
++    positions = [i for i, value in enumerate(argv) if value == name]
++    require(len(positions) == 1 and not any(value.startswith(name + "=") for value in argv),
++            "Missing/duplicate exact worker flag: " + name)
++    index = positions[0]
++    require(index + 1 < len(argv) and bool(argv[index + 1])
++            and not argv[index + 1].startswith("-"), "Missing exact worker flag value: " + name)
++    return argv[index + 1]
++
++
++def python_module(argv):
++    module = flag(argv, "-m")
++    index = argv.index("-m")
++    prefix = argv[1:index]
++    require(all(value in {"-B", "-u"} for value in prefix) and len(prefix) == len(set(prefix)),
++            "Python worker module must precede its exact arguments")
++    return module
+ 
+ 
+ def verify_policy(admission):
+@@ -309,12 +351,12 @@
+     require(type(ready.get("started_at")) in {int, float}
+             and ready["started_at"] >= datetime.fromisoformat(ready_pid["CreationDate"]).timestamp(),
+             "Readiness predates the actual worker identity")
+-    command = actual[0]["CommandLine"]
+-    require(re.search(r"(?:^|\s)-m\s+hpc_forest\.r2max_worker(?:\s|$)", command)
++    command = windows_argv(actual[0]["CommandLine"])
++    require(python_module(command) == "hpc_forest.r2max_worker"
+             and flag(command, "--session-id") == session
+             and flag(command, "--required-jobs") == policy["scope_id"]
+             and Path(flag(command, "--executable")).resolve() == Path(cli["executable_path"]).resolve()
+-            and "--transport-smoke" not in command
++            and not any(x == "--transport-smoke" or x.startswith("--transport-smoke=") for x in command)
+             and flag(command, "--channel") == remote_root + "/results-" + job + "/mailbox"
+             and Path(flag(command, "--dependency-receipt")).resolve() == proof_path
+             and Path(flag(command, "--output")).resolve() == binding_path.parent == ready_path.parent,
+@@ -370,12 +412,13 @@
+             continue
+         if not re.search(r"hpc_forest\.[a-z0-9_]*worker|reprendre-relais-r1\.py", command):
+             continue
+-        match = re.search(r'--session-id["\x27]?\s+["\x27]?([0-9a-f]{32})(?:["\x27]|\s|$)', command)
+-        require(match is not None, "Unknown research worker without exact session")
++        session = flag(windows_argv(command), "--session-id")
++        require(re.fullmatch(r"[0-9a-f]{32}", session) is not None,
++                "Unknown research worker without exact session")
+         require(all(row.get(k) is not None for k in
+                     ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")),
+                 "Incomplete research worker identity")
+-        sessions.setdefault(match[1], []).append(row)
++        sessions.setdefault(session, []).append(row)
+     require(len(sessions) <= MAX_TOTAL_WORKERS, "More than four native worker sessions")
+     for rows_for_session in sessions.values():
+         require(len(rows_for_session) <= 2, "More than the launcher/Python pair for one session")

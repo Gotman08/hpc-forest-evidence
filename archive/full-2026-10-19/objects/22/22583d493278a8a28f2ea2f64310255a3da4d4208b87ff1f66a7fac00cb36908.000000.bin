@@ -1,0 +1,103 @@
+set -euo pipefail
+[[ ${SLURM_JOB_ID:-} =~ ^[0-9]+$ ]] || exit 70
+[[ ${SLURM_JOB_NUM_NODES:-} == 1 && ${SLURM_NTASKS:-} == 1 && ${SLURM_CPUS_PER_TASK:-} == 4 && ${SLURM_MEM_PER_NODE:-} == 16384 ]] || exit 71
+[[ ${SLURM_RESTART_COUNT:-0} == 0 ]] || exit 72
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4
+srun --nodes=1 --ntasks=1 --cpus-per-task=4 --mem=16G --cpu-bind=cores --time=03:00:00 /scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python -I -B -u - <<'ASTRA_MAX_R2B_PREFLIGHT'
+"""Proposed allocated preflight only; this local file has never been executed."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import sys
+import zipfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+SCOPE = "hpc-forest-primes-native-max-r2b"
+SESSION = "979ef61f50d041639c1cd46e1942a3f3"
+SOURCE_SHA = "1a1dde5f1de6b3e3f062e3984c57c6327f714a7570b41e5734371bcda291e33b"
+PLAN_SHA = "000323615fbb6fd602c3f69d1bcd20b46d22ab631400300f3e9068dcf151fc3f"
+RUNTIME_MANIFEST_SHA = "5ca0ac5e94d9a45f3dac1313d44158a8ec3fc15d791665e57b870d8705fffe9f"
+EXTRACTION = Path("/scratch_p/nimarano/hpc-forest-primes-native-contract-qualification-20261018-r2b-88935dd02ad5/extraction")
+NATIVE_ROOT = Path("/scratch_p/nimarano/hpc-forest-primes-native-max-r2b-979ef61f50d041639c1cd46e1942a3f3")
+ADMISSION_ROOT = Path("/scratch_p/nimarano/hpc-forest-primes-native-max-r2b-admission-979ef61f50d041639c1cd46e1942a3f3")
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+SPACK_GCC = "/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"
+DEADLINE = datetime(2026, 10, 31, 23, tzinfo=UTC)
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# Refuse before Spack, native imports, directory creation, mailbox or model calls.
+env = os.environ
+require(platform.system() == "Linux" and platform.machine().lower() in {"aarch64", "arm64"}, "Own Linux ARM64 compute allocation required")
+require(re.fullmatch(r"[0-9]+", env.get("SLURM_JOB_ID", "")), "Concrete allocated Slurm job required")
+required = {"SLURM_JOB_NUM_NODES": "1", "SLURM_NTASKS": "1", "SLURM_CPUS_PER_TASK": "4", "SLURM_MEM_PER_NODE": "16384"}
+require(all(env.get(key) == value for key, value in required.items()), "Exact 1-node/1-task/4-CPU/16384-MiB allocation required")
+require(env.get("SLURM_RESTART_COUNT", "0") == "0", "Started native calls must never be replayed")
+require(all(env.get(key, "") in {"", "0"} for key in ("SLURM_GPUS", "SLURM_GPUS_PER_NODE", "SLURM_JOB_GPUS", "SLURM_STEP_GPUS", "CUDA_VISIBLE_DEVICES")), "Zero GPU allocation required")
+require(hasattr(os, "sched_getaffinity"), "Effective affinity must be observable")
+affinity = sorted(os.sched_getaffinity(0))
+require(len(affinity) == 4, "Exactly four effective CPUs required")
+require(datetime.now(UTC) + timedelta(seconds=10800 + 10800) < DEADLINE, "Exclusive deadline cannot fit 3-hour allocation plus 3-hour receipt/audit reserve")
+require(not NATIVE_ROOT.exists() and not NATIVE_ROOT.is_symlink(), "Fresh native root required; preserve any earlier attempt without replay")
+require(Path(sys.executable).resolve() == Path(PYTHON).resolve(), "Exact existing ARM64 Python required")
+source_zip = EXTRACTION / "HPC-Forest-Primes-Natif-MAX-r2b.zip"
+plan_path = EXTRACTION / "native-max-plan.json"
+runtime_manifest = EXTRACTION / "runtime-manifest-r2max.json"
+for path, expected in ((source_zip, SOURCE_SHA), (plan_path, PLAN_SHA), (runtime_manifest, RUNTIME_MANIFEST_SHA)):
+    require(path.is_file() and not path.is_symlink() and sha(path) == expected, "Changed deployed r2b artifact: " + path.name)
+project = EXTRACTION / "HPC-Forest"
+require(project.is_dir() and not project.is_symlink(), "Existing deployed project required")
+expected_files = json.loads(runtime_manifest.read_bytes())
+require(len(expected_files) == 103, "Exact 103-member deployed source required")
+local = {p.relative_to(project).as_posix(): p for p in project.rglob("*") if p.is_file() and not any(part in {"__pycache__", ".ruff_cache", ".pytest_cache"} for part in p.relative_to(project).parts)}
+require(set(local) == set(expected_files) and all(not p.is_symlink() and sha(p) == expected_files[name] for name, p in local.items()), "Deployed source membership or bytes changed")
+with zipfile.ZipFile(source_zip) as archive:
+    names = archive.namelist()
+    require(len(names) == len(set(names)) == 103, "Source ZIP membership changed")
+    require(all(name.startswith("HPC-Forest/") and name.removeprefix("HPC-Forest/") in local and archive.read(name) == local[name.removeprefix("HPC-Forest/")].read_bytes() for name in names), "Deployed source differs from exact r2b ZIP")
+plan = json.loads(plan_path.read_bytes())
+require(plan.get("scope_id") == SCOPE and plan.get("source_zip_sha256") == SOURCE_SHA and plan.get("cells", {}).get("gpt-6-astra") == SESSION and plan.get("maximum_cells_per_authorization") == 1 and plan.get("efforts") == ["max"] and plan.get("automatic_extension") is False, "Exact Astra MAX selected-cell plan required")
+sys.path.insert(0, str(project / "src"))
+from hpc_forest.native_r2max import allocation_guard, verify_runtime
+
+allocation = allocation_guard()
+verify_runtime(source_zip)
+# Only this exact new admission directory is created, after all allocated/source guards.
+# The native result root stays absent until the sealed runner admits its authorization.
+require(not NATIVE_ROOT.exists() and not NATIVE_ROOT.is_symlink(), "Native root must remain absent before wait")
+require(ADMISSION_ROOT.parent == Path("/scratch_p/nimarano") and ADMISSION_ROOT.name == "hpc-forest-primes-native-max-r2b-admission-" + SESSION, "Exact owned admission path required")
+require(not ADMISSION_ROOT.exists() and not ADMISSION_ROOT.is_symlink(), "Admission path must be fresh; never reuse/replay")
+ADMISSION_ROOT.mkdir(mode=0o700, exist_ok=False)
+marker = {"schema": "hpc-forest-astra-max-allocation-ready-v1", "verified": True, "scope_id": SCOPE,
+          "model": "gpt-6-astra", "effort": "max", "session_id": SESSION, "job_id": allocation["job_id"],
+          "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+          "preparation_manifest_sha256": "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd",
+          "allocation": allocation, "native_root": str(NATIVE_ROOT), "admission_root": str(ADMISSION_ROOT),
+          "native_root_absent_before_wait": True, "native_model_calls": 0, "source_files_verified": 103,
+          "authorization_still_required": True, "utc": datetime.now(UTC).isoformat()}
+with (ADMISSION_ROOT / "allocation-ready.json").open("x", encoding="utf8") as marker_stream:
+    json.dump(marker, marker_stream, sort_keys=True)
+    marker_stream.flush()
+    os.fsync(marker_stream.fileno())
+print(json.dumps({"schema": "hpc-forest-primes-r2max-native-allocated-preflight-v1", "scope_id": SCOPE, "session_id": SESSION, "model": "gpt-6-astra", "effort": "max", "mother_model": "gpt-6-astra", "mother_effort": "max", "allocation": allocation, "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA, "source_files_verified": 103, "qualification_job_not_replayed": "752087", "spack_gcc_existing_hash": SPACK_GCC, "native_model_calls_before_wait": 0, "authorization_still_required": True, "utc": datetime.now(UTC).isoformat()}), flush=True)
+WAIT_ARGV = ['/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python', '-I', '-B', '-u', '/scratch_p/nimarano/hpc-forest-primes-native-contract-qualification-20261018-r2b-88935dd02ad5/extraction/HPC-Forest/examples/marathon22/wait_r2max_authorization.py', '--root', '/scratch_p/nimarano/hpc-forest-primes-native-max-r2b-979ef61f50d041639c1cd46e1942a3f3', '--authorization', '/scratch_p/nimarano/hpc-forest-primes-native-max-r2b-admission-979ef61f50d041639c1cd46e1942a3f3/authorization.json', '--authorization-ready', '/scratch_p/nimarano/hpc-forest-primes-native-max-r2b-admission-979ef61f50d041639c1cd46e1942a3f3/authorization-ready.json', '--wait-seconds', '600']
+# Load only an existing GCC after all allocation/source guards. No installation.
+command = "set -euo pipefail\nromeo_load_armgpu_env\nspack load " + shlex.quote(SPACK_GCC) + "\nexec " + shlex.join(WAIT_ARGV)
+child = {**env, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1", "OMP_NUM_THREADS": "4", "OMP_DYNAMIC": "FALSE", "OMP_PROC_BIND": "close", "OMP_PLACES": "cores", "CUDA_VISIBLE_DEVICES": ""}
+os.execvpe("/bin/bash", ["/bin/bash", "-lc", command], child)
+
+ASTRA_MAX_R2B_PREFLIGHT

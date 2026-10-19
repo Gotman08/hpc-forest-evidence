@@ -1,0 +1,86 @@
+"""Cross-check the growth snapshots and prepare a concise human-readable receipt."""
+import hashlib
+import json
+import tarfile
+from collections import defaultdict
+from pathlib import Path
+
+BASE=Path(r"C:\Users\nicol\Documents\Codex\2026-10-15\cr")
+OUT=BASE/"outputs/Essai-long-ROMEO"
+data=json.loads((OUT/"donnees-arbres.json").read_text(encoding="utf-8"))
+frames=[json.loads(line) for line in (OUT/"topology-events.jsonl").read_text(encoding="utf-8").splitlines()]
+assert len(frames)==40 and [f["cursor"] for f in frames]==list(range(1,41))
+assert all(b["scored_nodes"]>=a["scored_nodes"] and b["tokens_used"]>=a["tokens_used"] for a,b in zip(frames,frames[1:]))
+last=frames[-1]
+assert last["status"]=="search_complete" and last["trials"]==88 and last["scored_nodes"]==20 and last["max_depth"]==3
+for tree in data["trees"]:
+    snapshot=next(t for t in last["trees"] if t["role"]==tree["role"])
+    assert snapshot["checkpoint_sha256"]==tree["checkpoint_sha256"]
+    assert len(snapshot["nodes"])==len(tree["nodes"])
+    for n in tree["nodes"]:
+        item=next(i for i in snapshot["nodes"] if i["label"]==n["label"])
+        assert item["score"]==n["score"] and item["depth"]==n["depth"] and item["child_count"]==n["children"]
+summary=json.loads((OUT/"qwen2.5-coder-14b-summary.json").read_text(encoding="utf-8"))
+assert summary["package_sha256"]==hashlib.sha256((OUT/"submission.zip").read_bytes()).hexdigest()
+assert summary["complete"] and data["cleanup"]["owned_server_stopped"] and data["cleanup"]["owned_cache_removed"]
+with tarfile.open(OUT/"results-746880.tar.gz") as tar:
+    gpu=json.load(tar.extractfile("results-746880/qwen2.5-coder-14b-gpu-before.json"))
+    residents=[m for m in gpu["models"] if m.get("name")=="qwen2.5-coder:14b" or m.get("model")=="qwen2.5-coder:14b"]
+    assert residents and all(m["size_vram"]>0 for m in residents)
+groups=defaultdict(list)
+for tree in data["trees"]:
+    for t in tree["trials"]:
+        if t["correct"] is True:
+            groups[t["binary"]].append(t["label"])
+receipt={"result_validated":True,"snapshot_count":len(frames),"final_checkpoints_match_snapshots":True,
+         "trial_to_checkpoint_correspondence":True,"score_formula_checked":True,
+         "llm_usage_known":True,"gpu_residency_observed":residents,
+         "valid_candidate_binary_hashes":len(groups),"binary_groups":dict(groups),
+         "confirmation_correct":all(c["outcome"]["correct"] is True for c in data["confirmations"]),
+         "package_sha256":summary["package_sha256"],"cleanup":data["cleanup"]}
+(OUT/"validation.json").write_text(json.dumps(receipt,indent=2,ensure_ascii=False),encoding="utf-8")
+rows="\n".join(f"| {t['role']} | {len(t['trials'])} | {t['candidates']} | {t['rootChildren']} | {t['maxDepth']} |" for t in data["trees"])
+best=next(t for tree in data["trees"] for t in tree["trials"] if t["id"]==data["best"]["experiment_id"])
+confirmed=data["best"]
+text=f'''# Essai long ROMEO : croissance réelle de la forêt
+
+Le job Slurm **746880**, terminé avec le code **0:0** le 15 octobre 2026, a exécuté **88 appels réels** à Qwen2.5-Coder 14B en **4 min 52 s**. Les preuves ont été transférées et contrôlées par SHA-256. L'animation utilise les relations parent/enfant du registre et des checkpoints TreeQuest.
+
+## Résultat structurel
+
+La forêt contient **24 nœuds : 4 racines techniques et 20 nœuds candidats**. Parmi ces derniers, **19 programmes ont passé les tests** ; **A5** a échoué à la compilation et reste une observation de score zéro. **68 propositions supplémentaires étaient des doublons** : elles ont consommé leur essai, sans ajouter de nœud ni de récompense.
+
+| Arbre | Essais | Nœuds candidats | Fils directs de la racine | Profondeur maximale |
+|---|---:|---:|---:|---:|
+{rows}
+
+La racine G possède trois fils : **G1, G2 et G11**. Le chemin **G → G2 → G10 → G13** atteint la profondeur 3, avec des programmes valides à chaque niveau. L'arbre C montre aussi qu'un nœud intermédiaire peut avoir plusieurs fils : **C4 → C14** et **C4 → C18**. La racine est au niveau 0.
+
+Les numéros désignent les essais, pas une numérotation continue des nœuds conservés. G3, par exemple, est absent de l'arbre parce que sa proposition était un doublon.
+
+## Conditions et calculs
+
+La campagne utilise deux cycles, avec douze essais par spécialiste A/B/C et huit intégrations G par cycle : **89 créneaux de recherche**, référence comprise, puis **3 confirmations**. Les limites étaient de 600 000 tokens, 1 200 secondes applicatives et une profondeur maximale de 6. La consommation déclarée est de **287 833 tokens**, sans usage inconnu ni réservation restante.
+
+La politique **TreeQuest 0.3.2 / AB-MCTS-A** est inchangée. Elle a choisi les parents ; aucune branche n'a été ajoutée pour les besoins du dessin. Un candidat mesuré reçoit `q = T0 / (T0 + T)`, avec les moyennes de trois mesures du programme C. Un échec de compilation reçoit zéro ; un doublon ne reçoit pas de nouveau score. La confirmation réévalue les versions existantes et ne modifie pas ces arbres.
+
+Le modèle est `qwen2.5-coder:14b`, digest `9ec8897f747e246e970bc5cfdda85d22f1123dc2e3d34978a010a75968716849`, température 0, contexte 16 384, sortie limitée à 3 072 tokens. Ollama 0.40.4 a tourné sur le nœud ARM **romeo-a058**, dans une allocation de **1 GH200, 4 CPU et 64 Gio**. Le GPU sert à l'inférence ; les candidats C/OpenMP sont évalués sur CPU avec deux threads. Le contrôleur installé a été comparé octet pour octet au wheel déjà validé, sans modification.
+
+## Confirmation et limites
+
+Les trois versions reconstruites en confirmation — référence, G10 et B24 — ont passé les tests indépendants. **{best['label']}** a été retenu : **{confirmed['mean_seconds']*1000:.3f} ms**, contre **{confirmed['reference_seconds']*1000:.3f} ms** pour la référence, soit **{confirmed['improvement_fraction']*100:.2f} %** de réduction sur ce petit benchmark. Ces chiffres ne classent pas globalement les modèles.
+
+Les 19 validations correspondent à **{len(groups)} empreintes binaires différentes** : des commits distincts peuvent produire le même exécutable. Les doublons fréquents limitent donc la nouveauté obtenue avec ce générateur à température zéro. La campagne établit l'élargissement et la descente de la recherche ; elle ne mesure pas une supériorité de H sur U.
+
+## Preuves conservées
+
+- `donnees-arbres.json` : parents, profondeurs, scores, résultats et configuration.
+- `registry-746880.sqlite3` et `topology-events.jsonl` : registre et 40 captures de croissance.
+- `validation.json` : vérifications des checkpoints, scores, compteurs, résidence GPU et paquet final.
+- `animation-browser-verification.json` : relecture contrôlée sur les quatre arbres, sélection, pause, remontée des scores et affichage clair/sombre à 320 et 736 pixels.
+- `results-746880.tar.gz` : archive complète, dépôts Git, propositions et journaux ; SHA-256 `{data['archiveSha256']}`.
+
+Le serveur possédé par ce job a été arrêté et ses poids temporaires retirés. Les anciennes campagnes et leurs animations sont conservées.
+'''
+(OUT/"bilan.md").write_text(text,encoding="utf-8")
+print(json.dumps({"valid":True,"snapshots":len(frames),"valid_binaries":len(groups),"best":best["label"],"gpu_resident_bytes":residents[0]["size_vram"]},indent=2))

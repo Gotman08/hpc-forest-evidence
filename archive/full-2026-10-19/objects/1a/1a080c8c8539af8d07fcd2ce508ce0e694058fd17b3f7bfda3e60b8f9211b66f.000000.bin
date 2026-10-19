@@ -1,0 +1,259 @@
+#include "knn.h"
+#include <omp.h>
+#include <string.h>
+
+typedef struct {
+    float dist;
+    char label;
+    long idx;
+} HeapEntry;
+
+static inline int worse_entry(const HeapEntry *a, const HeapEntry *b) {
+    if (a->dist != b->dist) return a->dist > b->dist;
+    return a->idx > b->idx;
+}
+
+static inline void swap_entries(HeapEntry *a, HeapEntry *b) {
+    HeapEntry t = *a; *a = *b; *b = t;
+}
+
+static inline void sift_up(HeapEntry *heap, int pos) {
+    while (pos > 0) {
+        int parent = (pos - 1) / 2;
+        if (worse_entry(&heap[pos], &heap[parent])) {
+            swap_entries(&heap[pos], &heap[parent]);
+            pos = parent;
+        } else break;
+    }
+}
+
+static inline void sift_down(HeapEntry *heap, int start, int end) {
+    int root = start;
+    while (1) {
+        int child = 2 * root + 1;
+        if (child > end) break;
+        int right = child + 1;
+        if (right <= end && worse_entry(&heap[right], &heap[child])) child = right;
+        if (worse_entry(&heap[root], &heap[child])) {
+            swap_entries(&heap[root], &heap[child]);
+            root = child;
+        } else break;
+    }
+}
+
+static int compare_candidates(const void *a, const void *b) {
+    const HeapEntry *ca = (const HeapEntry *)a;
+    const HeapEntry *cb = (const HeapEntry *)b;
+    if (ca->dist < cb->dist) return -1;
+    if (ca->dist > cb->dist) return 1;
+    if (ca->idx < cb->idx) return -1;
+    if (ca->idx > cb->idx) return 1;
+    return 0;
+}
+
+char knn(Dataset *ds, int k, Point to_evaluate) {
+    long total = ds->n;
+    float px = to_evaluate.x;
+    float py = to_evaluate.y;
+
+    // Allocate aligned distances array
+    float *dists = NULL;
+    if (posix_memalign((void **)&dists, 64, total * sizeof(float)) != 0) {
+        on_error();
+    }
+
+    // Compute all squared distances in parallel with SIMD
+    #pragma omp parallel for simd schedule(static) aligned(ds->xs, ds->ys, dists: 64)
+    for (long p = 0; p < total; ++p) {
+        float dx = ds->xs[p] - px;
+        float dy = ds->ys[p] - py;
+        dists[p] = dx * dx + dy * dy;
+    }
+
+    int nt = omp_get_max_threads();
+    HeapEntry **local_heaps = (HeapEntry **)malloc(sizeof(HeapEntry *) * nt);
+    int *local_sizes = (int *)calloc(nt, sizeof(int));
+    if (!local_heaps || !local_sizes) on_error();
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        HeapEntry *heap = (HeapEntry *)malloc(sizeof(HeapEntry) * k);
+        if (!heap) on_error();
+        int heap_size = 0;
+
+        #pragma omp for schedule(static)
+        for (long p = 0; p < total; ++p) {
+            float d = dists[p];
+            HeapEntry e;
+            e.dist = d;
+            e.label = ds->labels[p];
+            e.idx = p;
+
+            if (heap_size < k) {
+                heap[heap_size++] = e;
+                sift_up(heap, heap_size - 1);
+            } else {
+                if (!worse_entry(&e, &heap[0])) {
+                    heap[0] = e;
+                    sift_down(heap, 0, k - 1);
+                }
+            }
+        }
+
+        local_heaps[tid] = heap;
+        local_sizes[tid] = heap_size;
+    }
+
+    // Merge all candidates
+    long total_cand = 0;
+    for (int t = 0; t < nt; ++t) total_cand += local_sizes[t];
+
+    HeapEntry *cands = (HeapEntry *)malloc(sizeof(HeapEntry) * total_cand);
+    if (!cands) on_error();
+    long pos = 0;
+    for (int t = 0; t < nt; ++t) {
+        memcpy(cands + pos, local_heaps[t], sizeof(HeapEntry) * local_sizes[t]);
+        pos += local_sizes[t];
+        free(local_heaps[t]);
+    }
+    free(local_heaps);
+    free(local_sizes);
+
+    qsort(cands, total_cand, sizeof(HeapEntry), compare_candidates);
+
+    // Build final label array of size k
+    char *labels = (char *)malloc(sizeof(char) * k);
+    if (!labels) on_error();
+    long take = total_cand < k ? total_cand : k;
+    for (long i = 0; i < take; ++i) {
+        labels[i] = cands[i].label;
+    }
+    for (int i = (int)take; i < k; ++i) {
+        labels[i] = -1;
+    }
+
+    free(cands);
+    free(dists);
+
+    // Count frequencies
+    int counts[256] = {0};
+    for (int i = 0; i < k; ++i) {
+        unsigned char c = (unsigned char)labels[i];
+        counts[c]++;
+    }
+    free(labels);
+
+    int best_count = -1;
+    char best_label = 0;
+    for (int c = 0; c < 256; ++c) {
+        if (counts[c] > best_count) {
+            best_count = counts[c];
+            best_label = (char)c;
+        }
+    }
+
+    return best_label;
+}
+
+// Parsing functions
+
+void on_error() {
+    printf("Invalid input file.\n");
+    exit(1);
+}
+
+int parse_number_of_groups() {
+    int n;
+    if (scanf(" n_groups=%d ", &n) != 1) on_error();
+    return n;
+}
+
+Point parse_point() {
+    float x, y;
+    if (scanf(" (%f ,%f) ", &x, &y) != 2) on_error();
+    Point point;
+    point.x = x;
+    point.y = y;
+    return point;
+}
+
+int parse_k() {
+    int k;
+    if (scanf(" k=%d ", &k) != 1) on_error();
+    return k;
+}
+
+static void *aligned_realloc(void *ptr, size_t old_size, size_t new_size) {
+    void *new_ptr = NULL;
+    if (posix_memalign(&new_ptr, 64, new_size) != 0) return NULL;
+    memcpy(new_ptr, ptr, old_size);
+    free(ptr);
+    return new_ptr;
+}
+
+Dataset *parse_dataset() {
+    int n_groups = parse_number_of_groups();
+
+    long capacity = 1024;
+    float *xs = NULL;
+    float *ys = NULL;
+    char *labels = NULL;
+
+    if (posix_memalign((void **)&xs, 64, capacity * sizeof(float)) != 0) on_error();
+    if (posix_memalign((void **)&ys, 64, capacity * sizeof(float)) != 0) on_error();
+    labels = (char *)malloc(capacity);
+    if (!labels) on_error();
+
+    long n = 0;
+
+    for (int gi = 0; gi < n_groups; ++gi) {
+        char label;
+        int length;
+        if (scanf(" label=%c ", &label) != 1) on_error();
+        if (scanf(" length=%d ", &length) != 1) on_error();
+
+        for (int j = 0; j < length; ++j) {
+            Point p = parse_point();
+            if (n == capacity) {
+                long new_capacity = capacity * 2;
+                float *new_xs = aligned_realloc(xs, capacity * sizeof(float), new_capacity * sizeof(float));
+                if (!new_xs) on_error();
+                xs = new_xs;
+                float *new_ys = aligned_realloc(ys, capacity * sizeof(float), new_capacity * sizeof(float));
+                if (!new_ys) on_error();
+                ys = new_ys;
+                char *new_labels = realloc(labels, new_capacity);
+                if (!new_labels) on_error();
+                labels = new_labels;
+                capacity = new_capacity;
+            }
+            xs[n] = p.x;
+            ys[n] = p.y;
+            labels[n] = label;
+            ++n;
+        }
+    }
+
+    Dataset *ds = (Dataset *)malloc(sizeof(Dataset));
+    if (!ds) on_error();
+    ds->xs = xs;
+    ds->ys = ys;
+    ds->labels = labels;
+    ds->n = n;
+    return ds;
+}
+
+int main() {
+    Dataset *ds = parse_dataset();
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(ds, k, to_evaluate));
+
+    free(ds->xs);
+    free(ds->ys);
+    free(ds->labels);
+    free(ds);
+    return 0;
+}

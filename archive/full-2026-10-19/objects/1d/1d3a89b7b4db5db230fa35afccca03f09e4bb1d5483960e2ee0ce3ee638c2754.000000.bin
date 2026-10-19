@@ -1,0 +1,89 @@
+#include <cstdio>
+#include <vector>
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+#include <omp.h>
+
+static inline int read_int() {
+    int x = 0;
+    char c = getchar_unlocked();
+    while (c <= ' ') c = getchar_unlocked();
+    bool neg = false;
+    if (c == '-') { neg = true; c = getchar_unlocked(); }
+    do {
+        x = x * 10 + (c - '0');
+        c = getchar_unlocked();
+    } while (c > ' ');
+    return neg ? -x : x;
+}
+
+int main() {
+    int n = read_int();
+    int s = read_int();
+
+    const int stride = n + 1;
+    std::vector<int64_t> ps(stride * stride, 0);
+
+    // Single-pass integral image construction (source B)
+    for (int i = 0; i < n; ++i) {
+        long long row_sum = 0;
+        const int base_i   = (i + 1) * stride;
+        const int base_im1 = i * stride;
+        #pragma ivdep
+        for (int j = 0; j < n; ++j) {
+            int val = read_int();
+            row_sum += val;
+            ps[base_i + (j + 1)] = ps[base_im1 + (j + 1)] + row_sum;
+        }
+    }
+
+    const int limit = n - s;          // inclusive upper bound for start indices
+    if (limit < 0) { printf("0\n"); return 0; }   // safety, though problem guarantees S<N
+
+    int64_t mxSum = LLONG_MIN;
+    const int B = 64;                 // block size from source A
+
+    #pragma omp parallel for reduction(max:mxSum) schedule(static) if(n > 1000)
+    for (int ii = 0; ii <= limit; ii += B) {
+        const int i_end = std::min(ii + B, limit + 1);
+        for (int jj = 0; jj <= limit; jj += B) {
+            const int j_end = std::min(jj + B, limit + 1);
+            #pragma ivdep
+            for (int i = ii; i < i_end; ++i) {
+                const int64_t * __restrict__ row_i_s = &ps[(i + s) * stride];
+                const int64_t * __restrict__ row_i   = &ps[i * stride];
+                int j = jj;
+#ifdef __ARM_NEON
+                // NEON vectorisation from source B: process two columns at once
+                for (; j + 1 < j_end; j += 2) {
+                    const int64x2_t v_a = vld1q_s64(&row_i_s[j + s]);
+                    const int64x2_t v_b = vld1q_s64(&row_i[j + s]);
+                    const int64x2_t v_c = vld1q_s64(&row_i_s[j]);
+                    const int64x2_t v_d = vld1q_s64(&row_i[j]);
+                    int64x2_t sum = vsubq_s64(v_a, v_b);
+                    sum = vsubq_s64(sum, v_c);
+                    sum = vaddq_s64(sum, v_d);
+                    const int64_t s0 = vgetq_lane_s64(sum, 0);
+                    const int64_t s1 = vgetq_lane_s64(sum, 1);
+                    if (s0 > mxSum) mxSum = s0;
+                    if (s1 > mxSum) mxSum = s1;
+                }
+#endif
+                // Scalar fallback for remaining columns
+                #pragma ivdep
+                for (; j < j_end; ++j) {
+                    const int64_t sum_val = row_i_s[j + s] - row_i[j + s]
+                                          - row_i_s[j] + row_i[j];
+                    if (sum_val > mxSum) mxSum = sum_val;
+                }
+            }
+        }
+    }
+
+    printf("%d\n", static_cast<int>(mxSum));
+    return 0;
+}

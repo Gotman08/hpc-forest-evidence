@@ -1,0 +1,179 @@
+/*
+    This program solves Laplace's equation on a regular 2D grid using simple Jacobi iteration.
+
+    The stencil calculation stops when  ( err >= CONV_THRESHOLD OR  iter > ITER_MAX )
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
+
+#define CONV_THRESHOLD 1.0e-5f // threshold of convergence
+
+// matrix to be solved
+double **grid;
+
+// auxiliary matrix
+double **new_grid;
+
+// size of each side of the grid
+int size;
+int iter_max_num;
+
+// return the absolute value of a number
+double absolute(double num){
+    if(num < 0)
+        return -1.0 * num;
+    return num;
+}
+
+
+// allocate memory for the grid
+void allocate_memory(){
+    grid = (double **) malloc(size * sizeof(double *));
+    new_grid = (double **) malloc(size * sizeof(double *));
+
+    for(int i = 0; i < size; i++){
+        grid[i] = (double *) malloc(size * sizeof(double));
+        new_grid[i] = (double *) malloc(size * sizeof(double));
+    }
+}
+
+// initialize the grid
+void initialize_grid(){
+    int center = size / 2;
+    int linf = center - (size / 10);
+    int lsup = center + (size / 10);
+    for (int i = 0; i < size; i++){
+        for (int j = 0; j < size; j++){
+            // inicializa região de calor no centro do grid
+            if ( i >= linf && i <= lsup && j >= linf && j <= lsup)
+                grid[i][j] = 100;
+            else
+                grid[i][j] = 0;
+            // Both buffers retain the fixed boundary values when their roles change.
+            new_grid[i][j] = grid[i][j];
+        }
+    }
+}
+
+// save the grid in a file
+void save_grid(){
+
+    for(int i = 0; i < size; i++){
+        for(int j = 0; j < size; j++){
+            fprintf(stdout, "%lf ", grid[i][j]);
+        }
+        fprintf(stdout, "\n");
+    }
+}
+
+int main(int argc, char *argv[]){
+
+    fscanf(stdin, "%d", &size);
+    fscanf(stdin, "%d", &iter_max_num);
+    
+    int hasError = 1;
+    int iter = 0;
+
+    struct timeval time_start;
+    struct timeval time_end;
+
+    // Track cells that could be nonzero, beginning with the initialized heat patch.
+    int center = size / 2;
+    int active_min_i = center - (size / 10);
+    int active_max_i = center + (size / 10);
+    int active_min_j = center - (size / 10);
+    int active_max_j = center + (size / 10);
+    int work_min_i, work_max_i, work_min_j, work_max_j;
+    int full_sweep = 0;
+
+    // allocate memory to the grid (matrix)
+    allocate_memory();
+
+    // set grid initial conditions
+    initialize_grid();
+
+    //printf("Jacobi relaxation calculation: %d x %d grid\n", size, size);
+
+    // get the start time
+    //gettimeofday(&time_start, NULL);
+
+    // A conservative active box grows by one cell per iteration. Once it covers
+    // most of the grid, use full sweeps to avoid maintaining a small-region path.
+    // A single persistent team avoids creating a new team for each iteration.
+    #pragma omp parallel if(size >= 128)
+    {
+        while ( hasError && iter < iter_max_num ) {
+
+            #pragma omp single
+            {
+                hasError = 0;
+
+                if (!full_sweep) {
+                    if (active_min_i > 0) active_min_i--;
+                    if (active_min_j > 0) active_min_j--;
+                    if (active_max_i < size - 1) active_max_i++;
+                    if (active_max_j < size - 1) active_max_j++;
+
+                    long long active_height = (long long)(active_max_i - active_min_i + 1);
+                    long long active_width = (long long)(active_max_j - active_min_j + 1);
+                    long long active_cells = active_height * active_width;
+                    long long total_cells = (long long)size * (long long)size;
+                    long long full_threshold = total_cells - total_cells / 4;
+
+                    if (active_cells >= full_threshold) {
+                        full_sweep = 1;
+                        active_min_i = 0;
+                        active_min_j = 0;
+                        active_max_i = size - 1;
+                        active_max_j = size - 1;
+                    }
+                }
+
+                work_min_i = active_min_i > 1 ? active_min_i : 1;
+                work_min_j = active_min_j > 1 ? active_min_j : 1;
+                work_max_i = active_max_i < size - 2 ? active_max_i : size - 2;
+                work_max_j = active_max_j < size - 2 ? active_max_j : size - 2;
+            }
+
+            // Cells outside the expanded box have only zero-valued neighbors,
+            // so their update and convergence contribution are both zero.
+            #pragma omp for collapse(2) schedule(static) reduction(|:hasError)
+            for (int i = work_min_i; i <= work_max_i; i++) {
+                for (int j = work_min_j; j <= work_max_j; j++) {
+                    new_grid[i][j] = 0.25 * (grid[i][j+1] + grid[i][j-1] +
+                                             grid[i-1][j] + grid[i+1][j]);
+
+                    double errorCurrent = absolute(new_grid[i][j] - grid[i][j]);
+                    if (errorCurrent > CONV_THRESHOLD) {
+                        hasError = 1;
+                    }
+                }
+            }
+
+            // Every active interior cell was just overwritten; swapping buffers
+            // avoids a separate full-grid copy while leaving boundaries fixed.
+            #pragma omp single
+            {
+                double **temp_grid = grid;
+                grid = new_grid;
+                new_grid = temp_grid;
+                iter++;
+            }
+        }
+    }
+
+    // get the end time
+    //gettimeofday(&time_end, NULL);
+
+    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +
+    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;
+
+    //save the final grid in file
+    save_grid();
+
+    //printf("\nKernel executed in %lf seconds with %d iterations.\n", exec_time, iter);
+
+    return 0;
+}

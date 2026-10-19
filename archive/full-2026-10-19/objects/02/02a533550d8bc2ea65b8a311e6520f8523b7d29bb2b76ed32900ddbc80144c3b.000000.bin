@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include \"knn.h\"\n#include <stdint.h>\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\nstatic inline unsigned first_set_lane(uint32_t mask) {\n#if defined(__GNUC__) || defined(__clang__)\n    return (unsigned) __builtin_ctz((unsigned int) mask);\n#else\n    unsigned lane = 0;\n    while ((mask & UINT32_C(1)) == 0) {\n        mask >>= 1;\n        lane++;\n    }\n    return lane;\n#endif\n}\n\nchar knn(int n_groups, Group * groups, int k, Point to_evaluate) {\n    char * labels = (char *) malloc(sizeof(char) * k);\n    float * distances = (float *) malloc(sizeof(float) * k);\n\n    enum {\n        DISTANCE_BLOCK_SIZE = 256,\n        CANDIDATE_WORD_BITS = 32,\n        CANDIDATE_WORD_COUNT =\n            (DISTANCE_BLOCK_SIZE + CANDIDATE_WORD_BITS - 1) / CANDIDATE_WORD_BITS\n    };\n    float block_distances[DISTANCE_BLOCK_SIZE];\n    uint32_t candidate_masks[CANDIDATE_WORD_COUNT];\n    int i, j, x, y;\n\n    for (i = 0; i < k; i++) {\n        labels[i] = -1;\n        distances[i] = -1;\n    }\n\n    for (i = 0; i < n_groups; i++) {\n        Group g = groups[i];\n\n        for (j = 0; j < g.length;) {\n            int count = g.length - j;\n            if (count > DISTANCE_BLOCK_SIZE) {\n                count = DISTANCE_BLOCK_SIZE;\n            }\n\n            const Point * points = g.points + j;\n            const float cutoff = distances[k - 1];\n            const int have_cutoff = cutoff != -1.0f;\n            const int mask_count =\n                (count + CANDIDATE_WORD_BITS - 1) / CANDIDATE_WORD_BITS;\n\n            /* Keep the floating-point loop independent of mask reductions. */\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC ivdep\n#endif\n            for (int lane = 0; lane < count; lane++) {\n                block_distances[lane] =\n                    euclidean_distance_no_sqrt(to_evaluate, points[lane]);\n            }\n\n            for (int word = 0; word < mask_count; word++) {\n                const int first = word * CANDIDATE_WORD_BITS;\n                int lanes = count - first;\n                if (lanes > CANDIDATE_WORD_BITS) {\n                    lanes = CANDIDATE_WORD_BITS;\n                }\n\n                uint32_t mask = 0;\n                if (!have_cutoff) {\n                    mask = UINT32_MAX >> (CANDIDATE_WORD_BITS - lanes);\n                } else {\n                    int lane = 0;\n#if defined(__aarch64__) && defined(__ARM_NEON)\n                    const float32x4_t threshold = vdupq_n_f32(cutoff);\n                    uint32x4_t packed = vdupq_n_u32(0);\n                    uint32x4_t lane_bits = {\n                        UINT32_C(1), UINT32_C(2),\n                        UINT32_C(4), UINT32_C(8)\n                    };\n\n                    for (; lane + 4 <= lanes; lane += 4) {\n                        const float32x4_t d =\n                            vld1q_f32(block_distances + first + lane);\n                        const uint32x4_t retain =\n                            vmvnq_u32(vcgeq_f32(d, threshold));\n                        packed = vorrq_u32(packed,\n                                           vandq_u32(retain, lane_bits));\n                        lane_bits = vshlq_n_u32(lane_bits, 4);\n                    }\n\n                    /* Vector lanes own disjoint bits, so addition equals OR. */\n                    mask = vaddvq_u32(packed);\n#endif\n                    for (; lane < lanes; lane++) {\n                        const float d = block_distances[first + lane];\n                        mask |= (uint32_t) (!(d >= cutoff)) << lane;\n                    }\n                }\n\n                candidate_masks[word] = mask;\n            }\n\n            /* Ascending set bits preserve stable input-order insertion. */\n            for (int word = 0; word < mask_count; word++) {\n                uint32_t remaining = candidate_masks[word];\n                while (remaining != 0) {\n                    int lane = (int) first_set_lane(remaining);\n                    int b = word * CANDIDATE_WORD_BITS + lane;\n                    remaining &= remaining - UINT32_C(1);\n\n                    float d = block_distances[b];\n                    if (d == -1.0f) {\n                        continue;\n                    }\n\n                    float current_cutoff = distances[k - 1];\n                    if (current_cutoff != -1.0f && d >= current_cutoff) {\n                        continue;\n                    }\n\n                    for (x = 0; x < k; x++) {\n                        if (d < distances[x] || distances[x] == -1) {\n                            for (y = k - 1; y > x; y--) {\n                                distances[y] = distances[y - 1];\n                                labels[y] = labels[y - 1];\n                            }\n\n                            distances[x] = d;\n                            labels[x] = g.label;\n\n                            break;\n                        }\n                    }\n                }\n            }\n\n            j += count;\n        }\n    }\n\n    qsort(labels, k, sizeof(char), compare_for_sort);\n\n    char most_frequent = labels[0];\n    int most_frequent_count = 1;\n    int current_frequency = 1;\n\n    for (i = 1; i < k; i++) {\n        if (labels[i] != labels[i - 1]) {\n            if (current_frequency > most_frequent_count) {\n                most_frequent = labels[i - 1];\n                most_frequent_count = current_frequency;\n            }\n\n            current_frequency = 1;\n        } else {\n            current_frequency++;\n        }\n\n        if (i == k - 1 && current_frequency > most_frequent_count) {\n            most_frequent = labels[i - 1];\n            most_frequent_count = current_frequency;\n        }\n    }\n\n\n    return most_frequent;\n}\n\nint main() {\n    int n_groups = parse_number_of_groups();\n    \n    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);\n\n    for (int i = 0; i < n_groups; i++) {\n        groups[i] = parse_next_group();\n    }\n\n    int k = parse_k();\n\n    Point to_evaluate = parse_point();\n\n    printf(\"%c\", knn(n_groups, groups, k, to_evaluate));\n}\n",
+        "path": "src/knn.c"
+      }
+    ],
+    "hypothesis": "Separating distance evaluation from mask reduction should expose straightforward SIMD arithmetic; ARM64 NEON can then pack cutoff comparisons without per-point variable shifts.",
+    "notes": "Preserves distance expressions, unordered comparisons, stable insertion, parsing and voting. Includes scalar tails and a non-ARM fallback. Not executed locally.",
+    "sources_kept": [],
+    "transformations": [
+      "Move independent distance calculations into a dedicated vectorizable loop.",
+      "Pack ARM64 comparisons using NEON lane weights and one horizontal reduction per mask word.",
+      "Generate complete masks directly when no cutoff exists."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "ffae91007c4a429c8b7c43bd00092490",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "cb249d3a7bee7cdc5f10d7228ba9d82ef2fe1a6c2a45c3f19468971d1ce15880",
+  "session_id": "c43035f2c991479c811228cc4db0a141",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "3399c60308b1045ec495d82ef1cbac04472c2aff52b724d07337910d93e65e45",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 16052,
+        "output_tokens": 7203,
+        "reasoning_output_tokens": 5417
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 23255,
+    "tool_events": []
+  }
+}

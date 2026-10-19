@@ -1,0 +1,276 @@
+"""Neutral data/selection tests only: no CLI, worker, C, RPC, or shell execution."""
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import importlib.util
+import json
+import sys
+import tarfile
+import types
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location('neutral_' + name, HERE / (name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+cells = load('cell_selection')
+factory = load('assemble_admissions')
+worker = load('bootstrap_worker')
+stage = load('remote_stage')
+publication = load('publication')
+
+
+@pytest.mark.parametrize('model', cells.MODELS)
+@pytest.mark.parametrize('phase', cells.PHASES)
+def test_exact_nine_plan_cells(model, phase):
+    pins = json.loads((HERE / 'pins-source-plan.json').read_text(encoding='utf8'))
+    plan_path = Path(pins['plan']['path'])
+    assert hashlib.sha256(plan_path.read_bytes()).hexdigest() == factory.PLAN
+    plan = json.loads(plan_path.read_text(encoding='utf8'))
+    assert cells.select(model, phase, session_id=plan['contract_cells'][model][phase]) == cells.CELLS[model][phase]
+
+
+@pytest.mark.parametrize('bad', ['gpt-6-luna', 'sol', 'gpt-6-sol', 'gpt-5.6-sol', 'GPT-6-ASTRA', '', None])
+def test_unknown_or_luna_model_refused(bad):
+    with pytest.raises(ValueError):
+        cells.select(bad, 'roots')
+
+
+@pytest.mark.parametrize('effort', ['high', 'medium', 'MAX', '', None])
+def test_max_only(effort):
+    with pytest.raises(ValueError):
+        cells.select(cells.MODELS[0], 'roots', effort=effort)
+
+
+@pytest.mark.parametrize('phase', ['pilot', 'extension', 'Roots', ''])
+def test_no_pilot_or_unknown_phase(phase):
+    with pytest.raises(ValueError):
+        cells.select(cells.MODELS[0], phase)
+
+
+@pytest.mark.parametrize('model', cells.MODELS)
+def test_cross_model_session_refused(model):
+    other = next(m for m in cells.MODELS if m != model)
+    with pytest.raises(ValueError):
+        cells.select(model, 'roots', session_id=cells.CELLS[other]['roots'])
+    with pytest.raises(ValueError):
+        cells.select(model, 'roots', session_id='97f7a5e17d13486ebed5b4f109aea093')
+
+
+@pytest.mark.parametrize('job', sorted(cells.BEGUN_JOBS) + ['', 752306, 'JOB'])
+def test_started_or_guessed_job_refused(job):
+    with pytest.raises(ValueError):
+        cells.select(cells.MODELS[0], 'roots', job_id=job)
+
+
+@pytest.mark.parametrize('count', [1, 2, 3])
+def test_cap4_includes_source_only_and_new_lane(count):
+    assert cells.check_capacity(count) == count
+
+
+@pytest.mark.parametrize('count', [0, 4, 5, -1, True, 1.0])
+def test_fifth_or_missing_so_lane_refused(count):
+    with pytest.raises(ValueError):
+        cells.check_capacity(count)
+
+
+@pytest.mark.parametrize('model', cells.MODELS)
+def test_projection_is_exact_and_effect_free(model, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Projection attempted an execution or cache gate')
+    monkeypatch.setattr(worker, '_execute', forbidden)
+    monkeypatch.setattr(worker, '_read_ref', forbidden)
+    monkeypatch.setattr(Path, 'mkdir', forbidden)
+    session = cells.CELLS[model]['roots']
+    ref = {'path': str(HERE / 'NONEXISTENT-EVIDENCE.json'), 'sha256': 'a' * 64}
+    result = worker.dry_run(model=model, phase='roots', job_id='999999', effort='max',
+        output=HERE / ('worker-' + session), authorization_ref=ref, codex_config_ref=ref, owner_ref=ref)
+    assert result['model'] == model and result['session_id'] == session
+    assert result['verified'] is False and result['generation_admitted'] is False
+    assert result['execution_performed'] is False and result['model_calls'] == 0
+    assert '--once' in result['worker_argv'] and result['worker_argv'][-2:] == ['900', '--once']
+
+
+def test_execute_requires_explicit_flag_before_reading_anything(monkeypatch):
+    monkeypatch.setattr(worker, '_fresh_output', lambda spec: pytest.fail('Effect before explicit execute'))
+    with pytest.raises(worker.BootstrapError):
+        worker._execute({}, execute=False)
+
+
+@pytest.mark.parametrize('phase,rows', [('roots', []), ('advice', [{}]), ('harvest', [{}, {}])])
+def test_phase_gate_no_false_admission(phase, rows):
+    if phase == 'roots':
+        assert factory.check_previous_phases(rows, cells.MODELS[0], phase) is None
+    else:
+        with pytest.raises(ValueError, match='not yet integrated'):
+            factory.check_previous_phases(rows, cells.MODELS[0], phase)
+
+
+@pytest.mark.parametrize('phase,rows', [('roots', [{}]), ('advice', []), ('harvest', [{}])])
+def test_predecessor_gaps_and_extra_refused(phase, rows):
+    with pytest.raises(ValueError):
+        factory.check_previous_phases(rows, cells.MODELS[0], phase)
+
+
+def test_false_template_never_reads_or_writes(monkeypatch):
+    monkeypatch.setattr(factory, 'bootstrap_source', lambda: pytest.fail('False draft crossed evidence gate'))
+    with pytest.raises(ValueError):
+        factory.assemble({'schema': 'hpc-forest-dynamic-r4b-launch-inputs-v1', 'verified': False}, HERE / 'NO-OUTPUT')
+    assert not (HERE / 'NO-OUTPUT').exists()
+
+
+@pytest.fixture
+def frozen_render(monkeypatch):
+    project = Path(json.loads((HERE / 'pins-source-plan.json').read_text(encoding='utf8'))['source_project'])
+    # Execute only this pure function and its literal schema definitions from the
+    # sealed AST; no imports, subprocess, compiler, candidate, or native module.
+    source = ast.parse((project / 'src/hpc_forest/dynamic_mother.py').read_text(encoding='utf8'))
+    wanted = {'object_schema', 'PLAN_SCHEMA', 'ADVICE_SCHEMA', 'HARVEST_SCHEMA', 'TEXT', 'render_meta'}
+    nodes = [n for n in source.body if (isinstance(n, ast.FunctionDef) and n.name in wanted)
+             or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in wanted for t in n.targets))]
+    namespace = {'json': json, 'public_meta_payload': lambda phase, payload: copy.deepcopy(payload), 'InfrastructureError': ValueError}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<sealed-pure-render>', 'exec'), namespace)  # noqa: S102 - pure named AST only
+    mailbox = types.ModuleType('hpc_forest.codex_mailbox')
+    mailbox.PROTOCOL = 'hpc-forest-codex-mailbox-v1'
+    mailbox.TOKEN_CEILING = 196608
+    dynamic = types.ModuleType('hpc_forest.dynamic_mother')
+    dynamic.render_meta = namespace['render_meta']
+    package = types.ModuleType('hpc_forest')
+    monkeypatch.setitem(sys.modules, 'hpc_forest', package)
+    monkeypatch.setitem(sys.modules, 'hpc_forest.codex_mailbox', mailbox)
+    monkeypatch.setitem(sys.modules, 'hpc_forest.dynamic_mother', dynamic)
+    return namespace
+
+
+@pytest.mark.parametrize('model', cells.MODELS)
+@pytest.mark.parametrize('phase', cells.PHASES)
+def test_request_exact_model_phase_schema_and_minimum(model, phase, frozen_render):
+    session = cells.CELLS[model][phase]
+    request = stage.make_request(phase, session, {}, model=model, now=1000, nonce='b' * 32)
+    assert request['model'] == model and request['session_id'] == session and request['reasoning_effort'] == 'max'
+    assert request['expires_at'] == 1600 and request['token_ceiling'] == 196608
+    baseline = frozen_render['render_meta'](phase, stage.neutral_payload(phase, {}))
+    assert request['schema'] == baseline['schema']
+    assert request['messages'][1:] == baseline['messages'][1:]
+    if phase == 'roots':
+        assert request['messages'][0]['content'] == baseline['messages'][0]['content'] + (
+            ' For this synthetic roots interface contract, the directions array must contain '
+            'between 1 and 8 entries inclusive; an empty array is invalid.')
+        assert 'minItems' not in request['schema']['properties']['directions']
+    else:
+        assert request['messages'] == baseline['messages']
+
+
+def test_nine_rendered_commands_are_data_not_submit():
+    commands = json.loads((HERE / 'COMMANDES-PROPOSEES.json').read_text(encoding='utf8'))
+    assert commands['verified'] is False and commands['automatic_loop'] is False
+    assert commands['pilot_admitted'] is False and len(commands['commands']) == 9
+    for model in cells.MODELS:
+        for phase in cells.PHASES:
+            folder = HERE / cells.SLUGS[model] / phase
+            command = (folder / 'commande-allouee.sh').read_text(encoding='utf8')
+            assert command.count('exec srun ') == 1 and '--cpu-bind=cores' in command
+            assert '--model ' + model + ' --effort max --phase ' + phase in command
+            assert '\n' in command and '\\nexec' not in command
+            assert 'sbatch ' not in command and 'codex ' not in command
+            proposal = json.loads((folder / 'job-prepare-propose.json').read_text(encoding='utf8'))
+            template = json.loads((folder / 'factory-input-NON-ADMIS.json').read_text(encoding='utf8'))
+            assert proposal['time_limit'] == '01:00:00' and proposal['cpus_per_task'] == 4
+            assert template['verified'] is False and template['job_id'] is None
+            assert template['session_id'] == cells.CELLS[model][phase]
+    with tarfile.open(HERE / 'native-interface-models-max-r2.tar.gz') as archive:
+        assert {m.name for m in archive.getmembers()} == {'remote_stage.py', 'cell_selection.py', 'stage-manifest.json'}
+        assert all(m.isfile() for m in archive.getmembers())
+        for name in ('remote_stage.py', 'cell_selection.py'):
+            assert archive.extractfile(name).read() == (HERE / name).read_bytes()
+
+
+def test_publication_foreign_cell_refused():
+    model = cells.MODELS[0]
+    cell = {'scope_id': factory.SCOPE, 'source_zip_sha256': factory.SOURCE, 'plan_sha256': factory.PLAN,
+            'model': model, 'effort': 'max', 'session_id': cells.CELLS[cells.MODELS[1]]['roots'],
+            'job_id': '999999', 'remote_root': '/scratch_p/nimarano/foreign'}
+    with pytest.raises(ValueError):
+        publication.validate_cell({'phase': 'roots'}, cell)
+
+
+def test_reader_abi_is_descriptive_and_closed():
+    abi = json.loads((HERE / 'READER-ABI.json').read_text(encoding='utf8'))
+    assert len(set(abi['refs14'])) == 14 and len(set(abi['expected11'])) == 11
+    assert abi['integration_admitted'] is False and abi['reader_source_copy_or_execution_in_this_delivery'] is False
+    assert not (HERE / 'receipt_native.py').exists() and not (HERE / 'receive_phase.py').exists()
+
+def census_fixture():
+    def identity(pid, command):
+        return {'ProcessId': pid, 'ParentProcessId': 100, 'ExecutablePath': 'C:/NEUTRAL/python.exe',
+                'CommandLine': command, 'CreationDate': '2026-10-18T00:00:00.1234567Z'}
+    so = [identity(pid, 'python -m hpc_forest.r2max_worker --session-id 665743a02b824021a697b6a4884a667c')
+          for pid in (37900, 37848)]
+    rows = [*so, {'ProcessId': 0, 'ParentProcessId': 0, 'ExecutablePath': None, 'CommandLine': None, 'CreationDate': None}]
+    closure = {'schema': 'hpc-forest-r2c-owned-main-only-stop-receipt-v1', 'verified': True,
+               'all_three_main_identities_absent': True, 'source_only_identities_preserved': True,
+               'source_only': so, 'actions': [{'identity': identity(pid, 'NEUTRAL closed')} for pid in (1, 2, 3)]}
+    census = {'schema': 'hpc-forest-dynamic-r4b-full-cim-v1', 'complete_census': True, 'strict_utf8_decoding': True,
+              'captured_at_utc': 1000, 'rows': rows, 'rows_count': len(rows), 'other_native_groups': []}
+    return census, closure, identity
+
+
+def test_census_preserves_so_five_fields_and_tolerates_system_nulls():
+    census, closure, _ = census_fixture()
+    so, count = factory.check_census(census, closure, now=1000)
+    assert count == 1 and {r['ProcessId'] for r in so} == {37900, 37848}
+
+
+@pytest.mark.parametrize('fault', ['unknown-worker', 'pid-reuse', 'missing-so', 'future', 'expired'])
+def test_census_faults_remain_closed(fault):
+    census, closure, identity = census_fixture()
+    if fault == 'unknown-worker':
+        census['rows'].append(identity(999, 'python -m hpc_forest.codex_worker --session-id unknown'))
+        census['rows_count'] += 1
+    elif fault == 'pid-reuse':
+        census['rows'][0] = {**census['rows'][0], 'CreationDate': '2026-10-18T00:00:01Z'}
+    elif fault == 'missing-so':
+        census['rows'].pop(0)
+        census['rows_count'] -= 1
+    elif fault == 'future':
+        census['captured_at_utc'] = 1001
+    else:
+        census['captured_at_utc'] = 879
+    with pytest.raises(ValueError):
+        factory.check_census(census, closure, now=1000)
+
+
+@pytest.mark.parametrize('groups', [1, 2])
+def test_census_counts_actual_admitted_pairs_once(groups, tmp_path, monkeypatch):
+    census, closure, identity = census_fixture()
+    mock_admission = types.SimpleNamespace(validate_authorization=lambda *args: None)
+    monkeypatch.setattr(factory, 'bootstrap_source', lambda: ({}, mock_admission))
+    for index in range(groups):
+        model = cells.MODELS[index]
+        session = cells.CELLS[model]['roots']
+        job = str(999990 + index)
+        command = str(HERE / 'bootstrap_worker.py') + ' --model ' + model + ' --session-id ' + session
+        pair = [identity(9000 + index * 2 + i, command) for i in range(2)]
+        auth = {'verified': True, 'scope_id': factory.SCOPE, 'source_zip_sha256': factory.SOURCE,
+                'plan_sha256': factory.PLAN, 'model': model, 'effort': 'max', 'session_id': session, 'job_id': job,
+                'remote_root': '/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-' + session,
+                'purpose': 'technical-contract', 'technical_phase': 'roots', 'NEUTRAL_FIXTURE_ONLY': True}
+        path = tmp_path / (model + '.json')
+        path.write_text(json.dumps(auth), encoding='utf8')
+        census['rows'].extend(pair)
+        census['rows_count'] += 2
+        census['other_native_groups'].append({'model': model, 'phase': 'roots', 'session_id': session,
+            'job_id': job, 'full_identities': pair, 'authorization': factory.reference(path)})
+    assert factory.check_census(census, closure, now=1000)[1] == 1 + groups
+    with pytest.raises(ValueError, match='Started or duplicate'):
+        factory.check_census(census, closure, now=1000, selected_session=cells.CELLS[cells.MODELS[0]]['roots'])

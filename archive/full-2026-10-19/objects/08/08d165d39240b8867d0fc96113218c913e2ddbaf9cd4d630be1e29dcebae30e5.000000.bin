@@ -1,0 +1,207 @@
+"""Freeze a fresh matched comparison; no old candidate or operator algorithm is imported."""
+from __future__ import annotations
+
+import datetime as dt
+import difflib
+import hashlib
+import json
+import shlex
+import shutil
+import tarfile
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+WORKSPACE = OUT.parents[2]
+PROJECT = WORKSPACE / "work/marathon-gpt61sol-max/harness-r2/project"
+PREVIOUS = WORKSPACE / "outputs/HPC-Forest-Harnais-v2/HPC-Forest-Harnais-v2.zip"
+SOURCE_SHA = "70e565a2ccc4d30b6bc45f1ed47c57b67f3e1445865102522d5eba09b2d1d3b7"
+REMOTE_ROOT = "/scratch_p/nimarano/hpc-forest-gpt61sol-max-harness-20261015-r2"
+REMOTE_ARCHIVE = "/scratch_p/nimarano/hpc-forest-gpt61sol-max-harness-20261015-r2.tar.gz"
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def main():
+    assert sha(PREVIOUS) == SOURCE_SHA
+    suite = ET.parse(OUT / "validation-locale/junit.xml").find("testsuite")
+    assert suite is not None and suite.get("failures") == suite.get("errors") == "0"
+    assert (OUT / "validation-locale/ruff.log").read_text(encoding="utf-8-sig").strip() == "All checks passed!"
+    native = json.loads((OUT / "validation-native/verification.json").read_text(encoding="utf8"))
+    assert native["complete"] and len(native["calls"]) == 2
+    auth = json.loads((OUT / "autorisation-comparaison.json").read_text(encoding="utf8"))
+    with zipfile.ZipFile(PREVIOUS) as z:
+        old = {n.removeprefix("HPC-Forest/"): z.read(n) for n in z.namelist() if not n.endswith("/")}
+    ignored = {".git", "__pycache__", ".pytest_cache", ".ruff_cache"}
+    paths = {p.relative_to(PROJECT).as_posix(): p for p in sorted(PROJECT.rglob("*"))
+             if p.is_file() and not (set(p.relative_to(PROJECT).parts) & ignored)
+             and p.suffix != ".pyc" and p.name != "FILES.sha256.json"}
+    changed = {n for n, p in paths.items() if n in old and sha(p) != hashlib.sha256(old[n]).hexdigest()}
+    assert changed == {"src/hpc_forest/codex_process.py", "src/hpc_forest/codex_mailbox.py",
+        "src/hpc_forest/controller.py", "src/hpc_forest/node_harness.py",
+        "examples/marathon22/runtime-baseline.json"}, changed
+    assert set(paths) - set(old) == {"tests/test_codex_harness_authorization.py",
+        "tests/test_harness_comparison_runner.py", "tests/test_confirmation_deadline.py",
+        "examples/marathon22/romeo_harness_comparison.py"}
+    runtime = PROJECT / "examples/marathon22/runtime-baseline.json"
+    save(runtime, {n: sha(PROJECT / "src/hpc_forest" / n)
+                   for n in json.loads(runtime.read_text(encoding="utf8"))})
+    manifest = {n: sha(p) for n, p in paths.items()}
+    save(PROJECT / "FILES.sha256.json", manifest)
+    paths["FILES.sha256.json"] = PROJECT / "FILES.sha256.json"
+    changes = sorted(n for n, p in paths.items()
+                     if n not in old or sha(p) != hashlib.sha256(old[n]).hexdigest())
+    diff = []
+    for n in changes:
+        if n == "FILES.sha256.json":
+            continue
+        before = old.get(n, b"").decode().splitlines(keepends=True)
+        diff.extend(difflib.unified_diff(before, paths[n].read_text(encoding="utf8").splitlines(keepends=True),
+                                        fromfile="harnais-v2/" + n, tofile="comparaison/" + n))
+    (OUT / "interfaces-et-observation.diff").write_text("".join(diff), encoding="utf8")
+    source = OUT / "HPC-Forest-GPT61Sol-MAX-Harnais-r2.zip"
+    with zipfile.ZipFile(source, "x", zipfile.ZIP_DEFLATED) as z:
+        for name, path in sorted(paths.items()):
+            z.write(path, "HPC-Forest/" + name)
+    with zipfile.ZipFile(source) as z:
+        assert z.testzip() is None
+        assert all(hashlib.sha256(z.read("HPC-Forest/" + n)).hexdigest() == sha(p)
+                   for n, p in paths.items())
+    protocol = {
+        "schema": "hpc-forest-matched-gpt-harness-comparison-v1",
+        "human_request": auth["user_message"], "prepared_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "model": "gpt-6.1-sol", "reasoning_effort": "max", "session_id": auth["session_id"],
+        "arms": ["reference", "mixed-harness"], "problems": ["knn", "sum", "nbody"],
+        "order": [["reference", "knn"], ["mixed-harness", "knn"], ["mixed-harness", "sum"],
+                  ["reference", "sum"], ["reference", "nbody"], ["mixed-harness", "nbody"]],
+        "order_chosen_before_results": True, "source_archive_sha256": sha(source),
+        "base_harness_archive_sha256": SOURCE_SHA, "seed": 23,
+        "schedule": {"cycles": 2, "trials_per_role_per_cycle": 3, "integrations_per_cycle": 3,
+                     "planned_slots_per_problem_per_arm": 24, "simultaneously_admitted_missions": 1},
+        "matched_preparation": "The official-source bundle and fixed inputs are prepared once per problem, then copied into the other arm; no model-generated candidate or diagnostic is copied",
+        "budget_per_problem_per_arm": {"wall_seconds": 7200, "tokens": 1500000,
+            "generation_seconds": 600, "reference_reservation": 196608,
+            "harness_reservation": 589824, "max_harness_calls_per_mission": 3},
+        "inference": "Native Windows Codex CLI, existing local ChatGPT login, hosted OpenAI model",
+        "candidate_cpus": 4, "candidate_gpus": 0, "memory_gib": 16,
+        "exact_oracle": True, "search_measurements": 3, "confirmation_measurements": 5,
+        "minimum_confirmed_gain": 0.03, "uninitialized_compiler_gates": True,
+        "operator_algorithm_hints": False, "manual_candidate_repairs": False,
+        "historical_candidates_imported": False, "historical_diagnostics_imported": False,
+        "external_research": "Model-chosen HTTPS URLs on the unchanged generic host allowlist; no seeded corpus",
+        "general_web_search": False, "inner_checks": "Compilation and development correctness, no inner timing/reward",
+        "observer": "Passive exports after batches, never injected into model prompts",
+        "source_assembly_revision": "r2",
+        "confirmed_infrastructure_fix": "Search generation and evaluations stop before the unchanged 120-second final confirmation reserve; applied equally to both arms",
+        "confirmed_admission_fix": "The original ABC batch reserved 3*589824 tokens before any settlement under a 1500000 ceiling. Both arms now admit and settle one role at a time, preserving role order, TreeQuest, slot counts and all ceilings",
+        "previous_preparation_job": "747848 cancelled solely for the reproduced admission incident; no candidate from it is reused",
+        "original_pilot_747664": "Stopped at wall limit without confirmation; preserved, never promoted as confirmed or used to seed this comparison",
+        "native_contract_probe": {"passed": True, "forced_and_isolated": True,
+            "calls": 2, "known_tokens": sum(c["usage"]["tokens"] for c in native["calls"])},
+        "single_pair_per_problem": True, "causal_harness_superiority_established": False,
+        "comparison_limit": "Equal ceilings do not ensure equal realized calls, tokens or time; report all realized costs",
+        "deepseek_completion_claimed": False, "existing_campaigns_modified": False,
+        "full_reference_campaign_after_deepseek_still_separate": True,
+    }
+    save(OUT / "assistance-protocol.json", protocol)
+    payload = OUT / "payload-r2"
+    payload.mkdir()
+    shutil.copyfile(source, payload / "project.zip")
+    shutil.copyfile(OUT / "assistance-protocol.json", payload / "assistance-protocol.json")
+    old_payload = WORKSPACE / "work/marathon-gpt61sol-max/pilot-r1/payload"
+    shutil.copytree(old_payload / "qa-deps", payload / "qa-deps")
+    shutil.copyfile(old_payload / "timer_probe.py", payload / "timer_probe.py")
+    shutil.copytree(OUT / "validation-native", payload / "native-contract-proof")
+    shutil.copyfile(OUT / "valider-contrat-natif.py", payload / "native-contract-proof/validator.py")
+    official = WORKSPACE / "outputs/Marathon22-autonome/sources-officielles"
+    payload_manifest = {
+        "files": {p.relative_to(payload).as_posix(): sha(p) for p in payload.rglob("*") if p.is_file()},
+        "official_files": {n: sha(official / n) for n in ("knn.zip", "sum.zip", "nbody.zip", "problemset.txt")},
+    }
+    save(payload / "payload-manifest.json", payload_manifest)
+    archive = OUT / "hpc-forest-gpt61sol-max-harness-r2.tar.gz"
+    with tarfile.open(archive, "x:gz") as t:
+        t.add(payload, arcname="payload")
+    script = f'''set -euo pipefail
+archive={shlex.quote(REMOTE_ARCHIVE)}
+root={shlex.quote(REMOTE_ROOT)}
+py={shlex.quote(PYTHON)}
+test ! -e "$root"
+printf '%s  %s\\n' '{sha(archive)}' "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" --strip-components=1 -C "$root"
+"$py" - "$root" <<'PY'
+import hashlib,json,os,platform,shutil,stat,sys,zipfile
+from pathlib import Path
+root=Path(sys.argv[1])
+manifest=json.loads((root/'payload-manifest.json').read_text())
+for name,expected in manifest['files'].items():
+    assert (root/name).resolve().is_relative_to(root.resolve())
+    assert hashlib.sha256((root/name).read_bytes()).hexdigest()==expected,name
+project=root/'project'
+with zipfile.ZipFile(root/'project.zip') as z:
+    for info in z.infolist():
+        assert info.filename.startswith('HPC-Forest/') and not stat.S_ISLNK(info.external_attr >> 16)
+        target=project/info.filename.removeprefix('HPC-Forest/')
+        assert target.resolve().is_relative_to(project.resolve())
+        if info.is_dir():target.mkdir(parents=True,exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(z.read(info))
+for name,expected in json.loads((project/'FILES.sha256.json').read_text()).items():
+    assert hashlib.sha256((project/name).read_bytes()).hexdigest()==expected,name
+shutil.copytree(project/'src/hpc_forest',root/'runtime/hpc_forest')
+shutil.copytree(project/'tests',root/'tests')
+shutil.copytree(project/'examples',root/'examples')
+for p in (project/'examples/marathon22').iterdir():
+    if p.is_file():shutil.copyfile(p,root/p.name)
+official=root/'sources-officielles'
+official.mkdir()
+for name,expected in manifest['official_files'].items():
+    original=Path('/scratch_p/nimarano/hpc-forest-marathon22-20261015-r1/sources-officielles')/name
+    shutil.copyfile(original,official/name)
+    assert hashlib.sha256((official/name).read_bytes()).hexdigest()==expected,name
+resources={{'machine':platform.machine(),'affinity_cpus':sorted(os.sched_getaffinity(0)),
+    'slurm_job_id':os.environ.get('SLURM_JOB_ID'),'slurm_cpus_per_task':os.environ.get('SLURM_CPUS_PER_TASK'),
+    'slurm_memory_mb':os.environ.get('SLURM_MEM_PER_NODE'),'candidate_gpus':0,
+    'disk_free_bytes':shutil.disk_usage(root).free}}
+(root/'resources-romeo.json').write_text(json.dumps(resources,indent=2)+'\\n')
+print('Verified frozen source, payload and official inputs',flush=True)
+PY
+export PYTHONPATH="$root/runtime:$root/qa-deps"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export OPENBLAS_NUM_THREADS=1
+flock -w 120 /tmp/hpc-forest-preflight-nimarano.lock "$py" -m pytest "$root/tests" -q -p no:cacheprovider --junitxml="$root/preflight-junit.xml" > "$root/preflight-tests.log" 2>&1
+cat "$root/preflight-tests.log"
+"$py" "$root/timer_probe.py" "$root/timer-probe.json"
+exec "$py" -u "$root/romeo_harness_comparison.py" --root "$root" --session-id {auth['session_id']} --worker-wait-seconds 600
+'''
+    (OUT / "romeo-command.sh").write_text(script, encoding="utf8", newline="\n")
+    resources = {"arch": "armgpu", "cpus_per_task": 4, "mem_gb": 16,
+                 "gpus_per_node": 0, "time_limit": "14:00:00"}
+    result = {"archive": str(archive), "sha256": sha(archive), "bytes": archive.stat().st_size,
+        "remote_archive": REMOTE_ARCHIVE, "remote_root": REMOTE_ROOT,
+        "source_archive": str(source), "source_sha256": sha(source),
+        "session_id": auth["session_id"], "scope_id": auth["scope_id"],
+        "command": "bash -c " + shlex.quote(script), "submitted": False,
+        "resources": resources, "spack_packages": ["/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"],
+        "changed_files": changes, "local_tests": {"tests": int(suite.get('tests')),
+            "skipped": int(suite.get('skipped')), "passed": int(suite.get('tests')) - int(suite.get('skipped'))},
+        "native_contract_probe_passed": True}
+    save(OUT / "payload-and-command.json", result)
+    save(OUT / "recu-source.json", {k: result[k] for k in (
+        "source_archive", "source_sha256", "changed_files", "local_tests", "native_contract_probe_passed")})
+    print(json.dumps({k: result[k] for k in ("archive", "sha256", "bytes", "source_sha256", "local_tests")}))
+
+
+if __name__ == "__main__":
+    main()

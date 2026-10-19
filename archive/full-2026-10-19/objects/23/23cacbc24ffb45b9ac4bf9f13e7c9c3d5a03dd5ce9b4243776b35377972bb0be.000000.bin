@@ -1,0 +1,191 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+class FastInput {
+    unsigned char buffer[1 << 16];
+    std::size_t position = 0;
+    std::size_t length = 0;
+
+    int readByte() {
+        if (position == length) {
+            length = std::fread(buffer, 1, sizeof(buffer), stdin);
+            position = 0;
+            if (length == 0) return -1;
+        }
+        return buffer[position++];
+    }
+
+public:
+    bool next(int& result) {
+        int c = readByte();
+        while (c >= 0 && c <= ' ') c = readByte();
+        if (c < 0) return false;
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = readByte();
+        std::uint32_t magnitude = 0;
+        while (static_cast<unsigned>(c - '0') < 10u) {
+            magnitude = magnitude * 10u + static_cast<unsigned>(c - '0');
+            c = readByte();
+        }
+        const std::int64_t value = static_cast<std::int64_t>(magnitude);
+        result = static_cast<int>(negative ? -value : value);
+        return true;
+    }
+};
+
+#if defined(__aarch64__)
+static inline int32x4_t prefix4(int32x4_t values) {
+    const int32x4_t zero = vdupq_n_s32(0);
+    values = vaddq_s32(values, vextq_s32(zero, values, 3));
+    return vaddq_s32(values, vextq_s32(zero, values, 2));
+}
+#endif
+
+static int best_row(const int* columns, int n, int s, int first) {
+    const int count = n - s;
+    const int* entering = columns + s;
+    const int* leaving = columns;
+    int carry = 0;
+    int bestPrefix = 0;
+    int j = 0;
+
+#if defined(__aarch64__)
+    const int32x4_t zero = vdupq_n_s32(0);
+    for (; j + 16 <= count; j += 16) {
+        // Each lane summarizes a different consecutive four-delta chunk.
+        const int32x4x4_t in = vld4q_s32(entering + j);
+        const int32x4x4_t out = vld4q_s32(leaving + j);
+        int32x4_t totals = vsubq_s32(in.val[0], out.val[0]);
+        int32x4_t maxima = totals;
+        totals = vaddq_s32(totals, vsubq_s32(in.val[1], out.val[1]));
+        maxima = vmaxq_s32(maxima, totals);
+        totals = vaddq_s32(totals, vsubq_s32(in.val[2], out.val[2]));
+        maxima = vmaxq_s32(maxima, totals);
+        totals = vaddq_s32(totals, vsubq_s32(in.val[3], out.val[3]));
+        maxima = vmaxq_s32(maxima, totals);
+
+        const int32x4_t prefixTotals = prefix4(totals);
+        const int32x4_t preceding = vextq_s32(zero, prefixTotals, 3);
+        const int blockMaximum = vmaxvq_s32(vaddq_s32(maxima, preceding));
+        bestPrefix = std::max(bestPrefix, carry + blockMaximum);
+        carry += vgetq_lane_s32(prefixTotals, 3);
+    }
+    for (; j + 4 <= count; j += 4) {
+        const int32x4_t deltas = vsubq_s32(vld1q_s32(entering + j),
+                                         vld1q_s32(leaving + j));
+        const int32x4_t prefixes = prefix4(deltas);
+        bestPrefix = std::max(bestPrefix, carry + vmaxvq_s32(prefixes));
+        carry += vgetq_lane_s32(prefixes, 3);
+    }
+#endif
+
+    for (; j < count; ++j) {
+        carry += entering[j] - leaving[j];
+        bestPrefix = std::max(bestPrefix, carry);
+    }
+    return first + bestPrefix;
+}
+
+static std::int64_t best_row(const std::int64_t* columns, int n, int s,
+                             std::int64_t first) {
+    std::int64_t best = first;
+    for (int j = 0; j < n - s; ++j) {
+        first += columns[j + s] - columns[j];
+        best = std::max(best, first);
+    }
+    return best;
+}
+
+template<class Sum>
+static void add_row(Sum* __restrict columns,
+                    const int* __restrict values, int n) {
+    for (int j = 0; j < n; ++j) {
+        columns[j] += static_cast<Sum>(values[j]);
+    }
+}
+
+template<class Sum>
+static Sum slide_columns(Sum* __restrict columns,
+                         const int* __restrict incoming,
+                         const int* __restrict outgoing, int n, int s) {
+    Sum edgeDelta = 0;
+    int j = 0;
+    for (; j < s; ++j) {
+        const Sum delta = static_cast<Sum>(incoming[j])
+                        - static_cast<Sum>(outgoing[j]);
+        columns[j] += delta;
+        edgeDelta += delta;
+    }
+    for (; j < n; ++j) {
+        columns[j] += static_cast<Sum>(incoming[j])
+                    - static_cast<Sum>(outgoing[j]);
+    }
+    return edgeDelta;
+}
+
+template<class Sum>
+static Sum maximum_sum(const int* matrix, int n, int s) {
+    std::vector<Sum> columns(static_cast<std::size_t>(n), Sum(0));
+    for (int row = 0; row < s; ++row) {
+        add_row(columns.data(), matrix + static_cast<std::size_t>(row) * n, n);
+    }
+
+    Sum first = 0;
+    for (int j = 0; j < s; ++j) first += columns[j];
+    Sum best = best_row(columns.data(), n, s, first);
+
+    for (int top = 1; top <= n - s; ++top) {
+        const int* outgoing = matrix + static_cast<std::size_t>(top - 1) * n;
+        const int* incoming = matrix + static_cast<std::size_t>(top + s - 1) * n;
+        first += slide_columns(columns.data(), incoming, outgoing, n, s);
+        const Sum candidate = best_row(columns.data(), n, s, first);
+        best = std::max(best, candidate);
+    }
+    return best;
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.next(n) || !input.next(s)) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t elements = static_cast<std::size_t>(n) * n;
+    std::unique_ptr<int[]> matrix(new int[elements]);
+    int minimum = std::numeric_limits<int>::max();
+    int maximum = std::numeric_limits<int>::min();
+    for (std::size_t k = 0; k < elements; ++k) {
+        int value;
+        if (!input.next(value)) return 0;
+        matrix[k] = value;
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+
+    // These bounds cover actual sums and every delta-prefix intermediate.
+    const std::int64_t area = static_cast<std::int64_t>(s) * s;
+    const bool narrow =
+        area * minimum >= std::numeric_limits<int>::min() &&
+        area * maximum <= std::numeric_limits<int>::max() &&
+        area * (static_cast<std::int64_t>(maximum) - minimum)
+            <= std::numeric_limits<int>::max();
+
+    const std::int64_t answer = narrow
+        ? static_cast<std::int64_t>(maximum_sum<int>(matrix.get(), n, s))
+        : maximum_sum<std::int64_t>(matrix.get(), n, s);
+    std::printf("%lld\n", static_cast<long long>(answer));
+    return 0;
+}

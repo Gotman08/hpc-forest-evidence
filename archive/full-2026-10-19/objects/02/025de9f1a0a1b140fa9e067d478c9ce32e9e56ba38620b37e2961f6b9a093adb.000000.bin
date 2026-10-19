@@ -1,0 +1,312 @@
+"""Independent cold byte audit; never execute or import received artifacts."""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import tarfile
+import traceback
+import xml.etree.ElementTree as ET
+import zipfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
+
+OUT = Path(__file__).resolve().parent
+RX = OUT.parent
+BASE = OUT.parents[3]
+SEALED = BASE / "outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2d"
+PROJECT = BASE / "work/hpc-forest-primes-native-max-r2d/project"
+QENV = BASE / "outputs/HPC-Forest-Primes-Natif-Qualification-r2d/revision-r2"
+RELANCE = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2d"
+OP = RELANCE / "operations-parent"
+SCOPE = "hpc-forest-primes-native-max-r2d"
+REMOTE = "/scratch_p/nimarano/hpc-forest-primes-native-contract-qualification-20261018-r2d-afef88fa43a3"
+CANONICAL = REMOTE.replace("/scratch_p/", "/gpfs/scratch/", 1)
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+OUTER_SHA = "d599dbe13d5bd1b3a70f8c0e010dc718126e31fed71baa8a9614afc7e17a7f08"
+INNER_SHA = "1f436fb936ed13d164df629c8aebbe5887c571f550fe40c1e3226924af45cb16"
+SOURCE_SHA = "13ccaf7c74d13db246d1127a25c511bc03d7989ba9097eb6ad7b4f681c0a0a46"
+PLAN_SHA = "5e052db689fc423720be60dab97fbca70c82b64487d02d3d8fe2d0f796d9c96c"
+RUNTIME_SHA = "e22f1852be37ae853fc144a9463013f7664cd4ece0e95f95e3e9349053eceee4"
+BUNDLE_SHA = "afef88fa43a3c48597f4326c8dd214d9c0aba87ff3c82a552405aac899f3c3a3"
+QUAL_SHA = "697a53b55b540ce27625d98f6e4a7615807e5ec70f7579425d9e6882c0bd36ed"
+REFERENCE_SHA = "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d"
+ALLOC = {"job_id": "752606", "architecture": "aarch64", "nodes": 1, "tasks": 1,
+         "cpus_per_task": 4, "memory_mib": 16384, "gpus": 0,
+         "affinity_cpu_ids": [0, 1, 2, 3], "affinity_cpu_count": 4}
+checks = []
+
+
+def require(condition, name):
+    if not condition:
+        raise AssertionError(name)
+    checks.append(name)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def value(raw):
+    return json.loads(raw)
+
+
+def read_json(path):
+    return value(path.read_bytes())
+
+
+def save(name, obj):
+    with (OUT / name).open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(obj, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def inventory(root):
+    result = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            require(not p.is_symlink(), "regular local inventory: " + p.relative_to(root).as_posix())
+            result[p.relative_to(root).as_posix()] = sha(p.read_bytes())
+    return result
+
+
+def tar_material(raw, prefix, count):
+    result = {}
+    total = 0
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+        members = archive.getmembers()
+        require(len(members) == count and count <= 1000, "bounded exact tar member count")
+        for member in members:
+            path = PurePosixPath(member.name)
+            require(member.isfile() and not member.issym() and not member.islnk(), "regular tar member only")
+            require(str(path) == member.name and not path.is_absolute()
+                    and ".." not in path.parts and "\\" not in member.name and ":" not in member.name
+                    and not any(ord(c) < 32 for c in member.name), "canonical tar path")
+            require(member.name.startswith(prefix) and len(member.name) > len(prefix), "exact tar root")
+            name = member.name[len(prefix):]
+            require(name not in result and 0 <= member.size <= 16 * 1024**2, "unique bounded member")
+            total += member.size
+            require(total <= 64 * 1024**2, "bounded total expanded bytes")
+            result[name] = archive.extractfile(member).read()
+            require(len(result[name]) == member.size, "complete member bytes")
+    return result
+
+
+def structured(path):
+    raw = read_json(path)
+    return raw.get("structuredContent") or value(raw["content"][0]["text"])
+
+
+def blocked(*_args, **_kwargs):
+    raise RuntimeError("Cold audit forbids executable, model, CLI and network effects")
+
+
+def main():
+    pins = {
+        SEALED / "HPC-Forest-Primes-Natif-MAX-r2d.zip": SOURCE_SHA,
+        SEALED / "native-max-plan.json": PLAN_SHA,
+        SEALED / "runtime-manifest-r2max.json": RUNTIME_SHA,
+        SEALED / "hpc-forest-primes-native-max-r2d-proposition.tar.gz": BUNDLE_SHA,
+        SEALED / "proposal-bundle-manifest.json": "a83bdb10b7507b53d811281c3d153152d9c212b7053e7b6a199ae4658154073c",
+        SEALED / "LIVRAISON-LOCALE-FINALE.json": "ed86d9f29d1c326ec453c28718aabb2d1d42434f51a0d51c471eee811139d3f7",
+        RELANCE / "revue-source/REVUE-INDEPENDANTE-CAP4.json": "a7c56242f04b057ff9e9bf3b5ac5efb6d9a36f28592df1a21ac44ec29f7f5335",
+        QENV / "qualification-wrapper.py": "1f8be2cf8b8b0f5b23109d72a0f16582beafd32b35898b88f09fab68d259d415",
+        QENV / "commande-allouee-proposee.sh": "98ffe3cda7c83f092b53ffc3a38e12a22705e09adbbb755761c84255df2fd0d3",
+        QENV / "bindings-proposees.json": "534fa19ea1b5335c511056c58eb762231661e27179ab80633eaf356bf698c020",
+        RELANCE / "revue-qualification/REVUE-INDEPENDANTE-ENVELOPPE-R2.json": "0184fab4e6896ad18734ed3c156422163268d5884553908abf35ab576192b57a",
+        RX / "envelope-results-752606.tar.gz": OUTER_SHA,
+    }
+    for path, expected in pins.items():
+        require(path.is_file() and not path.is_symlink() and sha(path.read_bytes()) == expected,
+                "pinned exact bytes: " + path.name)
+    evidence = dict(pins)
+    for name in ["archive-annoncee.json", "archive-transfert.json", "efficacite.json", "logs-terminaux.json", "statut-terminal.json"]:
+        path = RX / name
+        evidence[path] = sha(path.read_bytes())
+    for name in ["soumission-q-intention.json", "soumission-q-observee.json", "arguments-job-prepare.json"]:
+        path = OP / name
+        evidence[path] = sha(path.read_bytes())
+    local_before = inventory(PROJECT)
+    prep_before = inventory(SEALED / "certified-preparation")
+    before = {"artifacts": {str(p): digest for p, digest in evidence.items()},
+              "source_project": local_before, "certified_preparation": prep_before}
+    save("inventaire-avant.json", before)
+    outer_raw = (RX / "envelope-results-752606.tar.gz").read_bytes()
+    require(len(outer_raw) == 831636, "outer archive exact bytes 831636")
+    ann = value(structured(RX / "archive-annoncee.json")["content"])
+    transfer = structured(RX / "archive-transfert.json")
+    require(ann["sha256"] == OUTER_SHA and ann["bytes"] == 831636 and ann["passed"] is True,
+            "announced outer SHA and bytes")
+    require(all(transfer[k] == OUTER_SHA for k in ["remote_sha256", "empreinte_locale", "empreinte_distante"])
+            and transfer["bytes"] == 831636 and transfer["verifie"] is True, "three announced remote/local SHA equal")
+    status = structured(RX / "statut-terminal.json")
+    efficiency = structured(RX / "efficacite.json")
+    logs = structured(RX / "logs-terminaux.json")
+    require(str(status["job_id"]) == "752606" and status["state"] == "COMPLETED"
+            and status["exit_code"] == "0:0" and status["scheduler_success_observed"] is True,
+            "fresh terminal COMPLETED 0:0")
+    require(efficiency["alloc_cpus"] == 4 and efficiency["alloc_gpus"] == 0
+            and efficiency["req_mem_mb"] == 16384, "efficiency allocation agrees")
+    require(logs["truncated"] is False and logs["files_limited"] is False
+            and logs["has_stderr_content"] is False, "terminal raw streams complete and stderr empty")
+    submit = structured(OP / "soumission-q-observee.json")
+    intent = read_json(OP / "soumission-q-intention.json")
+    args = read_json(OP / "arguments-job-prepare.json")
+    require(submit["submitted"] is True and str(submit["job_id"]) == "752606"
+            and submit["plan_id"] == intent["plan_id"] and submit["plan_sha256"] == intent["plan_sha256"],
+            "single submit intent reconciled to received job")
+    require(intent["single_submit"] is True and intent["no_resubmit_if_unknown"] is True
+            and intent["qualification_max_seconds"] == 900 and intent["reception_audit_reserve_seconds"] == 10800,
+            "single attempt and strict time reserve")
+    require(args["cpus_per_task"] == 4 and args["mem"] == "16G" and args["gpus"] == 0
+            and args["time"] == "00:15:00", "requested allocation and 900 seconds maximum")
+    outer = tar_material(outer_raw, "qualification-envelope/", 563)
+    restoration = OUT / "restauration-neuve-01"
+    restoration.mkdir(exist_ok=False)
+    slots = restoration / "files"
+    slots.mkdir(exist_ok=False)
+    restored = {}
+    for index, (name, raw) in enumerate(sorted(outer.items())):
+        target = slots / f"{index:06d}.bin"
+        with target.open("xb") as stream:
+            stream.write(raw)
+        restored[name] = {"slot": target.relative_to(restoration).as_posix(), "sha256": sha(raw), "bytes": len(raw)}
+    save("carte-restauration.json", restored)
+    restored_before = inventory(restoration)
+    save("restauration-avant.json", restored_before)
+    runtime = read_json(SEALED / "runtime-manifest-r2max.json")
+    require(len(runtime) == 105 and all(local_before.get(n) == digest for n, digest in runtime.items()),
+            "all 105 reviewed local source bytes unchanged")
+    extra = set(local_before) - set(runtime)
+    require(all(n.startswith((".pytest_cache/", ".ruff_cache/")) for n in extra), "only preserved cache files outside manifested source105")
+    with zipfile.ZipFile(io.BytesIO((SEALED / "HPC-Forest-Primes-Natif-MAX-r2d.zip").read_bytes())) as archive:
+        infos = [i for i in archive.infolist() if not i.is_dir()]
+        require(len(infos) == 105 and len({i.filename for i in infos}) == 105, "105 unique source ZIP members")
+        zipped = {i.filename.removeprefix("HPC-Forest/"): sha(archive.read(i)) for i in infos}
+        require(zipped == runtime, "ZIP source105 equals runtime manifest")
+    bundle = tar_material((SEALED / "hpc-forest-primes-native-max-r2d-proposition.tar.gz").read_bytes(), "", 211)
+    bundle_hashes = {n: sha(raw) for n, raw in bundle.items()}
+    manifest = read_json(SEALED / "proposal-bundle-manifest.json")["files"]
+    require({n: digest for n, digest in bundle_hashes.items() if n != "proposal-bundle-manifest.json"} == manifest,
+            "all 210 bundle members equal manifest plus manifest itself")
+    extracted = {n.removeprefix("extraction/"): sha(raw) for n, raw in outer.items() if n.startswith("extraction/")}
+    require(extracted == bundle_hashes, "all 211 received extracted bundle members identical")
+    require(value(outer["input-inventory-before.json"]) == bundle_hashes
+            and value(outer["input-inventory-after.json"])["files"] == bundle_hashes, "remote before/after exact bundle unchanged")
+    envelope = value(outer["envelope-receipt.json"])
+    allocation_before = value(outer["allocation-before-work.json"])
+    bindings = read_json(QENV / "bindings-proposees.json")
+    require(envelope["bindings"] == bindings == allocation_before["bindings"], "actual envelope exact sealed bindings")
+    require(envelope["allocation"] == ALLOC == allocation_before["allocation"], "actual ARM64 4CPU 16GiB zeroGPU affinity")
+    require(allocation_before["passed"] is False and allocation_before["qualification_launched_count"] == 0,
+            "allocation receipt precedes qualification")
+    require(envelope["passed"] is True and envelope["qualification_launched_count"] == 1
+            and envelope["qualification_returncode"] == 0 and envelope["input_files_unchanged"] is True,
+            "one successful official qualification with unchanged inputs")
+    require(all(envelope[k] is False for k in ["native_research_admitted", "performance_claimed"])
+            and envelope["native_model_calls"] == 0 and envelope["negative_preserved_no_retry"] is True,
+            "mechanical qualification only and negatives preserved")
+    start = datetime.fromisoformat(envelope["started_utc"])
+    finish = datetime.fromisoformat(envelope["finished_utc"])
+    require(start == datetime.fromisoformat(allocation_before["started_utc"]) and 0 <= (finish-start).total_seconds() < 900
+            and start + timedelta(seconds=900+10800) < datetime(2026,10,31,23,tzinfo=UTC), "qualification maximum plus audit strictly before deadline")
+    lane = value(outer["lane-delta-process.json"])
+    lane_intent = value(outer["lane-delta-intent.json"])
+    require(lane == {"returncode": 0, "timed_out": False, "executions": 1, "retry": False, "native_model_calls": 0}
+            and lane_intent["launch_count"] == 1 and lane_intent["no_retry"] is True and lane_intent["native_model_calls"] == 0,
+            "lane delta one invocation zero retry zero model")
+    junit = ET.fromstring(outer["lane-delta.xml"])
+    suites = junit.findall("testsuite")
+    cases = junit.findall(".//testcase")
+    require(len(suites) == 1 and int(suites[0].attrib["tests"]) == 36 and len(cases) == 36
+            and all(int(suites[0].attrib[k]) == 0 for k in ["errors","failures","skipped"])
+            and len({(c.attrib["classname"],c.attrib["name"]) for c in cases}) == 36
+            and not junit.findall(".//failure") and not junit.findall(".//error") and not junit.findall(".//skipped"),
+            "36 distinct allocated lane tests zero error failure skip")
+    require(envelope["lane_delta_tests"] == {"returncode":0,"passed":36,"executions":1,"native_model_calls":0,"junit_sha256":sha(outer["lane-delta.xml"])}
+            and outer["lane-delta.stderr"] == b"" and outer["qualification-launch.stderr"] == b"", "JUnit exact link and raw stderr preserved empty")
+    qualification_intent = value(outer["qualification-launch-intent.json"])
+    require(qualification_intent["launch_count"] == 1 and qualification_intent["no_retry"] is True
+            and qualification_intent["native_model_calls"] == 0 and qualification_intent["argv"][:3] == [PYTHON,"-I","-B"]
+            and qualification_intent["argv"][3] == REMOTE + "/extraction/HPC-Forest/examples/marathon22/qualify_r2max_contract.py",
+            "one exact official qualifier intent")
+    qraw = outer["qualification-original.json"]
+    require(sha(qraw) == QUAL_SHA and qraw == outer["Q/qualification.json"] == (OUT/"qualification-original.json").read_bytes(),
+            "original qualification bytes retained and exact outer duplicates")
+    inner_raw = outer["Q.tar.gz"]
+    require(sha(inner_raw) == INNER_SHA and inner_raw == (OUT/"Q.tar.gz").read_bytes()
+            and value(outer["Q-archive.json"])["sha256"] == INNER_SHA
+            and envelope["qualification_archive_sha256"] == INNER_SHA, "inner archive actual announced envelope SHA equal")
+    inner = tar_material(inner_raw, "qualification/", 291)
+    q = value(qraw)
+    expected = {"qualification.json": QUAL_SHA,
+                **{"prepared/"+n:d for n,d in q["prepared_files"].items()},
+                **{"official-evaluator-trace/"+n:d for n,d in q["official_evaluator_trace_files"].items()}}
+    require({n:sha(raw) for n,raw in inner.items()} == expected and inner["qualification.json"] == qraw
+            and all(outer["Q/"+n] == raw for n,raw in inner.items()), "all 291 inner Q members exact received bytes and complete inventories")
+    require(q["schema"] == "hpc-forest-primes-r2max-allocated-contract-qualification-v1"
+            and q["scope_id"] == SCOPE and q["verified"] is True and q["plan_sha256"] == PLAN_SHA
+            and q["allocation"] == ALLOC and q["native_model_calls"] == 0 and q["calibration"] is False
+            and q["native_research_admitted"] is False and q["hardware_or_process_isolation_proved"] is False
+            and q["prepared_root"] == CANONICAL+"/Q/prepared"
+            and q["reference_source_sha256"] == REFERENCE_SHA
+            and start.timestamp() <= q["started_at"] < q["finished_at"] <= finish.timestamp(), "qualification exact identity allocation no calibration or research admission")
+    # Only the locally reviewed and just rehashed source105 is imported; archive bytes stay opaque.
+    subprocess.Popen = blocked
+    subprocess.run = blocked
+    os.system = blocked
+    socket.socket = blocked
+    sys.path.insert(0, str(PROJECT / "src"))
+    from hpc_forest import native_r2max as native
+    data = native.verify_preparation(SEALED / "certified-preparation")
+    native.verify_qualification(q, SOURCE_SHA, prepared=False)
+    native.verify_qualification_members(q, lambda n: inner["prepared/"+n], data)
+    trace = native.verify_trace_members(q, lambda n: inner["official-evaluator-trace/"+n],
+                                       read_prepared_member=lambda n: inner["prepared/"+n])
+    require(trace["original_archive_links_verified"] is True and trace["phases"] == ["search","confirmation"]
+            and trace["cluster_paths_followed_locally"] is False, "independent pure actual official evaluator trace byte verification")
+    restored_after = inventory(restoration)
+    after = {"artifacts": {str(p): sha(p.read_bytes()) for p in evidence},
+             "source_project": inventory(PROJECT), "certified_preparation": inventory(SEALED/"certified-preparation")}
+    require(before == after and restored_before == restored_after, "all originals sources prep caches and restored files unchanged after pure audit")
+    save("inventaire-apres.json", after)
+    save("restauration-apres.json", restored_after)
+    report = {
+        "schema": "hpc-forest-r2d-independent-received-qualification-audit-v1", "verified": True,
+        "scope_id": SCOPE, "job_id": "752606", "status": "received_mechanical_qualification_only",
+        "native_research_admitted": False, "native_model_calls": 0, "generation_calls": 0,
+        "performance_claimed": False, "calibration": False, "hardware_or_process_isolation_proved": False,
+        "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA, "runtime_manifest_sha256": RUNTIME_SHA,
+        "bundle_sha256": BUNDLE_SHA, "qualification_sha256": QUAL_SHA, "archive_sha256": INNER_SHA,
+        "envelope_archive_sha256": OUTER_SHA, "envelope_archive_bytes": len(outer_raw),
+        "inner_archive_bytes": len(inner_raw), "outer_restored_regular_files": len(outer),
+        "inner_regular_files": len(inner), "source_files_verified": len(runtime), "bundle_members_verified": len(bundle),
+        "allocation": ALLOC, "lane_tests": envelope["lane_delta_tests"], "unique_certified_cases": 12,
+        "official_evaluator_trace": trace, "search_measurements": 3, "confirmation_measurements": 5,
+        "qualification_launch_count": 1, "maximum_seconds": 900, "audit_reserve_seconds": 10800,
+        "qualification_original": {"path": str(OUT/"qualification-original.json"), "sha256": QUAL_SHA},
+        "inner_archive": {"path": str(OUT/"Q.tar.gz"), "sha256": INNER_SHA},
+        "restoration": {"path": str(restoration), "opaque_numbered_slots": True, "member_paths_not_materialized": True},
+        "preserved_local_cache_files": sorted(extra), "before_after_identical": True,
+        "archive_code_imported": False, "received_executables_run": False, "cluster_paths_followed_locally": False,
+        "cli_or_model_or_compiler_or_network_called": False, "tests_rerun_locally": False,
+        "external_executable_bytes_independently_verified": False,
+        "blocking_findings": [], "checks_completed": len(checks), "checks": sorted(set(checks)),
+        "audited_at_utc": datetime.now(UTC).isoformat(), "auditor_sha256": sha(Path(__file__).read_bytes()),
+    }
+    save("AUDIT-INDEPENDANT-Q752606.json", report)
+    print(json.dumps({k:report[k] for k in ["verified","qualification_sha256","archive_sha256","outer_restored_regular_files","official_evaluator_trace","native_research_admitted"]}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException as exc:
+        save("REFUS-AUDIT-INDEPENDANT.json", {"verified":False,"native_research_admitted":False,
+             "error_type":type(exc).__name__,"error":str(exc),"checks_completed":len(checks),
+             "traceback":traceback.format_exc(),"auditor_sha256":sha(Path(__file__).read_bytes())})
+        raise

@@ -1,0 +1,149 @@
+"""Fictitious requests only: never invoke a model or connect to ROMEO."""
+import asyncio
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("relay_recovery", HERE / "reprendre-relais-r1.py")
+relay = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(relay)
+relay.install_identity("gpt-5.6-terra", "max")
+SESSION = "a" * 32
+NONCE = "b" * 32
+CHANNEL = "/scratch_p/test/hpc-forest-gpt61sol-max-fixture/results-1/mailbox"
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(relay.original.json_bytes(value))
+
+
+def fixture(output, delivered=False, claimed=True, response=True):
+    folder = output / NONCE
+    request = {"protocol": relay.original.PROTOCOL, "session_id": SESSION,
+               "nonce": NONCE, "model": "gpt-5.6-terra", "reasoning_effort": "max",
+               "kind": "source-proposal"}
+    write(folder / "downloaded-request.json", request)
+    digest = relay.sha256((folder / "downloaded-request.json").read_bytes())
+    if claimed:
+        write(folder / "generation-claimed.json", {"request_sha256": digest})
+    if response:
+        value = relay.original.response_envelope(request, digest, data={"fixture": True},
+                    error=None, infrastructure_error=False,
+                    usage={"tokens": 1, "token_accounting": "exact", "llm_calls": 1})
+        write(folder / "response.json", value)
+        raw = (folder / "response.json").read_bytes()
+        if delivered:
+            write(folder / "response-ready.json", {"sha256": relay.sha256(raw), "bytes": len(raw)})
+            write(folder / "delivered.json", {"request_sha256": digest,
+                  "response_sha256": relay.sha256(raw), "delivered_at": 1})
+    return folder, request
+
+
+class Transfer:
+    def __init__(self, request, fail_once=False):
+        self.request = request
+        self.fail_once = fail_once
+        self.uploads = []
+
+    async def download(self, remote, local):
+        write(local, self.request)
+        return {"verifie": True}
+
+    async def upload(self, local, remote):
+        if self.fail_once:
+            self.fail_once = False
+            raise relay.InfrastructureError("fictitious upload interruption")
+        self.uploads.append((remote, local.read_bytes()))
+        return {"verifie": True}
+
+
+def forbid_generation(*args, **kwargs):
+    raise AssertionError("No model invocation is allowed in cache recovery tests")
+
+
+def test_delivered_cache_is_verified_and_skipped(tmp_path, monkeypatch):
+    _, request = fixture(tmp_path, delivered=True)
+    monkeypatch.setattr(relay.original, "run_codex", forbid_generation)
+    transfer = Transfer(request)
+    worker = relay.ResumedWorker(transfer, CHANNEL, SESSION, tmp_path, None, set())
+    assert worker.completed == {NONCE}
+    assert not asyncio.run(worker.handle(NONCE + ".request.json"))
+    assert transfer.uploads == []
+
+
+def test_pending_response_retransmits_identical_bytes_without_generation(tmp_path, monkeypatch):
+    folder, request = fixture(tmp_path)
+    before = (folder / "response.json").read_bytes()
+    monkeypatch.setattr(relay.original, "run_codex", forbid_generation)
+    transfer = Transfer(request)
+    worker = relay.ResumedWorker(transfer, CHANNEL, SESSION, tmp_path, None, set())
+    assert asyncio.run(worker.handle(NONCE + ".request.json"))
+    assert (folder / "response.json").read_bytes() == before
+    assert relay.cache_state(tmp_path, SESSION) == {NONCE}
+
+
+def test_claim_without_response_is_not_regenerated(tmp_path, monkeypatch):
+    folder, request = fixture(tmp_path, response=False)
+    monkeypatch.setattr(relay.original, "run_codex", forbid_generation)
+    worker = relay.ResumedWorker(Transfer(request), CHANNEL, SESSION, tmp_path, None, set())
+    assert asyncio.run(worker.handle(NONCE + ".request.json"))
+    value = json.loads((folder / "response.json").read_bytes())
+    assert value["infrastructure_error"] is True
+    assert "not replayed" in value["error"]
+
+
+def test_second_transfer_attempt_uses_same_cache(tmp_path, monkeypatch):
+    folder, request = fixture(tmp_path)
+    before = (folder / "response.json").read_bytes()
+    monkeypatch.setattr(relay.original, "run_codex", forbid_generation)
+    first = relay.ResumedWorker(Transfer(request, fail_once=True), CHANNEL, SESSION, tmp_path, None, set())
+    with pytest.raises(relay.InfrastructureError):
+        asyncio.run(first.handle(NONCE + ".request.json"))
+    second = relay.ResumedWorker(Transfer(request), CHANNEL, SESSION, tmp_path, None, set())
+    assert asyncio.run(second.handle(NONCE + ".request.json"))
+    assert (folder / "response.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("session_id", "c" * 32), ("model", "gpt-6-luna"),
+    ("reasoning_effort", "low"), ("request_sha256", "0" * 64)])
+def test_altered_response_envelope_is_rejected(tmp_path, field, value):
+    folder, _ = fixture(tmp_path, delivered=True)
+    response = json.loads((folder / "response.json").read_bytes())
+    response[field] = value
+    write(folder / "response.json", response)
+    with pytest.raises(relay.InfrastructureError):
+        relay.cache_state(tmp_path, SESSION)
+
+
+def test_ready_marker_tamper_is_rejected(tmp_path):
+    folder, _ = fixture(tmp_path, delivered=True)
+    write(folder / "response-ready.json", {"sha256": "0" * 64, "bytes": 1})
+    with pytest.raises(relay.InfrastructureError):
+        relay.cache_state(tmp_path, SESSION)
+
+
+def test_invocation_without_claim_is_rejected(tmp_path):
+    folder, _ = fixture(tmp_path, claimed=False)
+    write(folder / "invocation.json", {"fixture": True})
+    with pytest.raises(relay.InfrastructureError):
+        relay.cache_state(tmp_path, SESSION)
+
+
+def test_frozen_source_bytes_are_required(tmp_path):
+    import zipfile
+    archive = tmp_path / "source.zip"
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "module.py").write_bytes(b"pass\n")
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("HPC-Forest/module.py", b"pass\n")
+    digest = relay.sha256(archive.read_bytes())
+    assert relay.frozen_source(archive, project, digest) == 1
+    (project / "module.py").write_bytes(b"altered\n")
+    with pytest.raises(relay.InfrastructureError):
+        relay.frozen_source(archive, project, digest)

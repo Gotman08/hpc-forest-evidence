@@ -1,0 +1,128 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define BI 8       /* i-tile size for register blocking */
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system.
+ *
+ * The force loop is register-blocked over i: for each tile of BI
+ * bodies we preload their coordinates into local arrays and then
+ * sweep j from 0 to n-1, reusing each loaded p[j] across the whole
+ * tile. This reduces memory traffic by a factor of BI while keeping
+ * the per-body summation order (j increasing) bit-exact.
+ */
+void body_force(Body *restrict p, float dt, int n) {
+  #pragma omp parallel for schedule(static)
+  for (int i0 = 0; i0 < n; i0 += BI) {
+    int count = (i0 + BI <= n) ? BI : (n - i0);
+
+    float px[BI], py[BI], pz[BI];
+    float fx[BI], fy[BI], fz[BI];
+
+    for (int ii = 0; ii < count; ++ii) {
+      int idx = i0 + ii;
+      px[ii] = p[idx].x;
+      py[ii] = p[idx].y;
+      pz[ii] = p[idx].z;
+      fx[ii] = 0.0f;
+      fy[ii] = 0.0f;
+      fz[ii] = 0.0f;
+    }
+
+    for (int j = 0; j < n; ++j) {
+      float pjx = p[j].x;
+      float pjy = p[j].y;
+      float pjz = p[j].z;
+
+      #pragma omp simd
+      for (int ii = 0; ii < count; ++ii) {
+        float dx = pjx - px[ii];
+        float dy = pjy - py[ii];
+        float dz = pjz - pz[ii];
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1 / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx[ii] += dx * inv_dist3; 
+        fy[ii] += dy * inv_dist3; 
+        fz[ii] += dz * inv_dist3;
+      }
+    }
+
+    for (int ii = 0; ii < count; ++ii) {
+      int idx = i0 + ii;
+      p[idx].vx += dt*fx[ii];
+      p[idx].vy += dt*fy[ii];
+      p[idx].vz += dt*fz[ii];
+    }
+  }
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+  
+  exit(EXIT_SUCCESS);
+}

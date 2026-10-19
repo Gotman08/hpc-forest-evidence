@@ -1,0 +1,164 @@
+"""Normalize and admit the audited Sol receipt; no experimental execution."""
+from __future__ import annotations
+
+import copy
+import csv
+import hashlib
+import importlib.util
+import json
+import sqlite3
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+EDITORIAL = STUDY / "edition-professionnelle"
+ROOT = HERE / "restauration-neuve/results-749415"
+VERSION = STUDY / "versions/20261017-avant-couverture-sol-max-professionnelle"
+
+
+def read(p):
+    return json.loads(p.read_text(encoding="utf-8-sig"))
+
+
+def sha(p):
+    with p.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def save(p, value):
+    p.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    preserved = read(VERSION / "PRESERVATION.json")
+    assert preserved["all_copied_bytes_verified"] and preserved["copied_files"] == 2487
+    old_manifest = preserved["previous_manifest"]["files"]
+    assert len(old_manifest) == 637
+    assert all(sha(VERSION / name) == expected == sha(STUDY / name) for name, expected in old_manifest.items())
+    receipt = read(HERE / "reception-verifiee.json")
+    assert receipt["verified"] and receipt["all_113_published_requests_delivered_and_reconciled"]
+    for key in ("audit", "supplemental_audit", "reconciliation", "owned_stop"):
+        assert sha(Path(receipt[key]["path"])) == receipt[key]["sha256"]
+    spec = importlib.util.spec_from_file_location("sol_reporting_helpers", STUDY / "consolider-couverture-luna-comparaison.py")
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+    audit = read(HERE / "audit-initial.json")
+    reconciliation = read(HERE / "reconciliation-livraisons.json")
+    others = {name: {r["subject"]: r for r in read(STUDY / f"resultats-couverture-{name}-max.json")["rows"]}
+              for name in ("luna", "astra", "terra")}
+    rows, missions, trees, comparisons, calls = [], [], [], [], []
+    for subject in audit["subjects"]:
+        slug = subject["subject"]
+        campaign = ROOT / slug
+        contract = read(campaign / "trusted/contract.json")
+        config = read(campaign / "trusted/config.json")
+        common = copy.deepcopy(contract)
+        common["benchmark"].pop("reference_seconds")
+        refs = {}
+        for name, previous in others.items():
+            comparable = copy.deepcopy(previous[slug]["contract"])
+            comparable["benchmark"].pop("reference_seconds")
+            assert common == comparable, (slug, name, "Contract differs")
+            refs[name] = {"contract_sha256": previous[slug]["contract_sha256"], "same_comparable_contract": True}
+        comparisons.append({"subject": slug, "sol_contract_sha256": sha(campaign / "trusted/contract.json"),
+            "common_contract_sha256": hashlib.sha256(json.dumps(common, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "references": refs, "only_excluded_field": "benchmark.reference_seconds", "timings_pooled": False,
+            "causal_model_or_harness_ranking_proved": False})
+        with sqlite3.connect((campaign / "registry.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+            roles = dict(db.execute("SELECT id,role FROM trials"))
+        selected_calls = [c for c in reconciliation["records"] if Path(c["request_references"][0]).parts[0] == slug]
+        for item in selected_calls:
+            request = read(ROOT / item["request_references"][0])
+            role = "mère" if request.get("meta_role") else "intégration" if roles[request["mission_id"].rsplit("-h", 1)[0]] == "G" else "enfant"
+            calls.append({"session_id": item["session_id"], "nonce": item["nonce"], "subject": slug,
+                "campaign": "grille-r1/coverage-gpt-6.1-sol-max", "kind": role,
+                "native_invocation_observed": item["native_invocation_observed"], "usage_measured": item["usage_measured"],
+                "exact_total": item["known_exact_tokens"] if item["usage_measured"] else None,
+                "state": "expired_no_native" if not item["native_invocation_observed"] else "exact" if item["usage_measured"] else "unmetered",
+                "request_sha256": item["request_sha256"], "status": item["status"]})
+        rows.append({"subject": slug, "model": "gpt-6.1-sol", "effort": "max", "job_id": "749415",
+            "campaign_root": str(campaign), "confirmation": subject["best_confirmed"],
+            "gain_fraction": subject["confirmed_gain_fraction"], "statuses": subject["statuses"],
+            "topology": subject["topology"], "native_calls": sum(c["native_invocation_observed"] for c in selected_calls),
+            "known_exact_tokens": sum(c["known_exact_tokens"] for c in selected_calls),
+            "unmetered_calls": sum(c["native_invocation_observed"] and not c["usage_measured"] for c in selected_calls),
+            "trials": subject["trials"], "mother_requests": subject["published_mother_requests"],
+            "harness_repaired_proposals": subject["automatically_repaired_proposals"],
+            "samples": helpers.confirmation_data(campaign, subject), "contract": contract,
+            "contract_sha256": sha(campaign / "trusted/contract.json"), "budget": config["budget"], "operator_algorithm_hints": 0})
+        trees.append({"subject": slug, "topology": read(ROOT / (slug + "-progress.json")), "trials": subject["detailed_trials"]})
+        missions.extend({"subject": slug, **t} for t in subject["detailed_trials"])
+    assert len(rows) == 14 and len(calls) == 113
+    totals = Counter()
+    for row in rows:
+        totals.update(row["statuses"])
+    role_totals = {role: {"calls": sum(c["native_invocation_observed"] for c in calls if c["kind"] == role),
+        "known_exact_tokens": sum(c["exact_total"] or 0 for c in calls if c["kind"] == role),
+        "unmetered_calls": sum(c["native_invocation_observed"] and not c["usage_measured"] for c in calls if c["kind"] == role)}
+        for role in ("mère", "enfant", "intégration")}
+    cohort = {"schema": "hpc-forest-received-fourteen-subject-sol-max-v1", "observed_utc": datetime.now(UTC).isoformat(),
+        "job_id": "749415", "archive_sha256": receipt["archive_sha256_announced_remote_and_local"], "rows": rows,
+        "received_subjects": 14, "native_calls": 110, "known_exact_tokens": 2502330, "unmetered_calls": 8,
+        "published_requests": 113, "expired_before_invocation": 3, "statuses": dict(totals), "trials": len(missions),
+        "scored_nodes": sum(r["topology"]["scored_nodes"] for r in rows), "retained_baselines": 2,
+        "tokens_by_role": role_totals, "model_input": False, "total_exact_consumption_available": False,
+        "universal_correctness_or_model_ranking_proved": False}
+    assert sum(c["native_invocation_observed"] for c in calls) == 110
+    assert sum(c["exact_total"] or 0 for c in calls) == 2502330
+    save(STUDY / "resultats-couverture-sol-max.json", cohort)
+    save(STUDY / "details-missions-couverture-sol-max.json", missions)
+    save(STUDY / "arbres-couverture-sol-max.json", trees)
+    save(STUDY / "comparabilite-couvertures-luna-astra-terra-sol-max.json", {"observed_utc": cohort["observed_utc"], "rows": comparisons})
+    save(HERE / "appels-natifs-figes.json", {"calls": calls, "tokens_by_role": role_totals})
+    with (STUDY / "jetons-par-appel-couverture-sol-max.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(calls[0])); writer.writeheader(); writer.writerows(calls)
+    body = f"""# Couverture Sol MAX : quatorze sujets reçus et audités
+
+Le job 749415 est clos, reçu et réconcilié. Archive annoncée, distante et locale : `{cohort['archive_sha256']}`. Les 9 268 fichiers restaurés, dont le manifeste de restauration, et les 90 sources R1 sont inchangés. Les audits natif et complémentaire vérifient les contrats, identités, parents, intégrations, sorties et cinq confirmations des finalistes valides. Aucun modèle ou candidat n’est exécuté par cette réception.
+
+Douze programmes modifiés sont confirmés sur les contrats finis ; tropical et Sokoban conservent leurs références. R1 atteint 24 groupes et 76 cellules auditées sur 300. Une seule recherche par cellule et la graine 23 ne permettent aucun rang causal de modèle ou gain général du harnais.
+
+{helpers.table(['Sujet','Référence (s)','Retenu (s)','Réduction confirmée'], [[r['subject'],f"{r['confirmation']['reference_seconds']:.9f}",f"{r['confirmation']['mean_seconds']:.9f}",f"{100*r['gain_fraction']:.4f} %"] for r in rows])}
+
+Les quatorze contrats sont égaux à ceux de Luna, Astra et Terra après exclusion du seul benchmark.reference_seconds ; les temps entre allocations ne sont pas fusionnés. Les quatre exclusions de préparation restent distinctes des résultats de modèle. Le seuil de promotion est 3 %, avec trois mesures de recherche puis cinq confirmations intercalées.
+
+Les 113 requêtes sont toutes livrées et réconciliées : 110 invocations natives, 2 502 330 jetons exacts connus, huit invocations non mesurées et trois expirations prouvées avant invocation. Les compteurs manquants gardent leur consommation inconnue ; réservations, cache et raisonnement ne sont pas ajoutés une seconde fois. Les {len(missions)} missions comprennent {totals['valid']} valides et {totals['infrastructure_error']} infrastructure_error, avec {cohort['scored_nodes']} sommets notés. Aucun négatif n’est effacé ni rejoué.
+
+{helpers.table(['Rôle','Invocations','Jetons exacts connus','Invocations non mesurées'], [[k,v['calls'],v['known_exact_tokens'],v['unmetered_calls']] for k,v in role_totals.items()])}
+
+Slurm indique COMPLETED 0:0, 6 h 22 min 23 s, quatre CPU ARM64, 16 GiB demandés et zéro GPU ; 235,8 secondes CPU et 269,4 MiB RSS maximum sont les compteurs d’allocation. Ils ne mesurent ni le CPU d’inférence hébergée ni le nombre exact de threads d’un programme. Aucun diagnostic CPU postérieur n’est ajouté. La conformité algorithmique stricte de quicksort doit être revue séparément pour ce modèle.
+
+Le relais et ses sept identités possédées sont arrêtés après audit et réconciliation. Trois processus Epic antérieurs, dont le champ parent réutilise le PID du lanceur, ont été explicitement exclus et préservés ; aucun arrêt récursif sur PID n’est utilisé. Source-only reste actif. La même file R1 passe à Luna xhigh dans une nouvelle allocation, avec sa session déjà planifiée, sans reprendre les recherches closes. Le premier répartiteur a refusé un argument Python avant tout appel distant ; refus et correction isolée sont conservés.
+
+Preuves : reception-verifiee.json, audit-initial.json, audit-complementaire.json, reconciliation-livraisons.json et owned-worker-stopped.json dans ce dossier ; résultats, comparabilité, vrais arbres, missions et CSV sous la racine de l’étude. L’article exige une admission explicite et un contrôle visuel avant livraison. Aucun résultat R5, apprentissage Flash ou résultat final source-only n’est revendiqué.
+"""
+    (STUDY / "BILAN-COUVERTURE-SOL-MAX.md").write_text(body, encoding="utf-8")
+    admissions = read(EDITORIAL / "admissions.json")
+    assert not any(x["cohort"] == "sol_max_fourteen_subjects" for x in admissions["reviewed_new_cohorts"])
+    admissions["received_file_paths"]["r1"].append(str(STUDY / "runs/coverage-gpt-6.1-sol-max/audit.json"))
+    admissions["received_file_paths"]["r1"].sort()
+    admissions["reviewed_new_cohorts"].append({"cohort": "sol_max_fourteen_subjects", "job_id": "749415",
+        "independent_reception_sha256": sha(HERE / "reception-verifiee.json"), "audit_sha256": sha(HERE / "audit-initial.json"),
+        "supplemental_audit_sha256": sha(HERE / "audit-complementaire.json"),
+        "reconciliation_sha256": sha(HERE / "reconciliation-livraisons.json"),
+        "contract_comparisons": "comparabilite-couvertures-luna-astra-terra-sol-max.json",
+        "contract_comparisons_sha256": sha(STUDY / "comparabilite-couvertures-luna-astra-terra-sol-max.json"),
+        "native_calls_observed": 110, "known_exact_tokens": 2502330, "unmetered_calls": 8,
+        "expired_before_native_invocation": 3, "historical_global_ledger_replaced_not_added": True,
+        "new_cpu_cohort_admitted": False, "new_source_only_cells": 0,
+        "review": "Fourteen finite contracts, all finalists and five confirmations, originals, negative states and delivery reconciliation reviewed; no causal model rank."})
+    admissions.update(expected_registry_count=107, expected_principal_results=91, observed_utc=datetime.now(UTC).isoformat())
+    save(EDITORIAL / "admissions.json", admissions)
+    save(EDITORIAL / "admission-sol-verifiee.json", {"verified": True, "job_id": "749415",
+        "receipt_sha256": sha(HERE / "reception-verifiee.json"), "preserved_version": str(VERSION),
+        "preserved_copies": preserved["copied_files"], "previous_manifest_files_reverified": len(old_manifest),
+        "normalized_cohort_sha256": sha(STUDY / "resultats-couverture-sol-max.json"),
+        "admissions_sha256": sha(EDITORIAL / "admissions.json"), "article_rendering_and_visual_review_pending": True,
+        "new_model_calls": 0, "candidate_executions_or_compilations": 0})
+    print(json.dumps({"admitted_subjects": 14, "registries_expected": 107, "results_expected": 91, "scored_nodes": cohort["scored_nodes"], "tokens_by_role": role_totals}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

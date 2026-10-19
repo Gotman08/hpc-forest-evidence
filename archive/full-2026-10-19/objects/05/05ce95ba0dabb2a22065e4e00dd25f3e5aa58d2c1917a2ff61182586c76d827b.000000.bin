@@ -1,0 +1,271 @@
+"""Describe closed LOW searches and immutable-binary post-hoc measurements."""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCALING = HERE.parent / "HPC-Forest-Conformite-Coeurs-r2/serie-05"
+EFFORT_LIST = ["max", "xhigh", "high", "medium", "low"]
+MODELS = ["gpt-6-luna", "gpt-6-astra", "gpt-5.6-terra", "gpt-6.1-sol"]
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write(path, data):
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def table(headers, rows):
+    return "\n".join(["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers),
+                      *["| " + " | ".join(str(v).replace("|", "/").replace("\n", " ") for v in row) + " |" for row in rows]])
+
+
+def main():
+    state = read(HERE / "coordinator-state.json")
+    inventory = read(HERE.parent / "HPC-Forest-Mere-Dynamique-r3/tokens-par-modele.json")
+    audit = read(SCALING / "audit.json")
+    assert audit["evidence_integrity_verified"] and audit["all_cases_and_physical_core_counts_received"]
+    assert audit["measurement_completed"] and audit["failed_or_incomplete_configurations"] == 0
+    with (SCALING / "comparaisons-par-campagne.csv").open(encoding="utf-8-sig", newline="") as stream:
+        scaling = list(csv.DictReader(stream))
+    rows, calls, trials, episodes, contracts, comparisons = [], [], [], [], [], []
+    for model in MODELS:
+        group = next(q for q in state["queue"] if q["key"] == f"screen-{model}-low")
+        assert group["state"] == "received_and_audited"
+        original_audit = read(group["audit_path"])
+        assert original_audit["coverage_and_final_confirmations_verified"]
+        subject = original_audit["subjects"][0]
+        native = [x for x in inventory["native_calls"] if x["campaign"] == "grille-r1/" + group["key"]]
+        assert all(x["state"] == "exact" and x["model"] == model and x["effort"] == "low" for x in native)
+        assert len({(x["session_id"], x["nonce"]) for x in native}) == len(native)
+        assert len(native) == subject["archived_native_invocations"]
+        assert sum(x["exact_total"] for x in native) == subject["archived_exact_native_tokens"]
+        durations = []
+        for call in native:
+            assert sha(call["request_path"]) == call["request_file_sha256"]
+            assert sha(call["response_path"]) == call["response_file_sha256"]
+            invocation = read(Path(call["request_path"]).parent / "invocation.json")
+            assert invocation["model"] == model and invocation["reasoning_effort"] == "low"
+            argv = invocation["argv"]
+            assert argv[argv.index("--model") + 1] == model
+            assert 'model_reasoning_effort="low"' in argv
+            metadata = read(Path(call["request_path"]).parent / "codex.jsonl.json")
+            durations.append(metadata["seconds"])
+        roles = {role: {"calls": sum(x["kind"] == role for x in native),
+                        "tokens": sum(x["exact_total"] for x in native if x["kind"] == role)}
+                 for role in sorted({x["kind"] for x in native})}
+        points = [x for x in scaling if x["model"] == model and x["effort"] == "low"]
+        largest = max(int(x["size"]) for x in points)
+        points = sorted((x for x in points if int(x["size"]) == largest), key=lambda x: int(x["cores"]))
+        assert [int(x["cores"]) for x in points] == [1, 2, 4, 8, 16]
+        assert all(x["full_valid_measurement"] == "True" for x in points)
+        confirmation = subject["best_confirmed"]
+        assert abs(1 - confirmation["mean_seconds"] / confirmation["reference_seconds"]
+                   - subject["confirmed_gain_fraction"]) < 1e-12
+        campaign = HERE / "runs" / group["key"] / "preuves" / ("results-" + group["job_id"]) / "2023-count"
+        for record in subject["detailed_trials"]:
+            trials.append({"model": model, "effort": "low", "job_id": group["job_id"], **record})
+            path = campaign / "logs" / record["id"] / "node-harness.json"
+            episode = read(path)
+            assert not episode["holdout_access"] and not episode["outer_tree_reward_assigned"]
+            episodes.append({"model": model, "role": record["role"], "status": record["status"],
+                             "path": str(path.resolve()), "sha256": sha(path), **episode})
+        rows.append({"model": model, "effort": "low", "job_id": group["job_id"],
+                     "archive_sha256": group["archive_sha256"], "audit_path": group["audit_path"],
+                     "audit_sha256": sha(group["audit_path"]), "confirmation": confirmation,
+                     "gain_fraction": subject["confirmed_gain_fraction"], "topology": subject["topology"],
+                     "trials": subject["trials"], "statuses": subject["statuses"],
+                     "native_calls": len(native), "input_tokens": sum(x["input_tokens"] for x in native),
+                     "output_tokens": sum(x["output_tokens"] for x in native),
+                     "exact_tokens": sum(x["exact_total"] for x in native), "tokens_by_role": roles,
+                     "cached_input_tokens_included": sum(x["cached_input_tokens"] or 0 for x in native),
+                     "reasoning_output_tokens_included": sum(x["reasoning_output_tokens"] or 0 for x in native),
+                     "native_cli_wall_seconds_sum": sum(durations), "native_cli_durations_count": len(durations),
+                     "scheduler": group["scheduler"], "harness_repairs": subject["automatically_repaired_proposals"],
+                     "autonomous_documentary_actions": subject["autonomous_research_actions"],
+                     "largest_scaling_size": largest, "largest_scaling_points": points,
+                     "scaling_points_are_a_new_series": True, "official_contest_compliance_certified": False})
+        calls.extend(native)
+        for effort in EFFORT_LIST:
+            earlier = next(q for q in state["queue"] if q["key"] == f"screen-{model}-{effort}")
+            assert earlier["state"] == "received_and_audited"
+            a = read(earlier["audit_path"])["subjects"][0]
+            camp = HERE / "runs" / earlier["key"] / "preuves" / ("results-" + earlier["job_id"]) / "2023-count"
+            contract = read(camp / "trusted/contract.json")
+            config = read(camp / "trusted/config.json")
+            cases = []
+            for phase in ["search", "confirmation", "benchmark"]:
+                for case in ([contract[phase]] if phase == "benchmark" else contract[phase]):
+                    cases.append({"phase": phase, "name": case["name"],
+                                  "stdin_sha256": sha(camp / "trusted" / case["stdin"]),
+                                  "stdout_sha256": case["expected"]["stdout"]["sha256"]})
+            contracts.append({"key": earlier["key"], "cases": cases, "budget": config["budget"],
+                              "seed": config["seed"], "harness": config["harness"], "comparison": contract["comparison"]})
+            comparisons.append({"model": model, "effort": effort, "job_id": earlier["job_id"],
+                                "gain_fraction": a["confirmed_gain_fraction"],
+                                "reference_seconds": a["best_confirmed"]["reference_seconds"],
+                                "chosen_seconds": a["best_confirmed"]["mean_seconds"], "topology": a["topology"]})
+    assert len({json.dumps({k: v for k, v in c.items() if k != "key"}, sort_keys=True) for c in contracts}) == 1
+    write(HERE / "comparabilite-max-xhigh-high-medium-low.json", {
+        "relevant_contracts_and_input_bytes_identical": True, "cells": contracts,
+        "hardware_frequency_or_full_node_exclusivity_certified": False,
+        "independent_search_repetitions_per_identity_effort": 1})
+    data = {"observed_utc": datetime.now(UTC).isoformat(), "subject": "2023-count", "effort": "low",
+            "rows": rows, "effort_comparisons": comparisons, "native_calls": len(calls),
+            "exact_native_tokens": sum(x["exact_total"] for x in calls), "scored_nodes": sum(x["topology"]["scored_nodes"] for x in rows),
+            "scaling_audit": audit, "operator_algorithm_hints": 0, "candidate_edits": 0,
+            "model_input": False, "universal_correctness_or_model_ranking_proved": False}
+    write(HERE / "resultats-quatre-low.json", data)
+    write(HERE / "details-missions-quatre-low.json", trials)
+    write(HERE / "episodes-harnais-quatre-low.json", episodes)
+    with (HERE / "jetons-par-appel-quatre-low.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(calls[0])); writer.writeheader(); writer.writerows(calls)
+    grid, grid_calls = [], []
+    for model in MODELS:
+        for effort in EFFORT_LIST:
+            group = next(g for g in state["queue"] if g["key"] == f"screen-{model}-{effort}")
+            assert group["state"] == "received_and_audited"
+            original = read(group["audit_path"])
+            assert original["coverage_and_final_confirmations_verified"]
+            a = original["subjects"][0]
+            native = [c for c in inventory["native_calls"] if c["campaign"] == "grille-r1/" + group["key"]]
+            assert native and all(c["model"] == model and c["effort"] == effort for c in native)
+            for call in native:
+                assert sha(call["request_path"]) == call["request_file_sha256"]
+                if call["response_file_sha256"]:
+                    assert sha(call["response_path"]) == call["response_file_sha256"]
+                invocation = read(Path(call["request_path"]).parent / "invocation.json")
+                assert invocation["model"] == model and invocation["reasoning_effort"] == effort
+                argv = invocation["argv"]
+                assert argv[argv.index("--model") + 1] == model
+                assert f'model_reasoning_effort="{effort}"' in argv
+            group_root = HERE / "runs" / group["key"]
+            assert sha(group_root / ("results-" + group["job_id"] + ".tar.gz")) == group["archive_sha256"]
+            exact = [c for c in native if c["state"] == "exact"]
+            unknown = [c for c in native if c["state"] != "exact"]
+            grid.append({"model": model, "effort": effort, "job_id": group["job_id"],
+                "campaign_root": str(group_root.resolve()), "archive_sha256": group["archive_sha256"],
+                "audit_path": group["audit_path"], "audit_sha256": sha(group["audit_path"]),
+                "confirmation": a["best_confirmed"], "gain_fraction": a["confirmed_gain_fraction"],
+                "trials": a["trials"], "statuses": a["statuses"], "topology": a["topology"],
+                "harness_repairs": a["automatically_repaired_proposals"], "autonomous_readings": a["autonomous_research_actions"],
+                "native_calls": len(native), "metered_calls": len(exact), "unmetered_calls": len(unknown),
+                "known_exact_tokens": sum(c["exact_total"] for c in exact),
+                "known_input_tokens": sum(c["input_tokens"] for c in exact),
+                "known_output_tokens": sum(c["output_tokens"] for c in exact),
+                "archived_native_invocations": a["archived_native_invocations"],
+                "local_native_supplements_count": len(native)-a["archived_native_invocations"],
+                "tokens_by_role": {role: {"calls": sum(c["kind"] == role for c in native),
+                    "known_exact_tokens": sum(c["exact_total"] for c in exact if c["kind"] == role),
+                    "unmetered_calls": sum(c["kind"] == role for c in unknown)}
+                    for role in sorted({c["kind"] for c in native})}})
+            grid_calls.extend(native)
+    assert len(grid) == 20 and len({(c["session_id"], c["nonce"]) for c in grid_calls}) == len(grid_calls)
+    grid_data = {"observed_utc": datetime.now(UTC).isoformat(), "subject": "2023-count", "cells_received": 20,
+        "rows": grid, "native_calls": len(grid_calls), "known_exact_tokens": sum(r["known_exact_tokens"] for r in grid),
+        "unmetered_calls": sum(r["unmetered_calls"] for r in grid), "one_seed_per_cell": True,
+        "model_ranking_proved": False, "official_contest_compliance_certified": False,
+        "relevant_contracts_and_inputs_identical": True, "operator_algorithm_hints": 0, "model_input": False}
+    write(HERE / "resultats-vingt-couples-count.json", grid_data)
+    with (HERE / "jetons-par-appel-vingt-couples-count.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(grid_calls[0])); writer.writeheader(); writer.writerows(grid_calls)
+    text = f"""# Cohorte LOW et première grille complète des vingt couples sur count 2023
+
+Instantané du {data['observed_utc']}. Les quatre modèles et les cinq efforts max/xhigh/high/medium/low ont maintenant chacun une recherche fraîche reçue et auditée sur count 2023. Cette première grille de vingt cellules porte sur un seul sujet : les quinze sujets admis et leurs 300 cellules ne sont pas déclarés terminés. R1 poursuit sa couverture séparément. Les programmes, diagnostics et rapports de l'opérateur ne sont jamais réinjectés dans une recherche.
+
+## 1. Exigences, domaine et préparation
+
+L'énoncé demande un nombre de chemins modulo 1000000007 dans une grille à obstacles, avec N < 200000, coordonnées dans la grille et restriction sur M pour N > 1000. La préparation conserve les sources officielles inchangées, les sorties exactes, les diagnostics GCC de variables non initialisées et les contrôles négatifs. Les jeux finis du benchmark et les cinq tailles post-hoc satisfont les contraintes revues. Les preuves ne certifient pas le domaine complet, les jeux cachés, l'emballage ou un classement au concours. MPI est conditionnel dans les règles 2023, limité à quatre processus ; aucune obligation de douze nœuds n'a été trouvée.
+
+## 2. Identités réelles et séparation des rôles
+
+Les invocations relues portent les quatre identités exactes gpt-6-luna, gpt-6-astra, gpt-5.6-terra et gpt-6.1-sol. La mère et les propositions d'une cellule ont le même effort ; LOW est passé explicitement dans les arguments natifs. La CLI authentifiée du PC utilise une inférence hébergée. Les compilations et mesures sont réalisées sous allocation ROMEO. L'opérateur ne propose pas d'algorithme et ne répare aucun candidat. Les documents et sorties de modèles sont des données, pas des instructions de conduite pour l'opérateur.
+
+## 3. Matériel, budgets et chronologie
+
+Les recherches réservent quatre cœurs ARM64, 16 GiB et zéro GPU. Le plafond de recherche est 1800 secondes et 1,5 million de jetons, avec huit missions de programme et deux épisodes de mère au maximum ; un harnais peut employer trois appels partageant 600 secondes. Un créneau, un appel natif et un sommet mesuré ne sont pas la même unité. Les mesures post-hoc imposent les affinités 1/2/4/8/16 sur seize cœurs physiques vérifiés. La mémoire maximale réellement utilisée n'est pas disponible, et l'identité des fréquences ou l'exclusivité complète du nœud ne sont pas prouvées.
+
+## 4. Confirmations LOW et temps absolus d'origine
+
+Les secondes suivantes appartiennent au benchmark de recherche à quatre cœurs et aux cinq confirmations intercalées. Réduction = 1 - temps retenu/temps de référence. Les chronométrages plus grands du post-hoc ci-dessous constituent une autre série.
+
+"""
+    text += table(["Modèle", "Job", "Référence (s)", "Retenu (s)", "Secondes gagnées", "Réduction"], [
+        [r["model"], r["job_id"], f"{r['confirmation']['reference_seconds']:.9f}", f"{r['confirmation']['mean_seconds']:.9f}",
+         f"{r['confirmation']['reference_seconds']-r['confirmation']['mean_seconds']:.9f}", f"{100*r['gain_fraction']:.4f} %"] for r in rows])
+    text += "\n\n## 5. Tailles d'arbres, parents et sources de récolte\n\n"
+    text += table(["Modèle", "Missions", "Sommets", "Profondeur", "Fils maximum", "Statuts"], [
+        [r["model"], r["trials"], r["topology"]["scored_nodes"], r["topology"]["max_depth"], r["topology"]["max_children"], json.dumps(r["statuses"], ensure_ascii=False)] for r in rows])
+    text += """
+
+Luna accomplit huit missions mais n'ajoute que six sommets mesurés : une proposition dupliquée n'ajoute pas de score et une mission s'arrête sur un échec du contrat de génération. Les six programmes mesurés restent à la première profondeur. Les trois autres atteignent huit sommets et deux niveaux, avec deux fils au maximum. Les tentatives supplémentaires internes ne deviennent pas des sommets MCTS. Les 32 missions, hypothèses déclarées, commits, parents et sources G sont conservés dans [l'annexe exhaustive LOW](details-missions-quatre-low.json). Les liens de source d'une récolte ne sont pas confondus avec les liens de parenté d'un arbre.
+
+## 6. Mère, harnais et opérations observées
+
+Le programme retenu de Luna est le C a9f1de68044342f3 ; il déclare une mise à jour en place d'une ligne et une réduction du coût d'entrée, tout en conservant une récurrence séquentielle. Le G d'Astra e704f9d8d2ed4151 cite 8ad10638231442c4 et 85b460b1a34648e7, et déclare combiner des tuiles OpenMP de 256 par 256 en vagues avec des scans NEON. Le C de Terra 583a951e221b489e déclare traiter des segments de ligne en parallèle avec propagation des reports. Le G de Sol d8e2c275fa0746ad cite 8087bf3fada8499d, deb870c2dc304003 et c7ae6f95e11c4729 ; il déclare combiner des bandes persistantes, des lots de seize lignes, des listes d'obstacles et des scans SIMD de huit cellules. Ce sont des déclarations accompagnant les codes archivés, pas une preuve causale indépendante de chaque transformation.
+
+Luna a deux reprises après échec de développement qui aboutissent à un programme passant les contrôles, ainsi que des réponses sans fichiers rejetées par le contrat. Un épisode G reste en échec après trois tentatives ; ces appels consomment des jetons même sans programme final évaluable. Terra réussit trois reprises, dont deux après des sorties différentes de l'oracle et une après une erreur de compilation. Sol réussit une reprise après compilation rejetée. Astra n'emploie qu'une proposition interne par mission. Aucun avertissement ou oracle n'est supprimé ; les réparations viennent des modèles. Aucun accès au holdout, score de vitesse interne ou lecture documentaire spontanée n'est observé. [Les épisodes](episodes-harnais-quatre-low.json) conservent chaque état, diagnostic, appel et empreinte.
+
+R1 impose encore les rôles A/B/C/G et deux épisodes de mère : la variante R4 à n racines indépendantes et conseil local isolé n'est pas validée par ces résultats. La récolte produit un nouveau programme, testé et chronométré à part ; elle n'hérite pas d'un score de ses sources.
+
+## 7. Appels, jetons et temps de génération LOW
+
+"""
+    text += table(["Modèle", "Appels", "Entrée", "Sortie", "Total exact", "Mère appels / jetons", "Enfants / G"], [
+        [r["model"], r["native_calls"], r["input_tokens"], r["output_tokens"], r["exact_tokens"],
+         f"{r['tokens_by_role']['mère']['calls']} / {r['tokens_by_role']['mère']['tokens']}",
+         f"{r['tokens_by_role']['enfant']['calls']} / {r['tokens_by_role']['intégration']['calls']}"] for r in rows])
+    text += f"\n\nLa cohorte LOW utilise **{len(calls)} appels et {data['exact_native_tokens']} jetons exacts**, dont huit appels de mère ; aucun compteur LOW n'est inconnu. Cache et raisonnement sont inclus dans l'entrée et la sortie. Les dix reprises internes supplémentaires par rapport à quarante appels initiaux sont des épisodes du harnais, pas dix nouveaux sommets. Le détail par requête est dans [le CSV LOW](jetons-par-appel-quatre-low.csv).\n\n"
+    text += table(["Modèle", "Durée job", "Somme CLI (s)", "Cache inclus", "Raisonnement inclus"], [
+        [r["model"], r["scheduler"].get("elapsed", "inconnue"), f"{r['native_cli_wall_seconds_sum']:.3f}",
+         r["cached_input_tokens_included"], r["reasoning_output_tokens_included"]] for r in rows])
+    text += "\n\nCes temps CLI incluent attente, transport et génération hébergée ; ils ne sont pas une durée de décodage et ne permettent pas d'annoncer un débit natif de jetons/s. Aucun prix API fictif n'est appliqué à la connexion ChatGPT.\n\n## 8. Montée en cœurs des mêmes exécutables\n\n"
+    text += f"Le job {audit['job_id']} a exécuté les cinq binaires inchangés (quatre candidats et leur référence commune), sans modèle, édition ou compilation, sur cinq entrées N=512/2048/4096/8192/16384. Une chauffe et cinq passages intercalés par affinité donnent {audit['configuration_count']} points et {audit['raw_sample_count']} temps, tous corrects sur les sorties exactes. La grande grille contient 32765 obstacles. Les temps incluent lancement du processus et entrées-sorties.\n\n"
+    text += table(["Modèle LOW", "1 cœur (s)", "2 cœurs (s)", "4 cœurs (s)", "8 cœurs (s)", "16 cœurs (s)", "S(16)"], [
+        [r["model"], *[f"{float(p['chosen_seconds']):.9f}" for p in r["largest_scaling_points"]],
+         f"{float(r['largest_scaling_points'][-1]['own_speedup_vs_one_core']):.4f}"] for r in rows])
+    text += "\n\nS(16) compare le même programme entre un et seize cœurs, pas un candidat à sa référence. Les rapports contre référence, secondes gagnées, écarts-types, occupation CPU et efficacités S(p)/p restent recalculables dans [les 625 mesures brutes](../HPC-Forest-Conformite-Coeurs-r2/serie-05/mesures-brutes.csv) et [leurs comparaisons](../HPC-Forest-Conformite-Coeurs-r2/serie-05/comparaisons-par-campagne.csv). Une occupation CPU moyenne ne prouve pas un nombre précis de threads utiles.\n\n"
+    efficiency = read(SCALING / "efficacite.json")
+    text += f"L'allocation dure {efficiency['elapsed_seconds']} secondes : {efficiency['cpu_seconds_used']} secondes CPU utilisées sur {efficiency['cpu_seconds_reserved']} réservées ({efficiency['cpu_efficiency_pct']} %). Cette moyenne inclut les phases volontairement limitées à moins de seize cœurs et la référence séquentielle ; ce n'est pas l'efficacité à seize cœurs d'un candidat isolé. La mémoire maximale utilisée n'est pas disponible.\n\n"
+    text += "## 9. Première comparaison des vingt couples\n\nLes vingt contrats ont les mêmes entrées, sorties attendues, graine, budgets, harnais et mode de comparaison dans les champs contrôlés : [preuve](comparabilite-max-xhigh-high-medium-low.json). Cette égalité n'établit pas une identité des états internes de service, des fréquences ou charges de nœud. Chaque temps de référence est mesuré dans sa propre allocation ; les séries ne sont pas fusionnées.\n\n"
+    text += table(["Modèle / effort", "Référence (s)", "Retenu (s)", "Réduction", "Sommets / profondeur", "Appels", "Jetons connus", "Non mesurés"], [
+        [r["model"]+" / "+r["effort"], f"{r['confirmation']['reference_seconds']:.9f}", f"{r['confirmation']['mean_seconds']:.9f}",
+         f"{100*r['gain_fraction']:.4f} %", f"{r['topology']['scored_nodes']} / {r['topology']['max_depth']}", r["native_calls"],
+         r["known_exact_tokens"], r["unmetered_calls"]] for r in grid])
+    text += f"\n\nL'ensemble des vingt cellules compte **{grid_data['native_calls']} appels natifs uniques, {grid_data['known_exact_tokens']} jetons exacts connus et {grid_data['unmetered_calls']} appels non mesurés**. Le total connu est un minimum : les réservations imputées à ces derniers ne sont pas ajoutées comme une consommation mesurée, ni considérées comme un plafond de service démontré. Les réponses locales tardives des premières cellules MAX complètent les invocations archivées sans réécrire leurs audits historiques ; l'annexe distingue leurs nombres. [Le JSON des vingt cellules](resultats-vingt-couples-count.json) et [le CSV de tous leurs appels](jetons-par-appel-vingt-couples-count.csv) séparent mère, enfants et G, entrée, sortie, cache et raisonnement.\n\n"
+    text += "![Vingt couples : gains confirmés et jetons connus ; astérisque si consommation incomplète](figures/09-vingt-couples-gains-tokens.png)\n\n"
+    text += """
+## 10. Pourquoi certains arbres sont plus petits
+
+Les budgets plafonnent des ressources, pas des nombres garantis de sommets. Les premiers MAX et plusieurs xhigh ont des appels interrompus au délai de génération ou de mission, des compteurs non mesurés et une consommation de temps qui laisse moins de créneaux utilisables. Une réponse tardive peut être comptabilisée localement sans devenir un candidat de l'arbre. Les plafonds de délai, les événements archivés et les registres expliquent ces différences opérationnelles ; la lenteur du programme candidat n'est pas à elle seule une cause de petit arbre. Les comparaisons MAX détaillées restent conservées séparément.
+
+HIGH, MEDIUM et LOW ont ici huit missions par modèle, mais les doublons et échecs sans programme évaluable réduisent les nouveaux sommets. LOW Luna consomme seize appels pour seulement six sommets, Astra dix pour huit : le harnais peut occuper plusieurs appels dans un seul épisode. Un modèle peut aussi répéter un programme au lieu d'étendre sa branche ; cette répétition ne devient pas artificiellement un nouveau résultat. Une profondeur faible n'est donc pas automatiquement un défaut du MCTS ou une preuve de modèle plus faible.
+
+## 11. Interprétation scientifique et résultats négatifs
+
+Luna MEDIUM conserve la référence et ce résultat reste dans la comparaison. LOW Luna améliore la charge d'origine mais pas autant que son MAX ; ce seul contraste ne démontre pas une règle générale d'effort. Les gains d'Astra et Sol sont proches sur plusieurs efforts, alors que programmes et coûts diffèrent. Plus de raisonnement demandé ne garantit ni plus de sommets, ni moins de jetons de campagne, ni un meilleur programme. Les comparaisons ne contiennent qu'une recherche par couple et une seule graine : les cinq chronométrages ne sont pas cinq recherches indépendantes. Les répétitions de recherche et nouvelles distributions restent à réaliser avant toute affirmation statistique générale.
+
+Les courbes peuvent montrer un plafonnement, mais des causes comme les synchronisations, attentes actives, dépendances ou limites de représentation demandent un profilage dédié. Les déclarations de transformation et le comportement mesuré sont séparés ; aucune pensée interne n'est reconstituée. Le matériel adapté, les entrées finies et l'absence de soumission empêchent d'attribuer un rang officiel. La mère dynamique R4 et la couverture de tous les sujets restent des expérimentations distinctes en attente ou en cours.
+
+## 12. Provenance, intégrité et conservation
+
+"""
+    text += f"L'archive post-hoc est `{audit['archive_sha256']}` ; {audit['files_verified_before_and_after']} fichiers sont vérifiés avant et après audit en lecture seule. Le [JSON LOW](resultats-quatre-low.json) relie les quatre archives, identités, confirmations, parents et nouvelles mesures. Tous les anciens résultats et versions d'article sont conservés. Aucun candidat n'est modifié ni réutilisé comme amorce et aucun post-hoc n'est transmis à un arbre.\n"
+    (HERE / "BILAN-QUATRE-LOW-ET-VINGT-COUPLES.md").write_text(text, encoding="utf8")
+    print(json.dumps({"low_campaigns": len(rows), "low_native_calls": len(calls), "low_exact_tokens": data["exact_native_tokens"],
+        "low_scored_nodes": data["scored_nodes"], "grid_calls": grid_data["native_calls"],
+        "grid_known_tokens": grid_data["known_exact_tokens"], "grid_unmetered_calls": grid_data["unmetered_calls"]}))
+
+
+if __name__ == "__main__":
+    main()

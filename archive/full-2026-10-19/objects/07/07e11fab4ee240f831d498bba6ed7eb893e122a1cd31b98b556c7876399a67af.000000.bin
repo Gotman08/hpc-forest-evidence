@@ -1,0 +1,120 @@
+"""Reconcile only a preserved complete local cache against the received R2 mailbox."""
+from __future__ import annotations
+
+import json
+import re
+
+from audit_common import (
+    JOB,
+    MODEL,
+    PLAN_SHA,
+    SCOPE,
+    SESSION,
+    SOURCE_SHA,
+    need,
+    read_json,
+    sha,
+)
+
+NONCE = re.compile(r"[0-9a-f]{32}\Z")
+
+
+def mailbox_and_cache(mailbox, cache):
+    paths = list((mailbox / "requests").glob("*.request.json"))
+    need(len(paths) <= 500, "Unexpected native request count")
+    out = {"unique_session_nonce_pairs": 0, "exact_known_tokens": 0, "exact_known_native_invocations": 0,
+           "unknown_native_invocations": 0, "unresolved_nonces": [], "mother_requests": 0,
+           "child_requests": 0, "nonce_records": []}
+    seen, missions, mother_phases = set(), set(), set()
+    for path in paths:
+        request = read_json(path)
+        nonce = request.get("nonce")
+        need(isinstance(nonce, str) and NONCE.fullmatch(nonce) and path.name == nonce + ".request.json", "Unsafe nonce")
+        key = (request.get("session_id"), nonce)
+        need(key not in seen, "Duplicate session/nonce")
+        seen.add(key)
+        need(request.get("kind") == "source-proposal" and request.get("model") == MODEL
+             and request.get("reasoning_effort") == "max" and request.get("session_id") == SESSION,
+             "Mixed identity or smoke request")
+        mother = request.get("meta_role")
+        need(mother in {None, "mother-preparation", "mother-synthesis"}, "Unknown mother phase")
+        out["mother_requests" if mother else "child_requests"] += 1
+        need(isinstance(request.get("mission_id"), str) and request["mission_id"] not in missions, "Duplicate/missing request mission ID")
+        missions.add(request["mission_id"])
+        if mother:
+            need(mother not in mother_phases, "Repeated mother phase")
+            mother_phases.add(mother)
+        request_sha = sha(path.read_bytes())
+        local = cache / nonce
+        claim = read_json(local / "generation-claimed.json")
+        need(claim.get("request_sha256") == request_sha and (local / "downloaded-request.json").read_bytes() == path.read_bytes(), "Cache claim/download differs")
+        needed = [mailbox / "responses" / f"{nonce}.response.json", mailbox / "responses" / f"{nonce}.ready.json",
+                  mailbox / "logs" / f"{nonce}.invocation.json", mailbox / "logs" / f"{nonce}.codex.jsonl",
+                  mailbox / "logs" / f"{nonce}.codex.jsonl.json", mailbox / "logs" / f"{nonce}.delivered.json",
+                  local / "response.json", local / "response-ready.json", local / "delivered.json"]
+        if not all(p.is_file() and not p.is_symlink() for p in needed):
+            out["unresolved_nonces"].append(nonce)
+            out["unknown_native_invocations"] += 1
+            continue
+        response_path, ready_path, invocation_path, events_path, process_path, delivery_path = needed[:6]
+        response, ready, invocation, process, delivered = [read_json(p) for p in (response_path, ready_path, invocation_path, process_path, delivery_path)]
+        response_sha = sha(response_path.read_bytes())
+        need((local / "response.json").read_bytes() == response_path.read_bytes()
+             and (local / "response-ready.json").read_bytes() == ready_path.read_bytes()
+             and (local / "delivered.json").read_bytes() == delivery_path.read_bytes(), "Local/archive delivery bytes differ")
+        need(ready.get("sha256") == response_sha and ready.get("bytes") == response_path.stat().st_size
+             and delivered.get("request_sha256") == request_sha and delivered.get("response_sha256") == response_sha,
+             "Ready/delivered SHA mismatch")
+        need(delivered.get("scope_id") == SCOPE and delivered.get("session_id") == SESSION
+             and delivered.get("model") == MODEL and delivered.get("effort") == "max"
+             and delivered.get("job_id") == JOB and delivered.get("source_zip_sha256") == SOURCE_SHA
+             and delivered.get("plan_sha256") == PLAN_SHA, "Wrong delivered scope")
+        need(response.get("nonce") == nonce and response.get("request_sha256") == request_sha
+             and response.get("session_id") == SESSION and response.get("model") == MODEL
+             and response.get("reasoning_effort") == "max", "Wrong response identity")
+        argv = invocation.get("argv", [])
+        need(invocation.get("request_sha256") == request_sha and invocation.get("model") == MODEL
+             and invocation.get("reasoning_effort") == "max" and invocation.get("source_execution_allowed") is False
+             and argv == process.get("argv") and "--model" in argv and argv[argv.index("--model") + 1] == MODEL
+             and 'model_reasoning_effort="max"' in argv and 'forced_login_method="chatgpt"' in argv,
+             "Archived invocation MAX/CLI provenance differs")
+        for local_name, remote_path in (("invocation.json", invocation_path), ("codex.jsonl", events_path), ("codex.jsonl.json", process_path)):
+            need((local / local_name).read_bytes() == remote_path.read_bytes(), "Cache invocation/event/process bytes differ")
+        usages, tools = [], []
+        for line in events_path.read_text(encoding="utf8", errors="strict").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError as exc:
+                raise ValueError("Malformed native JSONL; invocation cannot be fully reconciled") from exc
+            if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+                usages.append(event["usage"])
+            if event.get("type") in {"item.started", "item.completed", "item.updated"}:
+                kind = event.get("item", {}).get("type")
+                if kind not in {None, "error", "reasoning", "agent_message"}:
+                    tools.append(kind)
+        need(not tools, "Native CLI attempted a forbidden tool")
+        known = len(usages) == 1 and all(all(type(u.get(k)) is int and u[k] >= 0 for k in ("input_tokens", "output_tokens")) for u in usages)
+        tokens = sum(u["input_tokens"] + u["output_tokens"] for u in usages) if known else None
+        usage = response.get("usage", {})
+        if known and usage.get("token_accounting") == "exact":
+            need(usage.get("tokens") == tokens and usage.get("llm_calls") == 1 and usage.get("tool_events") == [] and usage.get("codex_jsonl_sha256") == sha(events_path.read_bytes()), "Native exact usage/hash mismatch")
+            out["exact_known_tokens"] += tokens
+            out["exact_known_native_invocations"] += len(usages)
+        else:
+            out["unknown_native_invocations"] += 1
+            out["unresolved_nonces"].append(nonce)
+        if response.get("infrastructure_error") is not False or process.get("returncode") != 0 or process.get("timed_out") is not False:
+            out["unresolved_nonces"].append(nonce)
+        out["nonce_records"].append({"nonce": nonce, "mission_id": request["mission_id"], "mother": bool(mother), "exact_tokens": tokens if known else None,
+                                      "known_model_negative": bool(response.get("error"))})
+    expected_responses = {f"{nonce}{suffix}" for _, nonce in seen for suffix in (".response.json", ".ready.json")}
+    actual_responses = {p.name for p in (mailbox / "responses").iterdir() if p.is_file()}
+    need(actual_responses <= expected_responses, "Orphan archived response/ready not linked to a request")
+    dirs = {p.name for p in cache.iterdir() if p.is_dir() and NONCE.fullmatch(p.name)}
+    need(dirs == {nonce for _, nonce in seen}, "Extra/missing cache claims not reconciled")
+    need(not any(p.is_file() and (p.name.endswith((".writing", ".pending", ".tmp")) or p.name.startswith("pending")) for p in cache.rglob("*")), "Pending cache artifact blocks complete admission")
+    need(out["mother_requests"] <= 2, "Mother call ceiling exceeded")
+    out["unique_session_nonce_pairs"] = len(seen)
+    out["mission_ids"] = sorted(missions)
+    out["unresolved_nonces"] = sorted(set(out["unresolved_nonces"]))
+    return out

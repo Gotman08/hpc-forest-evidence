@@ -1,0 +1,150 @@
+"""Admit only the two independently received Terra cohorts after preservation."""
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib.util
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+EDITORIAL = STUDY / "edition-professionnelle"
+COMPARE = STUDY.parent / "HPC-Forest-Harnais-Comparaison-r1"
+VERSION = STUDY / "versions/20261017-avant-terra-double-professionnelle"
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def save_new(path, value):
+    with path.open("x", encoding="utf8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def main():
+    preserved = read(VERSION / "PRESERVATION.json")
+    assert preserved["all_copied_bytes_verified"] and preserved["copied_files"] == 4450
+    assert len(preserved["previous_manifest"]["files"]) == 1063
+    assert all(sha(VERSION / name) == digest for name, digest in preserved["files"].items())
+    assert sha(VERSION / "edition-professionnelle/manifeste-edition.json") == preserved["previous_manifest_sha256"]
+    admissions = read(EDITORIAL / "admissions.json")
+    before = copy.deepcopy(admissions)
+    assert (before["expected_registry_count"], before["expected_principal_results"]) == (165, 149)
+    gate_spec = importlib.util.spec_from_file_location("terra_receipt_gates", EDITORIAL / "terra_accounting.py")
+    gates = importlib.util.module_from_spec(gate_spec)
+    gate_spec.loader.exec_module(gates)
+    descriptors = [
+        ("terra_xhigh_fourteen_subjects", STUDY / "receptions/coverage-terra-xhigh-750909",
+         STUDY / "resultats-couverture-terra-xhigh.json", "750909", "xhigh", 14, 104, 1966540, 7, 9),
+        ("source_only_terra_max_fifteen_subjects", COMPARE / "receptions/source-only-terra-max-750831",
+         STUDY / "resultats-source-only-terra-max.json", "750831", "max", 15, 59, 823583, 31, 35),
+    ]
+    bound_receipts = []
+    for name, folder, normalized, job, effort, subjects, calls, tokens, unmetered, unknown_requests in descriptors:
+        assert not any(item["cohort"] == name for item in admissions["reviewed_new_cohorts"])
+        receipt, cohort = read(folder / "reception-verifiee.json"), read(normalized)
+        assert gates.verified_receipt(receipt) and str(receipt["job_id"]) == job
+        assert cohort["received_subjects"] == len(cohort["rows"]) == subjects
+        assert (cohort["native_calls"], cohort["known_exact_tokens"], cohort["unmetered_calls"]) == (calls, tokens, unmetered)
+        assert all(row["model"] == "gpt-5.6-terra" and row["effort"] == effort
+                   and str(row["job_id"]) == job for row in cohort["rows"])
+        for key, expected in (("native_calls", calls), ("known_exact_tokens", tokens), ("unmetered_calls", unmetered)):
+            assert sum(row[key] for row in cohort["rows"]) == expected
+        for value in receipt.values():
+            if isinstance(value, dict) and set(value) >= {"path", "sha256"}:
+                assert sha(value["path"]) == value["sha256"]
+        absence = receipt.get("absence") or receipt.get("owned_interfaces_absent")
+        assert absence and "owned_stop" not in receipt
+        reconciliation = read(folder / "reconciliation-livraisons.json")
+        assert reconciliation["all_published_requests_accounted_for"]
+        assert not reconciliation["all_published_requests_delivered"]
+        assert not reconciliation["total_exact_consumption_available"]
+        assert reconciliation["requests_with_unknown_consumption"] == unknown_requests
+        assert (reconciliation["native_invocations_observed"], reconciliation["known_exact_tokens"],
+                reconciliation["unmeasured_native_invocations"]) == (calls, tokens, unmetered)
+        assert sum(not item["usage_measured"] for item in reconciliation["records"]) == unknown_requests
+        assert all(item["known_exact_tokens"] is None for item in reconciliation["records"] if not item["usage_measured"])
+        assert receipt.get("new_cli_used_in_this_cohort", False) is False
+        assert receipt.get("new_cli_used_for_this_cohort", False) is False
+        original_cli = receipt.get("original_cli_used_for_completed_cohort") or receipt.get("cli_version_for_this_completed_cohort")
+        assert original_cli and original_cli.endswith("0.162.0-alpha.17.2")
+        admissions["reviewed_new_cohorts"].append({
+            "cohort": name, "job_id": job,
+            "independent_reception_sha256": sha(folder / "reception-verifiee.json"),
+            "normalized_cohort_sha256": sha(normalized),
+            "reconciliation_sha256": sha(folder / "reconciliation-livraisons.json"),
+            "absence_receipt_sha256": absence["sha256"],
+            "native_calls_observed": calls, "known_exact_tokens": tokens,
+            "unmetered_calls": unmetered, "requests_with_unknown_consumption": unknown_requests,
+            "all_published_requests_reconciled": True, "all_published_requests_delivered": False,
+            "total_exact_consumption_available": False, "new_cpu_cohort_admitted": False,
+            "new_source_only_cells": 15 if subjects == 15 else 0, "source_only_300_barrier_passed": False,
+            "original_cli_used_for_completed_cohort": "codex-cli 0.162.0-alpha.17.2",
+            "new_cli_used_in_this_cohort": False,
+            "review": "Exact identities, finite contracts, parents/sources, all finalists and five confirmations, negatives and every published request reviewed. Undelivered claims and unobserved invocations remain unknown. Descriptive only; no causal rank.",
+        })
+        bound_receipts.append({"job_id": job, "receipt_path": str(folder / "reception-verifiee.json"),
+                               "receipt_sha256": sha(folder / "reception-verifiee.json"),
+                               "normalized_path": str(normalized), "normalized_sha256": sha(normalized)})
+    spec = importlib.util.spec_from_file_location("terra_professional_pipeline", EDITORIAL / "pipeline.py")
+    pipeline = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pipeline)
+    fresh = pipeline.received_files()
+    expected_delta = {
+        "r1": {str((STUDY / "runs/coverage-gpt-5.6-terra-xhigh/audit.json").resolve())},
+        "source_only": {str((COMPARE / name).resolve()) for name in
+                        ("runs/source-only-gpt-5.6-terra-max/audit.json",
+                         "receptions/source-only-terra-max-750831/audit-initial.json",
+                         "receptions/source-only-terra-max-750831/audit-independant.json")
+                        if (COMPARE / name).exists()},
+    }
+    for key, values in fresh.items():
+        assert set(before["received_file_paths"][key]) <= set(values)
+        assert set(values) - set(before["received_file_paths"][key]) == expected_delta.get(key, set()), (key, "Unreviewed audit")
+    assert len(expected_delta["source_only"]) >= 1
+    admissions.update(received_file_paths=fresh, expected_registry_count=194,
+                      expected_principal_results=178, observed_utc=datetime.now(UTC).isoformat())
+    assert admissions["reviewed_new_cohorts"][:-2] == before["reviewed_new_cohorts"]
+    save_new(HERE / "admissions-avant.json", before)
+    (EDITORIAL / "admissions.json").write_text(json.dumps(admissions, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    proof = {"verified": True, "preserved_version": str(VERSION), "preserved_files": 4450,
+             "previous_manifest_files_reverified": 1063, "new_cohorts": [row[0] for row in descriptors],
+             "bound_receipts": bound_receipts, "new_subject_results": 29,
+             "admissions_sha256": sha(EDITORIAL / "admissions.json"), "registries_expected": 194,
+             "results_expected": 178, "CPU_samples_unchanged": 11575,
+             "native_closed_cohorts": 13, "native_closed_invocations": 1580,
+             "native_closed_known_exact_tokens": 33796289, "native_closed_unmetered_invocations": 144,
+             "total_native_consumption_exact": False, "new_model_calls": 0,
+             "candidate_execution_or_compilation": False, "article_rendering_and_visual_review_pending": True}
+    save_new(EDITORIAL / "admission-terra-double-verifiee.json", proof)
+    id_path = STUDY.parents[1] / "ID.md"
+    id_lines = id_path.read_text(encoding="utf8").splitlines()
+    states = {
+        "ID-015": " Source-only Luna/Astra/Terra MAX reçus : 45/300 issues ; 255 non reçues. R1 118/300 cellules. Véritable Codex non admis, 239 tests r7 neutres distincts. ",
+        "ID-017": " Deux cohortes Terra admises après préservation de 4 450 fichiers, dont 1 063 manifestés ; 194 registres et 178 résultats en recalcul, construction et revue visuelle attendues. ",
+        "ID-021": " Vingt couples count, quatre couvertures MAX et trois xhigh reçus : 118 cellules R1 auditées ; identités et négatifs conservés. ",
+        "ID-040": " 194 registres, 178 résultats et 11 575 temps CPU inchangés ; treize cohortes natives closes, inconnus et non-livraisons distincts, douze rubriques en reconstruction et revue visuelle attendue. ",
+    }
+    for i, line in enumerate(id_lines):
+        for key, state in states.items():
+            if line.startswith("| " + key + " |"):
+                cells = line.split("|")
+                cells[3] = state
+                id_lines[i] = "|".join(cells)
+    import re
+    assert re.findall(r"^\| (ID-\d{3}) \|", "\n".join(id_lines), re.MULTILINE) == [f"ID-{i:03d}" for i in range(1, 41)]
+    id_path.write_text("\n".join(id_lines) + "\n", encoding="utf8")
+    print(json.dumps(proof))
+
+
+if __name__ == "__main__":
+    main()

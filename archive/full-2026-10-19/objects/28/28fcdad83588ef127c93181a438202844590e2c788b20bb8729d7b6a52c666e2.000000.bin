@@ -1,0 +1,211 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system.
+ * Uses Structure-of-Arrays layout for better cache locality and vectorization.
+ * Outer loop unrolled by factor 2 (pairwise) so that each load of body j's
+ * coordinates is reused for two consecutive i values, reducing memory traffic.
+ */
+void body_force(float *restrict x, float *restrict y, float *restrict z,
+                float *restrict vx, float *restrict vy, float *restrict vz,
+                float dt, int n) {
+  #pragma omp parallel for schedule(static)
+  for (int i = 0; i < n - 1; i += 2) {
+    float fx_i = 0.0f, fy_i = 0.0f, fz_i = 0.0f;
+    float fx_ip1 = 0.0f, fy_ip1 = 0.0f, fz_ip1 = 0.0f;
+
+    const float xi   = x[i];
+    const float yi   = y[i];
+    const float zi   = z[i];
+    const float xi1  = x[i+1];
+    const float yi1  = y[i+1];
+    const float zi1  = z[i+1];
+
+    for (int j = 0; j < n; ++j) {
+      // body i
+      float dx = x[j] - xi;
+      float dy = y[j] - yi;
+      float dz = z[j] - zi;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1.0f / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx_i += dx * inv_dist3;
+      fy_i += dy * inv_dist3;
+      fz_i += dz * inv_dist3;
+
+      // body i+1 (reuses x[j], y[j], z[j] from the same load)
+      dx = x[j] - xi1;
+      dy = y[j] - yi1;
+      dz = z[j] - zi1;
+      sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      inv_dist = 1.0f / sqrt(sqrd_dist);
+      inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx_ip1 += dx * inv_dist3;
+      fy_ip1 += dy * inv_dist3;
+      fz_ip1 += dz * inv_dist3;
+    }
+
+    vx[i]   += dt*fx_i;   vy[i]   += dt*fy_i;   vz[i]   += dt*fz_i;
+    vx[i+1] += dt*fx_ip1; vy[i+1] += dt*fy_ip1; vz[i+1] += dt*fz_ip1;
+  }
+
+  // Handle odd number of bodies (last body processed sequentially)
+  if (n % 2 != 0) {
+    int i = n - 1;
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    const float xi = x[i];
+    const float yi = y[i];
+    const float zi = z[i];
+
+    for (int j = 0; j < n; ++j) {
+      float dx = x[j] - xi;
+      float dy = y[j] - yi;
+      float dz = z[j] - zi;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1.0f / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    vx[i] += dt*fx; vy[i] += dt*fy; vz[i] += dt*fz;
+  }
+}
+
+/*
+ * Read a binary dataset with initialized bodies.
+ */
+void read_dataset(float **restrict x, float **restrict y, float **restrict z,
+                  float **restrict vx, float **restrict vy, float **restrict vz,
+                  int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+
+  const int n = *nbodies;
+  // Allocate aligned memory for SoA arrays
+  size_t alignment = 64;
+  if (posix_memalign((void**)x, alignment, n * sizeof(float)) != 0) {
+    fprintf(stderr,"\nError allocating x array\n");
+    exit(EXIT_FAILURE);
+  }
+  if (posix_memalign((void**)y, alignment, n * sizeof(float)) != 0) {
+    fprintf(stderr,"\nError allocating y array\n");
+    exit(EXIT_FAILURE);
+  }
+  if (posix_memalign((void**)z, alignment, n * sizeof(float)) != 0) {
+    fprintf(stderr,"\nError allocating z array\n");
+    exit(EXIT_FAILURE);
+  }
+  if (posix_memalign((void**)vx, alignment, n * sizeof(float)) != 0) {
+    fprintf(stderr,"\nError allocating vx array\n");
+    exit(EXIT_FAILURE);
+  }
+  if (posix_memalign((void**)vy, alignment, n * sizeof(float)) != 0) {
+    fprintf(stderr,"\nError allocating vy array\n");
+    exit(EXIT_FAILURE);
+  }
+  if (posix_memalign((void**)vz, alignment, n * sizeof(float)) != 0) {
+    fprintf(stderr,"\nError allocating vz array\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Read interleaved data into temporary buffer and scatter to SoA
+  float *tmp = (float*)malloc(n * 6 * sizeof(float));
+  if (!tmp) {
+    fprintf(stderr,"\nError allocating tmp buffer\n");
+    exit(EXIT_FAILURE);
+  }
+  b = fread(tmp, n * 6 * sizeof(float), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    free(tmp);
+    exit(EXIT_FAILURE);
+  }
+
+  for (int i = 0; i < n; ++i) {
+    (*x)[i] = tmp[i*6 + 0];
+    (*y)[i] = tmp[i*6 + 1];
+    (*z)[i] = tmp[i*6 + 2];
+    (*vx)[i] = tmp[i*6 + 3];
+    (*vy)[i] = tmp[i*6 + 4];
+    (*vz)[i] = tmp[i*6 + 5];
+  }
+
+  free(tmp);
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies,
+                   const float *restrict x, const float *restrict y, const float *restrict z,
+                   const float *restrict vx, const float *restrict vy, const float *restrict vz) {
+  // Gather SoA into interleaved buffer
+  float *tmp = (float*)malloc(nbodies * 6 * sizeof(float));
+  if (!tmp) {
+    fprintf(stderr,"\nError allocating tmp buffer for output\n");
+    exit(EXIT_FAILURE);
+  }
+  for (int i = 0; i < nbodies; ++i) {
+    tmp[i*6 + 0] = x[i];
+    tmp[i*6 + 1] = y[i];
+    tmp[i*6 + 2] = z[i];
+    tmp[i*6 + 3] = vx[i];
+    tmp[i*6 + 4] = vy[i];
+    tmp[i*6 + 5] = vz[i];
+  }
+
+  int b = fwrite(tmp, nbodies * 6 * sizeof(float), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    free(tmp);
+    exit(EXIT_FAILURE);
+  }
+
+  free(tmp);
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  float *x = NULL, *y = NULL, *z = NULL;
+  float *vx = NULL, *vy = NULL, *vz = NULL;
+
+  read_dataset(&x, &y, &z, &vx, &vy, &vz, &nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(x, y, z, vx, vy, vz, DT, nbodies);
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < nbodies; ++i) {
+      x[i] += vx[i] * DT;
+      y[i] += vy[i] * DT;
+      z[i] += vz[i] * DT;
+    }
+  }
+
+  write_dataset(nbodies, x, y, z, vx, vy, vz);
+
+  free(x); free(y); free(z);
+  free(vx); free(vy); free(vz);
+
+  exit(EXIT_SUCCESS);
+}

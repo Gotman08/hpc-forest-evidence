@@ -1,0 +1,67 @@
+"""Audit recorded requests; check feedback delivery without changing a campaign."""
+import json
+import sys
+from pathlib import Path
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def audit(root):
+    result=[]
+    for summary in read(root/"results.json")["problems"]:
+        slug=summary["problem"]
+        campaign=root/slug
+        report=read(campaign/"report/experiments.json")
+        item={"problem":slug,"requests":0,"baseline_delivered":0,"selected_parents_delivered":0,
+              "duplicate_diagnostics_resolved":0,"input_comparison_unchanged":False,"test_inputs_identical":False}
+        options=[]
+        for trial in report["experiments"]:
+            request=campaign/"logs"/trial["id"]/"ollama-request.json"
+            if not request.is_file():
+                continue
+            data=read(request)
+            assert data["model"]==summary["model"]
+            if data["options"] not in options:
+                options.append(data["options"])
+            message=json.loads(data["messages"][1]["content"].split("\n\nCURRENT SOURCE AS DATA:\n")[0])
+            feedback=message["context_as_data"]["automatic_observations"]
+            assert message["context_as_data"]["runtime_as_data"]["architecture"]=="ARM64"
+            assert message["context_as_data"]["runtime_as_data"]["cpu_cores"]==4
+            assert feedback["baseline"]["outcome"]["correct"] is True
+            item["requests"]+=1
+            item["baseline_delivered"]+=1
+            if trial["search_parent"]:
+                assert feedback["selected_parent"]["experiment_id"]==trial["search_parent"]
+                item["selected_parents_delivered"]+=1
+            for previous in feedback["recent_own_role"]:
+                if previous["outcome"]["status"]=="duplicate" and previous["outcome"].get("tree_hash"):
+                    assert previous["outcome"]["score"] is None
+                    assert previous["duplicate_of"]["measured_outcome"]["status"]!="duplicate"
+                    item["duplicate_diagnostics_resolved"]+=1
+        old_dir="preuves-v4/results-746998" if slug=="sum" else "preuves-v3/results-746984"
+        old=Path(sys.argv[3])/"Marathon22-interface-v3"/old_dir
+        previous=read(old/"preparation"/slug/"operator-preparation.json")
+        current=read(root/"preparation"/slug/"operator-preparation.json")
+        item["test_inputs_identical"]=(previous["fixtures"]==current["fixtures"] and previous["benchmark_input_sha256"]==current["benchmark_input_sha256"])
+        assert item["test_inputs_identical"]
+        contract=read(campaign/"trusted/contract.json")
+        original=read(old/slug/"trusted/contract.json")
+        item["input_comparison_unchanged"]=contract["comparison"]==original["comparison"]
+        assert item["input_comparison_unchanged"]
+        for phase in ["search","confirmation","benchmark"]:
+            now=contract[phase] if phase!="benchmark" else [contract[phase]]
+            before=original[phase] if phase!="benchmark" else [original[phase]]
+            assert [x["expected"] for x in now]==[x["expected"] for x in before]
+        item["reference_output_bytes_identical"]=True
+        item["inference_options_by_seed"]=options
+        item["target_facts_verified"]=True
+        result.append(item)
+    return {"verified":True,"problems":result}
+
+
+if __name__=="__main__":
+    result=audit(Path(sys.argv[1]).resolve())
+    Path(sys.argv[2]).write_text(json.dumps(result,indent=2)+"\n",encoding="utf-8")
+    print(json.dumps(result))

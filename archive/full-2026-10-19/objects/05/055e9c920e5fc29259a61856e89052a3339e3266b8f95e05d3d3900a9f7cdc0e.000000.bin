@@ -1,0 +1,496 @@
+"""Neutral fixtures only; no CIM, process handles, worker cache, or stop execution."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location(
+    "stop_file_gates", HERE / "preparer-arret.py"
+)
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+NOW = datetime(2026, 10, 18, 5, 0, 0, tzinfo=UTC).timestamp()
+
+
+def row(pid, parent=0, command="foreign.exe", created="2026-10-18T04:00:00.1234567Z"):
+    return {
+        "ProcessId": pid,
+        "ParentProcessId": parent,
+        "ExecutablePath": "C:/fixture/python.exe",
+        "CommandLine": command,
+        "CreationDate": created,
+    }
+
+
+def fixtures():
+    owned = [row(p, command="python -m hpc_forest.worker") for p in g.OWNED_ORDER]
+    preserved = [row(p, command="transport fixture") for p in g.PRESERVED_ORDER]
+    system = {
+        "ProcessId": 0,
+        "ParentProcessId": 0,
+        "ExecutablePath": None,
+        "CommandLine": None,
+        "CreationDate": None,
+    }
+    rows = owned + preserved + [system, row(100)]
+    census = {
+        "captured_at_utc": "2026-10-18T05:00:00.0000000Z",
+        "complete_census": True,
+        "strict_utf8_decoding": True,
+        "rows_count": len(rows),
+        "rows": rows,
+    }
+    return census, copy.deepcopy(census), owned, preserved
+
+
+def classify(census, baseline, owned, preserved):
+    return g.classify(census, baseline, owned, preserved, now=NOW)
+
+
+def test_exact_nine_and_preserved_five():
+    c, b, o, p = fixtures()
+    result = classify(c, b, o, p)
+    assert result["present_owned"] == list(g.OWNED_ORDER)
+    assert result["preserved_observer_transport_present"] == list(g.PRESERVED_ORDER)
+    assert not set(result["present_owned"]) & set(g.PRESERVED_ORDER)
+
+
+def test_natural_absence_is_not_target_substitution():
+    c, b, o, p = fixtures()
+    c["rows"] = [r for r in c["rows"] if r["ProcessId"] not in {37848, 36356}]
+    c["rows_count"] = len(c["rows"])
+    result = classify(c, b, o, p)
+    assert result["absent_owned"] == [37848]
+    assert result["preserved_observer_transport_naturally_absent"] == [36356]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("ParentProcessId", 123),
+        ("CommandLine", "changed"),
+        ("ExecutablePath", "C:/other.exe"),
+        ("CreationDate", "2026-10-18T04:00:00.1234568Z"),
+    ],
+)
+def test_owned_reuse_or_any_identity_change_refused(field, value):
+    c, b, o, p = fixtures()
+    c["rows"][0] = {**c["rows"][0], field: value}
+    with pytest.raises(ValueError, match="identity changed"):
+        classify(c, b, o, p)
+
+
+def test_preserved_identity_change_refused():
+    c, b, o, p = fixtures()
+    c["rows"][9] = {**c["rows"][9], "CreationDate": "2026-10-18T04:00:00.1234568Z"}
+    with pytest.raises(ValueError, match="identity changed"):
+        classify(c, b, o, p)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m hpc_forest.unrecognized_worker",
+        'PYTHON "C:/X/BOOTSTRAP_WORKER.PY"',
+        'python "C:/x/OBSERVER-MIXTE.PY"',
+    ],
+)
+def test_unknown_native_or_reader_refused(command):
+    c, b, o, p = fixtures()
+    r = row(777, command=command)
+    c["rows"].append(r)
+    b["rows"].append(copy.deepcopy(r))
+    c["rows_count"] += 1
+    b["rows_count"] += 1
+    with pytest.raises(ValueError, match="Unknown native"):
+        classify(c, b, o, p)
+
+
+@pytest.mark.parametrize("parent", [37848, 41724])
+def test_new_descendant_never_adopted(parent):
+    c, b, o, p = fixtures()
+    c["rows"].append(row(777, parent=parent))
+    c["rows_count"] += 1
+    with pytest.raises(ValueError, match="unknown descendant"):
+        classify(c, b, o, p)
+
+
+def newborn(pid, parent=100, **changes):
+    return {
+        **row(pid, parent=parent, created="2026-10-18T05:00:00.0000000Z"),
+        **changes,
+    }
+
+
+def add_rows(census, *rows):
+    census["rows"].extend(rows)
+    census["rows_count"] = len(census["rows"])
+
+
+def test_new_foreign_independent_birth_is_recorded_never_targeted():
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777))
+    result = classify(c, b, o, p)
+    assert result["new_independent_foreign_identities"] == [
+        {
+            "ProcessId": 777,
+            "ancestor_pids": [777],
+            "anchor_pid": 100,
+            "anchor_kind": "unchanged_five_field_foreign_baseline",
+            "never_targeted": True,
+        }
+    ]
+    assert result["present_owned"] == list(g.OWNED_ORDER)
+    assert "CommandLine" not in json.dumps(result["new_independent_foreign_identities"])
+
+
+def test_new_foreign_chain_anchors_to_unchanged_baseline():
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777), newborn(778, parent=777))
+    result = classify(c, b, o, p)
+    assert result["new_independent_foreign_identities"][1]["ancestor_pids"] == [
+        778,
+        777,
+    ]
+    assert result["new_independent_foreign_identities"][1]["anchor_pid"] == 100
+
+
+def test_new_foreign_explicit_system_root():
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777, parent=0))
+    result = classify(c, b, o, p)
+    assert (
+        result["new_independent_foreign_identities"][0]["anchor_kind"]
+        == "explicit_system_root_0_or_4"
+    )
+
+
+def test_new_foreign_orphan_refused():
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777, parent=999))
+    with pytest.raises(ValueError, match="orphan"):
+        classify(c, b, o, p)
+
+
+def test_new_foreign_missing_baseline_parent_is_not_assumed_same_identity():
+    c, b, o, p = fixtures()
+    c["rows"] = [r for r in c["rows"] if r["ProcessId"] != 100]
+    add_rows(c, newborn(777))
+    with pytest.raises(ValueError, match="orphan"):
+        classify(c, b, o, p)
+
+
+def test_new_foreign_cycle_refused():
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777, parent=778), newborn(778, parent=777))
+    with pytest.raises(ValueError, match="cycle"):
+        classify(c, b, o, p)
+
+
+def test_new_foreign_parent_created_after_child_refused():
+    c, b, o, p = fixtures()
+    c["captured_at_utc"] = "2026-10-18T05:00:10.0000000Z"
+    add_rows(
+        c,
+        newborn(777, CreationDate="2026-10-18T05:00:05.0000000Z"),
+        newborn(778, parent=777, CreationDate="2026-10-18T05:00:04.0000000Z"),
+    )
+    with pytest.raises(ValueError, match="after child"):
+        g.classify(c, b, o, p, now=NOW + 10)
+
+
+def test_exact_operator_and_new_launcher_have_independent_foreign_chain():
+    c, b, o, p = fixtures()
+    add_rows(
+        c,
+        newborn(778),
+        newborn(
+            777,
+            parent=778,
+            ExecutablePath="C:/Windows/pwsh.exe",
+            CommandLine=str(HERE / "arreter-individuellement.ps1"),
+        ),
+    )
+    result = g.classify(c, b, o, p, operator_pid=777, now=NOW)
+    assert result["operator_process_never_targeted"] == 777
+    assert [r["ProcessId"] for r in result["new_independent_foreign_identities"]] == [
+        778
+    ]
+    assert 777 not in result["present_owned"]
+
+
+@pytest.mark.parametrize(
+    "created", ["2026-10-18T04:59:59.9999999Z", "2026-10-18T05:00:00.0000001Z"]
+)
+def test_new_foreign_birth_outside_snapshot_interval_refused(created):
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777, CreationDate=created))
+    with pytest.raises(ValueError, match="outside"):
+        classify(c, b, o, p)
+
+
+def test_new_foreign_indirect_owned_descendant_refused():
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777, parent=37848), newborn(778, parent=777))
+    with pytest.raises(ValueError, match="descendant"):
+        classify(c, b, o, p)
+
+
+@pytest.mark.parametrize(
+    "command,exe",
+    [
+        ('"C:/copied/CODEX.EXE" app-server', "C:/fixture/python.exe"),
+        ("codex exec", "C:/fixture/python.exe"),
+        ("inert fixture", "C:/copied/codex.exe"),
+    ],
+)
+def test_new_unknown_cli_is_never_independent(command, exe):
+    c, b, o, p = fixtures()
+    add_rows(c, newborn(777, CommandLine=command, ExecutablePath=exe))
+    with pytest.raises(ValueError, match="native CLI"):
+        classify(c, b, o, p)
+
+
+def test_foreign_pid_reuse_refused():
+    c, b, o, p = fixtures()
+    c["rows"][-1] = {**c["rows"][-1], "CreationDate": "2026-10-18T04:01:00.1234567Z"}
+    with pytest.raises(ValueError, match="baseline PID reused"):
+        classify(c, b, o, p)
+
+
+@pytest.mark.parametrize("age", [-1, 121])
+def test_census_future_or_expired_refused(age):
+    c, b, o, p = fixtures()
+    c["captured_at_utc"] = (
+        datetime.fromtimestamp(NOW - age, UTC).isoformat().replace("+00:00", "Z")
+    )
+    with pytest.raises(ValueError, match="Fresh complete"):
+        classify(c, b, o, p)
+
+
+@pytest.mark.parametrize("field", ["complete_census", "strict_utf8_decoding"])
+def test_incomplete_census_refused(field):
+    c, b, o, p = fixtures()
+    c[field] = False
+    with pytest.raises(ValueError, match="Fresh complete"):
+        classify(c, b, o, p)
+
+
+def test_duplicate_census_refused():
+    c, b, o, p = fixtures()
+    c["rows"].append(copy.deepcopy(c["rows"][0]))
+    c["rows_count"] += 1
+    with pytest.raises(ValueError, match="duplicate"):
+        classify(c, b, o, p)
+
+
+def test_incomplete_baseline_refused():
+    c, b, o, p = fixtures()
+    b["complete_census"] = False
+    with pytest.raises(ValueError, match="parent baseline"):
+        classify(c, b, o, p)
+
+
+def test_preserved_identity_in_target_partition_refused():
+    _c, _b, o, p = fixtures()
+    tampered = copy.deepcopy(o)
+    tampered[0] = p[0]
+    with pytest.raises(ValueError, match="ordered partition"):
+        g.partition(tampered, o, g.OWNED_ORDER)
+
+
+def test_reordered_targets_refused():
+    _c, _b, o, _p = fixtures()
+    with pytest.raises(ValueError, match="ordered partition"):
+        g.partition(list(reversed(o)), o, g.OWNED_ORDER)
+
+
+def test_seventh_tick_preserved():
+    assert g.stamp("2026-10-18T04:00:00.1234567Z") != g.stamp(
+        "2026-10-18T04:00:00.1234568Z"
+    )
+    assert g.stamp("2026-10-18T04:00:00.123456Z") == "2026-10-18T04:00:00.1234560Z"
+
+
+def final_fixtures(monkeypatch):
+    monkeypatch.setattr(g, "RECEIPT_SHA", "f" * 64)
+    refs = {
+        k: {"path": str(HERE / ("NEUTRAL-" + k + ".json")), "sha256": h}
+        for k, h in {
+            "baseline": g.BASELINE_SHA,
+            "reconciliation": g.RECON_SHA,
+            "late_remote_readback": g.LATE_SHA,
+            "independent_audit": g.AUDIT_SHA,
+            "normalization": "1" * 64,
+        }.items()
+    }
+    final = {
+        "schema": "hpc-forest-source-only-final-reception-v1",
+        "verified": True,
+        "job_id": "751592",
+        "session_id": g.SESSION,
+        "scope_id": g.SCOPE,
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "source_zip_sha256": g.SOURCE,
+        **refs,
+    }
+    for k in (
+        "coverage_and_final_confirmations_verified",
+        "read_only_file_verification_before_and_after",
+        "deliveries_reconciled",
+        "all_started_calls_reconciled",
+        "scientific_reception_verified",
+        "independent_audit_verified",
+        "owned_stop_requires_separate_review_and_fresh_identity",
+    ):
+        final[k] = True
+    rec = {
+        "verified": True,
+        "all_started_calls_reconciled": True,
+        "unknown_invocations": 0,
+        "unresolved": [],
+        "requests_with_unknown_consumption": 10,
+        "exact_consumption_tokens_total": None,
+        "native_invocations_observed": 121,
+        "known_exact_tokens": 2676472,
+    }
+    audit = {
+        "schema": "hpc-forest-source-only-independent-cold-audit-v1",
+        "verified": True,
+        "job_id": "751592",
+        "session_id": g.SESSION,
+        "scope_id": g.SCOPE,
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "source_zip_sha256": g.SOURCE,
+        "subject_count": 15,
+        "subjects": [{"verified": True} for _ in range(15)],
+        "all15_final_confirmations_verified": True,
+        "reconciliation": refs["reconciliation"],
+    }
+    data = {
+        g.BASELINE_SHA: {"verified": True, "before_after_inventory_identical": True},
+        g.RECON_SHA: rec,
+        g.LATE_SHA: {
+            "verified": True,
+            "all_124_deliveries_readback_supported": True,
+            "unknown_consumption_remains_unknown": True,
+        },
+        g.AUDIT_SHA: audit,
+        "1" * 64: {"neutral": True},
+        "f" * 64: final,
+    }
+    monkeypatch.setattr(g, "load", lambda r: data[r["sha256"]])
+    return (
+        {"path": str(g.RX / "reception-verifiee.json"), "sha256": "f" * 64},
+        final,
+        rec,
+        audit,
+    )
+
+
+def test_neutral_final_gate_keeps_ten_unknowns_null(monkeypatch):
+    r, _f, _rec, _a = final_fixtures(monkeypatch)
+    assert g.final_proof(r)[1]["exact_consumption_tokens_total"] is None
+
+
+@pytest.mark.parametrize(
+    "field", ["verified", "scientific_reception_verified", "independent_audit_verified"]
+)
+def test_false_final_flag_refused_before_cache(monkeypatch, field):
+    r, f, _rec, _a = final_fixtures(monkeypatch)
+    f[field] = False
+    monkeypatch.setattr(
+        g, "verify_cache", lambda _: pytest.fail("must never read cache")
+    )
+    with pytest.raises(ValueError):
+        g.prepare(r, {}, {})
+
+
+def test_unknown_consumption_cannot_be_zeroed(monkeypatch):
+    r, _f, rec, _a = final_fixtures(monkeypatch)
+    rec["exact_consumption_tokens_total"] = 2676472
+    with pytest.raises(ValueError, match="unknowns"):
+        g.final_proof(r)
+
+
+def test_fifteen_confirmations_required(monkeypatch):
+    r, _f, _rec, a = final_fixtures(monkeypatch)
+    a["all15_final_confirmations_verified"] = False
+    with pytest.raises(ValueError, match="fifteen-subject"):
+        g.final_proof(r)
+
+
+def test_audit_pin_cannot_be_substituted(monkeypatch):
+    r, f, _rec, _a = final_fixtures(monkeypatch)
+    f["independent_audit"]["sha256"] = "2" * 64
+    with pytest.raises(ValueError, match="immutable"):
+        g.final_proof(r)
+
+
+def test_changed_reference_refused(tmp_path):
+    p = tmp_path / "inert.json"
+    p.write_text(json.dumps({"neutral": True}), encoding="utf8")
+    r = g.ref(p)
+    p.write_text("{}", encoding="utf8")
+    with pytest.raises(ValueError, match="reference"):
+        g.load(r)
+
+
+def test_no_process_or_native_import_in_python_helper():
+    import ast
+
+    tree = ast.parse((HERE / "preparer-arret.py").read_text(encoding="utf8"))
+    imports = [
+        n.module if isinstance(n, ast.ImportFrom) else a.name
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for a in (n.names if isinstance(n, ast.Import) else [None])
+    ]
+    assert not any(
+        x in {"subprocess", "socket", "ctypes", "psutil"} or x.startswith("hpc_forest")
+        for x in imports
+    )
+
+
+def test_ps_only_individual_stop_and_exclusive_intent():
+    text = (HERE / "arreter-individuellement.ps1").read_text(encoding="utf8")
+    assert "Stop-Process -InputObject $ownedProcess -Force" in text
+    assert "[System.IO.FileMode]::CreateNew" in text and "$stream.Flush($true)" in text
+    assert text.index("Write-NewJson $preflight $intentPath") < text.index(
+        "Stop-Process -InputObject"
+    )
+    assert (
+        "Exact-Partition $plan.owned_targets_in_stop_order $trusted.owned_targets_in_stop_order"
+        in text
+    )
+    assert (
+        "Exact-Partition $plan.preserved_observer_transport_identities $trusted.preserved_observer_transport_identities"
+        in text
+    )
+    assert (
+        "taskkill" not in text.casefold()
+        and "Stop-Process -Id" not in text
+        and "Stop-Process -Name" not in text
+    )
+
+
+def test_existing_cli_exec_is_not_accepted_as_baseline_foreign():
+    c, b, o, p = fixtures()
+    process = row(
+        777,
+        command='"C:/copied/codex.exe" exec --fixture-only',
+        created="2026-10-18T04:00:00.1234567Z",
+    )
+    add_rows(c, process)
+    add_rows(b, copy.deepcopy(process))
+    with pytest.raises(ValueError, match="Active native CLI generation"):
+        classify(c, b, o, p)

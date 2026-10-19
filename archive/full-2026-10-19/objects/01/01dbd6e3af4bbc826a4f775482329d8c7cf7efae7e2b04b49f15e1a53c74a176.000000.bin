@@ -1,0 +1,182 @@
+"""Local minimal staging and readback reconciliation; never invokes any transport or process."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path, PurePosixPath
+
+SCOPE = 'hpc-forest-primes-native-max-r2e'
+SOURCE = 'f15b840cca876a4c465775f5553a0eaa539a9b98e56fe942136a1fcbde9b86b9'
+PLAN = '4b430e181948e55e463dfd1e60bdce96308a9190534734feb22354e4116ebde9'
+CELLS = {'gpt-6-astra': 'f81b76a9bc484f669a210c476ae6f9b0',
+    'gpt-5.6-terra': 'e3678f243ba54a9fadb57440641c0599',
+    'gpt-6.1-sol': '515db6fd166e4b68875f34cf2fe733fa'}
+HERE = Path(__file__).resolve().parent
+
+
+class Refusal(RuntimeError):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise Refusal(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {'path': str(Path(path).resolve()), 'sha256': sha(path)}
+
+
+def artifact(value):
+    require(isinstance(value, dict) and set(value) == {'path', 'sha256'}, 'Closed local reference required')
+    path = Path(value['path'])
+    require(path.is_absolute() and path.is_file() and not path.is_symlink()
+            and re.fullmatch('[0-9a-f]{64}', value['sha256']) and sha(path) == value['sha256'], 'Changed or missing local artifact')
+    return path
+
+
+def read(value):
+    return json.loads(artifact(value).read_text(encoding='utf8'))
+
+
+def save(directory, name, value):
+    with (directory / name).open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+    return ref(directory / name)
+
+
+def inventory(directory):
+    require(directory.is_dir() and not directory.is_symlink(), 'Ordinary exact directory required')
+    result = {}
+    for path in directory.rglob('*'):
+        require(path.is_file() and not path.is_symlink() and path.parent == directory, 'No subdirectory, link or special staged item permitted')
+        result[path.name] = {'sha256': sha(path), 'bytes': path.stat().st_size}
+    return result
+
+
+def stage(m, output, manifest, marker_ref):
+    """Called only after the factory's actual gates; makes no new admission claim."""
+    require((m.SCOPE, m.SOURCE, m.PLAN) == (SCOPE, SOURCE, PLAN) and CELLS.get(m.MODEL) == m.SESSION, 'Pinned R2d cell required')
+    root = '/scratch_p/nimarano/' + SCOPE + '-admission-' + m.SESSION
+    require(m.ADMISSION_ROOT == root and str(manifest['job_id']).isdigit(), 'Exact allocated cell root/job required')
+    rows = [*manifest['dependencies'], manifest['authorization_publish_after_dependencies']]
+    require(len(manifest['dependencies']) == 23 and len(rows) == 24, 'Exact current minimal dependency graph required')
+    copied = {}
+    for row in rows:
+        require(set(row) == {'remote_path', 'local'}, 'Closed upload row required')
+        path = PurePosixPath(row['remote_path'])
+        require(str(path) == row['remote_path'] and str(path.parent) == root and path.name not in
+                {'authorization-ready.json', 'allocation-ready.json'} and path.name not in copied
+                and '\\' not in path.name and '..' not in path.parts, 'Only unique flat exact admission files allowed')
+        source = artifact(row['local'])
+        copied[path.name] = source
+    require('authorization.json' in copied, 'Authorization must be staged separately from ready')
+    ready = read(manifest['ready_publish_last']['local'])
+    auth = read(ref(copied['authorization.json']))
+    require(auth.get('verified') is True and auth.get('scope_id') == SCOPE and auth.get('model') == m.MODEL
+            and auth.get('session_id') == m.SESSION and auth.get('job_id') == manifest['job_id']
+            and ready.get('sha256') == sha(copied['authorization.json'])
+            and manifest['ready_publish_last']['remote_path'] == root + '/authorization-ready.json', 'Ready/auth exact cell linkage required')
+    marker = read(marker_ref)
+    require(marker.get('schema') == 'hpc-forest-max-cell-allocation-ready-v1' and marker.get('verified') is True
+            and marker.get('scope_id') == SCOPE and marker.get('model') == m.MODEL
+            and marker.get('session_id') == m.SESSION and marker.get('job_id') == manifest['job_id']
+            and marker.get('source_zip_sha256') == SOURCE and marker.get('plan_sha256') == PLAN
+            and marker.get('admission_root') == root, 'Actual exact zero-call allocation marker required')
+    directory = output / 'publication-locale'
+    directory.mkdir(exist_ok=False)
+    group = directory / PurePosixPath(root).name
+    group.mkdir(exist_ok=False)
+    for name, source in copied.items():
+        with (group / name).open('xb') as stream:
+            stream.write(source.read_bytes())
+        require(sha(group / name) == sha(source), 'Staged bytes changed')
+    expected = inventory(group)
+    plan = {'schema': 'hpc-forest-max-cell-minimal-directory-publication-v1', 'verified': False, 'performed': False,
+        'scope_id': SCOPE, 'model': m.MODEL, 'effort': 'max', 'session_id': m.SESSION, 'job_id': manifest['job_id'],
+        'source_zip_sha256': SOURCE, 'plan_sha256': PLAN, 'qualification_reception_sha256': m.QRECEPTION,
+        'remote_root': root, 'staged_directory': str(group.resolve()), 'inventory': expected,
+        'allocation_marker': marker_ref, 'ready': manifest['ready_publish_last'],
+        'directory_upload': {'tool': 'mcp__romeo__upload_to_romeo', 'arguments': {
+            'local_path': str(group.resolve()), 'remote_path': '/scratch_p/nimarano', 'verify': True}},
+        'directory_readback': {'tool': 'mcp__romeo__download_from_romeo', 'arguments': {
+            'remote_path': root, 'local_path': str((directory / 'readback').resolve()), 'recursive': True, 'verify': True}},
+        'file_upload_count_without_grouping': 25, 'grouped_upload_count': 2,
+        'directory_tool_hash_verified': False, 'readback_sha_comparison_required_before_all_ready': True,
+        'full_cim_config_credentials_exported': False, 'native_calls': 0}
+    return save(directory, 'publication-arguments.json', plan)
+
+
+def verify_one(item):
+    require(set(item) == {'publication', 'upload_result', 'download_result'}, 'Closed readback item required')
+    value = read(item['publication'])
+    require(value.get('schema') == 'hpc-forest-max-cell-minimal-directory-publication-v1'
+            and value.get('verified') is False and value.get('performed') is False
+            and (value.get('scope_id'), value.get('source_zip_sha256'), value.get('plan_sha256')) == (SCOPE, SOURCE, PLAN)
+            and CELLS.get(value.get('model')) == value.get('session_id') and str(value.get('job_id', '')).isdigit(), 'Pinned publication plan required')
+    root = '/scratch_p/nimarano/' + SCOPE + '-admission-' + value['session_id']
+    group = Path(value['staged_directory'])
+    require(value['remote_root'] == root and group.name == PurePosixPath(root).name
+            and group.is_relative_to(HERE), 'Exact owned stage and remote root required')
+    require(inventory(group) == value['inventory'] and len(value['inventory']) == 24
+            and 'authorization-ready.json' not in value['inventory'], 'Staged minimal inventory changed')
+    upload, download = read(item['upload_result']), read(item['download_result'])
+    upload = upload.get('structuredContent', upload)
+    download = download.get('structuredContent', download)
+    require(upload.get('ok') is True and upload.get('sent') == str(group) and upload.get('to') == root,
+            'Actual upload result must name the exact grouped destination')
+    copied = Path(value['directory_readback']['arguments']['local_path'])
+    require(copied.is_relative_to(group.parent) and copied.name == 'readback'
+            and download.get('ok') is True and download.get('downloaded') == root
+            and download.get('to') == str(copied), 'Actual exact readback result required')
+    before = inventory(copied)
+    expected = {**value['inventory'], 'allocation-ready.json': {'sha256': value['allocation_marker']['sha256'],
+        'bytes': artifact(value['allocation_marker']).stat().st_size}}
+    require(before == expected, 'Readback must contain exactly24 admitted files plus the original allocation marker')
+    ready_path = artifact(value['ready']['local'])
+    ready = read(value['ready']['local'])
+    require(value['ready']['remote_path'] == root + '/authorization-ready.json'
+            and ready.get('sha256') == before['authorization.json']['sha256']
+            and ready.get('bytes') == before['authorization.json']['bytes']
+            and ready.get('job_id') == value['job_id'] and ready.get('session_id') == value['session_id']
+            and inventory(copied) == before, 'Readback/ready bytes or identity changed')
+    return value, {'tool': 'mcp__romeo__upload_to_romeo', 'arguments': {
+        'local_path': str(ready_path), 'remote_path': root + '/authorization-ready.json', 'verify': True}}
+
+
+def verify_cohort(items, output):
+    require(isinstance(items, list) and len(items) == 3, 'All three readbacks must precede every ready')
+    checked = [verify_one(item) for item in items]
+    require({v['model'] for v, _ in checked} == set(CELLS) and len({v['job_id'] for v, _ in checked}) == 3
+            and len({v['qualification_reception_sha256'] for v, _ in checked}) == 1, 'Exact three distinct cohort cells with one real qualification required')
+    output.mkdir(exist_ok=False)
+    return save(output, 'ready-uploads-arguments-seulement.json', {
+        'schema': 'hpc-forest-max-cap4-cohort-readbacks-reconciled-v1', 'verified': False, 'performed': False,
+        'directory_readback_bytes_reconciled': True, 'source_zip_sha256': SOURCE, 'plan_sha256': PLAN,
+        'evidence': items, 'ready_uploads_after_all_three_readbacks': [row for _, row in checked],
+        'native_research_admitted_by_this_report': False, 'normal_first_call_proved': False,
+        'native_calls': 0, 'worker_started': False})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', type=Path, required=True)
+    parser.add_argument('--input-sha256', required=True)
+    parser.add_argument('--output-name', required=True)
+    args = parser.parse_args()
+    require(re.fullmatch('[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.output_name), 'Fresh simple output name required')
+    value = read({'path': str(args.input.resolve()), 'sha256': args.input_sha256})
+    require(set(value) == {'schema', 'cells'} and value['schema'] == 'hpc-forest-max-cap4-publication-readback-input-v1', 'Closed cohort readback input required')
+    result = verify_cohort(value['cells'], HERE / args.output_name)
+    print(json.dumps({'result': result, 'performed': False, 'uploads': 0, 'native_calls': 0}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

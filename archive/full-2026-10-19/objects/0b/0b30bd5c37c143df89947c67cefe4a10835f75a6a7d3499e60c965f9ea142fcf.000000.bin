@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\n/*\n * All threads in the persistent team call this routine. Complete\n * four-target blocks and scalar remainder bodies are distributed once.\n * Each target accumulates sources in ascending j order.\n */\nvoid body_force(Body *p, float dt, int n) {\n#if defined(__aarch64__) && defined(__ARM_NEON)\n  const int vector_end = n - n % 4;\n  const float32x4_t softening = vdupq_n_f32(SOFTENING);\n  const float64x2_t one = vdupq_n_f64(1.0);\n\n#ifdef _OPENMP\n#pragma omp for schedule(static) nowait\n#endif\n  for (int i = 0; i < vector_end; i += 4) {\n    const float32x4_t x = {p[i].x, p[i + 1].x, p[i + 2].x, p[i + 3].x};\n    const float32x4_t y = {p[i].y, p[i + 1].y, p[i + 2].y, p[i + 3].y};\n    const float32x4_t z = {p[i].z, p[i + 1].z, p[i + 2].z, p[i + 3].z};\n    float32x4_t fx = vdupq_n_f32(0.0f);\n    float32x4_t fy = vdupq_n_f32(0.0f);\n    float32x4_t fz = vdupq_n_f32(0.0f);\n\n    for (int j = 0; j < n; j++) {\n      float32x4_t dx = vdupq_n_f32(p[j].x) - x;\n      float32x4_t dy = vdupq_n_f32(p[j].y) - y;\n      float32x4_t dz = vdupq_n_f32(p[j].z) - z;\n      float32x4_t sqrd_dist = dx*dx + dy*dy + dz*dz + softening;\n\n      /* Preserve double sqrt and division before conversion to float. */\n      float64x2_t distance_lo = vcvt_f64_f32(vget_low_f32(sqrd_dist));\n      float64x2_t distance_hi = vcvt_f64_f32(vget_high_f32(sqrd_dist));\n      float64x2_t inverse_lo = vdivq_f64(one, vsqrtq_f64(distance_lo));\n      float64x2_t inverse_hi = vdivq_f64(one, vsqrtq_f64(distance_hi));\n      float32x4_t inv_dist = vcombine_f32(vcvt_f32_f64(inverse_lo),\n                                         vcvt_f32_f64(inverse_hi));\n      float32x4_t inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*vgetq_lane_f32(fx, 0);\n    p[i].vy += dt*vgetq_lane_f32(fy, 0);\n    p[i].vz += dt*vgetq_lane_f32(fz, 0);\n    p[i + 1].vx += dt*vgetq_lane_f32(fx, 1);\n    p[i + 1].vy += dt*vgetq_lane_f32(fy, 1);\n    p[i + 1].vz += dt*vgetq_lane_f32(fz, 1);\n    p[i + 2].vx += dt*vgetq_lane_f32(fx, 2);\n    p[i + 2].vy += dt*vgetq_lane_f32(fy, 2);\n    p[i + 2].vz += dt*vgetq_lane_f32(fz, 2);\n    p[i + 3].vx += dt*vgetq_lane_f32(fx, 3);\n    p[i + 3].vy += dt*vgetq_lane_f32(fy, 3);\n    p[i + 3].vz += dt*vgetq_lane_f32(fz, 3);\n  }\n#else\n  const int vector_end = 0;\n#endif\n\n  /* This loop's implicit barrier also completes all vector blocks. */\n#ifdef _OPENMP\n#pragma omp for schedule(static)\n#endif\n  for (int i = vector_end; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n\n  /*\n   * Reuse one team across all timesteps, serializing small systems.\n   * Barriers separate force computation, integration, and the next step.\n   */\n#ifdef _OPENMP\n#pragma omp parallel if(nbodies >= 64) default(none) shared(bodies, nbodies)\n#endif\n  {\n    for (int iter = 0; iter < N_ITER; iter++) {\n      body_force(bodies, DT, nbodies);\n\n#ifdef _OPENMP\n#pragma omp for schedule(static)\n#endif\n      for (int i = 0; i < nbodies; i++) {\n        bodies[i].x += bodies[i].vx * DT;\n        bodies[i].y += bodies[i].vy * DT;\n        bodies[i].z += bodies[i].vz * DT;\n      }\n    }\n  }\n\n  write_dataset(nbodies, bodies);\n\n  free(bodies);\n\n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "Combining persistent OpenMP target parallelism with four-target NEON SIMD may outperform either archived transformation alone while preserving per-target arithmetic order.",
+    "notes": "Unmeasured integration; no commands executed. Binary I/O, constants, and ten timesteps remain unchanged. Controller evaluates full-program correctness and speed.",
+    "sources_kept": [
+      "60e063cb2c7546e6",
+      "54bd03f810e143a0"
+    ],
+    "transformations": [
+      "Reuse one statically scheduled OpenMP team across all ten timesteps, serialized below 64 bodies.",
+      "Vectorize four complete target bodies per NEON block, retaining ascending-source accumulation, double-precision square root and division, and the archived float expression structure.",
+      "Workshare complete vector blocks and scalar remainder bodies exactly once, retaining barriers before position integration and before the next timestep.",
+      "Preserve the scalar fallback for non-NEON targets."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "cf7f78e4e5dd43b981e34bfedbd12e0a",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "356d1f6e1bbabc860194bcf07422be403265e5135e41840f90d983e8b436199c",
+  "session_id": "665743a02b824021a697b6a4884a667c",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "20d38507c860ed58fe2c92c9a355f94c3e1083af2266dde2d3d84f7a66106ca9",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 22358,
+        "output_tokens": 4691,
+        "reasoning_output_tokens": 2543
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 27049,
+    "tool_events": []
+  }
+}

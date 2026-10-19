@@ -1,0 +1,223 @@
+#include "knn.h"
+#include <math.h>
+
+static char vote_labels(char * labels, int k) {
+    int i;
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+static char insertion_knn(int n_groups, Group * groups, int k,
+                          Point to_evaluate, char * labels,
+                          float * distances) {
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+
+                    distances[x] = d;
+                    labels[x] = g.label;
+
+                    break;
+                }
+            }
+        }
+    }
+
+    return vote_labels(labels, k);
+}
+
+static char reference_knn(int n_groups, Group * groups, int k,
+                          Point to_evaluate) {
+    char * labels = (char *) malloc(sizeof(char) * (size_t) k);
+    float * distances = (float *) malloc(sizeof(float) * (size_t) k);
+    char answer = insertion_knn(n_groups, groups, k, to_evaluate, labels,
+                                distances);
+
+    free(distances);
+    free(labels);
+
+    return answer;
+}
+
+static inline int entry_is_worse(float first_distance, size_t first_order,
+                                 float second_distance, size_t second_order) {
+    return first_distance > second_distance ||
+           (first_distance == second_distance && first_order > second_order);
+}
+
+static void heap_sift_down(float * distances, size_t * orders, char * labels,
+                           size_t size, size_t root) {
+    float distance = distances[root];
+    size_t order = orders[root];
+    char label = labels[root];
+
+    while (root < size / 2) {
+        size_t child = root * 2 + 1;
+        size_t right = child + 1;
+
+        if (right < size &&
+            entry_is_worse(distances[right], orders[right],
+                           distances[child], orders[child])) {
+            child = right;
+        }
+
+        if (!entry_is_worse(distances[child], orders[child], distance, order)) {
+            break;
+        }
+
+        distances[root] = distances[child];
+        orders[root] = orders[child];
+        labels[root] = labels[child];
+        root = child;
+    }
+
+    distances[root] = distance;
+    orders[root] = order;
+    labels[root] = label;
+}
+
+static void heapify(float * distances, size_t * orders, char * labels,
+                    size_t size) {
+    size_t root = size / 2;
+
+    while (root != 0) {
+        root--;
+        heap_sift_down(distances, orders, labels, size, root);
+    }
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    size_t capacity;
+    size_t count;
+    size_t encounter;
+    size_t slot;
+    char * labels;
+    float * distances;
+    size_t * orders;
+    char answer;
+    int i, j;
+
+    if (k <= 0) {
+        return reference_knn(n_groups, groups, k, to_evaluate);
+    }
+
+    capacity = (size_t) k;
+    labels = (char *) malloc(sizeof(char) * capacity);
+    distances = (float *) malloc(sizeof(float) * capacity);
+    orders = (size_t *) malloc(sizeof(size_t) * capacity);
+
+    if (orders == NULL) {
+        answer = insertion_knn(n_groups, groups, k, to_evaluate, labels,
+                               distances);
+        free(distances);
+        free(labels);
+        return answer;
+    }
+
+    count = 0;
+    encounter = 0;
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            if (!isfinite(d)) {
+                free(orders);
+                answer = insertion_knn(n_groups, groups, k, to_evaluate,
+                                       labels, distances);
+                free(distances);
+                free(labels);
+                return answer;
+            }
+
+            if (count < capacity) {
+                distances[count] = d;
+                orders[count] = encounter;
+                labels[count] = g.label;
+                count++;
+
+                if (count == capacity) {
+                    heapify(distances, orders, labels, capacity);
+                }
+            } else if (d < distances[0]) {
+                distances[0] = d;
+                orders[0] = encounter;
+                labels[0] = g.label;
+                heap_sift_down(distances, orders, labels, capacity, 0);
+            }
+
+            encounter++;
+        }
+    }
+
+    if (count < capacity) {
+        for (slot = count; slot < capacity; slot++) {
+            labels[slot] = -1;
+        }
+    }
+
+    answer = vote_labels(labels, k);
+    free(orders);
+    free(distances);
+    free(labels);
+
+    return answer;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

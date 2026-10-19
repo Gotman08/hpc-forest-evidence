@@ -1,0 +1,278 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<stdint.h>
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  Node* data = NULL;
+  FILE *fl = NULL;
+
+  if (fname == NULL)
+    fl = stdin;
+  else
+    fl = fopen(fname, "r");
+
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  fscanf(fl, "%d %[^\n]", n, list);
+
+  if (*n > 0) {
+    if ((size_t)*n > SIZE_MAX / sizeof(Node)) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+    data = (Node*) malloc((size_t)*n * sizeof(Node));
+    if (data == NULL) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  for (int i = 0; i < *n; i++)
+    fscanf(fl, "%d %f %[^\n]", &data[i].id, &data[i].value, data[i].neighbors);
+
+  fclose(fl);
+  return data;
+}
+
+/* Returns the index of the node with the given id or -1 if not found. */
+int find_by_id(Node g[], int id, int size) {
+  int i = 0;
+  while ((i < size) && g[i].id != id)
+    i++;
+  if (i < size)
+    return i;
+  return -1;
+}
+
+/* Original traversal, also used if auxiliary allocation fails. */
+float get_costly(Node *g, int id, int size) {
+  char *t;
+  int idmax = -1;
+  float max = 0;
+  char *auxptr;
+
+  int nd = find_by_id(g, id, size);
+  if (nd < 0)
+    return max;
+
+  char aux[MAX];
+  strcpy(aux, g[nd].neighbors);
+  t = strtok_r(aux, " ", &auxptr);
+
+  do {
+    int d = find_by_id(g, atoi(t), size);
+    if (d >= 0 && max < g[d].value) {
+      max = g[d].value;
+      idmax = atoi(t);
+    }
+  } while ((t = strtok_r(NULL, " ", &auxptr)));
+
+  float r = g[nd].value;
+  if (idmax != -1)
+    r += get_costly(g, idmax, size);
+  return r;
+}
+
+typedef struct {
+  int id;
+  int row;
+} IdEntry;
+
+enum {
+  NEXT_UNKNOWN = -2,
+  NEXT_NONE = -1
+};
+
+/* Hot traversal state is separate from the cold neighbor strings. */
+typedef struct {
+  float value;
+  int next;
+} HotNode;
+
+typedef struct {
+  const Node *nodes;
+  IdEntry *index;
+  HotNode *hot;
+  float *path;
+  size_t mask;
+} SearchGraph;
+
+static size_t hash_id(int id) {
+  uint32_t x = (uint32_t)id;
+  x ^= x >> 16;
+  x *= UINT32_C(0x7feb352d);
+  x ^= x >> 15;
+  x *= UINT32_C(0x846ca68b);
+  x ^= x >> 16;
+  return (size_t)x;
+}
+
+static int init_search(SearchGraph *s, const Node *nodes, int n) {
+  s->nodes = nodes;
+  s->index = NULL;
+  s->hot = NULL;
+  s->path = NULL;
+  s->mask = 0;
+
+  if (n <= 0)
+    return 0;
+
+  size_t count = (size_t)n;
+  if (count > SIZE_MAX / 2)
+    return 0;
+
+  size_t capacity = 2;
+  size_t needed = count * 2;
+  while (capacity < needed) {
+    if (capacity > SIZE_MAX / 2)
+      return 0;
+    capacity *= 2;
+  }
+
+  if (capacity > SIZE_MAX / sizeof(IdEntry) ||
+      count > SIZE_MAX / sizeof(HotNode) ||
+      count > SIZE_MAX / sizeof(float))
+    return 0;
+
+  IdEntry *index = malloc(capacity * sizeof(*index));
+  HotNode *hot = malloc(count * sizeof(*hot));
+  float *path = malloc(count * sizeof(*path));
+  if (index == NULL || hot == NULL || path == NULL) {
+    free(index);
+    free(hot);
+    free(path);
+    return 0;
+  }
+
+  for (size_t i = 0; i < capacity; i++)
+    index[i].row = -1;
+
+  size_t mask = capacity - 1;
+  for (int i = 0; i < n; i++) {
+    hot[i].value = nodes[i].value;
+    hot[i].next = NEXT_UNKNOWN;
+
+    size_t slot = hash_id(nodes[i].id) & mask;
+    while (index[slot].row >= 0 && index[slot].id != nodes[i].id)
+      slot = (slot + 1) & mask;
+
+    /* Duplicate IDs retain the first input row, as in find_by_id. */
+    if (index[slot].row < 0) {
+      index[slot].id = nodes[i].id;
+      index[slot].row = i;
+    }
+  }
+
+  s->index = index;
+  s->hot = hot;
+  s->path = path;
+  s->mask = mask;
+  return 1;
+}
+
+static int indexed_find(const SearchGraph *s, int id) {
+  size_t slot = hash_id(id) & s->mask;
+  while (s->index[slot].row >= 0) {
+    if (s->index[slot].id == id)
+      return s->index[slot].row;
+    slot = (slot + 1) & s->mask;
+  }
+  return -1;
+}
+
+/* Resolve only reached nodes; subsequent visits use a compact row link. */
+static int selected_next(SearchGraph *s, int row) {
+  if (s->hot[row].next != NEXT_UNKNOWN)
+    return s->hot[row].next;
+
+  float max = 0;
+  int best = NEXT_NONE;
+  char aux[MAX];
+  char *auxptr;
+  strcpy(aux, s->nodes[row].neighbors);
+
+  for (char *t = strtok_r(aux, " ", &auxptr);
+       t != NULL;
+       t = strtok_r(NULL, " ", &auxptr)) {
+    int id = atoi(t);
+    int d = indexed_find(s, id);
+    if (d >= 0 && max < s->hot[d].value) {
+      max = s->hot[d].value;
+      /* ID -1 can win the comparison but suppresses recursion. */
+      best = id == -1 ? NEXT_NONE : d;
+    }
+  }
+
+  s->hot[row].next = best;
+  return best;
+}
+
+static float indexed_cost(SearchGraph *s, int id) {
+  int row = indexed_find(s, id);
+  if (row < 0)
+    return 0;
+
+  /* A DAG path contains at most n rows. Reuse contiguous scratch space. */
+  size_t length = 0;
+  while (row >= 0) {
+    s->path[length++] = s->hot[row].value;
+    row = selected_next(s, row);
+  }
+
+  /* Start at the leaf, not zero, and preserve each parent-first addition. */
+  float r = s->path[--length];
+  while (length > 0) {
+    float parent = s->path[--length];
+    parent += r;
+    r = parent;
+  }
+  return r;
+}
+
+static void destroy_search(SearchGraph *s) {
+  free(s->index);
+  free(s->hot);
+  free(s->path);
+  s->index = NULL;
+  s->hot = NULL;
+  s->path = NULL;
+  s->nodes = NULL;
+  s->mask = 0;
+}
+
+/* Main program - calls read input, computes sum for each node in the list, prints output. */
+int main() {
+  char *fileN = NULL;
+  char computelist[MAX];
+  int n = -1;
+  Node* input = NULL;
+
+  input = read_input(fileN, &n, computelist);
+
+  SearchGraph search;
+  int indexed = init_search(&search, input, n);
+
+  for (char *c = strtok(computelist, " "); c != NULL; c = strtok(NULL, " ")) {
+    float result = indexed ? indexed_cost(&search, atoi(c))
+                           : get_costly(input, atoi(c), n);
+    printf("%s: %f\n", c, result);
+  }
+
+  destroy_search(&search);
+  free(input);
+  return 0;
+}

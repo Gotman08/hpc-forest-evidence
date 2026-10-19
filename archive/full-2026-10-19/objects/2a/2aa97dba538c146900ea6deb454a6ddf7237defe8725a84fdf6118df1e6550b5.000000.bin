@@ -1,0 +1,194 @@
+"""Review only provided cold plan/CIM/proofs. No live cache or process API."""
+import hashlib
+import json
+from pathlib import Path
+import re
+
+BASE = Path("C:/Users/nicol/Documents/Codex/2026-10-15/cr")
+REL = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g"
+STOP = REL / "fermeture-relais-r2g-r2"
+HERE = Path(__file__).resolve().parent
+MAINS = [27596, 50984, 44728]
+ALL = [27596, 50984, 44728, 26476, 42528, 35676, 24588, 55448, 56920,
+       30936, 43460, 56872, 35172, 59820, 45980, 54620, 19700, 37820, 61176, 45916, 50420]
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+SESSIONS = {"110cefccf16b439eb226e475c875c8df", "5d8811082a1842f5836a2bdda982500f", "13eaca4e39cf4147a3f677a32fb5a52d"}
+BLOCKED = tuple(BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2g" / ("worker-" + s) for s in SESSIONS)
+
+
+def need(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def raw(path):
+    p = Path(path).absolute()
+    need(p.is_relative_to(BASE) and not any(p.is_relative_to(root) for root in BLOCKED)
+         and p.name.rstrip(" .").casefold() != "worker.lock", "Live worker cache or lock refused before read")
+    need(not p.is_symlink(), "Linked report refused")
+    return p.read_bytes()
+
+
+def ref(path):
+    return {"path": str(Path(path).absolute()), "sha256": hashlib.sha256(raw(path)).hexdigest()}
+
+
+def read(path):
+    return json.loads(raw(path).decode("utf-8-sig"))
+
+
+def read_ref(value):
+    need(ref(value["path"]) == value, "Frozen reference changed")
+    return read(value["path"])
+
+
+def identity(row):
+    need(type(row["ProcessId"]) is int and type(row["ParentProcessId"]) is int
+         and all(isinstance(row[k], str) and row[k] for k in FIELDS[2:])
+         and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z", row["CreationDate"]),
+         "Expected five-field identity opaque/untyped")
+    return {key: row[key] for key in FIELDS}
+
+
+component_pins = {
+    "preparer-fermeture-r2g-r2.py": "eac524843245d4ac2d0faa304724465baa6d709c2f7d8566c8f14937306ce9aa",
+    "graphe_possede_21.py": "7e7d04cb40bbbf740e7877240d80d87f679619133dfcd64b4edeb31966c59dab",
+    "fermer-identites-possedes-r2g-r2.ps1": "cdce5bceb1f01c1d7794126c73bd31546123ea2e3d90d3511571c49d8520880c",
+    "PINS-FINAUX-NON-ADMIS.json": "468b4355a6326151efd4496f4218cb15791bef3c9a068bee36dcdfbd78e74bfb",
+    "PIN-SOURCE-CONFIG-GRAPHE-NON-ADMIS.json": "a1fa7f5efea0d9233c23ef7ab588f654058f832f006e85c9998670b2b73bb8f8",
+    "GRAPHE-HISTORIQUE-21-CANDIDAT.json": "76ff6c473006c91d5f091343365882952974f27b128a1c19d645d7d612a9a524",
+    "plan-fermeture-r2g-r2.json": "cebb8975ebf19ea1f02ddd729e2fbff81816a80b9e4ef9788b2daebaa691441d",
+}
+reviewed_files = {}
+for name, digest in component_pins.items():
+    value = ref(STOP / name)
+    need(value["sha256"] == digest, "Reviewed helper/pin/plan changed")
+    reviewed_files[name] = value
+plan = read(STOP / "plan-fermeture-r2g-r2.json")
+pins = read(STOP / "PINS-FINAUX-NON-ADMIS.json")
+need(plan["schema"] == "hpc-forest-r2g-individual-owned-21-stop-plan-v2" and plan["verified"] is True
+     and plan["target_process_ids"] == ALL and plan["primary_main_process_ids"] == MAINS
+     and plan["natural_grace_seconds"] == 20 and plan["recursive_stop"] is False
+     and plan["stop_by_name"] is False and plan["worker_lock_read"] is False
+     and plan["source_context_alone_authorizes_stop"] is False
+     and plan["separate_independent_stop_review_required"] is True,
+     "Concrete plan is not exact nonrecursive reviewed scope")
+need(pins["schema"] == "hpc-forest-r2g-final-closure-pins-v1" and pins["preparation_only"] is False
+     and pins["effect_admitted"] is True and ref(STOP / "PINS-FINAUX-NON-ADMIS.json") == plan["pins"],
+     "Actual parent six-proof admission differs")
+proofs = {}
+for name, value in pins["proofs"].items():
+    need(value["status"] == "ADMIS", "One actual final proof is not admitted")
+    expected = {"path": value["path"], "sha256": value["sha256"]}
+    need(plan["final_proofs"][name] == expected, "Plan final-proof binding differs")
+    proofs[name] = read_ref(expected)
+need(proofs["independent_final_review"]["verified"] is True
+     and proofs["independent_final_review"]["blocking_findings"] == []
+     and plan["final_proofs"]["independent_final_review"]["sha256"] ==
+     "70028939f5819204d790a4bca5bb80611ef1ef0b22d4efd180326cd4a2c4f715",
+     "Actual independent final cold review missing")
+for value in proofs["frozen_evidence_inventory"]["files"]:
+    need(ref(value["path"]) == value, "Frozen bytes changed")
+recon = proofs["reconciliation"]
+need(recon["received_invocations"] == 10 and recon["exact_known_invocations"] == 7
+     and recon["exact_known_tokens"] == 146676 and recon["unmeasured_invocations"] == 3
+     and recon["exact_total_tokens"] is None and recon["all_requests_reconciled"] is True
+     and recon["no_active_or_inflight_claims"] is True and recon["native_research_admitted"] is False,
+     "Ten ended deliveries and known/unknown cost boundary differ")
+history = read_ref(plan["historical_graph"])
+historical = {r["identity"]["ProcessId"]: r for r in history["nodes"]}
+need(set(historical) == set(ALL) and len(history["nodes"]) == 21, "Historical graph differs")
+cim = read_ref(plan["fresh_full_cim"])
+need(plan["fresh_full_cim"]["sha256"] == "d71eafdfa48b7dcba5f6088cef7416a168fa0c414ea294e4941d7bd1a40257e7"
+     and cim["complete_census"] is True and cim["rows_count"] == len(cim["rows"]), "Supplied plan census incomplete")
+rows = {r["ProcessId"]: r for r in cim["rows"]}
+need(len(rows) == len(cim["rows"]), "Duplicate provided process IDs")
+for pid in ALL:
+    need(pid in rows and identity(rows[pid]) == identity(historical[pid]["identity"]), "Historical identity changed/reused")
+need([r["identity"]["ProcessId"] for r in plan["owned_graph_targets"]] == ALL,
+     "Actual planned fixed21 history ordering differs")
+for item in plan["owned_graph_targets"]:
+    need(item["identity"] == historical[item["identity"]["ProcessId"]]["identity"], "Plan identity differs")
+for row in rows.values():
+    pid, parent = row["ProcessId"], row["ParentProcessId"]
+    need(type(pid) is int and type(parent) is int, "Untyped supplied graph")
+    if pid in historical:
+        continue
+    command = row.get("CommandLine") or ""
+    need(not any(session in command for session in SESSIONS), "Unlisted cohort-session process exists")
+    if parent in historical:
+        birth = row.get("CreationDate")
+        need(isinstance(birth, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z", birth)
+             and birth < historical[parent]["identity"]["CreationDate"],
+             "Unlisted descendant of historical identity present")
+launch = read_ref(plan["launch_receipt"])
+initial = read_ref(plan["initial_full_cim"])
+initial_rows = {r["ProcessId"]: r for r in initial["rows"]}
+need(launch["verified"] is True and len(launch["workers"]) == 3, "Original real owned launch absent")
+for target in plan["targets"]:
+    pid = target["identity"]["ProcessId"]
+    launched = next(w for w in launch["workers"] if w["session_id"] == target["session_id"])
+    need(pid in MAINS and target["identity"] == identity(initial_rows[pid]) == identity(rows[pid])
+         and target["identity"] in launched["full_identities"] and target["job_id"] == launched["job_id"],
+         "Actual main identity lacks original launch provenance")
+    worker = next(w for w in proofs["cache_preservation"]["workers"] if w["session_id"] == target["session_id"])
+    copy = Path(worker["opaque_copy"])
+    ready, hold = read(copy / "worker-ready.json"), read(copy / "cli-technical-hold.json")
+    need(ready["pid"] == pid and ready["session_id"] == target["session_id"] and ready["job_id"] == target["job_id"]
+         and hold["new_generations_allowed"] is False, "Frozen ready/hold not bound to main")
+graph = read_ref(plan["owned_graph_source_evidence"])
+limits = plan["source_config_qualification_limits"]
+need(limits == graph["qualification"] and limits["installed_source_equals_loaded_runtime_proven"] is False
+     and limits["current_selected_mcp_declaration"]["historical_config_bytes_proven"] is False
+     and limits["descendants_are_stop_targets"] is False and plan["source_context_alone_authorizes_stop"] is False,
+     "Current source/config context promoted into loaded-code or effect proof")
+oauth = read(REL / "operations-parent/authentification-oauth-verifiee.json")
+need(ref(REL / "operations-parent/authentification-oauth-verifiee.json")["sha256"] ==
+     "39882d249ee59b1b248df9212900e345177b8fafe94eb1d45b8653707c1ba2d3"
+     and oauth["verified"] is True and oauth["auth_mode"] == "chatgpt"
+     and all(oauth[k] is False for k in ("api_key_in_auth_present", "OPENAI_API_KEY_environment_present",
+                                       "CODEX_API_KEY_environment_present", "secrets_exported")),
+     "Preserved real OAuth provenance differs")
+admission = REL / "operations-parent/admission-pins-finales-pour-plan-01/ADMISSION-REELLE-POUR-REVUE-PLAN.json"
+need(ref(admission)["sha256"] == "9d02cb050949c618e9b0bf95c2045e479f4beccbb504bf41eec8e70211e9a377",
+     "Actual parent pin admission receipt changed")
+adm = read(admission)
+for name, value in adm["before"].items():
+    need(ref(admission.parent / name)["sha256"] == value["sha256"], "Prior NON_ADMIS pin backup missing")
+for name, value in adm["after"].items():
+    need(ref(STOP / name) == value, "Admitted pin differs from parent receipt")
+result = {
+    "schema": "hpc-forest-r2g-independent-individual-owned-21-stop-review-v2",
+    "verified": True, "blocking_findings": [], "stop_executed_by_reviewer": False,
+    "contextual_graph_limits_explicitly_reviewed": True,
+    "runtime_loaded_code_or_historical_config_equality_claimed": False,
+    "permitted_effect_ids": MAINS,
+    "remaining_owned_service_wrapper_MCP_SSH_effects_permitted": False,
+    "FinishRemainingOwned_permitted": False,
+    "reviewed_files": reviewed_files,
+    "reviewed_plan": ref(STOP / "plan-fermeture-r2g-r2.json"),
+    "actual_parent_pin_admission": ref(admission), "actual_final_proofs": plan["final_proofs"],
+    "supplied_cold_plan_census": plan["fresh_full_cim"],
+    "supplied_plan_census_captured_at": cim["captured_at_utc"],
+    "provided_plan_census_is_not_action_freshness_authorization": True,
+    "fresh_complete_45_second_preflights_before_each_effect_still_required": True,
+    "main_five_field_identity_original_launch_ready_auth_provenance_verified": True,
+    "all_ten_started_invocations_and_deliveries_reconciled_before_stop": True,
+    "readable_cache_preserved_except_unread_operational_locks": True,
+    "held_Process_instance_and_native_birth_check_required": True,
+    "durable_CreateNew_global_and_individual_intents_required": True,
+    "UNKNOWN_effect_forbids_next_effect_and_retry": True,
+    "recursive_or_name_based_stop_permitted": False,
+    "natural_service_exit_grace_seconds": 20,
+    "remaining_services_must_be_preserved_if_not_naturally_absent": True,
+    "live_cache_CIM_capture_CLI_model_MCP_or_effect_access_by_reviewer": False,
+    "native_research_performance_five_confirmations_R5_admitted": False,
+    "limits": "Only the three exact owned main Process instances may be terminated by ROOT after fresh guards. The fixed21 plan is contextual; this review does not permit effects on the other18 identities. No exact total usage, backend cause, lock bytes, all21 absence or scientific success is invented. If natural closure is incomplete, preserve remaining services and partial outcome without automatic continuation.",
+}
+for name, value in reviewed_files.items():
+    need(ref(STOP / name) == value, "Reviewed input changed during review")
+out = STOP / "REVUE-ARRET-21-INDIVIDUEL.json"
+with out.open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(result, stream, indent=2, ensure_ascii=True)
+    stream.write("\n")
+print(json.dumps({"path": str(out), "sha256": ref(out)["sha256"], "permitted_effect_ids": MAINS}))

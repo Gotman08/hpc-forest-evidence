@@ -1,0 +1,184 @@
+"""Cold local argv/policy audit. No CLI, discovery, model or publication execution."""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+from pathlib import Path
+from subprocess import list2cmdline
+
+PRIVATE_FIELDS = {'invocation_sha256', 'process_sha256', 'argv_sha256',
+    'skill_override_sha256', 'task_cli_policy_sha256'}
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def expected_argv(client, executable, model, policy, directory):
+    """Pure rendering of source108 command_for; never call its file-writing constructor."""
+    directory = Path(directory)
+    argv = [executable, 'exec', '--ignore-user-config', '--strict-config', '--ephemeral',
+        '--skip-git-repo-check', '--sandbox', 'read-only', '--json', '--color', 'never',
+        '--model', model, '--output-schema', str(directory / 'output-schema.json'),
+        '--output-last-message', str(directory / 'agent-result.json'), '-C', str(directory)]
+    overrides = {
+        'model_reasoning_effort': 'max',
+        'model_instructions_file': str(directory / 'instructions.txt'),
+        'model_context_window': 65536, 'project_doc_max_bytes': 0,
+        'skills.max_context_tokens': 1,
+        'skills.config': [{'path': path, 'enabled': False} for path in policy['skill_candidate_directories']],
+        'skills.include_instructions': False, 'skills.bundled.enabled': False,
+        'approval_policy': 'never', 'forced_login_method': 'chatgpt', 'web_search': 'disabled',
+        'features.skip_host_skill_discovery': False,
+        **{'features.' + name: False for name in [
+            'shell_tool', 'unified_exec', 'apps', 'plugins', 'memories', 'multi_agent',
+            'multi_agent_v2', 'hooks', 'skill_search', 'browser_use', 'computer_use',
+            'image_generation', 'view_image', 'workspace_dependencies', 'code_mode_host',
+            'code_mode', 'code_mode_only', 'sleep_tool', 'unbounded_connection_retries',
+            'shell_snapshot', 'goals']}}
+    for key, value in overrides.items():
+        argv.extend(['--config', key + '=' + client.toml_override_value(value)])
+    argv.append('-')
+    require(len(list2cmdline(argv).encode('utf-16-le')) // 2 + 1 <= 32767,
+        'Frozen exact private command exceeds Windows argument bound')
+    return argv
+
+
+def inspect_private(first, resolve, cache, policy_ref, factory, tracked, scientific):
+    """Compare raw private metadata with source-bound public projections and policy."""
+    import copy
+    import importlib
+
+    policy_path = tracked.path(policy_ref)
+    cli = json.loads(resolve(first['admission_artifacts']['cli_identity']).read_bytes())
+    # This entry point rehashes the complete108 source inventory before importing pure validators.
+    policy = factory.checked_task_cli_policy(policy_ref, first['job_id'], cli)
+    client = importlib.import_module('hpc_forest.codex_process')
+    require(Path(client.__file__).resolve() == factory.PROJECT / 'src/hpc_forest/codex_process.py',
+        'Wrong source-bound pure CLI validator')
+    require(policy_ref['sha256'] == cli['task_cli_policy_sha256'], 'Initial CLI/policy digest differs')
+    canonical_cache = factory.LAUNCH / ('worker-' + first['session_id'])
+    private_first = copy.deepcopy(first)
+    private_paths, bindings, inventory = {}, {}, {}
+    original_first_normal = first['first_normal_delivered_call']
+    for index, call in enumerate(first['all_started_calls_reconciled']):
+        request = json.loads(resolve(call['request']).read_bytes())
+        nonce = request.get('nonce', '')
+        require(re.fullmatch('[0-9a-f]{32}', nonce) is not None and nonce not in bindings,
+            'Unique named completed nonce required')
+        raw_files = cache['nonces'][nonce]
+        private = call.get('private_cli_records', {})
+        require(set(private) == PRIVATE_FIELDS and all(re.fullmatch('[0-9a-f]{64}', str(v)) for v in private.values())
+            and call.get('private_cli_review_required') is True and call.get('private_cli_argv_verified') is False,
+            'Exact pending private CLI bindings required')
+        projections = {kind: json.loads(resolve(call[field]).read_bytes()) for kind, field in
+            (('invocation', 'invocation'), ('process', 'process'))}
+        checked = {}
+        for kind, filename in (('invocation', 'invocation.json'), ('process', 'codex.jsonl.json')):
+            path = tracked.path(raw_files[filename])
+            require(raw_files[filename]['sha256'] == private[kind + '_sha256'], 'Private raw record digest differs')
+            record = tracked.read(raw_files[filename])
+            expected = expected_argv(client, cli['executable_path'], first['model'], policy, canonical_cache / nonce)
+            require(record.get('argv') == expected, 'Private argv differs from exact source108 constructor/policy')
+            saved = client.CLI_POLICY
+            client.CLI_POLICY = policy
+            try:
+                actual_projection = client.cli_metadata_projection(path, policy_ref['sha256'], kind)
+            finally:
+                client.CLI_POLICY = saved
+            require(actual_projection == projections[kind], 'Received projection differs from actual private metadata')
+            plain, public = client.check_cli_metadata_projection(actual_projection, kind, cli, first['model'])
+            require(plain == {k: v for k, v in record.items() if k != 'argv'}, 'Projection lost nonprivate metadata')
+            checked[kind] = (record, public)
+            require(private['argv_sha256'] == actual_projection['private_argv_sha256']
+                and private['skill_override_sha256'] == actual_projection['private_skill_override_sha256']
+                and private['task_cli_policy_sha256'] == policy_ref['sha256'], 'Named private projection hashes differ')
+            field = kind
+            private_first['all_started_calls_reconciled'][index][field] = raw_files[filename]
+            private_paths[str(path)] = path
+            inventory[nonce + '/' + filename] = {'sha256': raw_files[filename]['sha256'], 'bytes': path.stat().st_size}
+        require(checked['invocation'][0]['argv'] == checked['process'][0]['argv']
+            and checked['invocation'][1] == checked['process'][1], 'Invocation/process argv differs')
+        log = resolve(call['error_and_usage_log'])
+        diagnostics = client.diagnostics_from_events(log)
+        require(diagnostics.get('clean') is True, 'Strict source108 CLI diagnostics block NORMAL admission')
+        previous_model, previous_effort = client.MODEL, client.EFFORT
+        client.MODEL, client.EFFORT = first['model'], 'max'
+        try:
+            usage, tools = client.usage_from_events(log)
+        finally:
+            client.MODEL, client.EFFORT = previous_model, previous_effort
+        response = json.loads(resolve(call['response']).read_bytes())
+        received_diagnostics = tracked.read(raw_files['cli-diagnostics.json'])
+        require(received_diagnostics == diagnostics, 'Named private diagnostics differ from preserved raw log')
+        usage['cli_diagnostics_sha256'] = raw_files['cli-diagnostics.json']['sha256']
+        usage['cli_diagnostic_count'] = len(diagnostics['findings'])
+        require(not tools and usage == response.get('usage') and usage.get('token_accounting') == 'exact',
+            'Exact strict source108 usage differs from delivered usage')
+        if call == original_first_normal:
+            private_first['first_normal_delivered_call'] = private_first['all_started_calls_reconciled'][index]
+        bindings[nonce] = {**private,
+            'invocation_projection_sha256': call['invocation']['sha256'],
+            'process_projection_sha256': call['process']['sha256']}
+    require(set(bindings) == set(cache['nonces']), 'Private collection extends the frozen first batch')
+
+    def private_resolver(item):
+        path = private_paths.get(item.get('path'))
+        if path is not None:
+            require(scientific.sha(path) == item['sha256'], 'Private raw changed during audit')
+            return path
+        return resolve(item)
+
+    # The historical strict NORMAL/usage/identity checker remains unchanged; only argv refs are local.
+    calls = scientific.call_boundary(private_first, private_resolver)
+    return {'call_bindings': bindings, 'named_private_inventory': inventory,
+        'task_cli_policy_sha256': policy_ref['sha256'], 'private_skill_path_count': len(policy['skill_candidate_directories']),
+        'policy_bytes': policy_path.stat().st_size, 'all_private_raws_received_and_hashed': True,
+        'argv_matches_projections_and_local_policy': True, 'cli_diagnostics_clean': True,
+        'raw_skill_paths_exported': False, 'transport': calls}
+
+
+def validate_snapshot(snapshot, snapshot_ref, first, first_ref, scientific):
+    binding = {**scientific.identity(first['model'], first['job_id']),
+        'remote_root': '/scratch_p/nimarano/' + scientific.SCOPE + '-' + first['session_id']}
+    fields = {'schema', *binding, 'first_batch_completed', 'first_start_receipt', 'evaluation_snapshot',
+        'first_start_public_verified', 'existing_campaign_deadline', 'existing_search_deadline',
+        'budget_or_chronology_reset', 'new_requests_created', 'private_cli_argv_verified_on_ARM',
+        'waiting_for_external_root_audit'}
+    require(set(snapshot) == fields and snapshot.get('schema') == 'hpc-forest-r2e-first-batch-paused-v1'
+        and all(snapshot.get(k) == v for k, v in binding.items())
+        and snapshot.get('first_batch_completed') is True and snapshot.get('first_start_public_verified') is True
+        and snapshot.get('first_start_receipt') == first_ref and snapshot.get('evaluation_snapshot') == first['evaluation_snapshot']
+        and snapshot.get('budget_or_chronology_reset') is False and type(snapshot.get('new_requests_created')) is int
+        and snapshot['new_requests_created'] == 0 and snapshot.get('private_cli_argv_verified_on_ARM') is False
+        and snapshot.get('waiting_for_external_root_audit') is True,
+        'Exact actual first-batch paused snapshot required')
+    require(all(type(snapshot.get(k)) in {int, float} and math.isfinite(snapshot[k]) for k in
+        ('existing_campaign_deadline', 'existing_search_deadline'))
+        and snapshot['existing_search_deadline'] <= snapshot['existing_campaign_deadline'] - 120,
+        'Existing search/campaign deadlines are inconsistent')
+    require(snapshot_ref['path'].endswith('/results-' + first['job_id'] + '/premier-batch-en-attente.json'),
+        'Paused snapshot must be the exact same job checkpoint')
+    return binding
+
+
+def release_proposals(binding, first_ref, evaluation_ref, snapshot_ref, private_audit_ref, audit_digest):
+    """Return bytes for root review/publication only; no remote effects and no extra budget."""
+    projection = {'schema': 'hpc-forest-r2e-private-cli-audit-digest-projection-v1', 'verified': True, **binding,
+        'first_start_receipt_sha256': first_ref['sha256'], 'paused_snapshot_sha256': snapshot_ref['sha256'],
+        'call_bindings': audit_digest['call_bindings'], 'all_private_raws_received_and_hashed': True,
+        'argv_matches_projections_and_local_policy': True, 'cli_diagnostics_clean': True,
+        'raw_skill_paths_exported': False, 'private_review_receipt_sha256': private_audit_ref['sha256']}
+    release = {'schema': 'hpc-forest-r2e-first-batch-release-v1', 'verified': True, **binding,
+        'paused_snapshot': snapshot_ref, 'first_start_receipt': first_ref, 'evaluation_snapshot': evaluation_ref,
+        'private_cli_audit': {'path': snapshot_ref['path'].rsplit('/', 1)[0] + '/audit-cli-prive-digest.json',
+            'sha256': digest((json.dumps(projection, ensure_ascii=False, indent=2) + '\n').encode('utf8'))},
+        'no_replay': True, 'new_model_or_budget_authorized': False}
+    return projection, release

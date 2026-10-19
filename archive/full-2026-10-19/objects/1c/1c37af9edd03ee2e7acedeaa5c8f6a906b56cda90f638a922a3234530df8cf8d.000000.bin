@@ -1,0 +1,146 @@
+"""Paired timings of frozen programs over sizes and 1/2/4/8/16 allocated cores.
+
+No model, source edit, recompilation, search reward or thread sampling is involved.
+The parent sleeps during subprocess.run; all programs use identical measurement.
+"""
+import hashlib
+import json
+import os
+import platform
+import random
+import statistics
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf8")
+
+
+def main(root):
+    job = os.environ.get("SLURM_JOB_ID", "")
+    if (not job.isdigit() or platform.machine().lower() != "aarch64"
+            or os.environ.get("SLURM_CPUS_PER_TASK") != "16"
+            or os.environ.get("SLURM_MEM_PER_NODE") != "16384"
+            or os.environ.get("SLURM_JOB_GPUS", "") not in {"", "N/A"}):
+        raise RuntimeError("Requires the owned 16-CPU / 16-GiB / zero-GPU ARM64 allocation")
+    for name, expected in json.loads((root / "FILES.sha256.json").read_text()).items():
+        path = root / name
+        if not path.resolve().is_relative_to(root) or path.is_symlink() or sha(path) != expected:
+            raise RuntimeError("Frozen scaling payload changed")
+    plan = json.loads((root / "scaling-plan.json").read_text())
+    affinity = sorted(os.sched_getaffinity(0))
+    if len(affinity) != 16:
+        raise RuntimeError("srun must bind this task to exactly its 16 assigned CPUs")
+    topology = []
+    for cpu in affinity:
+        base = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        topology.append({"cpu": cpu, "physical_package_id": (base / "physical_package_id").read_text().strip(),
+                         "core_id": (base / "core_id").read_text().strip()})
+    if len({(v["physical_package_id"], v["core_id"]) for v in topology}) != 16:
+        raise RuntimeError("Do not label hardware threads as 16 distinct physical cores")
+    output = root / "results"
+    output.mkdir(exist_ok=False)
+    (output / "inputs").mkdir()
+    binaries = {v["name"]: root / v["binary"] for v in plan["entries"]}
+    for binary in binaries.values():
+        binary.chmod(0o700)
+
+    def execute(name, case, cores):
+        binary = binaries[name]
+        os.sched_setaffinity(0, affinity[:cores])
+        try:
+            env = {**os.environ, "OMP_NUM_THREADS": str(cores), "OMP_THREAD_LIMIT": str(cores),
+                   "OMP_DYNAMIC": "FALSE", "OMP_PROC_BIND": "close", "OMP_PLACES": "cores",
+                   "CUDA_VISIBLE_DEVICES": ""}
+            with case.open("rb") as stream:
+                begin = time.perf_counter()
+                run = subprocess.run([str(binary)], stdin=stream, capture_output=True, env=env, timeout=60)
+                elapsed = time.perf_counter() - begin
+            return {"seconds": elapsed, "returncode": run.returncode,
+                    "stdout_sha256": hashlib.sha256(run.stdout).hexdigest(),
+                    "stderr": run.stderr.decode(errors="replace")[:2000]}
+        except subprocess.TimeoutExpired:
+            return {"seconds": None, "returncode": None, "timed_out": True}
+        finally:
+            os.sched_setaffinity(0, affinity)
+
+    results = {"schema": "hpc-forest-size-core-scaling-results-v1", "job_id": job,
+               "model_calls": 0, "candidate_edits": 0, "candidate_compilations": 0,
+               "profiled_sizes": plan["sizes"], "core_counts": plan["cores"],
+               "affinity_before_measurement": affinity, "physical_core_topology": topology,
+               "resources": {"allocated_cores": 16, "memory_gib": 16, "gpus": 0, "architecture": "ARM64"},
+               "measurement": "Full subprocess wall time; no /proc sampler; includes startup and IO",
+               "correctness": "Exact stdout bytes against unchanged reference on each new input",
+               "repetitions": plan["repetitions"], "warmups": 1,
+               "old_results_replaced": False, "official_contest_hardware_reproduced": False,
+               "points": [], "raw_round_orders": [], "complete": False}
+    for size in plan["sizes"]:
+        generator = random.Random(23)
+        blocked = sorted({(generator.randrange(size), generator.randrange(size)) for _ in range(2 * size)}
+                         - {(0, 0), (size - 1, size - 1)})
+        case = output / "inputs" / f"grid-{size}-seed23.in"
+        case.write_text(f"{size} {len(blocked)}\n" + "".join(f"{y} {x}\n" for y, x in blocked))
+        oracle = execute("reference", case, 1)
+        if oracle["returncode"] != 0:
+            raise RuntimeError("Untouched reference failed the new size")
+        points = {(name, cores): {"program": name, "cores": cores, "size": size,
+                                  "input_sha256": sha(case), "samples": [], "correct": True}
+                  for cores in plan["cores"] for name in binaries}
+        rng = random.Random(23 + size)
+        for repeat in range(plan["repetitions"] + 1):
+            order = list(points)
+            rng.shuffle(order)
+            results["raw_round_orders"].append({"size": size, "repeat": repeat, "warmup": repeat == 0,
+                                                "order": order})
+            for name, cores in order:
+                value = execute(name, case, cores)
+                value["matches_oracle"] = value.get("stdout_sha256") == oracle["stdout_sha256"] and value["returncode"] == 0
+                point = points[name, cores]
+                point["correct"] &= value["matches_oracle"]
+                if repeat:
+                    point["samples"].append(value)
+        for point in points.values():
+            times = [v["seconds"] for v in point["samples"]]
+            point["mean_seconds"] = statistics.mean(times) if point["correct"] else None
+            point["stdev_seconds"] = statistics.stdev(times) if point["correct"] else None
+            point["median_seconds"] = statistics.median(times) if point["correct"] else None
+            reference = points["reference", point["cores"]]
+            baseline_times = [v["seconds"] for v in reference["samples"]]
+            t0 = statistics.mean(baseline_times) if reference["correct"] else None
+            one = points[point["program"], 1]
+            t1 = statistics.mean(v["seconds"] for v in one["samples"]) if one["correct"] else None
+            mean = point["mean_seconds"]
+            point.update(reference_seconds=t0,
+                seconds_saved=t0 - mean if t0 and mean else None,
+                time_reduction_fraction=1 - mean / t0 if t0 and mean else None,
+                speedup_vs_reference=t0 / mean if t0 and mean else None,
+                own_speedup_vs_one_core=t1 / mean if t1 and mean else None,
+                own_parallel_efficiency=(t1 / mean) / point["cores"] if t1 and mean else None)
+            results["points"].append(point)
+        write(output / "results.json", results)
+        print(json.dumps({"event": "scaling_size_end", "size": size,
+                          "all_outputs_correct": all(p["correct"] for p in points.values())}), flush=True)
+    for entry in plan["entries"]:
+        if sha(binaries[entry["name"]]) != entry["sha256"]:
+            raise RuntimeError("Frozen program changed during scaling")
+    results["binary_hashes_after"] = {name: sha(path) for name, path in binaries.items()}
+    results["complete"] = True
+    write(output / "results.json", results)
+    write(output / "FILES.sha256.json", {p.relative_to(output).as_posix(): sha(p) for p in output.rglob("*") if p.is_file()})
+    archive = root / "scaling-results.tar.gz"
+    with tarfile.open(archive, "w:gz") as stream:
+        stream.add(output, arcname="results")
+    print(json.dumps({"event": "scaling_end", "archive": str(archive), "sha256": sha(archive),
+                      "points": len(results["points"]), "model_calls": 0}), flush=True)
+
+
+if __name__ == "__main__":
+    main(Path(sys.argv[1]).resolve(strict=True))

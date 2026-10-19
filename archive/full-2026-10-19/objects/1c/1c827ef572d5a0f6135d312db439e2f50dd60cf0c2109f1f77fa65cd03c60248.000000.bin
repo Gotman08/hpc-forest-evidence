@@ -1,0 +1,119 @@
+"""Neutral R2d lane projection counterexamples; never a production admission."""
+import copy
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('neutral_r2d_lane_tests', ROOT / 'lane_support.py')
+lane = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lane)
+
+
+def values(monkeypatch):
+    names = ('scientific_reception', 'reconciliation', 'source_only_absence', 'observer_release',
+             'current_verification', 'local_projection_producer_review')
+    refs = {name: {'path': 'NEUTRAL_NOT_PRODUCTION_' + name, 'sha256': str(i) * 64}
+            for i, name in enumerate(names, 1)}
+    refs['scientific_reception']['sha256'] = '6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7'
+    refs['reconciliation']['sha256'] = '0ed5c437d3737ec9a970a4183b3e80ce996e87a7f655e5fba9965a979682def8'
+    inputs = {'schema': 'hpc-forest-r2d-private-source-only-input-v1', 'source_only_state': 'received_absent', **refs}
+    cell = {'scope_id': 'hpc-forest-primes-native-max-r2f', 'source_zip_sha256': 'a' * 64,
+        'plan_sha256': 'b' * 64, 'model': 'gpt-6-astra', 'effort': 'max',
+        'session_id': 'c' * 32, 'job_id': '99999', 'remote_root': '/NEUTRAL_NOT_PRODUCTION'}
+    census_ref = {'path': 'NEUTRAL_PRIVATE_CURRENT', 'sha256': 'd' * 64}
+    source = SimpleNamespace(SCIENCE_SHA=refs['scientific_reception']['sha256'], RECON_SHA=refs['reconciliation']['sha256'])
+    review = {'schema': 'hpc-forest-max-cell-launch-factory-independent-review-v1', 'verified': True,
+        'blocking_findings': [], 'source_zip_sha256': cell['source_zip_sha256'], 'plan_sha256': cell['plan_sha256'],
+        'reviewed_files': {'lane_support.py': lane.sha(lane.__file__)}, 'NEUTRAL_NOT_PRODUCTION': True}
+    absence = {'fresh_full_cim': census_ref, 'prior_full_cim': {'sha256': 'e' * 64}}
+    def read(ref):
+        if ref == refs['local_projection_producer_review']:
+            return review
+        assert ref == refs['source_only_absence']
+        return absence
+    monkeypatch.setattr(lane, 'read', read)
+    monkeypatch.setattr(lane, 'verify_closed14', lambda *_a, **_k: (source, [], 1800000000.0, {}))
+    return inputs, cell, census_ref, review, absence
+
+
+@pytest.mark.parametrize('count', [0, 1, 2, 3])
+def test_received_absent_projection_has_typed_zero_and_no_private_rows(monkeypatch, count):
+    inputs, cell, census_ref, _review, _absence = values(monkeypatch)
+    projection, wrapper = lane.prepare(inputs, census_ref, cell, count,
+        factory_review_ref=inputs['local_projection_producer_review'])
+    for value in (projection, wrapper):
+        assert value['source_only_state'] == 'received_absent'
+        assert value['source_only_preserved'] is False
+        assert type(value['source_only_active_workers']) is int and value['source_only_active_workers'] == 0
+        assert type(value['active_native_workers_before_start']) is int and value['active_native_workers_before_start'] == count
+        assert value['maximum_native_workers_total'] == 4
+    assert projection['other_native_workers_count'] == count
+    assert projection['full_census_exported'] is False and projection['windows_census_observed_by_arm'] is False
+    assert len(projection['evidence_sha256']) == 9
+    assert all(len(value) == 64 for value in projection['evidence_sha256'].values())
+    assert wrapper['minimal_owned_observations'] is None
+    assert not ({'rows', 'config', 'credentials', 'CommandLine'} & set(projection))
+
+
+@pytest.mark.parametrize('count', [True, False, 1.0, -1, 4, '0'])
+def test_noninteger_or_fifth_lane_refused_before_evidence(monkeypatch, count):
+    inputs, cell, census_ref, _review, _absence = values(monkeypatch)
+    with pytest.raises(ValueError, match='Typed native count'):
+        lane.prepare(inputs, census_ref, cell, count, factory_review_ref=inputs['local_projection_producer_review'])
+
+
+@pytest.mark.parametrize('change', ['live', 'extra', 'wrong_review', 'changed_producer', 'old_census', 'pending_review'])
+def test_reused_or_unreviewed_projection_evidence_refused(monkeypatch, change):
+    inputs, cell, census_ref, review, absence = values(monkeypatch)
+    factory = inputs['local_projection_producer_review']
+    if change == 'live':
+        inputs['source_only_state'] = 'live'
+    elif change == 'extra':
+        inputs['unreviewed'] = True
+    elif change == 'wrong_review':
+        factory = copy.deepcopy(factory); factory['sha256'] = 'f' * 64
+    elif change == 'changed_producer':
+        review['reviewed_files']['lane_support.py'] = 'f' * 64
+    elif change == 'old_census':
+        absence['fresh_full_cim'] = {'path': 'NEUTRAL_OLD', 'sha256': 'f' * 64}
+    else:
+        review['verified'] = False
+    with pytest.raises(ValueError):
+        lane.prepare(inputs, census_ref, cell, 0, factory_review_ref=factory)
+
+
+def test_actual_reviewed_reader_loaded_without_any_live_action():
+    state = lane.source_state()
+    assert lane.sha(lane.READER) == lane.READER_SHA
+    assert state.SCIENCE_SHA == '6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7'
+    assert state.RECON_SHA == '0ed5c437d3737ec9a970a4183b3e80ce996e87a7f655e5fba9965a979682def8'
+
+
+@pytest.mark.parametrize('change', ['none', 'count', 'preserved', 'science'])
+def test_actual_sealed_R2d_lane_validator_interoperability(monkeypatch, tmp_path, change):
+    """Transported fixture is checked by real pure source108 code, never a model."""
+    import json
+    source = lane.BASE / 'work/hpc-forest-primes-natif-relance-r2f/project/src/hpc_forest/primes_lane_contract.py'
+    spec = importlib.util.spec_from_file_location('neutral_sealed_r2d_lane_contract', source)
+    contract = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(contract)
+    inputs, cell, census_ref, _review, _absence = values(monkeypatch)
+    projection, value = lane.prepare(inputs, census_ref, cell, 0,
+        factory_review_ref=inputs['local_projection_producer_review'])
+    if change == 'count':
+        projection['source_only_active_workers'] = False
+    elif change == 'preserved':
+        projection['source_only_preserved'] = True
+    elif change == 'science':
+        projection['evidence_sha256']['scientific_reception'] = 'f' * 64
+    p = tmp_path / 'NEUTRAL-NOT-PRODUCTION-projection.json'
+    p.write_text(json.dumps(projection), encoding='utf-8')
+    value['minimal_owned_observations'] = {'path': str(p), 'sha256': lane.sha(p)}
+    if change == 'none':
+        assert contract.validate_lane_v2(value, cell, lane.artifact, now=1800000010) == value
+    else:
+        with pytest.raises(ValueError):
+            contract.validate_lane_v2(value, cell, lane.artifact, now=1800000010)

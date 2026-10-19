@@ -1,0 +1,202 @@
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+struct IsWhitespace
+{
+    template <typename Char> auto
+    operator () (Char c) const -> bool
+    {
+        return (c == ' ' )
+            || (c == '\n')
+            || (c == '\r')
+            || (c == '\t')
+            || (c == '\f')
+            || (c == '\v') ;
+    }
+} ;
+
+template <typename String> inline auto
+remove_whitespaces (String text) -> String
+{
+    text.erase
+        ( std::remove_if
+            ( text.begin ()
+            , text.end ()
+            , IsWhitespace () )
+        , text.end () ) ;
+    return text ;
+}
+
+template <typename String, typename InStream> inline auto
+read_text_from_stdin (InStream& in) -> String
+{
+    std::istreambuf_iterator <char> begin (in), end ;
+    std::string text (begin, end) ;
+    text = remove_whitespaces (text) ;
+    return text ;
+}
+
+class BufferedOutput
+{
+public:
+    static const std::size_t capacity = 64u * 1024u ;
+
+    BufferedOutput () : used_ (0) {}
+
+    void append (const char* data, std::size_t count)
+    {
+        while (count != 0) {
+            std::size_t chunk = capacity - used_ ;
+            if (chunk > count) chunk = count ;
+            std::memcpy (buffer_ + used_, data, chunk) ;
+            used_ += chunk ;
+            data += chunk ;
+            count -= chunk ;
+            if (used_ == capacity) flush () ;
+        }
+    }
+
+    template <std::size_t HalfBytes>
+    void append_short_row (const char* data, std::size_t bytes)
+    {
+        // Dispatch guarantees HalfBytes <= bytes <= 2 * HalfBytes <= capacity.
+        if (bytes > capacity - used_) flush () ;
+        char* const destination = buffer_ + used_ ;
+        const std::size_t tail = bytes - HalfBytes ;
+
+        // Each copy stays inside the row and buffer. Overlapping destination
+        // bytes receive identical values; neither copy overlaps its source.
+        std::memcpy (destination, data, HalfBytes) ;
+        std::memcpy (destination + tail, data + tail, HalfBytes) ;
+        used_ += bytes ;
+    }
+
+    void flush ()
+    {
+        if (used_ != 0) {
+            std::cout.write
+                (buffer_, static_cast<std::streamsize> (used_)) ;
+            used_ = 0 ;
+        }
+    }
+
+private:
+    char buffer_ [capacity] ;
+    std::size_t used_ ;
+} ;
+
+template <std::size_t Stride> inline bool
+advance_permutation (char* symbols, std::size_t count)
+{
+    if (count < 2) return false ;
+
+    std::size_t suffix = count - 1 ;
+    while (suffix != 0
+        && !(symbols [(suffix - 1) * Stride]
+             < symbols [suffix * Stride])) {
+        -- suffix ;
+    }
+    if (suffix == 0) return false ;
+
+    const std::size_t pivot = suffix - 1 ;
+    const char pivot_value = symbols [pivot * Stride] ;
+    std::size_t successor = count - 1 ;
+    // The first suffix element is greater than the pivot, bounding this scan.
+    while (!(pivot_value < symbols [successor * Stride])) {
+        -- successor ;
+    }
+    symbols [pivot * Stride] = symbols [successor * Stride] ;
+    symbols [successor * Stride] = pivot_value ;
+
+    // Each reversal pair touches disjoint character slots.
+    const std::size_t pairs = (count - suffix) / 2 ;
+    for (std::size_t pair = 0 ; pair < pairs ; ++ pair) {
+        const std::size_t left = (suffix + pair) * Stride ;
+        const std::size_t right = (count - 1 - pair) * Stride ;
+        const char value = symbols [left] ;
+        symbols [left] = symbols [right] ;
+        symbols [right] = value ;
+    }
+    return true ;
+}
+
+template <std::size_t HalfBytes> inline void
+emit_short_permutations (BufferedOutput& output, char* row,
+                         std::size_t row_size, std::size_t count)
+{
+    char* const symbols = row + 2 ;
+    // Only the record copies have fixed widths; permutation transitions remain
+    // sequential because each transition depends on the preceding permutation.
+    do {
+        output.append_short_row<HalfBytes> (row, row_size) ;
+    } while (advance_permutation<2> (symbols, count)) ;
+}
+
+void print_permutations (std::string& text)
+{
+    const std::size_t count = text.size () ;
+    if (count == 0) return ;
+    std::sort (text.begin (), text.end ()) ;
+
+    BufferedOutput output ;
+    std::string row ;
+    std::size_t row_limit = row.max_size () ;
+    if (row_limit > BufferedOutput::capacity) {
+        row_limit = BufferedOutput::capacity ;
+    }
+
+    // Bound storage and check the size calculation before forming 2 * count + 4.
+    if (row_limit >= 4 && count <= (row_limit - 4) / 2) {
+        const std::size_t row_size = 2 * count + 4 ;
+        row.assign (row_size, ' ') ;
+        row [0] = '[' ;
+        row [row_size - 2] = ']' ;
+        row [row_size - 1] = '\n' ;
+
+        char* const row_data = &row [0] ;
+        char* const symbols = row_data + 2 ;
+        for (std::size_t i = 0 ; i < count ; ++ i) {
+            symbols [2 * i] = text [i] ;
+        }
+
+        // Select fixed-size head/tail copies once, outside enumeration.
+        // A nonempty input has a row of at least six bytes.
+        if (row_size <= 8) {
+            emit_short_permutations<4> (output, row_data, row_size, count) ;
+        } else if (row_size <= 16) {
+            emit_short_permutations<8> (output, row_data, row_size, count) ;
+        } else if (row_size <= 32) {
+            emit_short_permutations<16> (output, row_data, row_size, count) ;
+        } else if (row_size <= 64) {
+            emit_short_permutations<32> (output, row_data, row_size, count) ;
+        } else {
+            // Enumerate directly in the character slots; delimiters stay fixed.
+            do {
+                output.append (row.data (), row.size ()) ;
+            } while (advance_permutation<2> (symbols, count)) ;
+        }
+    } else {
+        // Oversized rows use the same bounded output buffer without a length limit.
+        char* const symbols = &text [0] ;
+        do {
+            output.append ("[ ", 2) ;
+            for (std::size_t i = 0 ; i < count ; ++ i) {
+                const char item [2] = {symbols [i], ' '} ;
+                output.append (item, 2) ;
+            }
+            output.append ("]\n", 2) ;
+        } while (advance_permutation<1> (symbols, count)) ;
+    }
+    output.flush () ;
+}
+
+int main (int argc, char const *argv [])
+{
+    std::string text = read_text_from_stdin <std::string> (std::cin) ;
+    print_permutations (text) ;
+    return 0 ;
+}

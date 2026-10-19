@@ -1,0 +1,120 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <immintrin.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system using SIMD.
+ */
+void body_force(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    __m256 fx = _mm256_setzero_ps();
+    __m256 fy = _mm256_setzero_ps();
+    __m256 fz = _mm256_setzero_ps();
+
+    for (int j = 0; j < n; j += 8) {
+      __m256 dx1 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].x), _mm256_set1_ps(p[i].x));
+      __m256 dy1 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].y), _mm256_set1_ps(p[i].y));
+      __m256 dz1 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].z), _mm256_set1_ps(p[i].z));
+
+      __m256 sqrd_dist1 = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(dx1, dx1), _mm256_mul_ps(dy1, dy1)), _mm256_add_ps(_mm256_mul_ps(dz1, dz1), _mm256_set1_ps(SOFTENING)));
+      __m256 inv_dist1 = _mm256_rsqrt_ps(sqrd_dist1);
+      __m256 inv_dist3_1 = _mm256_mul_ps(inv_dist1, _mm256_mul_ps(inv_dist1, inv_dist1));
+
+      fx = _mm256_add_ps(fx, _mm256_mul_ps(dx1, inv_dist3_1));
+      fy = _mm256_add_ps(fy, _mm256_mul_ps(dy1, inv_dist3_1));
+      fz = _mm256_add_ps(fz, _mm256_mul_ps(dz1, inv_dist3_1));
+
+      if (j + 4 < n) {
+        __m256 dx2 = _mm256_sub_ps(_mm256_loadu_ps(&p[j+4].x), _mm256_set1_ps(p[i].x));
+        __m256 dy2 = _mm256_sub_ps(_mm256_loadu_ps(&p[j+4].y), _mm256_set1_ps(p[i].y));
+        __m256 dz2 = _mm256_sub_ps(_mm256_loadu_ps(&p[j+4].z), _mm256_set1_ps(p[i].z));
+
+        __m256 sqrd_dist2 = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(dx2, dx2), _mm256_mul_ps(dy2, dy2)), _mm256_add_ps(_mm256_mul_ps(dz2, dz2), _mm256_set1_ps(SOFTENING)));
+        __m256 inv_dist2 = _mm256_rsqrt_ps(sqrd_dist2);
+        __m256 inv_dist3_2 = _mm256_mul_ps(inv_dist2, _mm256_mul_ps(inv_dist2, inv_dist2));
+
+        fx = _mm256_add_ps(fx, _mm256_mul_ps(dx2, inv_dist3_2));
+        fy = _mm256_add_ps(fy, _mm256_mul_ps(dy2, inv_dist3_2));
+        fz = _mm256_add_ps(fz, _mm256_mul_ps(dz2, inv_dist3_2));
+      }
+    }
+
+    float fx_sum[8], fy_sum[8], fz_sum[8];
+    _mm256_storeu_ps(fx_sum, fx);
+    _mm256_storeu_ps(fy_sum, fy);
+    _mm256_storeu_ps(fz_sum, fz);
+
+    p[i].vx += dt * (fx_sum[0] + fx_sum[1] + fx_sum[2] + fx_sum[3] + fx_sum[4] + fx_sum[5] + fx_sum[6] + fx_sum[7]);
+    p[i].vy += dt * (fy_sum[0] + fy_sum[1] + fy_sum[2] + fy_sum[3] + fy_sum[4] + fy_sum[5] + fy_sum[6] + fy_sum[7]);
+    p[i].vz += dt * (fz_sum[0] + fz_sum[1] + fz_sum[2] + fz_sum[3] + fz_sum[4] + fz_sum[5] + fz_sum[6] + fz_sum[7]);
+  }
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+  
+  exit(EXIT_SUCCESS);
+}

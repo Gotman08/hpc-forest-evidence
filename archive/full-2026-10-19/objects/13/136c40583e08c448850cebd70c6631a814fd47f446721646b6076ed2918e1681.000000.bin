@@ -1,0 +1,234 @@
+"""Receive existing mechanical evidence as bytes; never execute C or submit work."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import struct
+import tarfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+QUALIFICATION = HERE.parent
+DATA = QUALIFICATION.parent
+ARCHIVE_SHA = "1d70909bd68ee171854a592bf654b44f93a06589e8bf9ddbf04b7fde5210e58d"
+SOURCE_SHA = "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d"
+PAYLOAD_SHA = "e1116d931887fbebad63e88a7678df13bc09e0381a754d967c79ae8ac7c37eda"
+REVIEW_SHA = "af703fd382e2065eb966cebfd3eb201ee6286826dbc28802185c22c5932269ab"
+
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def unwrap(value):
+    if value.get("status") == "fulfilled":
+        value = value["value"]
+    require(not value.get("isError"), "Tool receipt is an error")
+    return value.get("structuredContent") or json.loads(next(x["text"] for x in value["content"]
+                                                           if x["type"] == "text"))
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): sha(p) for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def descriptor(path):
+    return {"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size}
+
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def restore(archive, root):
+    require(not root.exists(), "Preserve the first restoration; never overwrite")
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = bundle.getmembers()
+        require(len(members) == 101 and sum(item.size for item in members) < 64 * 1024**2,
+                "Unexpected archive count or size")
+        material = {}
+        for item in members:
+            name = PurePosixPath(item.name)
+            require(item.isfile() and not item.issym() and not item.islnk()
+                    and not name.is_absolute() and ".." not in name.parts and "\\" not in item.name
+                    and name.parts[0] == "qualification-results", "Unsafe archive member")
+            relative = name.relative_to("qualification-results").as_posix()
+            require(relative not in material, "Duplicate archive member")
+            material[relative] = bundle.extractfile(item).read()
+    root.mkdir()
+    for name, raw in material.items():
+        target = root / name
+        require(target.resolve().is_relative_to(root.resolve()), "Restoration escaped new root")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as stream:
+            stream.write(raw)
+    require(inventory(root) == {name: hashlib.sha256(raw).hexdigest() for name, raw in material.items()},
+            "Restored bytes differ from archive")
+
+
+def main():
+    require(__debug__, "Audit must run without -O")
+    terminal = unwrap(read(HERE / "statut-terminal.json"))
+    logs = unwrap(read(HERE / "logs-premiere-observation.json"))
+    efficiency = unwrap(read(HERE / "efficacite-terminale.json"))
+    sidecar = json.loads(unwrap(read(HERE / "sidecar-distant.json"))["content"])
+    transfer = unwrap(read(HERE / "telechargement-verifie.json"))
+    submitted = unwrap(read(QUALIFICATION / "submission-parent.json"))
+    uploaded = unwrap(read(QUALIFICATION / "upload-verifie.json"))
+    plan = unwrap(read(QUALIFICATION / "plan-relu.json"))
+    for proof in (terminal, efficiency, submitted):
+        require(str(proof["job_id"]) == "751926", "Wrong job receipt")
+    require(terminal["state"] == efficiency["state"] == "COMPLETED"
+            and terminal["exit_code"] == efficiency["exit_code"] == "0:0"
+            and terminal["finished"] is True and submitted["submission_observed"] is True,
+            "No successful terminal allocation proof")
+    require(submitted["plan_id"] == plan["plan_id"] == "e59bb8e9eafd4b7e82b46106d92ef108"
+            and submitted["plan_sha256"] == plan["plan_sha256"], "Unbound submission")
+    require(not logs["truncated"] and not logs["files_limited"] and not logs["has_stderr_content"]
+            and ARCHIVE_SHA in logs["content"] and "arch=aarch64 job=751926" in logs["content"],
+            "Incomplete or contradictory initial logs")
+    archive = HERE / "results-751926.tar.gz"
+    require(sidecar["sha256"] == transfer["remote_sha256"] == transfer["empreinte_locale"]
+            == transfer["empreinte_distante"] == sha(archive) == ARCHIVE_SHA
+            and transfer["verifie"] is True and sidecar["bytes"] == archive.stat().st_size,
+            "Announced/remote/local archive hashes differ")
+    require(uploaded["verifie"] is True and uploaded["remote_sha256"] == uploaded["empreinte_locale"]
+            == uploaded["empreinte_distante"] == sha(DATA / "qualification-primes-certifie-r1.tar.gz")
+            == PAYLOAD_SHA and sha(DATA / "REVUE-INDEPENDANTE-FINALE.json") == REVIEW_SHA,
+            "Reviewed payload/upload changed")
+    root = HERE / "restauration-neuve"
+    restore(archive, root)
+    before = inventory(root)
+    save("inventaire-avant-audit.json", before)
+    extraction = root / "extraction"
+    remote = read(root / "mechanical-reception.json")
+    actual_input = inventory(extraction)
+    require(actual_input == remote["inventory_before"] == remote["inventory_after"]
+            and len(actual_input) == 67 and remote["all67_extracted_files_unchanged"] is True,
+            "Remote protected input inventories differ")
+    with tarfile.open(DATA / "qualification-primes-certifie-r1.tar.gz", "r:gz") as payload:
+        original = {PurePosixPath(item.name).relative_to("hpc-forest-primes-max-certifie-r1").as_posix():
+                    payload.extractfile(item).read() for item in payload.getmembers()}
+    require(set(original) == set(actual_input)
+            and all((extraction / name).read_bytes() == raw for name, raw in original.items()),
+            "Returned67 inputs differ from locally reviewed payload")
+    allocation = read(root / "allocation.json")
+    official = read(root / "qualification/qualification.json")
+    require(allocation["job_id"] == "751926" and allocation["payload_sha256"] == PAYLOAD_SHA
+            and allocation["review_sha256"] == REVIEW_SHA and allocation["affinity_cpu_count"] == 4,
+            "Wrong allocated execution identity")
+    require(allocation["slurm"]["SLURM_JOB_NODELIST"] == "romeo-a057"
+            and allocation["slurm"]["SLURM_CPUS_PER_TASK"] == "4"
+            and allocation["slurm"]["SLURM_MEM_PER_NODE"] == "16384"
+            and not allocation["slurm"]["SLURM_JOB_GPUS"]
+            and efficiency["alloc_cpus"] == 4 and efficiency["alloc_gpus"] == 0
+            and efficiency["req_mem_mb"] == 16384, "Allocated resources differ")
+    require(official["resources"]["machine"] == "aarch64" and official["resources"]["python"] == "3.12.5"
+            and official["resources"]["affinity_cpu_count_observed"] == 4,
+            "Real ARM64 resource proof differs")
+    require(official["compiler_returncode"] == 0 and official["build"]["returncode"] == 0
+            and official["compiler_probe"]["returncode"] == 0
+            and not official["build"]["timed_out"] and not official["compiler_probe"]["timed_out"]
+            and official["build"]["os_error"] is None and official["compiler_probe"]["os_error"] is None,
+            "Compiler/build not successful")
+    require((root / "qualification/build.stderr").read_bytes() == b""
+            and (root / "qualification-launch.stderr").read_bytes() == b"", "Compilation/launcher stderr not empty")
+    module_path = extraction / "tools/validate.py"
+    spec = importlib.util.spec_from_file_location("received_primes_validator", module_path)
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+    independently_read = validator.validate_preparation(extraction / "data")
+    cases = []
+    require(len(independently_read["cases"]) == len(official["cases"]) == 12, "Not twelve received cases")
+    require({r["case"] for r in official["cases"]} == {r["case"] for r in independently_read["cases"]},
+            "Received case identities differ")
+    for row in independently_read["cases"]:
+        current = next(item for item in official["cases"] if item["case"] == row["case"])
+        stdout = root / "qualification" / (row["case"] + ".stdout")
+        stderr = root / "qualification" / (row["case"] + ".stderr")
+        expected = extraction / "data/private-audit-fixtures" / row["case"] / "expected.txt"
+        require(current["returncode"] == 0 and current["exact_output"] is True
+                and current["stderr_empty"] is True and current["timed_out"] is False
+                and current["os_error"] is None and stderr.read_bytes() == b""
+                and stdout.read_bytes() == expected.read_bytes()
+                and sha(stdout) == current["stdout_sha256"], "Output/negative marker differs: " + row["case"])
+        cases.append({**row, "reference_stdout_sha256": sha(stdout), "exact_bytes_verified": True})
+    source = extraction / "data/sources/primetest.c"
+    require(sha(source) == sha(extraction / "data/model-view/primetest.c") == SOURCE_SHA, "Official C changed")
+    binary = root / "qualification/official-reference"
+    header = binary.read_bytes()[:64]
+    require(header[:4] == b"\x7fELF" and header[4] == 2 and header[5] == 1, "Not ELF64 little-endian")
+    elf_type, machine = struct.unpack_from("<HH", header, 16)
+    require(machine == 183 and sha(binary) == official["binary_sha256"], "Not unchanged AArch64 ELF")
+    require(official["native_model_calls"] == official["research_cells_started"] == 0
+            and remote["native_model_calls"] == 0 and allocation["native_model_calls"] == 0
+            and official["native_research_admitted"] is False and remote["native_research_admitted"] is False
+            and official["source_and_data_unchanged"] is True, "False native admission or mutation")
+    require(remote["passed"] is True and remote["qualification_returncode"] == 0
+            and remote["failure"] is None and official["status"] == "mechanical_reference_passed_not_native_model_admitted",
+            "Remote mechanics did not pass")
+    after = inventory(root)
+    require(before == after, "Read-only audit changed restored bytes")
+    save("inventaire-apres-audit.json", after)
+    report = {
+        "schema": "hpc-forest-primes-arm64-mechanical-reception-audit-v1", "verified_utc": datetime.now(UTC).isoformat(),
+        "verified": True, "job_id": "751926", "plan_id": plan["plan_id"], "plan_sha256": plan["plan_sha256"],
+        "status": "mechanical_reference_received_restored_audited_native_research_not_admitted",
+        "archive_announced_remote_local_sha256": ARCHIVE_SHA, "archive_bytes": archive.stat().st_size,
+        "fresh_restored_files": len(before), "all_restored_bytes_unchanged_after_readonly_audit": True,
+        "protected_payload_files": len(actual_input), "all67_payload_bytes_unchanged_locally_remotely": True,
+        "official_c_sha256": SOURCE_SHA, "source_files_compiled": ["unchanged official primetest.c"],
+        "compiler_version_text": (root / "qualification/compiler-version.txt").read_text(),
+        "compiler_flags_proved_from_frozen_qualifier": ["-O2", "-std=c11", "-lm"],
+        "werror_or_future_native_evaluator_flags_qualified": False,
+        "elf": {"path": str(binary), "sha256": sha(binary), "class": 64, "endianness": "little",
+                "e_type": elf_type, "e_machine": machine, "architecture": "AArch64", "executed_locally": False},
+        "cases": cases, "exact_reference_outputs_verified": len(cases),
+        "resources": official["resources"], "slurm_efficiency": efficiency,
+        "max_rss_missing_is_not_zero": efficiency["max_rss_mb"] is None,
+        "native_model_calls": 0, "native_research_admitted": False, "performance_gain_claimed": False,
+        "local_c_or_binary_execution": False, "new_jobs_submitted": 0, "stops_performed": 0,
+        "limits": ["No live RUNNING poll; first observation was already terminal after a2second job.",
+                   "Qualification is only official-reference mechanics under the exact-O2-c11-lm flags; no Werror qualification.",
+                   "No nativeMAX model identity/transport/normalfirstdelivery/firstcandidateevaluation/runtimeprivateisolation proved.",
+                   "No research performance gain or generalP<=1000/arbitrary-fragment-order certification."],
+        "bindings": [descriptor(path) for path in [archive, HERE / "statut-terminal.json", HERE / "logs-premiere-observation.json",
+                    HERE / "efficacite-terminale.json", HERE / "sidecar-distant.json", HERE / "telechargement-verifie.json",
+                    QUALIFICATION / "submission-parent.json", QUALIFICATION / "upload-verifie.json",
+                    DATA / "REVUE-INDEPENDANTE-FINALE.json", HERE / "inventaire-avant-audit.json",
+                    HERE / "inventaire-apres-audit.json", Path(__file__)]]}
+    save("AUDIT-RECEPTION.json", report)
+    startup = {"schema": "hpc-forest-primes-first-mechanical-start-v1", "verified": True,
+               "kind": "mechanical_only_not_first_native_R2_start", "job_id": "751926",
+               "first_status_observed": "COMPLETED", "live_RUNNING_observed": False,
+               "scheduler_start_local": terminal["start"], "scheduler_end_local": terminal["end"],
+               "scheduler_log_offset": "+02:00", "node": "romeo-a057", "architecture": "aarch64",
+               "allocated_cpus": 4, "allocated_memory_mib": 16384, "allocated_gpus": 0,
+               "reference_build_passed": True, "exact_reference_outputs": 12, "stderr_empty": True,
+               "native_model_calls": 0, "native_first_normal_call_delivered": False,
+               "native_first_candidate_evaluation_performed": False, "native_research_admitted": False,
+               "full_audit": descriptor(HERE / "AUDIT-RECEPTION.json"),
+               "native_startup_gate_still_pending": True}
+    save("PREMIER-DEMARRAGE-MECANIQUE.json", startup)
+    print(json.dumps({"verified": True, "job_id": "751926", "restored_files": len(before),
+                      "protected_inputs": len(actual_input), "exact_outputs": len(cases), "ELF_machine": machine,
+                      "audit_sha256": sha(HERE / "AUDIT-RECEPTION.json"),
+                      "mechanical_startup_sha256": sha(HERE / "PREMIER-DEMARRAGE-MECANIQUE.json"),
+                      "native_research_admitted": False}))
+
+
+if __name__ == "__main__":
+    main()

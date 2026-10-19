@@ -1,0 +1,74 @@
+#include <iostream>
+#include <vector>
+#include <atomic>
+#include <memory>
+#include <thread>
+#include <algorithm>
+#include <omp.h>
+
+using namespace std;
+
+const int MOD = 1000000007;
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+    int n, m;
+    if (!(cin >> n >> m)) return 0;
+    vector<vector<bool>> blockedCells(n, vector<bool>(n, false));
+    for (int c = 0; c < m; ++c) {
+        int i, j;
+        cin >> i >> j;
+        blockedCells[i][j] = true;
+    }
+
+    vector<int> dp(n, 0);
+    dp[0] = 1;
+    int requested = min(omp_get_max_threads(), max(1, n / 256));
+    if (requested == 1) {
+        for (int i = 0; i < n; ++i) {
+            int left = 0;
+            for (int j = 0; j < n; ++j) {
+                int value = dp[j] + left;
+                if (value >= MOD) value -= MOD;
+                if (blockedCells[i][j]) value = 0;
+                dp[j] = left = value;
+            }
+        }
+    } else {
+        // Each column strip publishes immutable right-edge values in row batches.
+        vector<vector<int>> edges(requested, vector<int>(n));
+        struct alignas(64) Progress {
+            atomic<int> rows;
+            Progress() : rows(0) {}
+        };
+        unique_ptr<Progress[]> progress(new Progress[requested]);
+        #pragma omp parallel num_threads(requested)
+        {
+            const int tid = omp_get_thread_num();
+            const int team = omp_get_num_threads();
+            const int begin = static_cast<int>(static_cast<long long>(n) * tid / team);
+            const int end = static_cast<int>(static_cast<long long>(n) * (tid + 1) / team);
+            const int batch = 16;
+            for (int first = 0; first < n; first += batch) {
+                const int last = min(n, first + batch);
+                if (tid != 0) {
+                    while (progress[tid - 1].rows.load(memory_order_acquire) < last)
+                        this_thread::yield();
+                }
+                for (int i = first; i < last; ++i) {
+                    int left = tid == 0 ? 0 : edges[tid - 1][i];
+                    for (int j = begin; j < end; ++j) {
+                        int value = dp[j] + left;
+                        if (value >= MOD) value -= MOD;
+                        if (blockedCells[i][j]) value = 0;
+                        dp[j] = left = value;
+                    }
+                    edges[tid][i] = left;
+                }
+                progress[tid].rows.store(last, memory_order_release);
+            }
+        }
+    }
+    cout << dp[n - 1] << '\n';
+}

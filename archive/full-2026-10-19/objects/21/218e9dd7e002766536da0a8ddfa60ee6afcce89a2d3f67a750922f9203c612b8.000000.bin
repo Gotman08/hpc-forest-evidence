@@ -1,0 +1,228 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in
+ * the system.
+ */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("no-math-errno")
+#endif
+void body_force(Body *p, float dt, int n) {
+  enum { SOURCE_BLOCK = 128 };
+
+  if (n <= 0) {
+    return;
+  }
+
+  size_t stride = ((size_t)n + 15u) & ~(size_t)15u;
+  void *storage = malloc(3u * stride * sizeof(float) + 63u);
+
+  if (storage == NULL) {
+    for (int i = 0; i < n; ++i) {
+      float fx = 0.0f;
+      float fy = 0.0f;
+      float fz = 0.0f;
+
+      for (int j = 0; j < n; j++) {
+        float dx = p[j].x - p[i].x;
+        float dy = p[j].y - p[i].y;
+        float dz = p[j].z - p[i].z;
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1 / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+      }
+
+      p[i].vx += dt*fx;
+      p[i].vy += dt*fy;
+      p[i].vz += dt*fz;
+    }
+    return;
+  }
+
+  float *x = (float *)(((uintptr_t)storage + 63u) & ~(uintptr_t)63u);
+  float *y = x + stride;
+  float *z = y + stride;
+  const int target_pairs = n / 2 + n % 2;
+
+#ifdef _OPENMP
+#pragma omp parallel if(n >= 256)
+#endif
+  {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (int i = 0; i < n; ++i) {
+      x[i] = p[i].x;
+      y[i] = p[i].y;
+      z[i] = p[i].z;
+    }
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (int pair = 0; pair < target_pairs; ++pair) {
+      const int i0 = 2 * pair;
+      /* An odd final target is duplicated locally, but written only once. */
+      const int i1 = i0 + 1 < n ? i0 + 1 : i0;
+      const float xi0 = x[i0];
+      const float yi0 = y[i0];
+      const float zi0 = z[i0];
+      const float xi1 = x[i1];
+      const float yi1 = y[i1];
+      const float zi1 = z[i1];
+      float fx0 = 0.0f;
+      float fy0 = 0.0f;
+      float fz0 = 0.0f;
+      float fx1 = 0.0f;
+      float fy1 = 0.0f;
+      float fz1 = 0.0f;
+      float dx0[SOURCE_BLOCK];
+      float dy0[SOURCE_BLOCK];
+      float dz0[SOURCE_BLOCK];
+      float inv_dist30[SOURCE_BLOCK];
+      float dx1[SOURCE_BLOCK];
+      float dy1[SOURCE_BLOCK];
+      float dz1[SOURCE_BLOCK];
+      float inv_dist31[SOURCE_BLOCK];
+
+      for (int jb = 0; jb < n; ) {
+        int count = n - jb;
+        if (count > SOURCE_BLOCK) {
+          count = SOURCE_BLOCK;
+        }
+
+        /* Reuse each source position across two contiguous SIMD panels. */
+#ifdef _OPENMP
+#pragma omp simd
+#elif defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+        for (int k = 0; k < count; ++k) {
+          const float xj = x[jb + k];
+          const float yj = y[jb + k];
+          const float zj = z[jb + k];
+
+          float ddx0 = xj - xi0;
+          float ddy0 = yj - yi0;
+          float ddz0 = zj - zi0;
+          float sqrd_dist0 = ddx0*ddx0 + ddy0*ddy0 + ddz0*ddz0 + SOFTENING;
+          float inv_dist0 = 1 / sqrt(sqrd_dist0);
+          dx0[k] = ddx0;
+          dy0[k] = ddy0;
+          dz0[k] = ddz0;
+          inv_dist30[k] = inv_dist0 * inv_dist0 * inv_dist0;
+
+          float ddx1 = xj - xi1;
+          float ddy1 = yj - yi1;
+          float ddz1 = zj - zi1;
+          float sqrd_dist1 = ddx1*ddx1 + ddy1*ddy1 + ddz1*ddz1 + SOFTENING;
+          float inv_dist1 = 1 / sqrt(sqrd_dist1);
+          dx1[k] = ddx1;
+          dy1[k] = ddy1;
+          dz1[k] = ddz1;
+          inv_dist31[k] = inv_dist1 * inv_dist1 * inv_dist1;
+        }
+
+        /* Interleave independent targets without changing either source order. */
+        for (int k = 0; k < count; ++k) {
+          fx0 += dx0[k] * inv_dist30[k];
+          fy0 += dy0[k] * inv_dist30[k];
+          fz0 += dz0[k] * inv_dist30[k];
+          fx1 += dx1[k] * inv_dist31[k];
+          fy1 += dy1[k] * inv_dist31[k];
+          fz1 += dz1[k] * inv_dist31[k];
+        }
+        jb += count;
+      }
+
+      p[i0].vx += dt*fx0;
+      p[i0].vy += dt*fy0;
+      p[i0].vz += dt*fz0;
+      if (i1 != i0) {
+        p[i1].vx += dt*fx1;
+        p[i1].vy += dt*fy1;
+        p[i1].vz += dt*fz1;
+      }
+    }
+  }
+
+  free(storage);
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+  
+  exit(EXIT_SUCCESS);
+}

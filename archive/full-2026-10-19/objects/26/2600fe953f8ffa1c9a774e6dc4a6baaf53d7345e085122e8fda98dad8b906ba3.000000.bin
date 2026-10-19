@@ -1,0 +1,114 @@
+"""Prepare an isolated, immutable ROMEO pilot payload. Does not submit a job."""
+import datetime as dt
+import hashlib
+import json
+import shlex
+import tarfile
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+WORKSPACE = OUT.parents[2]
+PROJECT_ZIP = OUT.parent / "HPC-Forest-Harnais-v1.zip"
+SOURCE_SHA = "a0fe0d83324bbe6c68b14424e3bc27a640458904f82db4ede9f26f349e02c0e0"
+REMOTE_ROOT = "/scratch_p/nimarano/hpc-forest-harness-smallmodels-20261015-r1"
+REMOTE_ARCHIVE = "/scratch_p/nimarano/hpc-forest-harness-smallmodels-20261015-r1.tar.gz"
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+OLLAMA = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/tools/ollama-0.40.4/bin/ollama"
+OFFICIAL = WORKSPACE / "outputs/Marathon22-autonome/sources-officielles"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def main():
+    assert sha(PROJECT_ZIP) == SOURCE_SHA
+    protocol = {"schema": "hpc-forest-harness-small-models-smoke-v1",
+        "human_request": "apres test avec des petit models sur romeo pour voir si tout fonctionne bien",
+        "prepared_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "models": ["qwen2.5-coder:1.5b", "qwen2.5-coder:3b"], "problems": ["knn", "sum", "nbody"],
+        "purpose": "functional integration, not a controlled performance ablation",
+        "source_archive_sha256": SOURCE_SHA, "harness_enabled": True, "research_enabled": True,
+        "schedule": {"cycles": 1, "trials_per_role": 1, "integrations_per_cycle": 1,
+                     "planned_missions_per_problem_and_model": 4},
+        "budget_per_problem_and_model": {"wall_seconds": 600, "tokens": 600000,
+            "mission_token_reservation": 122880, "max_calls_per_mission": 3, "generation_seconds": 90,
+            "context_tokens": 32768, "max_output_tokens": 8192},
+        "seed": 23, "candidate_cpus": 4, "candidate_gpus": 0, "inference_gpus": 1,
+        "search_measurements": 3, "confirmation_measurements": 5, "minimum_gain": 0.03,
+        "compiler_uninitialized_checks": True, "operator_algorithm_changes": 0,
+        "manual_candidate_repairs": 0, "old_candidates_imported": False,
+        "technical_documentation_probes": "forced protocol fixtures, separate from all optimization contexts",
+        "general_web_search": False, "publication": False}
+    write(OUT / "assistance-protocol.json", protocol)
+    manifest = {"files": {"project.zip": SOURCE_SHA, "smoke_harness.py": sha(OUT / "smoke_harness.py"),
+                           "assistance-protocol.json": sha(OUT / "assistance-protocol.json")},
+                "official_files": {n: sha(OFFICIAL / n) for n in ("knn.zip", "sum.zip", "nbody.zip", "problemset.txt")}}
+    write(OUT / "payload-manifest.json", manifest)
+    archive = OUT / "hpc-forest-harness-smallmodels-r1.tar.gz"
+    if archive.exists():
+        raise RuntimeError("Preserve existing payload; create a new revision")
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(PROJECT_ZIP, arcname="project.zip", recursive=False)
+        for name in ("smoke_harness.py", "assistance-protocol.json", "payload-manifest.json"):
+            tar.add(OUT / name, arcname=name, recursive=False)
+    script = f'''set -euo pipefail
+archive={shlex.quote(REMOTE_ARCHIVE)}
+root={shlex.quote(REMOTE_ROOT)}
+py={shlex.quote(PYTHON)}
+test ! -e "$root"
+printf '%s  %s\\n' '{sha(archive)}' "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" -C "$root"
+"$py" - "$root" <<'PY'
+import hashlib,json,shutil,stat,sys,zipfile
+from pathlib import Path
+root=Path(sys.argv[1])
+manifest=json.loads((root/'payload-manifest.json').read_text())
+for name,expected in manifest['files'].items():
+    assert hashlib.sha256((root/name).read_bytes()).hexdigest()==expected, name
+project=root/'project'
+with zipfile.ZipFile(root/'project.zip') as z:
+    for info in z.infolist():
+        name=info.filename.removeprefix('HPC-Forest/')
+        target=project/name
+        assert info.filename.startswith('HPC-Forest/') and target.resolve().is_relative_to(project.resolve())
+        assert not stat.S_ISLNK(info.external_attr >> 16)
+        if info.is_dir():
+            target.mkdir(parents=True,exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(z.read(info))
+for name,expected in json.loads((project/'FILES.sha256.json').read_text()).items():
+    assert hashlib.sha256((project/name).read_bytes()).hexdigest()==expected,name
+official=root/'sources-officielles'
+official.mkdir()
+for name,expected in manifest['official_files'].items():
+    original=Path('/scratch_p/nimarano/hpc-forest-marathon22-20261015-r1/sources-officielles')/name
+    shutil.copyfile(original,official/name)
+    assert hashlib.sha256((official/name).read_bytes()).hexdigest()==expected,name
+print('Source and official inputs verified',flush=True)
+PY
+export PYTHONPATH="$root/project/src:$root/project/examples/marathon22"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export OPENBLAS_NUM_THREADS=1
+exec "$py" -u "$root/smoke_harness.py" --root "$root" --ollama {shlex.quote(OLLAMA)}
+'''
+    (OUT / "romeo-command.sh").write_text(script, encoding="utf8", newline="\n")
+    result = {"archive": str(archive), "sha256": sha(archive), "bytes": archive.stat().st_size,
+        "remote_archive": REMOTE_ARCHIVE, "remote_root": REMOTE_ROOT, "source_archive_sha256": SOURCE_SHA,
+        "command": "bash -c " + shlex.quote(script), "submitted": False,
+        "resources": {"arch": "armgpu", "cpus_per_task": 4, "mem_gb": 32,
+                      "gpus_per_node": 1, "time_limit": "00:45:00"},
+        "spack_packages": ["/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"]}
+    write(OUT / "payload-and-command.json", result)
+    print(json.dumps({k: result[k] for k in ("archive", "sha256", "bytes", "remote_root")}))
+
+
+if __name__ == "__main__":
+    main()

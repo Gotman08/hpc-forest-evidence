@@ -1,0 +1,83 @@
+--- R4b-candidat1/src/hpc_forest/dynamic_admission.py
++++ R4b-r2/src/hpc_forest/dynamic_admission.py
+@@ -122,14 +122,8 @@
+                     "Only the declared first pilot is admitted initially")
+         else:
+             first = json.loads(read_ref(refs["pilot_first_start"]).read_text(encoding="utf8"))
+-            require(first.get("schema") == "hpc-forest-dynamic-r4b-first-start-reception-v1"
+-                    and all(first.get(k) == v for k, v in base.items())
+-                    and first.get("model") == pilot_model and first.get("effort") == "max"
+-                    and first.get("session_id") == plan["cells"][pilot_model]
+-                    and first.get("received_first_normal_delivery_and_real_evaluation") is True
+-                    and first.get("unresolved_invocations") == [] and first.get("technical_errors") == []
+-                    and first.get("global_admission_verified") is False,
+-                    "Real received first NORMAL delivery/evaluation required before extension")
++            require(first_start_reception_valid(first, base, plan),
++                    "Real verified received first NORMAL delivery/evaluation required before extension")
+             for key in ("native_first_start", "receiving_audit"):
+                 read_ref(first[key])
+         contracts = proof(refs["native_contracts"], "hpc-forest-dynamic-r4b-native-contracts-v1", cell)
+@@ -142,6 +136,8 @@
+             require(row.get("phase") == phase and row.get("normal_native_delivery_verified") is True
+                     and row.get("closed_schema_verified") is True and row.get("usage_exact") is True,
+                     "An actual phase contract did not pass")
++            require(contract_session_valid(row.get("session_id"), value["model"], phase, plan),
++                    "A native contract session differs from its exact planned phase cell")
+             sessions.append(row["session_id"])
+             for key in ("request", "response", "invocation", "process", "jsonl", "ready", "delivered"):
+                 read_ref(row[key])
+@@ -152,6 +148,23 @@
+                 and re.fullmatch(r"[0-9a-f]{64}", value.get("allowed_request_sha256", "")) is not None,
+                 "A technical admission allows only one exact phase request")
+     return value
++
++
++def first_start_reception_valid(first, identity, plan):
++    pilot_model = plan.get("pilot_configuration", {}).get("model")
++    return (first.get("schema") == "hpc-forest-dynamic-r4b-first-start-reception-v1"
++            and first.get("verified") is True
++            and all(first.get(k) == v for k, v in identity.items())
++            and first.get("model") == pilot_model and first.get("effort") == "max"
++            and first.get("session_id") == plan["cells"][pilot_model]
++            and first.get("received_first_normal_delivery_and_real_evaluation") is True
++            and first.get("unresolved_invocations") == [] and first.get("technical_errors") == []
++            and first.get("global_admission_verified") is False)
++
++
++def contract_session_valid(session, model, phase, plan):
++    expected = plan.get("contract_cells", {}).get(model, {}).get(phase)
++    return isinstance(session, str) and bool(expected) and session == expected
+ 
+ 
+ def guard_request(authorization, request):
+--- R4b-candidat1/tests/test_r4b_privacy.py
++++ R4b-r2/tests/test_r4b_privacy.py
+@@ -241,6 +241,28 @@
+     with pytest.raises(InfrastructureError, match="freshness"):
+         mailbox.publish_request(auth["remote_root"] + "/results-999999/mailbox", request)
+     assert not calls
++
++
++@pytest.mark.parametrize("verified", [None, False, True])
++def test_first_start_receiving_flag_never_overrides_missing_verification(verified):
++    from hpc_forest.dynamic_admission import first_start_reception_valid
++    identity = {"scope_id": "unit-only", "source_zip_sha256": "1" * 64, "plan_sha256": "2" * 64}
++    plan = {"pilot_configuration": {"model": "gpt-6-luna"}, "cells": {"gpt-6-luna": "a" * 32}}
++    first = {"schema": "hpc-forest-dynamic-r4b-first-start-reception-v1", **identity,
++        "model": "gpt-6-luna", "effort": "max", "session_id": "a" * 32,
++        "received_first_normal_delivery_and_real_evaluation": True, "unresolved_invocations": [],
++        "technical_errors": [], "global_admission_verified": False}
++    if verified is not None:
++        first["verified"] = verified
++    # Pure field predicate only; this is never a full deployable admission.
++    assert first_start_reception_valid(first, identity, plan) is (verified is True)
++
++
++@pytest.mark.parametrize("session", [None, "c" * 32, "b" * 32])
++def test_contract_session_must_be_the_exact_declared_phase_cell(session):
++    from hpc_forest.dynamic_admission import contract_session_valid
++    plan = {"contract_cells": {"gpt-6-luna": {"roots": "b" * 32, "advice": "c" * 32}}}
++    assert contract_session_valid(session, "gpt-6-luna", "roots", plan) is (session == "b" * 32)
+ 
+ 
+ @pytest.mark.parametrize("violation", ["digest", "phase", "candidate"])

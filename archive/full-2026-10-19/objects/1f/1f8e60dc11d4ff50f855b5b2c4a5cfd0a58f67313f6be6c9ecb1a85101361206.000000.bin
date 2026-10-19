@@ -1,0 +1,90 @@
+"""Final-answer SFT data adapter for the pinned official V4-Flash-0731 format.
+
+No model, training, network, agent tools or runtime admission. Initial scope:
+plain system/user/assistant messages in non-thinking chat mode only.
+"""
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib.util
+import json
+import re
+from pathlib import Path
+
+
+class DataContractError(ValueError):
+    pass
+
+
+class OfficialDataAdapter:
+    def __init__(self, root: Path, *, max_tokens=4096):
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 65536:
+            raise DataContractError("Invalid training sequence bound")
+        observation = json.loads((root / "observation-modele.json").read_bytes())
+        self.revision = observation["revision"]
+        if observation["repository"] != "deepseek-ai/DeepSeek-V4-Flash-0731":
+            raise DataContractError("The training model identity differs")
+        source = root / "encoding_dsv4.py"
+        expected = observation["receipts"]["encoding_dsv4.py"]["sha256"]
+        if source.is_symlink() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+            raise DataContractError("Reviewed official encoder bytes changed")
+        # Additional structural check; this is not a security sandbox. The source
+        # was reviewed and pinned before any import and has only stdlib imports.
+        tree = ast.parse(source.read_bytes())
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [node.module] if isinstance(node, ast.ImportFrom) else [n.name for n in node.names]
+                if any(name not in {"copy", "typing", "json", "re"} for name in names):
+                    raise DataContractError("Encoder import differs from the reviewed source")
+        spec = importlib.util.spec_from_file_location("reviewed_official_dsv4_0731", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.formatter = module.encode_messages
+        tokenizer_path = root / "tokenizer.json"
+        receipt = json.loads((root / "tokenizer-reception.json").read_bytes())
+        if (receipt["revision"] != self.revision or tokenizer_path.is_symlink()
+                or hashlib.sha256(tokenizer_path.read_bytes()).hexdigest() != receipt["sha256"]):
+            raise DataContractError("Tokenizer bytes or revision differ")
+        from tokenizers import Tokenizer
+
+        self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        self.max_tokens = max_tokens
+        # The official tokenizer also reserves placeholders and multimodal
+        # delimiters. Reject all added-token strings in this text-only scope.
+        controls = {token.content for token in self.tokenizer.get_added_tokens_decoder().values()}
+        controls.update({"<think>", "</think>", "｜DSML｜", "<｜latest_reminder｜>"})
+        self.control_pattern = re.compile("|".join(re.escape(token) for token in sorted(controls)))
+
+    def encode(self, messages: list[dict]):
+        if (not isinstance(messages, list) or not 2 <= len(messages) <= 128
+                or any(not isinstance(message, dict) for message in messages)):
+            raise DataContractError("Expected a bounded list of message objects")
+        if (messages[-1].get("role") != "assistant"
+                or messages[-2].get("role") != "user"
+                or not messages[-1].get("content")):
+            raise DataContractError("Initial scope requires a final assistant answer after a user turn")
+        for message in messages:
+            if (set(message) != {"role", "content"} or not isinstance(message["role"], str)
+                    or message["role"] not in {"system", "user", "assistant"}
+                    or not isinstance(message["content"], str) or len(message["content"]) > 1_000_000
+                    or self.control_pattern.search(message["content"])):
+                raise DataContractError("Unsupported/protected message fields or reserved control tokens")
+        if sum(len(message["content"]) for message in messages) > 1_000_000:
+            raise DataContractError("Excessive total text before tokenization")
+        prefix = self.formatter(messages[:-1], thinking_mode="chat", reasoning_effort="low")
+        full = self.formatter(messages, thinking_mode="chat", reasoning_effort="low")
+        if not full.startswith(prefix):
+            raise DataContractError("Official formatter does not preserve this final-answer prefix")
+        tokens = self.tokenizer.encode(full, add_special_tokens=False).ids
+        prefix_tokens = self.tokenizer.encode(prefix, add_special_tokens=False).ids
+        if (tokens[:len(prefix_tokens)] != prefix_tokens or len(tokens) <= len(prefix_tokens)
+                or len(tokens) > self.max_tokens):
+            raise DataContractError("Unstable token boundary or excessive sequence length")
+        if self.tokenizer.decode(tokens, skip_special_tokens=False) != full:
+            raise DataContractError("Official tokenization does not preserve the encoded text")
+        return {"input_ids": tokens, "attention_mask": [1] * len(tokens),
+                "labels": [-100] * len(prefix_tokens) + tokens[len(prefix_tokens):],
+                "prompt_tokens": len(prefix_tokens), "target_tokens": len(tokens) - len(prefix_tokens),
+                "model_revision": self.revision, "scope": "chat-final-answer-only",
+                "weights_trained": False, "api_usage_inferred": False}

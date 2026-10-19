@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cassert>\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <limits>\n#include <memory>\n#include <vector>\n\n#if defined(__aarch64__)\n#include <arm_neon.h>\n#endif\n\nusing Sum = std::int64_t;\n\n#if defined(__aarch64__)\nstatic inline int64x2_t maximum_i64(int64x2_t a, int64x2_t b) {\n    return vbslq_s64(vcgtq_s64(a, b), a, b);\n}\n#endif\n\n// Each lane updates a distinct window column. Only the maximum is reduced.\ntemplate <bool RemoveOld, bool TrackMaximum>\nstatic Sum update_windows(const Sum* prefix, int s, Sum* history,\n                          Sum* totals, int count) {\n    Sum best = std::numeric_limits<Sum>::lowest();\n    int j = 0;\n\n#if defined(__aarch64__)\n    int64x2_t maximum0 = vdupq_n_s64(best);\n    int64x2_t maximum1 = maximum0;\n    for (; j + 4 <= count; j += 4) {\n        const int64x2_t horizontal0 = vsubq_s64(\n            vld1q_s64(prefix + j + s), vld1q_s64(prefix + j));\n        const int64x2_t horizontal1 = vsubq_s64(\n            vld1q_s64(prefix + j + s + 2), vld1q_s64(prefix + j + 2));\n        int64x2_t total0 = vaddq_s64(vld1q_s64(totals + j), horizontal0);\n        int64x2_t total1 = vaddq_s64(vld1q_s64(totals + j + 2), horizontal1);\n        if (RemoveOld) {\n            total0 = vsubq_s64(total0, vld1q_s64(history + j));\n            total1 = vsubq_s64(total1, vld1q_s64(history + j + 2));\n        }\n        vst1q_s64(history + j, horizontal0);\n        vst1q_s64(history + j + 2, horizontal1);\n        vst1q_s64(totals + j, total0);\n        vst1q_s64(totals + j + 2, total1);\n        if (TrackMaximum) {\n            maximum0 = maximum_i64(maximum0, total0);\n            maximum1 = maximum_i64(maximum1, total1);\n        }\n    }\n    if (TrackMaximum) {\n        maximum0 = maximum_i64(maximum0, maximum1);\n    }\n    for (; j + 2 <= count; j += 2) {\n        const int64x2_t horizontal = vsubq_s64(\n            vld1q_s64(prefix + j + s), vld1q_s64(prefix + j));\n        int64x2_t total = vaddq_s64(vld1q_s64(totals + j), horizontal);\n        if (RemoveOld) {\n            total = vsubq_s64(total, vld1q_s64(history + j));\n        }\n        vst1q_s64(history + j, horizontal);\n        vst1q_s64(totals + j, total);\n        if (TrackMaximum) {\n            maximum0 = maximum_i64(maximum0, total);\n        }\n    }\n    if (TrackMaximum) {\n        best = std::max(vgetq_lane_s64(maximum0, 0),\n                        vgetq_lane_s64(maximum0, 1));\n    }\n#endif\n\n    for (; j < count; ++j) {\n        const Sum horizontal = prefix[j + s] - prefix[j];\n        Sum total = totals[j] + horizontal;\n        if (RemoveOld) {\n            total -= history[j];\n        }\n        history[j] = horizontal;\n        totals[j] = total;\n        if (TrackMaximum) {\n            best = std::max(best, total);\n        }\n    }\n    return best;\n}\n\nint main() {\n    int n, s;\n    if (std::scanf(\"%d%d\", &n, &s) != 2) {\n        return 0;\n    }\n    assert(s < n);\n    assert(n < 8000);\n    assert(s > 0);\n    assert(n > 0);\n\n    const int windows = n - s + 1;\n    std::vector<Sum> prefix(n + 1);\n    std::vector<Sum> totals(windows, 0);\n    const std::size_t history_size = static_cast<std::size_t>(s) * windows;\n    std::unique_ptr<Sum[]> history(new Sum[history_size]);\n    Sum best = std::numeric_limits<Sum>::lowest();\n    int slot = 0;\n\n    for (int row = 0; row < n; ++row) {\n        prefix[0] = 0;\n        // Preserve the prefix dependency; vectorize the independent updates below.\n        for (int column = 0; column < n; ++column) {\n            int value;\n            if (std::scanf(\"%d\", &value) != 1) {\n                return 0;\n            }\n            prefix[column + 1] = prefix[column] + static_cast<Sum>(value);\n        }\n\n        Sum* previous = history.get() + static_cast<std::size_t>(slot) * windows;\n        if (row < s - 1) {\n            update_windows<false, false>(prefix.data(), s, previous,\n                                         totals.data(), windows);\n        } else if (row == s - 1) {\n            best = update_windows<false, true>(prefix.data(), s, previous,\n                                               totals.data(), windows);\n        } else {\n            const Sum row_best = update_windows<true, true>(\n                prefix.data(), s, previous, totals.data(), windows);\n            best = std::max(best, row_best);\n        }\n        if (++slot == s) {\n            slot = 0;\n        }\n    }\n\n    std::printf(\"%lld\\n\", static_cast<long long>(best));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "An O(N²) streaming algorithm with independent window-column updates should reduce computation and enable exact 64-bit ARM64 SIMD without violating sliding-sum dependencies.",
+    "notes": "No commands or measurements performed. Single-threaded, with scalar fallback and unchanged textual I/O. Ring entries are initialized before use; all intermediate arithmetic is 64-bit.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Replace serpentine traversal with per-row prefixes and an S-row ring of horizontal window sums.",
+      "Fuse independent vertical updates with ARM64 NEON maximum reductions, using two vector accumulators and scalar tails.",
+      "Keep the dependent prefix recurrence scalar and consider maxima only after S rows have accumulated."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "b6339aeddfad4ddd9ae6c2a58f049060",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "fb7fc323a403d9700d1a36a2ac4f9010521548d04199c58c2af006ceb51a8bd9",
+  "session_id": "c0e9dfffccc040969abe9f6f54635671",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "bd9a902c724113d4579f8383bd8444831c80eb4f94634aaa7a4417957defa7b3",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 4224,
+        "input_tokens": 11082,
+        "output_tokens": 9859,
+        "reasoning_output_tokens": 8200
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 20941,
+    "tool_events": []
+  }
+}

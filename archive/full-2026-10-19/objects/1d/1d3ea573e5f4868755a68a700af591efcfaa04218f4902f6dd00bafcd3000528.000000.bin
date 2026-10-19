@@ -1,0 +1,171 @@
+"""Independent inert JSON/AST controls; never import or run operator entrypoints."""
+
+import ast
+import copy
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PREP = HERE.parent
+BASE = PREP.parents[1]
+PROJ = PREP / "preparation-modeles-max-r1"
+ROOTS = PREP / "preparation-contrat-roots-explicite-r1"
+LAUNCH = PREP / "lancement-technique-r4b-r1"
+SOURCE = BASE / "work/hpc-forest-mere-dynamique-r4b-max/project/src/hpc_forest"
+checks = []
+inspected = {}
+
+
+def sha(path):
+    path = Path(path)
+    value = hashlib.sha256(path.read_bytes()).hexdigest()
+    inspected[str(path)] = value
+    return value
+
+
+def load(path):
+    path = Path(path)
+    sha(path)
+
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("Duplicate key: " + key)
+            value[key] = item
+        return value
+
+    return json.loads(path.read_text(encoding="utf8"), object_pairs_hook=unique)
+
+
+def check(name, condition):
+    if not condition:
+        raise AssertionError(name)
+    checks.append(name)
+
+
+def ref(item):
+    return sha(item["path"]) == item["sha256"]
+
+
+def tree(path):
+    sha(path)
+    return ast.parse(Path(path).read_text(encoding="utf8"))
+
+
+def function(module, name):
+    return next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+final = load(PROJ / "VERIFICATION-FINALE.json")
+proposal = load(PROJ / "PROJECTION-FINALE-NON-ADMISE.json")
+plan = load(PREP / "revision-source-r4b/revision-r2/dynamic-plan-r4b-max.json")
+negative = load(PREP / "operations-parent-roots-20261018/reception-roots-752306/RECONCILIATION-NEGATIVE-FINALE.json")
+check("final_verification_refs_exact", all(ref(r) for r in final["source_refs"]) and all(
+    ref(final[k]) for k in ("projection", "generator", "validator", "initial_generator_preserved",
+                           "initial_verification_historical_only", "initial_draft_historical_only")))
+check("final_verified_static_only", final["verified"] is True and
+      final["verified_scope"] == "static planning only; no native admission" and
+      final["generation_admitted"] is False and final["scientific_admission"] is False and
+      [final[k] for k in ("native_calls", "jobs_submitted", "processes_started")] == [0, 0, 0])
+check("proposal_not_admitted", proposal["verified"] is False and proposal["generation_admitted"] is False and
+      proposal["new_model_backend_attestation_observed"] is False and
+      [proposal[k] for k in ("model_calls", "jobs_submitted")] == [0, 0])
+check("proposal_source_plan_exact", ref(proposal["source_plan"]) and ref(proposal["sealed_source_zip"]) and
+      proposal["source_plan"]["sha256"] == "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b" and
+      proposal["sealed_source_zip"]["sha256"] == "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3")
+models = ("gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-terra")
+check("three_exact_models_MAX", tuple(m["model"] for m in proposal["models"]) == models and
+      all(m["effort"] == "max" for m in proposal["models"]))
+all_sessions = list(plan["cells"].values()) + [s for v in plan["contract_cells"].values() for s in v.values()]
+check("sixteen_unique_plan_sessions", len(all_sessions) == len(set(all_sessions)) == 16 and
+      all(len(s) == 32 and set(s) <= set("0123456789abcdef") for s in all_sessions))
+technical = []
+for model in proposal["models"]:
+    name = model["model"]
+    check("exact_sessions_and_roots_" + name, [c["phase"] for c in model["contracts"]] == ["roots", "advice", "harvest"] and
+          all(c["session_id"] == plan["contract_cells"][name][c["phase"]] and
+              c["remote_root"] == "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + c["session_id"] and
+              c["admission_root"] == "/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + c["session_id"] and
+              c["job_id"] is None and c["generation_admitted"] is False and
+              c["submission_performed"] is False and c["contract_result"] is None
+              for c in model["contracts"]))
+    technical += [c["session_id"] for c in model["contracts"]]
+    check("pilot_only_proposed_" + name, model["pilot_session_id_from_plan"] == plan["cells"][name] and
+          model["pilot_subject_proposed"] == "2023-count" and
+          all(model[k] is False for k in ("pilot_admitted", "current_plan_pilot_configuration_for_this_model",
+                                         "current_luna_only_launcher_supports_this_model")))
+check("nine_unique_technical_sessions", len(technical) == len(set(technical)) == 9)
+check("actual_plan_pilot_Luna_only", plan["pilot_configurations"] == [plan["pilot_configuration"]] and
+      plan["pilot_configuration"] == {"model": "gpt-6-luna", "effort": "max", "subject": "2023-count"} and
+      proposal["current_launcher_model"] == "gpt-6-luna")
+cap = proposal["concurrency_proposal"]
+check("cap_four_proposed_never_five", cap["source_only_workers"] == 1 and cap["new_model_workers"] == 3 and
+      cap["maximum_total"] == plan["maximum_native_workers_total"] == plan["max_parallel_native_generation_workers"] == 4 and
+      cap["admitted_now"] is False and cap["four_new_models_plus_source_only_refused"] is True)
+check("limits_resources_deadline_exact", proposal["scientific_limits_unchanged"] == plan["limits"] and
+      proposal["candidate_resources"] == plan["candidate_resources"] and
+      datetime.fromisoformat(proposal["deadline_exclusive_utc"]) == datetime.fromisoformat(plan["deadline_exclusive_utc"]) and
+      proposal["minimum_receipt_audit_reserve_seconds"] == 10800 and proposal["deadline_requires_fresh_check_after_wait"] is True)
+luna = proposal["luna_closed_negative"]
+check("negative_Luna_never_promoted_or_replayed", ref(luna["receipt"]) and luna["receipt"]["sha256"] ==
+      "d8085d8e077e0d501319bce314ea30ff8b3aca7df312f9acae10cda9325fda6f" and
+      luna["job_id"] == negative["job_id"] == "752306" and
+      luna["session_id"] == negative["session_id"] == plan["contract_cells"]["gpt-6-luna"]["roots"] and
+      all(luna[k] is False for k in ("replay_allowed", "positive_contract", "advice_harvest_pilot_admitted")) and
+      negative["closed_schema_verified"] is False and negative["normal_native_delivery_verified"] is False)
+
+delivery = load(ROOTS / "RECU-SHA-FINAL.json")
+check("roots_delivery_refs_exact", all(ref(r) for r in delivery["files"]) and ref(delivery["negative_luna_receipt_preserved"]) and
+      ref(delivery["actual_request_readonly_evidence"]) and ref(delivery["output_schema_readonly_evidence"]))
+check("roots_proposal_not_admitted", delivery["verified"] is False and
+      delivery["status"] == "PROPOSAL_NOT_ADMITTED_FOR_NATIVE_USE" and delivery["model_calls"] == 0 and
+      delivery["remote_actions"] == 0 and delivery["luna_replay"] is False and
+      delivery["allocated_zero_model_preflight_required"] is True and delivery["per_model_fresh_admissions_required"] is True)
+old = tree(LAUNCH / "remote_stage.py")
+new = tree(ROOTS / "remote_stage_PROPOSITION_NON_ADMISE.py")
+check("only_make_request_AST_changed", len(old.body) == len(new.body) and
+      [getattr(a, "name", type(a).__name__) for a, b in zip(old.body, new.body) if ast.dump(a) != ast.dump(b)] == ["make_request"])
+old_func, new_func = function(old, "make_request"), function(new, "make_request")
+check("roots_only_cardinality_sentence", len(new_func.body) == len(old_func.body) + 2 and
+      isinstance(new_func.body[-2], ast.If) and ast.unparse(new_func.body[-2].test) == "phase == 'roots'" and
+      ast.literal_eval(new_func.body[-2].body[0].value) ==
+      " For this synthetic roots interface contract, the directions array must contain between 1 and 8 entries inclusive; an empty array is invalid.")
+check("remaining_external_stage_unchanged", ast.dump(function(old, "neutral_payload")) == ast.dump(function(new, "neutral_payload")) and
+      ast.dump(function(old, "one_contract")) == ast.dump(function(new, "one_contract")))
+schema = load(delivery["output_schema_readonly_evidence"]["path"])
+actual_request = load(delivery["actual_request_readonly_evidence"]["path"])
+check("real_schema_closed_but_no_cardinality", schema == actual_request["schema"] and
+      schema["type"] == "object" and schema["additionalProperties"] is False and
+      set(schema["required"]) == {"analysis", "directions"} and
+      schema["properties"]["directions"]["type"] == "array" and
+      "minItems" not in schema["properties"]["directions"] and "maxItems" not in schema["properties"]["directions"] and
+      schema["properties"]["directions"]["items"]["additionalProperties"] is False and
+      set(schema["properties"]["directions"]["items"]["required"]) == {"title", "objective", "requires"})
+mother = tree(SOURCE / "dynamic_mother.py")
+isolated = ast.Module(body=[copy.deepcopy(function(mother, name)) for name in ("checked_text", "validate_directions")], type_ignores=[])
+namespace = {"InfrastructureError": ValueError}
+exec(compile(ast.fix_missing_locations(isolated), "<pure-frozen-validator-functions>", "exec"), namespace)
+for count, accepted in ((0, False), (1, True), (8, True), (9, False)):
+    data = {"analysis": "NEUTRAL schema fixture", "directions": [
+        {"title": "Interface " + str(i), "objective": "Typed interface fixture only", "requires": []} for i in range(count)]}
+    try:
+        outcome = namespace["validate_directions"](data, 8, {"cpu", "c", "cxx", "openmp"})
+    except ValueError:
+        check("frozen_validator_boundary_" + str(count), not accepted)
+    else:
+        check("frozen_validator_boundary_" + str(count), accepted and len(outcome["directions"]) == count)
+check("reviewer_has_not_imported_operator_modules", not any(name.startswith("hpc_forest") for name in __import__("sys").modules))
+
+result = {"schema": "hpc-forest-neutral-preparations-independent-static-checks-v1", "verified": True,
+          "scope": "static metadata/AST and isolated pure validator functions only; no native admission",
+          "observed_at_utc": datetime.now(timezone.utc).isoformat(), "checks_passed": len(checks), "checks": checks,
+          "inspected_files": [{"path": p, "sha256": s} for p, s in sorted(inspected.items())],
+          "source_imports": 0, "operator_entrypoints_executed": 0, "live_actions": 0,
+          "model_calls": 0, "C_compilations_or_executions": 0, "generation_admitted": False}
+with (HERE / "controles-statiques-1.json").open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    stream.write("\n")
+print(json.dumps({"passed": len(checks), "result": str(HERE / "controles-statiques-1.json")}))

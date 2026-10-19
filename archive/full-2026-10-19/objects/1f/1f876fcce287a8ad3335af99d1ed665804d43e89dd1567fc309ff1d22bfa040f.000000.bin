@@ -1,0 +1,165 @@
+"""Independent, offline statement checks; never imported by a model worker.
+
+This reviewer is separate from the closed r2 measurements. Measurement admission
+also requires a positive received-contract review and an allocated ARM64 gate.
+The admitted input subset is deliberately bounded for independent checking.
+"""
+from __future__ import annotations
+
+import math
+import re
+from collections import Counter
+from itertools import pairwise
+
+
+class ReviewError(ValueError):
+    """A required domain or observable-output property was not established."""
+
+
+def permutation_domain(raw: bytes) -> dict:
+    ignored = b" \t\r\n\v\f"
+    if any(value not in ignored and not 33 <= value <= 126 for value in raw):
+        raise ReviewError("permutations: printable ASCII subset required")
+    symbols = bytes(value for value in raw if value not in ignored)
+    if not 1 <= len(symbols) <= 10:
+        raise ReviewError("permutations: bounded nonempty input subset required")
+    counts = Counter(symbols)
+    distinct = math.factorial(len(symbols))
+    for count in counts.values():
+        distinct //= math.factorial(count)
+    if distinct > 100_000:
+        raise ReviewError("permutations: independent output-check budget exceeded")
+    return {"symbols": symbols, "counts": counts, "distinct_permutations": distinct}
+
+
+def check_permutations(raw: bytes, stdout: bytes) -> dict:
+    """Prove count, multiplicities, distinctness and order for this finite input.
+
+    No candidate or reference algorithm is executed, edited or recommended.
+    Formatting remains the bracket/space/LF format of the unchanged C++ source.
+    """
+    domain = permutation_domain(raw)
+    if not stdout.endswith(b"\n"):
+        raise ReviewError("permutations: original line terminator missing")
+    previous = None
+    # splitlines() would silently normalize CRLF and several control characters.
+    # Keep the original LF byte format; the campaign's exact oracle also remains.
+    lines = stdout[:-1].split(b"\n")
+    if len(lines) != domain["distinct_permutations"]:
+        raise ReviewError("permutations: incomplete or duplicate output count")
+    for line in lines:
+        if not (line.startswith(b"[ ") and line.endswith(b" ]")):
+            raise ReviewError("permutations: original bracket format required")
+        tokens = line[2:-2].split(b" ")
+        if any(len(token) != 1 for token in tokens):
+            raise ReviewError("permutations: malformed symbol spacing")
+        symbols = b"".join(tokens)
+        if Counter(symbols) != domain["counts"]:
+            raise ReviewError("permutations: changed input multiset")
+        if previous is not None and symbols <= previous:
+            raise ReviewError("permutations: output must be strictly lexicographic")
+        if line + b"\n" != b"[ " + b" ".join(tokens) + b" ]\n":
+            raise ReviewError("permutations: original byte format differs")
+        previous = symbols
+    return {"checked": True, "symbols": len(domain["symbols"]),
+            "permutations": len(lines), "complete_for_this_input": True}
+
+
+def tropical_domain(raw: bytes) -> dict:
+    tokens = raw.split()
+    if any(re.fullmatch(rb"-?[0-9]+", token) is None for token in tokens):
+        raise ReviewError("tropical: decimal integer input required")
+    values = [int(token) for token in tokens]
+    if len(values) < 3:
+        raise ReviewError("tropical: truncated header")
+    n, colors = values[:2]
+    if not 2 <= n <= 10 or not 1 <= colors <= n:
+        raise ReviewError("tropical: bounded connected-graph subset required")
+    if len(values) < n + 3:
+        raise ReviewError("tropical: truncated colors")
+    labels, m = values[2:n + 2], values[n + 2]
+    if any(not 0 <= color < colors for color in labels) or len(set(labels)) != colors:
+        raise ReviewError("tropical: declared color set differs")
+    if not n - 1 <= m <= n * (n - 1) // 2 or len(values) != n + 3 + 2 * m:
+        raise ReviewError("tropical: inconsistent simple-graph edge count")
+    edges, adjacency = set(), [set() for _ in range(n)]
+    for left, right in zip(values[n + 3::2], values[n + 4::2]):
+        if not (0 <= left < n and 0 <= right < n) or left == right:
+            raise ReviewError("tropical: invalid edge endpoint or self-loop")
+        edge = tuple(sorted((left, right)))
+        if edge in edges:
+            raise ReviewError("tropical: duplicate undirected edge")
+        edges.add(edge)
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+    reached, pending = {0}, [0]
+    while pending:
+        for other in adjacency[pending.pop()]:
+            if other not in reached:
+                reached.add(other)
+                pending.append(other)
+    if len(reached) != n:
+        raise ReviewError("tropical: disconnected input is outside reviewed subset")
+    return {"n": n, "colors": colors, "labels": labels,
+            "edges": edges, "adjacency": adjacency}
+
+
+def _maximum_colors(domain: dict) -> int:
+    """Exhaustive subset reachability oracle, independent of the supplied source.
+
+    Each state represents a simple path's visited set and possible final vertex.
+    It produces a number for the offline checker, never a model-facing solution.
+    """
+    n = domain["n"]
+    endpoints = [0] * (1 << n)
+    color_sets = [0] * (1 << n)
+    maximum = 0
+    for vertex in range(n):
+        endpoints[1 << vertex] = 1 << vertex
+    for visited in range(1, 1 << n):
+        bit = visited & -visited
+        color_sets[visited] = (color_sets[visited ^ bit]
+                               | 1 << domain["labels"][bit.bit_length() - 1])
+        if not endpoints[visited]:
+            continue
+        maximum = max(maximum, color_sets[visited].bit_count())
+        for vertex in range(n):
+            if endpoints[visited] & (1 << vertex):
+                for other in domain["adjacency"][vertex]:
+                    if not visited & (1 << other):
+                        endpoints[visited | (1 << other)] |= 1 << other
+    return maximum
+
+
+def check_tropical(raw: bytes, stdout: bytes) -> dict:
+    """Check path legality, color count and optimum without changing byte oracle."""
+    domain = tropical_domain(raw)
+    match = re.fullmatch(rb"([0-9]+(?:-[0-9]+)*)\n([0-9]+)\n?", stdout)
+    if match is None:
+        raise ReviewError("tropical: original two-line path output required")
+    path = [int(value) for value in match[1].split(b"-")]
+    if len(set(path)) != len(path) or any(not 0 <= value < domain["n"] for value in path):
+        raise ReviewError("tropical: path repeats or leaves the vertex set")
+    if any(right not in domain["adjacency"][left] for left, right in pairwise(path)):
+        raise ReviewError("tropical: consecutive vertices do not share an edge")
+    observed = len({domain["labels"][vertex] for vertex in path})
+    if int(match[2]) != observed:
+        raise ReviewError("tropical: printed count disagrees with path colors")
+    optimum = _maximum_colors(domain)
+    if observed != optimum:
+        raise ReviewError("tropical: legal path does not maximize color count")
+    return {"checked": True, "vertices": domain["n"], "path_vertices": len(path),
+            "observed_colors": observed, "optimal_colors": optimum,
+            "optimal_for_this_input": True}
+
+
+def input_domain(subject: str, raw: bytes) -> dict:
+    if subject == "2020-permutations":
+        result = permutation_domain(raw)
+        return {"checked": True, "size": len(result["symbols"]),
+                "distinct_permutations": result["distinct_permutations"]}
+    if subject == "2020-tropical":
+        result = tropical_domain(raw)
+        return {"checked": True, "size": result["n"], "colors": result["colors"],
+                "edges": len(result["edges"])}
+    raise ReviewError("Subject has no independent r3 review: " + subject)

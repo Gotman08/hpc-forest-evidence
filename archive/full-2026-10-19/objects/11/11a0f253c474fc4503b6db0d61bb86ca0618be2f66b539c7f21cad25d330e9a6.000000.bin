@@ -1,0 +1,240 @@
+"""Local positive/negative mathematical tests, never the C reference."""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest import mock
+
+import package_preparation
+import prepare
+import qualify_arm64
+import validate
+
+CODE = Path(__file__).resolve().parent
+DATA = Path(os.environ.get("PRIMES_CERTIFIED_DATA", CODE.parents[1] / "outputs/HPC-Forest-Primes-Max-Certifie-r1"))
+TEST_ROOT = CODE / "test-temporary"
+
+
+class CertificationTests(unittest.TestCase):
+    def setUp(self):
+        TEST_ROOT.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        self.folder = Path(self.temporary.name).resolve()
+        self.assertTrue(self.folder.is_relative_to(TEST_ROOT.resolve()))
+        shutil.copytree(DATA / "private-audit-fixtures/p02-v0", self.folder / "case")
+        self.case = self.folder / "case"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def certificate(self):
+        return json.loads((self.case / "certificate.json").read_text(encoding="utf-8"))
+
+    def save(self, cert):
+        (self.case / "certificate.json").write_text(json.dumps(cert), encoding="utf-8")
+
+    def change_input(self, lines, cert):
+        raw = ("\n".join(lines) + "\n").encode("ascii")
+        (self.case / "input.txt").write_bytes(raw)
+        cert["input_sha256"] = hashlib.sha256(raw).hexdigest()
+        self.save(cert)
+
+    def test_all_twelve_certified_fixtures(self):
+        report = validate.validate_preparation(DATA)
+        self.assertEqual(len(report["cases"]), 12)
+        self.assertEqual({r["p"] for r in report["cases"]}, {1, 2, 4, 8, 16, 30})
+        self.assertEqual(report["native_model_calls"], 0)
+
+    def test_independent_primality_boundary_and_pseudoprimes(self):
+        for n in (0, 1, 4, 9, 25, 49, 561, 1105, 1729, 2047, 1373653, 25326001, 321197185):
+            self.assertFalse(validate.prime32(n), n)
+        for n in (2, 3, 5, 7, 97, 65537, 2147483647):
+            self.assertTrue(validate.prime32(n), n)
+        with self.assertRaises(ValueError):
+            validate.prime32(2**31)
+
+    def test_sieve_and_miller_rabin_independent_agreement(self):
+        primes = set(prepare.prime_divisors(20000))
+        self.assertEqual(primes, {n for n in range(20001) if validate.prime32(n)})
+
+    def test_no_empty_or_p_zero_or_more_than_thirty(self):
+        for raw in (b"", b"0\n", b"31\n", b"1000\n"):
+            with self.assertRaises(ValueError):
+                validate.parse_input(raw)
+
+    def test_truncated_input_rejected(self):
+        lines = (self.case / "input.txt").read_text(encoding="ascii").splitlines()[:-1]
+        self.change_input(lines, self.certificate())
+        with self.assertRaisesRegex(ValueError, "2P"):
+            validate.validate_case(self.case)
+
+    def test_leading_zero_stripping_rejected(self):
+        lines = (self.case / "input.txt").read_text(encoding="ascii").splitlines()
+        lines[-1] = str(int(lines[-1]))
+        self.change_input(lines, self.certificate())
+        with self.assertRaisesRegex(ValueError, "leading zero"):
+            validate.validate_case(self.case)
+
+    def test_mixed_groups_rejected(self):
+        lines = (self.case / "input.txt").read_text(encoding="ascii").splitlines()
+        lines[1], lines[-1] = lines[-1], lines[1]
+        self.change_input(lines, self.certificate())
+        with self.assertRaisesRegex(ValueError, "left restriction"):
+            validate.validate_case(self.case)
+
+    def test_nonbijective_permutation_rejected(self):
+        cert = self.certificate()
+        cert["right_permutation"] = [0, 0]
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "bijective"):
+            validate.validate_case(self.case)
+
+    def test_missing_prime_source_rejected(self):
+        cert = self.certificate()
+        cert["source_primes"].pop()
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "P original primes"):
+            validate.validate_case(self.case)
+
+    def test_composite_source_rejected(self):
+        cert = self.certificate()
+        cert["source_primes"][0]["prime"] = 561
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "independently prime"):
+            validate.validate_case(self.case)
+
+    def test_original_cut_zero_loss_rejected(self):
+        cert = self.certificate()
+        cert["source_primes"][0]["right"] = str(int(cert["source_primes"][0]["right"]))
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "cut lost"):
+            validate.validate_case(self.case)
+
+    def test_multiset_multiplicity_not_deduplicated(self):
+        cert = self.certificate()
+        expected = cert["expected_primes_with_multiplicity"]
+        cert["expected_primes_with_multiplicity"] = [expected[0], expected[0]]
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "multiset"):
+            validate.validate_case(self.case)
+
+    def test_duplicate_or_missing_matrix_entry_rejected(self):
+        cert = self.certificate()
+        cert["matrix"][-1] = copy.deepcopy(cert["matrix"][0])
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "duplicate matrix"):
+            validate.validate_case(self.case)
+
+    def test_false_composite_witness_rejected(self):
+        cert = self.certificate()
+        next(x for x in cert["matrix"] if x["factor"] != 0)["factor"] = 1
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "composite witness"):
+            validate.validate_case(self.case)
+
+    def test_extra_cross_prime_rejected_even_with_legitimate_sources(self):
+        # Two independently prime originals can still produce a third prime.
+        # This is the precise failure the old random-halves fixtures did not rule out.
+        lefts = ["2", "4"]
+        rights = []
+        for suffix in range(1, 100000, 2):
+            candidate = f"{suffix:07d}"
+            pattern = [validate.prime32(int(left + candidate)) for left in lefts]
+            if not rights and pattern == [True, True]:
+                rights.append(candidate)
+            elif rights and pattern[1] and candidate != rights[0]:
+                rights.append(candidate)
+                break
+        self.assertEqual(len(rights), 2)
+        sources = [{"prime": int(left + right), "decimal": str(int(left + right)),
+                    "cut_index": len(left), "left": left, "right": right}
+                   for left, right in zip(lefts, rights)]
+        values = [int(left + right) for left in lefts for right in rights]
+        divisors = prepare.prime_divisors(10000)
+        raw = ("2\n" + "\n".join(lefts + rights) + "\n").encode("ascii")
+        expected_values = sorted(x["prime"] for x in sources)
+        expected = b"".join(f"{n}\n".encode("ascii") for n in expected_values)
+        cert = self.certificate()
+        cert.update({"source_primes": sources, "left_permutation": [0, 1], "right_permutation": [0, 1],
+                     "expected_primes_with_multiplicity": expected_values,
+                     "input_sha256": hashlib.sha256(raw).hexdigest(), "output_sha256": hashlib.sha256(expected).hexdigest(),
+                     "matrix": [{"left_index": i, "right_index": j, "value": int(left + right),
+                                 "factor": prepare.factor_or_zero(int(left + right), divisors)}
+                                for i, left in enumerate(lefts) for j, right in enumerate(rights)]})
+        cert["bounds"]["maximum_concatenation"] = max(values)
+        (self.case / "input.txt").write_bytes(raw)
+        (self.case / "expected.txt").write_bytes(expected)
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "extra or missing cross prime"):
+            validate.validate_case(self.case)
+
+    def test_overflow_and_long_strings_rejected(self):
+        raw = b"1\n" + b"8" * 50 + b"\n0000001\n"
+        with self.assertRaisesRegex(ValueError, "invalid fragment"):
+            validate.parse_input(raw)
+        cert = self.certificate()
+        cert["matrix"][0]["value"] = 2**63
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "matrix value"):
+            validate.validate_case(self.case)
+
+    def test_exact_output_bytes_required(self):
+        cert = self.certificate()
+        bad = (self.case / "expected.txt").read_bytes().rstrip(b"\n")
+        (self.case / "expected.txt").write_bytes(bad)
+        cert["output_sha256"] = hashlib.sha256(bad).hexdigest()
+        self.save(cert)
+        with self.assertRaisesRegex(ValueError, "P-line"):
+            validate.validate_case(self.case)
+
+    def test_preparer_refuses_unreviewed_size_and_exhaustion(self):
+        with self.assertRaisesRegex(ValueError, "reviewed finite sizes"):
+            prepare.make_case(31)
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            prepare.make_case(30, max_proposals=0)
+
+    def test_official_example_exposes_p_output_contradiction(self):
+        with zipfile.ZipFile(DATA / "sources/primes-official.zip") as archive:
+            parts = archive.read("input").decode("ascii").split("OUTPUT:\n")
+        lines = parts[0].splitlines()
+        p = int(lines[0])
+        actual = sorted(int(a + b) for a in lines[1:1 + p] for b in lines[1 + p:]
+                        if package_preparation.prime_example_diagnostic(int(a + b)))
+        self.assertEqual(actual, [int(x) for x in parts[1].splitlines()])
+        self.assertEqual(p, 4)
+        self.assertEqual(len(actual), 5)
+
+    def test_windows_qualification_refused_before_subprocess(self):
+        with mock.patch.object(qualify_arm64.platform, "system", return_value="Windows"), \
+                mock.patch.object(qualify_arm64.subprocess, "run") as runner:
+            with self.assertRaisesRegex(ValueError, "Windows execution forbidden"):
+                qualify_arm64.allocation()
+            runner.assert_not_called()
+
+    def test_qualification_without_slurm_refused(self):
+        with mock.patch.object(qualify_arm64.platform, "system", return_value="Linux"), \
+                mock.patch.object(qualify_arm64.platform, "machine", return_value="aarch64"), \
+                mock.patch.dict(qualify_arm64.os.environ, {}, clear=True), \
+                self.assertRaisesRegex(ValueError, "Slurm allocation"):
+            qualify_arm64.allocation()
+
+    def test_timeout_saved_without_retry(self):
+        failure = qualify_arm64.subprocess.TimeoutExpired(["neutral-fake"], 3, output=b"partial", stderr=b"late")
+        with mock.patch.object(qualify_arm64.subprocess, "run", side_effect=failure) as runner:
+            result = qualify_arm64.run_once(["neutral-fake"], timeout=3)
+            self.assertTrue(result["timed_out"])
+            self.assertEqual(result["stdout"], b"partial")
+            self.assertEqual(result["stderr"], b"late")
+            self.assertIsNone(result["returncode"])
+            runner.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

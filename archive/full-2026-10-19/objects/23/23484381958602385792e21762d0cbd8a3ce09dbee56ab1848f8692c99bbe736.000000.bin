@@ -1,0 +1,135 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define TILE 64
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+void read_dataset(int *nbodies, float **px, float **py, float **pz,
+                  float **vx, float **vy, float **vz) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading nbodie value\n"); exit(EXIT_FAILURE); }
+  int n = *nbodies;
+  Body *tmp = (Body *)malloc(n * sizeof(Body));
+  b = fread(tmp, n * sizeof(Body), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading input values\n"); exit(EXIT_FAILURE); }
+  *px = (float*)malloc(n*sizeof(float));
+  *py = (float*)malloc(n*sizeof(float));
+  *pz = (float*)malloc(n*sizeof(float));
+  *vx = (float*)malloc(n*sizeof(float));
+  *vy = (float*)malloc(n*sizeof(float));
+  *vz = (float*)malloc(n*sizeof(float));
+  for (int i=0;i<n;i++){
+    (*px)[i] = tmp[i].x;
+    (*py)[i] = tmp[i].y;
+    (*pz)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+  free(tmp);
+}
+
+void write_dataset(const int nbodies, float *px, float *py, float *pz,
+                   float *vx, float *vy, float *vz) {
+  Body *out = (Body*)malloc(nbodies*sizeof(Body));
+  for (int i=0;i<nbodies;i++){
+    out[i].x = px[i];
+    out[i].y = py[i];
+    out[i].z = pz[i];
+    out[i].vx = vx[i];
+    out[i].vy = vy[i];
+    out[i].vz = vz[i];
+  }
+  int b = fwrite(out, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) { fprintf(stderr,"\nError writing to output\n"); exit(EXIT_FAILURE); }
+  free(out);
+}
+
+static void body_force_tile(float *restrict px, float *restrict py, float *restrict pz,
+                            float *restrict vx, float *restrict vy, float *restrict vz,
+                            int i0, int i_end, int n) {
+  float fx[TILE], fy[TILE], fz[TILE];
+  int cnt = i_end - i0;
+  for (int t = 0; t < cnt; ++t) {
+    fx[t] = 0.0f;
+    fy[t] = 0.0f;
+    fz[t] = 0.0f;
+  }
+#define ACCUM(jj) \
+  do { \
+    float pjx = px[jj]; \
+    float pjy = py[jj]; \
+    float pjz = pz[jj]; \
+    _Pragma("omp simd") \
+    for (int t = i0; t < i_end; ++t) { \
+      int idx = t - i0; \
+      float dx = pjx - px[t]; \
+      float dy = pjy - py[t]; \
+      float dz = pjz - pz[t]; \
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING; \
+      float inv_dist = 1.0f / sqrt(sqrd_dist); \
+      float inv_dist3 = inv_dist * inv_dist * inv_dist; \
+      fx[idx] += dx * inv_dist3; \
+      fy[idx] += dy * inv_dist3; \
+      fz[idx] += dz * inv_dist3; \
+    } \
+  } while (0)
+
+  int j = 0;
+  for (; j + 3 < n; j += 4) {
+    ACCUM(j);
+    ACCUM(j+1);
+    ACCUM(j+2);
+    ACCUM(j+3);
+  }
+  for (; j < n; ++j) {
+    ACCUM(j);
+  }
+#undef ACCUM
+  for (int t = i0; t < i_end; ++t) {
+    int idx = t - i0;
+    vx[t] += DT * fx[idx];
+    vy[t] += DT * fy[idx];
+    vz[t] += DT * fz[idx];
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  float *px,*py,*pz,*vx,*vy,*vz;
+  read_dataset(&nbodies,&px,&py,&pz,&vx,&vy,&vz);
+
+  #pragma omp parallel
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      // Compute gravitational forces and update velocities.
+      #pragma omp for schedule(static,1)
+      for (int i0 = 0; i0 < nbodies; i0 += TILE) {
+        int i_end = i0 + TILE;
+        if (i_end > nbodies) i_end = nbodies;
+        body_force_tile(px, py, pz, vx, vy, vz, i0, i_end, nbodies);
+      }
+
+      // Update positions using the newly computed velocities.
+      #pragma omp for schedule(static,1)
+      for (int i = 0; i < nbodies; ++i) {
+        px[i] += vx[i] * DT;
+        py[i] += vy[i] * DT;
+        pz[i] += vz[i] * DT;
+      }
+    }
+  }
+
+  write_dataset(nbodies, px, py, pz, vx, vy, vz);
+
+  free(px); free(py); free(pz);
+  free(vx); free(vy); free(vz);
+  exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,452 @@
+"""One fresh planned source-only group; preserved CLI; no receipt or stop path."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RECEIPT = HERE.parent
+ROOT = RECEIPT.parents[1]
+STUDY = ROOT.parent / "HPC-Forest-Etude-2020-2024-r1"
+WORKSPACE = ROOT.parents[1]
+PROJECT = WORKSPACE / "work/hpc-forest-harnais-comparaison-r1/project/HPC-Forest"
+R1_HELPER = STUDY / "receptions/coverage-terra-xhigh-750909/continuation-cli-r1/coordonner-prochain-cli-r1.py"
+R1_HELPER_SHA = "4df5b26caa0b68b610ffa3015c372e8f61107e457a1d3a1a0063d2726479195a"
+spec = importlib.util.spec_from_file_location("source_only_shared_guards", R1_HELPER)
+shared = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(shared)
+require, read, digest, durable_json = shared.require, shared.read, shared.digest, shared.durable_json
+KEY = "source-only-gpt-6.1-sol-max"
+SESSION = "665743a02b824021a697b6a4884a667c"
+MODEL = "gpt-6.1-sol"
+EFFORT = "max"
+SOURCE = "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb"
+PAYLOAD = "2007538cc904993a9a7dacb689147d653d2dea03a114e27c447c9833c46740f7"
+PLAN_SHA = "5581009089925d99b7bb5fad329c3c4cf8424863a2ffe454dfc9c210d9d50314"
+GROUPS_SHA = "d814b2e562123f45c3c3757b3f708086ecabd9a5b1bc1166fab38254b6a43fee"
+SCOPE = "hpc-forest-harness-comparison-20261016-r1"
+MAXIMUM = 32400
+SOURCE_ZIP = ROOT / "HPC-Forest-Harnais-Comparaison-r1.zip"
+CLI = shared.CLI
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def modules():
+    require(digest(R1_HELPER) == R1_HELPER_SHA, "Shared isolated guard changed")
+    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(PROJECT / "src"))
+    import comparison_coordination
+    import comparison_reception
+    legacy = shared.load_module("source_only_authorization_primitives", ROOT / "coordonner-source-only.py")
+    return comparison_coordination, comparison_reception, legacy
+
+
+def deadline_guard(now):
+    require(now + MAXIMUM + shared.AUDIT_RESERVE < shared.DEADLINE,
+            "Source-only maximum plus audit reserve reaches exclusive deadline")
+
+
+def choose_next(state):
+    require(state.get("source_zip_sha256") == SOURCE and not state.get("error"), "Same source-only queue not ready")
+    pending = [g for g in state["queue"] if g["state"] != "received_and_audited"]
+    require(pending and all(g["state"] == "planned_not_submitted" for g in pending),
+            "Existing source-only submission requires reconciliation")
+    received = [g for g in state["queue"] if g["state"] == "received_and_audited" and g["arm"] == "source-only"]
+    require(len(received) == 3 and sum(len(g["subjects"]) for g in received) == 45,
+            "Exactly 45 strictly received source-only issues must precede this group")
+    group = pending[0]
+    require((group["key"], group["session_id"], group["arm"], group["model"], group["effort"],
+             group["job_maximum_seconds"]) == (KEY, SESSION, "source-only", MODEL, EFFORT, MAXIMUM),
+            "Next planned source-only identity differs")
+    require(len(group["subjects"]) == 15 and len(set(group["subjects"])) == 15, "Expected fresh fifteen subjects")
+    require(not any(k in group for k in ("job_id", "plan_id", "worker_identity", "worker_launch_attempt")),
+            "Next source-only group already has submission or process evidence")
+    return group
+
+
+def previous_identity_guard(receipt):
+    require(str(receipt.get("job_id")) == "750831"
+            and receipt.get("session_id") == "15219a6fd62b4dcb91b395dcd4ae03d5"
+            and receipt.get("source_zip_sha256") == SOURCE
+            and receipt.get("all_outcomes_accounted_for") is True
+            and receipt.get("coverage_and_final_confirmations_verified") is True
+            and receipt.get("deliveries_reconciled") is True
+            and receipt.get("read_only_file_verification_before_and_after") is True,
+            "Previous source-only receipt identity or strict verification differs")
+
+
+def previous_bound_reference(receipt, key, expected):
+    reference = receipt.get(key)
+    require(isinstance(reference, dict) and isinstance(reference.get("path"), str),
+            "Missing structured previous receipt reference: " + key)
+    require(Path(reference["path"]).resolve() == expected.resolve()
+            and reference.get("sha256") == digest(expected),
+            "Previous receipt reference path or SHA differs: " + key)
+
+
+def previous_absence_identities(absence):
+    identities = absence.get("recorded_identities")
+    checked = absence.get("recorded_process_ids_checked")
+    require(isinstance(identities, list) and bool(identities)
+            and isinstance(checked, list) and bool(checked)
+            and all(type(pid) is int and pid > 0 for pid in checked),
+            "Previous absence lacks recorded full identities and checked process IDs")
+    require(all(isinstance(identity, dict) and identity.get("ProcessId") in checked
+                and all(identity.get(field) is not None for field in
+                        ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate"))
+                for identity in identities), "Previous absence has an incomplete recorded identity")
+    return identities
+
+
+def previous_receipt_guard():
+    receipt = read(RECEIPT / "reception-verifiee.json")
+    previous_identity_guard(receipt)
+    audit = read(RECEIPT / "audit-initial.json")
+    reconciliation = read(RECEIPT / "reconciliation-livraisons.json")
+    complement = read(RECEIPT / "audit-complementaire.json")
+    absence = read(RECEIPT / "owned-interfaces-absent.json")
+    require(audit.get("all_outcomes_accounted_for") is True
+            and audit.get("coverage_and_final_confirmations_verified") is True
+            and len(audit["subjects"]) == 15 and audit.get("source_zip_sha256") == SOURCE,
+            "Previous native audit incomplete")
+    require(reconciliation.get("all_published_requests_accounted_for") is True
+            and complement.get("all_final_confirmations_verified") is True
+            and complement.get("all_restored_bytes_unchanged") is True, "Previous deliveries or byte audit incomplete")
+    require(absence.get("all_owned_interfaces_absent") is True
+            and absence["reconciliation"]["sha256"] == digest(RECEIPT / "reconciliation-livraisons.json")
+            and absence["supplemental_audit"]["sha256"] == digest(RECEIPT / "audit-complementaire.json")
+            and digest(absence["cim"]["path"]) == absence["cim"]["sha256"], "Previous source-only interfaces not absent")
+    for key, name in (("baseline_audit", "audit-initial.json"),
+                      ("supplemental_audit", "audit-complementaire.json"),
+                      ("reconciliation", "reconciliation-livraisons.json"),
+                      ("owned_interfaces_absent", "owned-interfaces-absent.json")):
+        previous_bound_reference(receipt, key, RECEIPT / name)
+    previous_absence_identities(absence)
+    return receipt, absence
+
+
+def cli_guard():
+    shared.cli_guard()
+    migration = read(HERE / "migration-cli-continuation-source-only.json")
+    require(migration.get("authorized") is True and migration.get("scope") == "one-next-source-only-group"
+            and migration.get("key") == KEY and migration.get("session_id") == SESSION
+            and migration.get("cli_sha256") == shared.CLI_SHA
+            and migration.get("old_pin_sha256") == shared.PIN_SHA
+            and migration.get("scientific_equivalence_claimed") is False, "Source-only CLI scope differs")
+    return migration
+
+
+def source_guard(coordination):
+    require(digest(SOURCE_ZIP) == SOURCE and digest(ROOT / "plan-comparaison.json") == PLAN_SHA
+            and digest(ROOT / "groupes-planifies.json") == GROUPS_SHA, "Frozen comparison plan/source changed")
+    manifest = coordination.check_local()
+    require(len(manifest["files"]) == 94, "Expected 94 frozen sources")
+    payload_path = ROOT / "source-only-deployment-r1.tar.gz"
+    require(payload_path.is_file() and payload_path.with_suffix(".inputs.json").is_file(),
+            "Existing immutable deployment package required; no package rebuild here")
+    payload, inputs = coordination.build_payload(payload_path)
+    require(payload["sha256"] == PAYLOAD, "Frozen deployment payload changed")
+    return payload, inputs
+
+
+def live_guard(own_allowed=False, runtime=False):
+    rows = shared.census()
+    sessions = shared.native_sessions(rows)
+    r1 = read(STUDY / "coordinator-state.json")
+    require(r1.get("source_zip_sha256") == shared.SOURCE, "R1 frozen source pin changed")
+    current = next(g for g in r1["queue"] if g["key"] == r1["current_key"])
+    if not runtime:
+        require((current["key"], current["session_id"], current["model"], current["effort"])
+                == (shared.KEY, shared.SESSION, shared.MODEL, shared.EFFORT), "Expected current reserved R1 Sol xhigh differs")
+        require(current["state"] == "working", "Wait for the fully identified R1 relay and ready marker")
+    require(set(sessions) <= {current["session_id"], SESSION}, "Unknown or third native worker")
+    actual_r1 = sessions.get(current["session_id"], [])
+    if actual_r1:
+        expected = current.get("worker_identity")
+        require(expected and any(shared.same_cim(expected, row) for row in actual_r1), "Current R1 relay identity changed")
+        ready_path = STUDY / "runs" / current["key"] / "worker/worker-ready.json"
+        require(ready_path.is_file(), "Current R1 relay has no verified ready marker")
+        ready = read(ready_path)
+        require(ready.get("session_id") == current["session_id"]
+                and any(row["ProcessId"] == ready["pid"] for row in actual_r1), "R1 real worker identity differs")
+        if current["session_id"] == shared.SESSION:
+            require(ready.get("codex_cli_version") == shared.CLI_VERSION
+                    and Path(ready["codex_executable"]).resolve() == CLI.resolve(), "R1 resolved a different CLI")
+    elif current["state"] == "received_and_audited" and runtime:
+        require(r1.get("stage") == "ready_for_next_group_after_audited_reception",
+                "R1 audited inter-group reservation is not explicit")
+    else:
+        require(runtime and current["state"] in {"not_started", "prepared", "submitting", "submitted", "worker_starting"},
+                "R1 missing relay requires incident reconciliation")
+        dispatcher = Path(r1["strict_dispatcher"])
+        identity = r1["strict_coordinator_identity"]
+        require(dispatcher.is_file() and str(dispatcher) in (identity.get("CommandLine") or "")
+                and any(shared.same_cim(identity, row) for row in rows), "R1 transition observer identity changed")
+    _, absence = previous_receipt_guard()
+    for old in previous_absence_identities(absence):
+        require(not any(shared.same_cim(old, row) for row in rows), "Previous source-only full identity still alive")
+    own = sessions.get(SESSION, [])
+    if not own_allowed:
+        require(not own, "This source-only relay already exists")
+    else:
+        launch = read(ROOT / "runs" / KEY / "worker-lancement.json")
+        require(any(shared.same_cim(launch["identity"], row) for row in own), "Owned source-only launcher exited or changed")
+        ready_path = ROOT / "runs" / KEY / "worker/worker-ready.json"
+        if ready_path.exists():
+            ready = read(ready_path)
+            require((ready.get("session_id"), ready.get("model"), ready.get("reasoning_effort"),
+                     ready.get("codex_cli_version")) == (SESSION, MODEL, EFFORT, shared.CLI_VERSION),
+                    "Owned source-only model/effort/CLI differs")
+            require(Path(ready["codex_executable"]).resolve() == CLI.resolve()
+                    and any(row["ProcessId"] == ready["pid"] for row in own), "Owned real source-only identity differs")
+        else:
+            require(time.time() - launch["launched_at"] < 120, "Source-only relay ready marker missing")
+    return rows, sessions, current
+
+
+def child_environment(base=None):
+    env = shared.child_environment(base)
+    env.update(PYTHONPATH=str(PROJECT / "src"), PYTHONOPTIMIZE="0")
+    return env
+
+
+def preflight(coordination, reception):
+    state = read(ROOT / "coordinator-state.json")
+    group = choose_next(state)
+    reception.validate_planned_group(group)
+    deadline_guard(time.time())
+    require(not (ROOT / "STOP-AFTER-CURRENT").exists(), "Requested stop marker present")
+    require(not (ROOT / "runs" / KEY).exists(), "Existing next group folder requires reconciliation")
+    previous_receipt_guard()
+    cli_guard()
+    payload, inputs = source_guard(coordination)
+    rows, sessions, r1 = live_guard()
+    return {"verified": True, "at": time.time(), "key": KEY, "session_id": SESSION,
+            "model": MODEL, "effort": EFFORT, "source_sha256": SOURCE, "source_files": 94,
+            "payload": payload, "inputs": inputs, "native_sessions": sorted(sessions), "census": rows,
+            "reserved_r1_session": r1["session_id"], "maximum_seconds": MAXIMUM,
+            "audit_reserve_seconds": shared.AUDIT_RESERVE, "new_groups_maximum": 1,
+            "no_receipt_or_stop": True, "model_calls": 0}
+
+
+def deployment_guard(proof, inputs):
+    require(proof.get("scope_id") == SCOPE and proof.get("source_zip_sha256") == SOURCE
+            and proof.get("input_manifest_sha256") == inputs["sha256"]
+            and proof.get("source_files_verified") == 94 and proof.get("original_preparation_files_verified") == 609
+            and proof.get("all_copied_bytes_verified") is True and proof.get("model_calls") == 0
+            and proof.get("candidate_compilations_or_executions") == 0 and proof.get("old_candidates_imported") is False,
+            "Official allocated deployment is not verified or imported candidates")
+
+
+async def lane_admission(rpc, folder):
+    rows, sessions, r1 = live_guard(runtime=True)
+    status = await shared.scheduler(rpc, str(r1["job_id"]))
+    release_items = read(ROOT / "voies-liberees.json")["releases"]
+    require(release_items, "Original audited GPT96 lane release missing")
+    coordination, _, _ = modules()
+    released = [coordination.released_dependency(item) for item in release_items]
+    require(any(item["role"] == "GPT96" for item in released), "Original released second lane not established")
+    receipt = {"schema": "hpc-forest-harness-comparison-lane-admission-v1", "scope_id": SCOPE,
+        "session_id": SESSION, "observed_at": time.time(), "current_state_verified": True,
+        "active_native_workers_before_admission": 1, "verified_dependency_release_receipts": release_items,
+        "source_only_previous_reception": {"path": str(RECEIPT / "reception-verifiee.json"),
+                                           "sha256": digest(RECEIPT / "reception-verifiee.json")},
+        "existing_active_roles": {"R1": {"current_state_verified": True, "job_id": str(r1["job_id"]),
+            "session_id": r1["session_id"], "scheduler": status, "reservation_includes_inter_job_gaps": True}},
+        "native_worker_census": rows, "native_sessions": sorted(sessions), "deadline_checked_at_submission": True}
+    target = folder / ("lane-admission-" + str(time.time_ns()) + ".json")
+    durable_json(target, receipt, exclusive=True)
+    return {"path": str(target), "sha256": digest(target)}
+
+
+async def run():
+    coordination, reception, legacy = modules()
+    with legacy.FileLock(ROOT / "comparison-coordinator.lock"):
+        verified = preflight(coordination, reception)
+        validation = read(HERE / "validation-locale.json")
+        require(validation.get("ok") is True and validation.get("dispatcher_sha256") == digest(__file__),
+                "Current source-only dispatcher lacks passing neutral validation")
+        durable_json(HERE / ("prevol-" + str(time.time_ns()) + ".json"), verified, exclusive=True)
+        state = read(ROOT / "coordinator-state.json")
+        group = choose_next(state)
+        folder = ROOT / "runs" / KEY
+        folder.mkdir()
+        rows = shared.census()
+        observer = next((row for row in rows if row["ProcessId"] == os.getpid()), None)
+        require(observer is not None, "Owned dispatcher full identity unavailable")
+        previous_admitted = HERE / "previous-reception-admitted.json"
+        previous_wrapper = read(previous_admitted)
+        require(previous_wrapper.get("verified") is True
+                and previous_wrapper["strict_reception"]["sha256"] == digest(RECEIPT / "reception-verifiee.json"),
+                "Bound previous source-only admission wrapper changed")
+        intent = {"schema": "hpc-forest-source-only-single-dispatch-intent-v1", "scope": "one-source-only-group",
+            "key": KEY, "session_id": SESSION, "source_sha256": SOURCE,
+            "dispatcher_path": str(Path(__file__).resolve()), "dispatcher_sha256": digest(__file__),
+            "observer_identity": observer, "at": time.time(),
+            "previous_reception": {"path": str(previous_admitted.resolve()), "sha256": digest(previous_admitted)},
+            "retry_without_reconciliation_forbidden": True}
+        intent_path = folder / "dispatch-intent.json"
+        durable_json(intent_path, intent, exclusive=True)
+        state.update(current_key=KEY, current_arm="source-only", error=None,
+                     strict_dispatcher=str(Path(__file__).resolve()), strict_coordinator_identity=observer,
+                     continuation_transition={"path": str(intent_path.resolve()), "sha256": digest(intent_path)},
+                     stage="dispatching_next_source_only_group_after_audit")
+
+        def save():
+            state["updated_at"] = time.time()
+            durable_json(ROOT / "coordinator-state.json", state)
+        state["cli_continuation_admission"] = {"path": str((HERE / "migration-cli-continuation-source-only.json").resolve()),
+                                               "sha256": digest(HERE / "migration-cli-continuation-source-only.json"),
+                                               "authorized_human_fallback": True}
+        save()
+        try:
+            async with legacy.Rpc(coordination.CONFIG) as rpc:
+                request, remote = coordination.request_for(group, verified["payload"])
+                durable_json(folder / "job-request.json", request, exclusive=True)
+                durable_json(folder / "cli-migration.json", read(HERE / "migration-cli-continuation-source-only.json"), exclusive=True)
+                deadline_guard(time.time())
+                cli_guard()
+                group["lane_admission"] = await lane_admission(rpc, folder)
+                durable_json(folder / "payload-transfer-intent.json", {
+                    "at": time.time(), "remote": remote["remote_payload"], "payload": verified["payload"]}, exclusive=True)
+                transfer = await rpc.upload(Path(verified["payload"]["path"]), remote["remote_payload"])
+                require(transfer.get("verifie") is True and transfer.get("remote_sha256") == PAYLOAD,
+                        "Deployment transfer hash differs")
+                durable_json(folder / "payload-transfer.json", transfer, exclusive=True)
+                deadline_guard(time.time())
+                live_guard(runtime=True)
+                durable_json(folder / "prepare-intent.json", {"at": time.time(), "key": KEY, "session_id": SESSION,
+                             "request_sha256": digest(folder / "job-request.json"), "replay_forbidden": True}, exclusive=True)
+                prepared = await rpc.call("job_prepare", **request)
+                durable_json(folder / "job-prepared.json", prepared, exclusive=True)
+                require(prepared.get("ok") is True and prepared.get("plan_id"), "Prepared plan unavailable")
+                group.update(state="prepared", plan_id=prepared["plan_id"], **remote)
+                save()
+                plan = await rpc.call("plan_get", plan_id=group["plan_id"])
+                durable_json(folder / "job-plan-reviewed.json", plan, exclusive=True)
+                coordination.review_prepared_plan(plan, request)
+                actual = plan["plan"]["entries"][0]["plan"]
+                require(actual["seconds"] == MAXIMUM and actual["spec"]["nodes"] == 1
+                        and actual["spec"]["ntasks_per_node"] == 1 and actual["spec"]["gpus_per_task"] == 0,
+                        "Prepared hardware/wall scope differs")
+                deadline_guard(time.time())
+                cli_guard()
+                group["lane_admission"] = await lane_admission(rpc, folder)
+                durable_json(folder / "submission-started.json", {"at": time.time(), "session_id": SESSION,
+                    "plan_id": group["plan_id"], "request_sha256": digest(folder / "job-request.json"),
+                    "unknown_outcome_requires_reconciliation": True}, exclusive=True)
+                group["state"] = "submitting"
+                save()
+                submitted = await rpc.call("job_submit", plan_id=group["plan_id"], confirm=True)
+                durable_json(folder / "submission.json", submitted, exclusive=True)
+                require(submitted.get("ok") is True and re.fullmatch(r"[0-9]+", str(submitted.get("job_id"))),
+                        "Submission result unknown; reconcile without repeat")
+                group.update(state="submitted", job_id=str(submitted["job_id"]), submitted_at=time.time())
+                state["research_jobs_submitted"] += 1
+                save()
+                failures = 0
+                while True:
+                    try:
+                        status = await shared.scheduler(rpc, group["job_id"])
+                        group["scheduler"] = status
+                        if status.get("finished"):
+                            state.update(stage="awaiting_audited_source_only_reception_after_strict_dispatch",
+                                recovery_next_action="Manual strict receipt of fifteen issues, native audit, delivery reconciliation before individually identified owned stop and same queue continuation")
+                            save()
+                            return
+                        if status["state"] == "RUNNING" and group["state"] == "submitted":
+                            deadline_guard(time.time())
+                            live_guard(runtime=True)
+                            cli_guard()
+                            deployment = await rpc.call("read_remote_file", path=group["remote_shared"] + "/deployment-receipt.json",
+                                                        offset=1, limit=300, max_chars=30000)
+                            proof = json.loads(deployment["content"])
+                            deployment_guard(proof, verified["inputs"])
+                            deployed_path = folder / "deployment-received.json"
+                            if deployed_path.exists():
+                                require(read(deployed_path) == proof, "Received official deployment changed")
+                            else:
+                                durable_json(deployed_path, proof, exclusive=True)
+                            channel_data = await rpc.call("read_remote_file",
+                                path=group["remote_root"] + f"/results-{group['job_id']}/channel.json",
+                                offset=1, limit=40, max_chars=6000)
+                            channel = json.loads(channel_data["content"])
+                            require((channel["session_id"], channel["model"], channel["effort"]) == (SESSION, MODEL, EFFORT),
+                                    "Source-only mailbox owner differs")
+                            require(KEY in channel["channel"] and channel["channel"].endswith(f"/results-{group['job_id']}/mailbox"),
+                                    "Source-only mailbox path differs")
+                            output = folder / "worker"
+                            require(not output.exists(), "Existing source-only cache must be reconciled")
+                            output.mkdir()
+                            authorization = legacy.Coordinator.authorization(None, group, folder)
+                            seconds = int(group["submitted_at"] + MAXIMUM + 900 - time.time())
+                            require(seconds > 0, "Original allocation/delivery grace elapsed")
+                            argv = [str(WORKSPACE / "work/.venv/Scripts/python.exe"), "-B", "-u", "-m", "hpc_forest.ablation_worker",
+                                "--resume", "--channel", channel["channel"], "--session-id", SESSION, "--output", str(output),
+                                "--codex-config", str(coordination.CONFIG), "--dependency-receipt", str(authorization),
+                                "--source-zip", str(SOURCE_ZIP), "--source-sha256", SOURCE, "--project", str(PROJECT),
+                                "--max-seconds", str(min(MAXIMUM + 900, seconds)), "--model", MODEL, "--effort", EFFORT]
+                            durable_json(folder / "worker-launch-started.json", {"argv": argv, "session_id": SESSION,
+                                "at": time.time(), "cli_sha256": shared.CLI_SHA, "retry_without_reconciliation_forbidden": True}, exclusive=True)
+                            group["state"] = "worker_starting"
+                            save()
+                            live_guard(runtime=True)
+                            cli_guard()
+                            with (output / "stdout.log").open("ab") as stdout, (output / "stderr.log").open("ab") as stderr:
+                                process = await asyncio.to_thread(subprocess.Popen, argv, stdin=subprocess.DEVNULL,
+                                    stdout=stdout, stderr=stderr, env=child_environment(),
+                                    creationflags=NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                            durable_json(folder / "worker-created.json", {"pid": process.pid, "at": time.time(),
+                                "session_id": SESSION, "no_retry_without_reconciliation": True}, exclusive=True)
+                            rows = shared.census()
+                            identity = next((row for row in rows if row["ProcessId"] == process.pid), None)
+                            require(identity is not None and SESSION in (identity.get("CommandLine") or ""),
+                                    "Owned source-only worker identity not established after Popen; never retry")
+                            durable_json(folder / "worker-lancement.json", {"argv": argv, "identity": identity,
+                                "session_id": SESSION, "launched_at": time.time(), "cli_sha256": shared.CLI_SHA}, exclusive=True)
+                            group.update(state="working", worker_identity=identity, channel=channel["channel"],
+                                         worker_started_at=time.time())
+                            state["stage"] = "running_next_source_only_group_strict_observation"
+                        elif group["state"] == "working":
+                            live_guard(own_allowed=True, runtime=True)
+                        save()
+                        failures = 0
+                    except Exception as exc:
+                        failures += 1
+                        durable_json(HERE / ("refus-" + str(time.time_ns()) + ".json"), {
+                            "at": time.time(), "error": str(exc), "consecutive": failures,
+                            "submission_replayed": False, "worker_restarted": False}, exclusive=True)
+                        if failures >= 3 or group["state"] == "worker_starting":
+                            raise
+                    await asyncio.sleep(30)
+        except Exception as exc:
+            state.update(stage="attention_required", error=str(exc))
+            save()
+            raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", action="store_true")
+    args = parser.parse_args()
+    if args.run:
+        asyncio.run(run())
+    else:
+        coordination, reception, legacy = modules()
+        with legacy.FileLock(ROOT / "comparison-coordinator.lock"):
+            result = preflight(coordination, reception)
+            target = HERE / ("prevol-" + str(time.time_ns()) + ".json")
+            durable_json(target, result, exclusive=True)
+            print(json.dumps({"verified": True, "preflight": str(target), "model_calls": 0}))
+
+
+if __name__ == "__main__":
+    main()

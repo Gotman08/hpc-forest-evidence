@@ -1,0 +1,121 @@
+"""Passive, local result registry; it never changes a candidate or calls a model."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import time
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf8"))
+
+
+def write(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(value, encoding="utf8")
+    temporary.replace(path)
+
+
+def refresh():
+    plan = load(ROOT / "matrix-plan.json")
+    state = load(ROOT / "coordinator-state.json") if (ROOT / "coordinator-state.json").exists() else {}
+    records, sources = [], {}
+    for group in state.get("queue", []):
+        folder = ROOT / "runs" / group["key"]
+        audit_file = folder / "audit.json"
+        audit = load(audit_file) if audit_file.exists() else {}
+        accepted = audit.get("coverage_and_final_confirmations_verified") is True
+        for key in group["subjects"]:
+            row = {"model": group["model"], "effort": group["effort"], "subject": key,
+                   "job_id": group.get("job_id"), "group": group["key"], "gain_fraction": None,
+                   "candidate_seconds": None, "reference_seconds": None, "nodes": None,
+                   "depth": None, "max_children": None, "native_calls": None, "tokens_exact": None,
+                   "mother_calls": None, "status": "non commencé", "source_version": "r1"}
+            exclusion = state.get("preparation_exclusions", {}).get(key)
+            if exclusion:
+                row.update(status="exclu avant génération", exclusion=exclusion.get("error"))
+            elif group["state"] in {"working", "submitted", "prepared", "submitting"}:
+                row["status"] = "en cours" if group["key"] == state.get("current_key") else "prévu"
+            if audit and not accepted and not exclusion:
+                row["status"] = "audit à vérifier"
+            if accepted and not exclusion:
+                item = next(a for a in audit["subjects"] if a["subject"] == key)
+                winner = item["best_confirmed"]
+                row.update(status="référence conservée" if winner["is_baseline"] else "gain confirmé",
+                           gain_fraction=winner["improvement_fraction"], candidate_seconds=winner["mean_seconds"],
+                           reference_seconds=winner["reference_seconds"], nodes=item["topology"]["scored_nodes"],
+                           depth=item["topology"]["max_depth"], max_children=item["topology"]["max_children"],
+                           native_calls=item["archived_native_invocations"], tokens_exact=item["archived_exact_native_tokens"],
+                           mother_calls=item["published_mother_requests"], audit_path=str(audit_file.resolve()))
+            records.append(row)
+        if accepted:
+            digest = hashlib.sha256(audit_file.read_bytes()).hexdigest()
+            sources[group["key"]] = {"audit_sha256": digest, "job_id": group.get("job_id"),
+                                     "path": str(audit_file.resolve())}
+    # Before the queue has been admitted, still expose all requested cells.
+    if not records:
+        records = [{"model": model, "effort": effort, "subject": subject, "status": "prévol",
+                    "gain_fraction": None} for model in plan["models"] for effort in plan["efforts"] for subject in plan["subjects"]]
+    assert len(records) == 380 and len({(r["model"],r["effort"],r["subject"]) for r in records}) == 380
+    current = next((g for g in state.get("queue", []) if g["key"] == state.get("current_key")), {})
+    calls = {"native_started":0,"native_delivered":0,"mother_started":0,"known_tokens":0}
+    if current:
+        worker = ROOT / "runs" / current["key"] / "worker"
+        for inv in worker.glob("*/invocation.json"):
+            try:
+                request = load(inv.parent / "request.json")
+                calls["native_started"] += 1
+                calls["mother_started"] += int(str(request.get("meta_role", "")).startswith("mother-"))
+                calls["native_delivered"] += int((inv.parent / "delivered.json").exists())
+                if (inv.parent / "response.json").exists():
+                    usage = load(inv.parent / "response.json").get("usage") or {}
+                    if usage.get("token_accounting") == "exact":calls["known_tokens"] += usage.get("tokens",0)
+            except (OSError, ValueError):
+                continue
+    document = {"updated_at":time.time(),"theoretical_cells":380,"model_count":4,"effort_count":5,
+                "subject_count":19,"preparation_ready":19-len(state.get("preparation_exclusions",{})),
+                "coordinator_stage":state.get("stage"),"current_group":current.get("key"),
+                "current_job":current.get("job_id"),"current_group_calls":calls,"records":records,
+                "audit_sources":sources,"operator_report_is_never_model_input":True}
+    write(ROOT/"MATRICE.json",json.dumps(document,ensure_ascii=False,indent=2)+"\n")
+    history_file=ROOT/"HISTORIQUE-MATRICE.jsonl"
+    previous={}
+    if history_file.exists():
+        previous={r["group"]:r["audit_sha256"] for line in history_file.read_text(encoding="utf8").splitlines() if (r:=json.loads(line))}
+    for group,source in sources.items():
+        if previous.get(group)!=source["audit_sha256"]:
+            with history_file.open("a",encoding="utf8") as stream:
+                stream.write(json.dumps({"received_at":time.time(),"group":group,**source},ensure_ascii=False)+"\n")
+    headers=["Sujet","Modèle","Effort","État","Réduction","Référence (s)","Candidat (s)","Sommets","Profondeur","Fils max.","Appels mère","Appels natifs","Job"]
+    def shown(value, digits=6):return "—" if value is None else f"{value:.{digits}f}" if isinstance(value,float) else str(value)
+    rows=[]
+    for r in records:
+        cells=[r["subject"],r["model"],r["effort"],r["status"],"—" if r.get("gain_fraction") is None else f"{100*r['gain_fraction']:.3f} %",shown(r.get("reference_seconds")),shown(r.get("candidate_seconds")),shown(r.get("nodes")),shown(r.get("depth")),shown(r.get("max_children")),shown(r.get("mother_calls")),shown(r.get("native_calls")),r.get("job_id")or"—"]
+        rows.append('<tr data-model="'+html.escape(r['model'])+'" data-effort="'+r['effort']+'"><td>'+'</td><td>'.join(html.escape(x)for x in cells)+'</td></tr>')
+    options=lambda values:'<option value="">Tous</option>'+''.join('<option>'+html.escape(v)+'</option>'for v in values)
+    confirmed=sum(r.get("gain_fraction") is not None for r in records)
+    excluded=sum(r["status"]=="exclu avant génération"for r in records)
+    body=f'''<!doctype html><html lang="fr"><meta charset="utf-8"><meta http-equiv="refresh" content="30"><title>HPC-Forest — suivi des modèles et efforts</title><style>body{{font:15px/1.5 system-ui;margin:32px;background:#f4f6f8;color:#223645}}h1{{font-size:27px}}.card{{padding:18px;background:white;border-radius:10px;margin:16px 0}}table{{border-collapse:collapse;background:white;font-size:12px;width:100%}}td,th{{padding:8px;border-bottom:1px solid #dde4e9;text-align:left;white-space:nowrap}}th{{position:sticky;top:0;background:#dde9f1}}select,input{{font:inherit;padding:6px;margin-right:15px}}.scroll{{overflow:auto;max-height:68vh}}small{{color:#4b616f}}</style><h1>HPC-Forest · modèles, efforts et sujets</h1><p>4 modèles × 5 efforts × 19 sujets = 380 configurations demandées.</p><div class="card"><b>{confirmed} confirmations auditées</b> · {excluded} exclusions de préparation · {document['preparation_ready']} sujets admissibles actuellement.<br>Groupe courant : {html.escape(str(document['current_group']))} · job {html.escape(str(document['current_job']))}<br>Groupe courant : {calls['native_started']} appels natifs commencés, {calls['native_delivered']} livrés, dont {calls['mother_started']} épisodes de mère ; {calls['known_tokens']} jetons exacts connus.<br><small>Une exclusion n’est pas un gain de zéro. Les appels, les épisodes internes et les sommets sont distincts. Les gains apparaissent après réception et audit, pas sur la seule base d’un temps de recherche.</small></div><div class="card"><label>Modèle <select id="model">{options(plan['models'])}</select></label><label>Effort <select id="effort">{options(plan['efforts'])}</select></label><label>Sujet <input id="subject" placeholder="année ou nom"></label></div><div class="scroll"><table><thead><tr>'''+''.join('<th>'+html.escape(x)+'</th>'for x in headers)+'''</tr></thead><tbody>'''+''.join(rows)+'''</tbody></table></div><script>function filter(){let m=document.querySelector('#model').value,e=document.querySelector('#effort').value,s=document.querySelector('#subject').value.toLowerCase();document.querySelectorAll('tbody tr').forEach(r=>r.hidden=(m&&r.dataset.model!==m)||(e&&r.dataset.effort!==e)||!r.cells[0].textContent.toLowerCase().includes(s));}document.querySelectorAll('select,input').forEach(x=>x.addEventListener('input',filter));</script></html>'''
+    write(ROOT/"MATRICE.html",body)
+    return document
+
+
+if __name__=="__main__":
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument("--watch",action="store_true")
+    args=parser.parse_args()
+    if args.watch:
+        sys.path.insert(0,str(ROOT.parents[1]/"work/marathon-archive-mother-r1/project/src"))
+        from hpc_forest.core import FileLock
+        with FileLock(ROOT/"report-observer.lock"):
+            while True:
+                refresh()
+                time.sleep(15)
+    else:
+        result=refresh()
+        print(json.dumps({k:result[k]for k in ['current_group','current_job','preparation_ready','current_group_calls']}))

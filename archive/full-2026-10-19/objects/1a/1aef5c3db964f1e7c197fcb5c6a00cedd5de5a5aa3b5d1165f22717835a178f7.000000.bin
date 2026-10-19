@@ -1,0 +1,49 @@
+"""Three neutral guards for interrupted nullable trials; no real audit."""
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("null_trial_reader_tested", HERE / "auditer-partiel-sol.py")
+d = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(d)
+
+
+def trial(name, state="completed", correct=True, parent=None, sources=(), role="A", depth=1):
+    mission = {"id": name, "role": role, "parent_id": parent, "sources": list(sources), "depth": depth}
+    result = None if state == "pending" else json.dumps({"status": "valid" if correct else "incorrect", "correct": correct})
+    return name, role, json.dumps(mission), state, result
+
+
+class NullTrials(unittest.TestCase):
+    def test_pending_sql_null_is_user_aborted_with_no_outcome(self):
+        data = d.verify_trial_rows([trial("a"), trial("g", state="pending", sources=["a"], role="G")])
+        self.assertEqual(data["statuses"], {"valid": 1, "user_aborted": 1})
+        self.assertIsNone(data["trials"]["g"]["result"])
+        self.assertEqual(data["unfinished_trials"], [{"id": "g", "registry_state": "pending",
+                         "status": "user_aborted", "result": None, "correct": None, "score": None}])
+
+    def test_terminal_null_and_pending_outcome_are_refused(self):
+        completed = trial("a")
+        pending = trial("p", state="pending")
+        for row in [(*completed[:4], None), (*pending[:4], completed[4]),
+                    (*pending[:3], "unknown", None), (*completed[:4], "null")]:
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                d.verify_trial_rows([row])
+
+    def test_unfinished_incorrect_or_missing_parent_and_sources_are_refused(self):
+        cases = [
+            [trial("p", state="pending"), trial("child", parent="p", depth=2)],
+            [trial("p", state="pending"), trial("g", sources=["p"], role="G")],
+            [trial("bad", correct=False), trial("child", parent="bad", depth=2)],
+            [trial("bad", correct=False), trial("g", sources=["bad"], role="G")],
+            [trial("g", sources=["foreign"], role="G")],
+        ]
+        for rows in cases:
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                d.verify_trial_rows(rows)
+
+
+if __name__ == "__main__":
+    unittest.main()

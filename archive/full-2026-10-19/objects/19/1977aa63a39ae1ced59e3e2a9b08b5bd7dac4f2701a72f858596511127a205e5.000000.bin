@@ -1,0 +1,243 @@
+"""Prepare/check one owned stop only after a genuine reconciled R2 pre-stop audit.
+
+No process API, shell or lock-byte read is used here. The PowerShell wrapper
+captures a complete fresh UTF-8 CIM envelope, then calls this data validator.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+SCOPE = "hpc-forest-primes-native-max-r1"
+SESSION = "c8044062692149138d826d3f388a08ef"
+JOB = "751992"
+SOURCE = "3e290f835570a8746be3c52144932b8c6866564980fd858cf4c0495a7b1e68c5"
+PLAN = "54ffd49f4dc868085d22208f773c4b4883590b25251b5992232509a1dc197024"
+PREP = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+OWNER = "dd3e98c9f64528569c6b9fae6814c17f13847ce5f4dd89dd7b3dbc9c4688f3db"
+BASELINE = "30d753ff33cf8aaff975c04fd14760d5a0425ab5933861aa1e1c2a89251c7cfe"
+ORDER = (41724, 41808, 53536, 28424, 47416, 39392, 47264)
+PRESERVE = (37900, 37848)
+KEYS = ("ProcessId", "ParentProcessId", "CreationDate", "ExecutablePath", "CommandLine")
+OWN = Path(__file__).resolve().parent
+BASE = OWN.parents[2]
+RECEPTION = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r1/reception-finale-751992"
+WORKER = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r1/worker"
+
+
+def need(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load(path):
+    need(path.is_file() and not path.is_symlink(), "Missing/linked proof")
+    return json.loads(path.read_bytes().decode("utf-8-sig"))
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": sha(path)}
+
+
+def stamp(value):
+    parsed = datetime.fromisoformat(value)
+    need(parsed.tzinfo is not None, "CIM date must carry an explicit UTC offset")
+    return parsed.timestamp()
+
+
+def identity(row):
+    need(isinstance(row, dict) and all(key in row for key in KEYS), "Incomplete five-field CIM census")
+    need(type(row["ProcessId"]) is int and type(row["ParentProcessId"]) is int, "CIM PID type differs")
+    need(row["CreationDate"] is None or isinstance(row["CreationDate"], str), "Invalid CIM creation value")
+    if row["CreationDate"] is not None:
+        stamp(row["CreationDate"])
+    return tuple(row[key] for key in KEYS)
+
+
+def index(rows):
+    need(isinstance(rows, list) and len(rows) >= 2, "Complete CIM array required")
+    result = {}
+    for row in rows:
+        identity(row)
+        need(row["ProcessId"] not in result, "Duplicate CIM PID")
+        result[row["ProcessId"]] = row
+    return result
+
+
+def family(rows, root_pid):
+    by = index(rows)
+    selected = {root_pid} if root_pid in by else set()
+    for _ in range(len(rows) + 1):
+        added = set()
+        for pid, row in by.items():
+            parent = row["ParentProcessId"]
+            if parent in selected:
+                need(stamp(row["CreationDate"]) >= stamp(by[parent]["CreationDate"]), "Numeric parent link points to a younger reused PID")
+                added.add(pid)
+        if added <= selected:
+            return selected
+        selected |= added
+    raise ValueError("Cyclic/unstable CIM ancestry")
+
+
+def classify(baseline, current, allow_absent):
+    old, now = index(baseline), index(current)
+    need(family(baseline, 41808) == set(ORDER), "Baseline owned family differs from the sealed seven identities")
+    for pid in PRESERVE:
+        need(pid in old and pid in now and identity(old[pid]) == identity(now[pid]), "Source-only relay identity changed or absent")
+    present, absent = [], []
+    for pid in ORDER:
+        need(pid in old, "Owned baseline missing")
+        if pid not in now:
+            need(allow_absent, "Owned identity absent before first preparation")
+            absent.append(pid)
+        else:
+            need(identity(now[pid]) == identity(old[pid]), "Owned PID reused/full identity changed; preserve it and block")
+            present.append(pid)
+    # Any fresh child linked to an owned numeric PID must also be one of the
+    # exact original five-field identities. A bare numeric PPID never grants ownership.
+    for pid, row in now.items():
+        if row["ParentProcessId"] in ORDER:
+            need(pid in ORDER and pid in old and identity(row) == identity(old[pid]), "Unknown/new descendant of owned family; stop blocked")
+    active_family = family(current, 41808)
+    need(active_family <= set(ORDER), "Unknown descendant in complete fresh CIM family")
+    # Every changed/new outside identity needs a full stable foreign/source-only
+    # baseline anchor in its current ancestry. Unknown/orphan ancestry blocks;
+    # numeric PPID alone never makes an identity a target or a safe foreign peer.
+    foreign_changes = []
+    for pid, row in now.items():
+        if pid in ORDER or pid in PRESERVE or pid in old and identity(row) == identity(old[pid]):
+            continue
+        chain, seen, child = [], {pid}, row
+        while True:
+            parent_pid = child["ParentProcessId"]
+            need(parent_pid not in ORDER, "New identity traces into owned family")
+            need(parent_pid not in seen and parent_pid in now, "New identity has unknown/orphan/cyclic ancestry; block")
+            parent = now[parent_pid]
+            if parent["CreationDate"] is not None:
+                need(stamp(child["CreationDate"]) >= stamp(parent["CreationDate"]), "New identity has a younger reused numeric parent")
+            chain.append(parent)
+            if parent_pid in old and identity(parent) == identity(old[parent_pid]):
+                foreign_changes.append({"identity": row, "classification": "foreign_preserved_by_full_stable_ancestry_anchor",
+                                        "fresh_ancestor_chain": chain, "baseline_anchor": old[parent_pid]})
+                break
+            seen.add(parent_pid)
+            child = parent
+    return {"present_owned": present, "naturally_absent_owned": absent,
+            "foreign_new_or_changed_preserved": foreign_changes, "source_only_full_identities_preserved": [now[p] for p in PRESERVE]}
+
+
+def validate_audit(data):
+    expected = {"schema": "hpc-forest-primes-r2max-readonly-audit-v1", "scope_id": SCOPE, "session_id": SESSION,
+                "job_id": JOB, "model": "gpt-6-luna", "effort": "max", "source_zip_sha256": SOURCE,
+                "plan_sha256": PLAN, "preparation_manifest_sha256": PREP}
+    need(all(data.get(key) == value for key, value in expected.items()), "Unrelated audit identity/source/plan")
+    need(not data.get("audit_error") and data.get("verified") is False and data.get("native_research_admitted") is False
+         and data.get("independent_raw_stdout_per_candidate_verified") is False
+         and data.get("independent_performance_audit_verified") is False,
+         "Pre-stop audit must remain globally limited, with no error")
+    need(data.get("received_model_artifacts_audited_with_owned_lock_pending") is True
+         and data.get("received_cohort_audited_with_explicit_raw_attribution_limit") is False
+         and data.get("evidence_inventory_before_after_identical") is True, "No successful reconciled pre-stop audit")
+    campaign = data.get("campaign", {})
+    need(campaign.get("received_native_checker_protocol_verified") is True
+         and campaign.get("lineage_and_five_confirmations_verified") is True, "Checker/lineage/five confirmations not verified procedurally")
+    transport = data.get("transport_cost_reconciliation", {})
+    need(transport.get("unique_session_nonce_pairs") == 10 and transport.get("exact_known_tokens") == 243141
+         and transport.get("unknown_native_invocations") == 0 and transport.get("unresolved_nonces") == [], "Transport ledger incomplete")
+    cache = data.get("cache_preservation", {})
+    need(cache.get("phase") == "pre_stop_owned_lock_pending" and cache.get("source_files_observed") == 133
+         and cache.get("readable_files_verified_before_stop") == cache.get("snapshot_files_verified") == 132
+         and cache.get("total_cache_bytes_preservation_complete") is False
+         and cache.get("owned_operational_lock_pending") is True and cache.get("worker_lock_sha256_before") is None,
+         "Unexpected cache exception; only one unread owned byte permitted")
+
+
+def check_cache(expected):
+    need((WORKER / "worker.lock").is_file() and not (WORKER / "worker.lock").is_symlink()
+         and (WORKER / "worker.lock").stat().st_size == 1, "Exact owned one-byte operational lock is missing/changed")
+    actual = {}
+    for path in sorted(WORKER.rglob("*")):
+        need(not path.is_symlink() and path.resolve().is_relative_to(WORKER.resolve()), "Linked/escaping live cache artifact")
+        if path.is_file():
+            name = path.relative_to(WORKER).as_posix()
+            if name == "worker.lock":
+                need(path.stat().st_size == 1, "Owned operational lock is not one byte")
+                continue  # Never read its bytes before owned stop.
+            actual[name] = {"bytes": path.stat().st_size, "sha256": sha(path)}
+    need(actual == expected and len(actual) == 132, "Readable live cache changed since received pre-stop audit")
+    return actual
+
+
+def build(args):
+    audit_path = args.audit.resolve()
+    need(sha(audit_path) == args.audit_sha256, "Changed exact audit bytes")
+    audit = load(audit_path)
+    validate_audit(audit)
+    baseline_path = RECEPTION / "cim-pendant-reception-finale.json"
+    owner_path = RECEPTION / "identite-proprietaire-verrou-r2.json"
+    need(sha(baseline_path) == BASELINE and sha(owner_path) == OWNER, "Changed sealed census/owner reference")
+    owner = load(owner_path)
+    need(owner.get("pid") == 41724 and owner.get("session_id") == SESSION and owner.get("source_zip_sha256") == SOURCE,
+         "Wrong owned worker identity")
+    baseline = load(baseline_path)
+    old = index(baseline)
+    need(owner["executable"] == old[41724]["ExecutablePath"] and owner["command_line"] == old[41724]["CommandLine"]
+         and owner["creation_time_utc"] == old[41724]["CreationDate"] and owner["parent_pid"] == old[41724]["ParentProcessId"],
+         "Owner reference does not bind all five baseline fields")
+    need("hpc_forest.r2max_worker" in old[41724]["CommandLine"] and SESSION in old[41724]["CommandLine"]
+         and "results-751992" in old[41724]["CommandLine"], "Wrong exact worker command")
+    fresh = load(args.fresh_cim)
+    need(sha(args.fresh_cim) == args.fresh_cim_sha256 and fresh.get("schema") == "hpc-forest-primes-r2max-fresh-full-cim-v1",
+         "No bound complete fresh CIM envelope")
+    captured = stamp(fresh["captured_at_utc"])
+    need(0 <= time.time() - captured <= 30 and fresh.get("complete_census") is True
+         and fresh.get("rows_count") == len(fresh["rows"]), "CIM is stale or incomplete")
+    classified = classify(baseline, fresh["rows"], args.allow_absent_owned)
+    expected = load(RECEPTION / "cache-snapshot-inventaire.json")
+    actual = check_cache(expected)
+    need(audit.get("inventory_sha256", {}).get("cache") == hashlib.sha256(json.dumps(actual, sort_keys=True).encode()).hexdigest(),
+         "Live readable cache does not match exact audited inventory digest")
+    return {"schema": "hpc-forest-primes-r2max-owned-individual-stop-plan-v1", "verified": True,
+            "verification_scope": "Stop preparation after actual limited audit, current readable cache and complete fresh CIM only",
+            "scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN, "preparation_manifest_sha256": PREP,
+            "job_id": JOB, "session_id": SESSION, "model": "gpt-6-luna", "effort": "max",
+            "pre_stop_audit_ref": ref(audit_path), "pre_stop_audit_sha256": args.audit_sha256,
+            "owner_identity_sha256": OWNER, "owner_identity_ref": ref(owner_path), "baseline_cim_ref": ref(baseline_path),
+            "fresh_cim_ref": ref(args.fresh_cim), "prepared_utc": datetime.now(UTC).isoformat(),
+            "original_cache_reverified_files": 132, "worker_lock_bytes_read": False, "worker_lock_sha256_before": None,
+            "owned_targets_in_stop_order": [old[p] for p in ORDER], "preserve_source_only_relay_identities": [old[p] for p in PRESERVE],
+            "classification": classified, "no_recursive_stop": True, "no_stop_by_name": True, "foreign_processes_targeted": False,
+            "native_research_admitted": False, "independent_performance_audit_verified": False,
+            "limits": ["Not an independent raw-stdout/performance admission.", "Changed/new foreign identities require a full stable baseline ancestry anchor; unknown/orphan/related identities block.", "Parent alone reviews and executes. No route change performed."]}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--audit", required=True, type=Path)
+    p.add_argument("--audit-sha256", required=True)
+    p.add_argument("--fresh-cim", required=True, type=Path)
+    p.add_argument("--fresh-cim-sha256", required=True)
+    p.add_argument("--allow-absent-owned", action="store_true")
+    p.add_argument("--plan-out", type=Path)
+    args = p.parse_args()
+    result = build(args)
+    if args.plan_out:
+        destination = args.plan_out.resolve()
+        need(destination.parent == OWN and destination.name == "plan-arret-individuel.json", "Stop plan must be a new owned file")
+        with destination.open("x", encoding="utf8") as stream:
+            json.dump(result, stream, indent=2, ensure_ascii=True)
+            stream.write("\n")
+    print(json.dumps(result, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,307 @@
+"""Import-safe local R4b worker bootstrap; only an explicit --execute can dispatch.
+
+The default projection reads pins only, creates nothing, and never opens a cache,
+authorization, OWNER marker, CLI, or private Codex configuration. It is not an
+admission. Configuration contents are never parsed, printed, or uploaded here.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import importlib.util
+import json
+import re
+import stat
+import sys
+import zipfile
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).absolute().parent
+BASE = HERE.parents[4]
+CACHE_ROOT = HERE.parents[2] / "lancement-modeles-max-r3"
+SOURCE = BASE / "work/hpc-forest-mere-dynamique-r4b-lane-r3/project"
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE_SHA = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN_SHA = "d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27"
+CLI_SHA = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+EFFORT = "max"
+PROTOCOL = "hpc-forest-codex-mailbox-v1"
+
+_selection_spec = importlib.util.spec_from_file_location("r4b_closed_cells", Path(__file__).resolve().parent / "cell_selection.py")
+cells = importlib.util.module_from_spec(_selection_spec)
+_selection_spec.loader.exec_module(cells)
+
+
+
+class BootstrapError(ValueError):
+    """The requested worker has not passed its real, current execution gates."""
+
+
+def _need(condition, message):
+    if not condition:
+        raise BootstrapError(message)
+
+
+def _absolute(value, label):
+    _need(isinstance(value, (str, Path)), "Absolute path required: " + label)
+    path = Path(value)
+    _need(path.is_absolute() and ".." not in path.parts, "Absolute non-traversing path required: " + label)
+    return path
+
+
+def _ref_shape(ref, label):
+    _need(isinstance(ref, dict) and set(ref) == {"path", "sha256"} and isinstance(ref.get("path"), str)
+          and isinstance(ref.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]) is not None,
+          "Closed path/SHA reference required: " + label)
+    return _absolute(ref["path"], label)
+
+
+def _json(raw, label):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            _need(key not in value, "Duplicate JSON member: " + label)
+            value[key] = item
+        return value
+
+    def constant(_):
+        raise BootstrapError("Non-finite JSON: " + label)
+
+    try:
+        value = json.loads(raw.decode("utf8", errors="strict"), object_pairs_hook=pairs, parse_constant=constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise BootstrapError("Invalid JSON: " + label) from exc
+    _need(isinstance(value, dict), "JSON object required: " + label)
+    return value
+
+
+def _load_pins():
+    pins = _json((HERE / "pins-source-plan.json").read_bytes(), "pins")
+    _check_pins(pins)
+    return pins
+
+
+def _check_pins(pins):
+    _need(isinstance(pins, dict) and pins.get("scope_id") == SCOPE and pins.get("models") == list(cells.MODELS)
+          and pins.get("effort") == EFFORT and pins.get("cli_sha256") == CLI_SHA
+          and pins.get("source_zip", {}).get("sha256") == SOURCE_SHA
+          and pins.get("plan", {}).get("sha256") == PLAN_SHA
+          and pins.get("contract_cells") == cells.CELLS and pins.get("pilot_admitted") is False
+          and isinstance(pins.get("source_project"), str)
+          and Path(pins["source_project"]) == SOURCE, "Wrong immutable R4b bootstrap pins")
+    for name in ("source_zip", "plan"):
+        _ref_shape(pins[name], name)
+    _absolute(pins.get("copied_cli_executable"), "copied CLI")
+
+
+def _spec(*, model, phase, job_id, output, authorization_ref, codex_config_ref, owner_ref, effort="max",
+          session_id=None, channel=None, pins=None, cli_policy_ref=None):
+    pins = _load_pins() if pins is None else pins
+    _check_pins(pins)
+    try:
+        expected_session = cells.select(model, phase, effort=effort, session_id=session_id, job_id=job_id)
+    except ValueError as exc:
+        raise BootstrapError(str(exc)) from exc
+    _need(job_id is not None, "Actual observed job ID required")
+    remote_root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + expected_session
+    expected_channel = remote_root + "/results-" + job_id + "/mailbox"
+    _need(session_id in (None, expected_session) and channel in (None, expected_channel), "Session/channel differs from the exact phase cell")
+    output_path = _absolute(output, "fresh output")
+    _need(output_path == CACHE_ROOT / ("worker-" + expected_session), "Exact new per-session source cache required")
+    for label, ref in (("authorization", authorization_ref), ("codex_config", codex_config_ref), ("OWNER", owner_ref), ("private task policy", cli_policy_ref)):
+        path = _ref_shape(ref, label)
+        _need(not path.is_relative_to(output_path), "Inputs must be received outside the new output: " + label)
+    _need(not output_path.is_relative_to(SOURCE) and output_path != SOURCE, "Worker output cannot enter sealed source")
+    return {"model": model, "phase": phase, "job_id": job_id, "session_id": expected_session, "remote_root": remote_root,
+            "channel": expected_channel, "output": str(output_path), "authorization_ref": dict(authorization_ref),
+            "codex_config_ref": dict(codex_config_ref), "owner_ref": dict(owner_ref), "pins": pins, "cli_policy_ref":dict(cli_policy_ref)}
+
+
+def _argv(spec):
+    args = ["--dependency-receipt", spec["authorization_ref"]["path"], "--output", spec["output"],
+            "--channel", spec["channel"], "--session-id", spec["session_id"],
+            "--executable", spec["pins"]["copied_cli_executable"],
+            "--codex-config", spec["codex_config_ref"]["path"], "--required-jobs", SCOPE,
+            "--max-seconds", "900"]
+    return [*args, "--once", "--cli-policy", spec["cli_policy_ref"]["path"], "--cli-policy-sha256", spec["cli_policy_ref"]["sha256"]]
+
+
+def worker_argv(*, model, phase, job_id, output, authorization_ref, codex_config_ref, owner_ref, effort="max",
+                session_id=None, channel=None, pins=None, cli_policy_ref=None) -> list[str]:
+    """Build matrix_worker args without reading private inputs or creating output.
+
+    Ref arguments are closed absolute {path, sha256} dictionaries. ``pins`` may
+    supply the same immutable metadata for pure callers; it cannot change cells.
+    No flags permitting transport-smoke, resume, arbitrary model, or replay exist.
+    """
+    return _argv(_spec(model=model, effort=effort, phase=phase, job_id=job_id, output=output, authorization_ref=authorization_ref,
+                       codex_config_ref=codex_config_ref, owner_ref=owner_ref, session_id=session_id,
+                       channel=channel, pins=pins, cli_policy_ref=cli_policy_ref))
+
+
+def dry_run(**arguments) -> dict:
+    """Return an explicitly unverified projection, never an execution receipt."""
+    spec = _spec(**arguments)
+    return {"schema": "hpc-forest-dynamic-r4b-worker-bootstrap-projection-v1", "verified": False,
+            "generation_admitted": False, "execution_performed": False, "model_calls": 0,
+            "scope_id": SCOPE, "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+            "model": spec["model"], "effort": EFFORT,
+            **{key: spec[key] for key in ("phase", "job_id", "session_id", "channel", "output")},
+            "authorization": spec["authorization_ref"], "codex_config": spec["codex_config_ref"],
+            "received_owner": spec["owner_ref"], "worker_argv": _argv(spec)}
+
+
+def _hash_ref(ref, label):
+    path = _ref_shape(ref, label)
+    _need(path.is_file() and not path.is_symlink(), "Unavailable regular input: " + label)
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for part in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(part)
+    _need(hasher.hexdigest() == ref["sha256"], "Changed input bytes: " + label)
+    return path
+
+
+def _read_ref(ref, label, maximum=8 * 1024 * 1024):
+    path = _hash_ref(ref, label)
+    with path.open("rb") as stream:
+        raw = stream.read(maximum + 1)
+    _need(len(raw) <= maximum and hashlib.sha256(raw).hexdigest() == ref["sha256"], "Oversized or changed JSON input: " + label)
+    return _json(raw, label)
+
+
+def _fresh_output(spec):
+    output = Path(spec["output"])
+    _need(not output.exists() and not output.is_symlink() and not getattr(output, "is_junction", lambda: False)()
+          and output.parent.is_dir() and not output.parent.is_symlink()
+          and not getattr(output.parent, "is_junction", lambda: False)(),
+          "A genuinely new worker output with an existing ordinary parent is required")
+    _need(not output.resolve().is_relative_to(SOURCE.resolve()), "Resolved output enters sealed source")
+
+
+def _verify_source(pins, model):
+    source_zip = _hash_ref(pins["source_zip"], "immutable source ZIP")
+    plan = _read_ref(pins["plan"], "immutable plan")
+    _need(plan.get("scope_id") == SCOPE and plan.get("source_zip_sha256") == SOURCE_SHA
+          and plan.get("efforts") == ["max"] and plan.get("maximum_native_workers_total") == 4
+          and plan.get("automatic_extension") is False
+          and plan.get("contract_cells", {}).get(model) == cells.CELLS[model],
+          "Plan cells or closed MAX policy changed")
+    _need(SOURCE.is_dir() and not SOURCE.is_symlink(), "Sealed source project unavailable")
+    paths = list(SOURCE.rglob("*"))
+    _need(all(not path.is_symlink() and not getattr(path, "is_junction", lambda: False)() for path in paths),
+          "Sealed project contains a filesystem alias")
+    actual = {path.relative_to(SOURCE).as_posix(): path for path in paths if path.is_file()}
+    with zipfile.ZipFile(source_zip) as archive:
+        files = [item for item in archive.infolist() if not item.is_dir()]
+        _need(len(files) == len(actual) == 110 and len({item.filename for item in files}) == 110,
+              "Exactly the 110 isolated lane-r2 source files are required")
+        names = set()
+        for item in files:
+            relative = item.filename.removeprefix("HPC-Forest/")
+            posix = PurePosixPath(relative)
+            mode = item.external_attr >> 16
+            _need(item.filename.startswith("HPC-Forest/") and relative and not posix.is_absolute()
+                  and ".." not in posix.parts and "\\" not in relative and ":" not in relative
+                  and (stat.S_IFMT(mode) in (0, stat.S_IFREG)) and relative in actual,
+                  "Unsafe or unexpected sealed ZIP member")
+            _need(actual[relative].read_bytes() == archive.read(item), "Sealed source bytes differ from ZIP")
+            names.add(relative)
+        _need(names == set(actual), "Sealed source inventory differs from ZIP")
+    return plan
+
+
+def _owner(marker, spec):
+    expected = {"protocol": PROTOCOL, "session_id": spec["session_id"], "model": spec["model"], "reasoning_effort": EFFORT,
+                "job_id": spec["job_id"], "owner": spec["job_id"]}
+    _need(marker == expected, "Received OWNER marker differs from this exact phase/session/job")
+
+
+def _authorization_binding(value, spec):
+    expected = {"schema": "hpc-forest-dynamic-r4b-max-authorization-v1", "verified": True, "scope_id": SCOPE,
+                "model": spec["model"], "effort": EFFORT, "session_id": spec["session_id"], "job_id": spec["job_id"],
+                "purpose": "technical-contract",
+                "remote_root": spec["remote_root"],
+                "canonical_remote_root": spec["remote_root"].replace("/scratch_p/", "/gpfs/scratch/", 1)}
+    _need(all(value.get(key) == item for key, item in expected.items()), "Authorization is not this exact selected MAX technical phase cell")
+    _need(value.get("technical_phase") == spec["phase"], "Technical authorization phase differs")
+    for name in ("source_zip", "plan"):
+        _need(value.get("artifacts", {}).get(name) == spec["pins"][name], "Authorization source/plan reference differs from pins")
+
+
+def _source_paths():
+    return [str(SOURCE / "src"), str(SOURCE / "examples/marathon22")]
+
+
+def _admission_module():
+    for name, module in list(sys.modules.items()):
+        if name == "hpc_forest" or name.startswith("hpc_forest."):
+            _need(getattr(module, "__file__", None) is not None
+                  and Path(module.__file__).resolve().is_relative_to((SOURCE / "src").resolve()),
+                  "Another hpc_forest source is already loaded")
+    return importlib.import_module("hpc_forest.dynamic_admission")
+
+
+def _execute(spec, *, execute=False):
+    """Future explicit execution gate; never called by projections or local tests."""
+    _need(execute is True, "Only explicit --execute can enter worker execution")
+    _fresh_output(spec)
+    before = _read_ref(spec["authorization_ref"], "local authorization")
+    _authorization_binding(before, spec)
+    _verify_source(spec["pins"], spec["model"])
+    marker = _read_ref(spec["owner_ref"], "already received OWNER", 65536)
+    _owner(marker, spec)
+    _hash_ref(spec["codex_config_ref"], "private Codex config")
+    original_path, original_argv, original_bytecode = list(sys.path), sys.argv, sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.path[:0] = _source_paths()
+    try:
+        admission = _admission_module()
+        value = admission.validate_authorization(Path(spec["authorization_ref"]["path"]), {SCOPE}, initial=True)
+        _need(value == before, "Authorization changed during verification")
+        _authorization_binding(value, spec)
+        admission.verify_task_cli_policy(value, Path(spec["cli_policy_ref"]["path"]), spec["cli_policy_ref"]["sha256"], spec["pins"]["copied_cli_executable"])
+        for label, ref in (("authorization", spec["authorization_ref"]), ("OWNER", spec["owner_ref"]),
+                           ("private Codex config", spec["codex_config_ref"]), ("private task policy",spec["cli_policy_ref"])):
+            _hash_ref(ref, label)
+        _fresh_output(spec)
+        sys.argv = ["hpc_forest.matrix_worker", *_argv(spec)]
+        # matrix_worker.main installs the admitted identity before importing Worker.main.
+        worker = importlib.import_module("hpc_forest.matrix_worker")
+        return worker.main()
+    finally:
+        sys.path[:] = original_path
+        sys.argv = original_argv
+        sys.dont_write_bytecode = original_bytecode
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", choices=cells.MODELS, required=True)
+    parser.add_argument("--effort", choices=["max"], required=True)
+    parser.add_argument("--phase", choices=cells.PHASES, required=True)
+    for name in ("job-id", "session-id", "channel", "output", "authorization", "authorization-sha256",
+                 "codex-config", "codex-config-sha256", "owner", "owner-sha256", "cli-policy", "cli-policy-sha256"):
+        parser.add_argument("--" + name, required=True)
+    parser.add_argument("--execute", action="store_true", help="Enter real admission checks and the source worker; never implicit")
+    args = parser.parse_args(argv)
+    arguments = {"model": args.model, "effort": args.effort, "phase": args.phase, "job_id": args.job_id, "session_id": args.session_id, "channel": args.channel,
+                 "output": args.output, "authorization_ref": {"path": args.authorization, "sha256": args.authorization_sha256},
+                 "codex_config_ref": {"path": args.codex_config, "sha256": args.codex_config_sha256},
+                 "owner_ref": {"path": args.owner, "sha256": args.owner_sha256},
+                 "cli_policy_ref": {"path":args.cli_policy,"sha256":args.cli_policy_sha256}}
+    try:
+        if args.execute:
+            return _execute(_spec(**arguments), execute=True)
+        print(json.dumps(dry_run(**arguments), indent=2))
+        return 0
+    except (BootstrapError, OSError, RuntimeError, KeyError, TypeError, zipfile.BadZipFile) as exc:
+        # Error classes only: source/module exceptions must never print config bodies.
+        print(json.dumps({"verified": False, "generation_admitted": False, "execution_requested": args.execute,
+                          "error": type(exc).__name__}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

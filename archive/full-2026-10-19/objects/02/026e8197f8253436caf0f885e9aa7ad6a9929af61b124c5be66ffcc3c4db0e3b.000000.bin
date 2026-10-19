@@ -1,0 +1,195 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+typedef struct {
+  int id;
+  int index;
+} IdIndex;
+
+/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  Node* data = NULL;
+  FILE *fl = NULL;
+
+  if (fname == NULL)
+    fl = stdin;
+  else
+    fl = fopen(fname, "r");
+
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  /* header */
+  fscanf(fl, "%d %[^\n]", n, list);
+
+  if (*n > 0) {
+    data = (Node*) malloc((*n) * sizeof(Node));
+    if(data == NULL){
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  for(int i = 0; i < *n; i++) {
+    data[i].neighbors[0] = '\0';
+    fscanf(fl, "%d %f %[^\n]", &data[i].id, &data[i].value, data[i].neighbors);
+  }
+
+  fclose(fl);
+  return data;
+}
+
+static int compare_id_index(const void *a, const void *b) {
+  const IdIndex *left = (const IdIndex *)a;
+  const IdIndex *right = (const IdIndex *)b;
+
+  if (left->id < right->id) return -1;
+  if (left->id > right->id) return 1;
+  if (left->index < right->index) return -1;
+  if (left->index > right->index) return 1;
+  return 0;
+}
+
+/* Returns the first index of the node with the given id or -1 if not found. */
+static int find_by_id(const IdIndex ids[], int id, int size) {
+  int low = 0;
+  int high = size;
+
+  while (low < high) {
+    int middle = low + (high - low) / 2;
+    if (ids[middle].id < id)
+      low = middle + 1;
+    else
+      high = middle;
+  }
+
+  if (low < size && ids[low].id == id)
+    return ids[low].index;
+  return -1;
+}
+
+/* Main program - preprocesses the chosen edges, then evaluates their DAG. */
+int main() {
+  char *fileN = NULL;
+  char computelist[MAX];
+  char query_text[MAX][MAX];
+  int query_ids[MAX];
+  int query_count = 0;
+  int n = -1;
+  Node* input = read_input(fileN, &n, computelist);
+
+  size_t allocation_count = n > 0 ? (size_t)n : 1;
+  IdIndex *ids = (IdIndex *)malloc(allocation_count * sizeof(*ids));
+  int *successor = (int *)malloc(allocation_count * sizeof(*successor));
+  int *reverse_head = (int *)malloc(allocation_count * sizeof(*reverse_head));
+  int *reverse_next = (int *)malloc(allocation_count * sizeof(*reverse_next));
+  int *queue = (int *)malloc(allocation_count * sizeof(*queue));
+  float *cost = (float *)malloc(allocation_count * sizeof(*cost));
+
+  if (ids == NULL || successor == NULL || reverse_head == NULL ||
+      reverse_next == NULL || queue == NULL || cost == NULL) {
+    fprintf(stderr, "Error!\n");
+    free(input);
+    free(ids);
+    free(successor);
+    free(reverse_head);
+    free(reverse_next);
+    free(queue);
+    free(cost);
+    return 1;
+  }
+
+  for (int i = 0; i < n; i++) {
+    ids[i].id = input[i].id;
+    ids[i].index = i;
+  }
+  if (n > 1)
+    qsort(ids, (size_t)n, sizeof(*ids), compare_id_index);
+
+  /* Each row is independent; guided chunks help balance varying neighbor counts. */
+  #pragma omp parallel for schedule(guided, 8) if (n >= 128)
+  for (int i = 0; i < n; i++) {
+    char aux[MAX];
+    char *saveptr = NULL;
+    char *token;
+    int selected = -1;
+    float best = 0.0f;
+
+    strcpy(aux, input[i].neighbors);
+    token = strtok_r(aux, " ", &saveptr);
+    while (token != NULL) {
+      int neighbor = find_by_id(ids, atoi(token), n);
+      if (neighbor >= 0 && best < input[neighbor].value) {
+        best = input[neighbor].value;
+        selected = neighbor;
+      }
+      token = strtok_r(NULL, " ", &saveptr);
+    }
+    successor[i] = selected;
+  }
+
+  /* Reverse the selected edges so each node is evaluated after its successor. */
+  for (int i = 0; i < n; i++)
+    reverse_head[i] = -1;
+  for (int i = 0; i < n; i++) {
+    reverse_next[i] = -1;
+    if (successor[i] >= 0) {
+      reverse_next[i] = reverse_head[successor[i]];
+      reverse_head[successor[i]] = i;
+    }
+  }
+
+  int queue_begin = 0;
+  int queue_end = 0;
+  for (int i = 0; i < n; i++) {
+    if (successor[i] < 0) {
+      cost[i] = input[i].value;
+      queue[queue_end++] = i;
+    }
+  }
+
+  while (queue_begin < queue_end) {
+    int node = queue[queue_begin++];
+    for (int parent = reverse_head[node]; parent >= 0;
+         parent = reverse_next[parent]) {
+      cost[parent] = input[parent].value + cost[node];
+      queue[queue_end++] = parent;
+    }
+  }
+
+  for (char *token = strtok(computelist, " "); token != NULL;
+       token = strtok(NULL, " ")) {
+    if (query_count < MAX) {
+      strcpy(query_text[query_count], token);
+      query_ids[query_count] = atoi(token);
+      query_count++;
+    }
+  }
+
+  for (int i = 0; i < query_count; i++) {
+    int index = find_by_id(ids, query_ids[i], n);
+    float result = index >= 0 ? cost[index] : 0.0f;
+    printf("%s: %f\n", query_text[i], result);
+  }
+
+  free(input);
+  free(ids);
+  free(successor);
+  free(reverse_head);
+  free(reverse_next);
+  free(queue);
+  free(cost);
+  return 0;
+}

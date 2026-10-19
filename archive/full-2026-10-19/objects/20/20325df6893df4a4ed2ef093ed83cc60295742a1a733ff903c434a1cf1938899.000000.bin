@@ -1,0 +1,275 @@
+#include "knn.h"
+#include <stdint.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+typedef struct {
+    size_t index;
+    float distance;
+    char label;
+} Neighbor;
+
+static int neighbor_worse(const Neighbor *a, const Neighbor *b) {
+    return a->distance > b->distance ||
+           (a->distance == b->distance && a->index > b->index);
+}
+
+static void sift_down(Neighbor *heap, size_t count, size_t root,
+                      Neighbor value) {
+    while (root < count / 2) {
+        size_t child = root * 2 + 1;
+        if (child + 1 < count &&
+            neighbor_worse(&heap[child + 1], &heap[child])) {
+            child++;
+        }
+        if (!neighbor_worse(&heap[child], &value)) {
+            break;
+        }
+        heap[root] = heap[child];
+        root = child;
+    }
+    heap[root] = value;
+}
+
+static void offer_neighbor(Neighbor *heap, size_t *count, size_t capacity,
+                           Neighbor value) {
+    if (*count < capacity) {
+        heap[*count] = value;
+        (*count)++;
+        if (*count == capacity) {
+            for (size_t i = capacity / 2; i > 0; i--) {
+                Neighbor current = heap[i - 1];
+                sift_down(heap, capacity, i - 1, current);
+            }
+        }
+    } else if (neighbor_worse(&heap[0], &value)) {
+        sift_down(heap, capacity, 0, value);
+    }
+}
+
+static int select_range(int n_groups, const Group *groups, Point to_evaluate,
+                        size_t first, size_t last, size_t capacity,
+                        Neighbor *heap, size_t *count) {
+    size_t offset = 0;
+    size_t used = 0;
+
+    for (int i = 0; i < n_groups && offset < last; i++) {
+        const Group *g = &groups[i];
+        size_t length = g->length > 0 ? (size_t)g->length : 0;
+        size_t group_end = offset + length;
+
+        if (group_end > first) {
+            size_t begin = first > offset ? first - offset : 0;
+            size_t end = last < group_end ? last - offset : length;
+
+            for (size_t j = begin; j < end; j++) {
+                float d = euclidean_distance_no_sqrt(to_evaluate, g->points[j]);
+                if (d != d) {
+                    *count = used;
+                    return 1;
+                }
+
+                Neighbor value;
+                value.index = offset + j;
+                value.distance = d;
+                value.label = g->label;
+                offer_neighbor(heap, &used, capacity, value);
+            }
+        }
+        offset = group_end;
+    }
+
+    *count = used;
+    return 0;
+}
+
+static int select_labels(int n_groups, const Group *groups, int k,
+                         Point to_evaluate, size_t n_points, char *labels) {
+    size_t capacity = (size_t)k;
+
+    /* With room for every point, only the label multiset matters. */
+    if (n_points <= capacity) {
+        size_t out = 0;
+        for (int i = 0; i < n_groups; i++) {
+            for (int j = 0; j < groups[i].length; j++) {
+                labels[out++] = groups[i].label;
+            }
+        }
+        while (out < capacity) {
+            labels[out++] = -1;
+        }
+        return 1;
+    }
+
+    int workers = 1;
+#ifdef _OPENMP
+    if (!omp_in_parallel()) {
+        workers = omp_get_max_threads();
+        if (workers > 4) workers = 4;
+        if (workers < 1) workers = 1;
+
+        /* Amortize team startup and keep the serial candidate merge small. */
+        while (workers > 1 &&
+               (n_points / (size_t)workers < 16384 ||
+                n_points / capacity < (size_t)workers * 8)) {
+            workers--;
+        }
+    }
+#endif
+
+    if (capacity > SIZE_MAX / sizeof(Neighbor) / (size_t)workers) {
+        return 0;
+    }
+    Neighbor *heaps = (Neighbor *)malloc(capacity * (size_t)workers *
+                                         sizeof(Neighbor));
+    if (heaps == NULL) {
+        return 0;
+    }
+
+    size_t counts[4] = {0, 0, 0, 0};
+    int has_nan = 0;
+
+#ifdef _OPENMP
+    if (workers > 1) {
+        size_t base = n_points / (size_t)workers;
+        size_t remainder = n_points % (size_t)workers;
+
+        #pragma omp parallel for schedule(static) num_threads(workers) reduction(|:has_nan)
+        for (int part = 0; part < workers; part++) {
+            size_t p = (size_t)part;
+            size_t first = p * base + (p < remainder ? p : remainder);
+            size_t last = first + base + (p < remainder);
+            has_nan |= select_range(n_groups, groups, to_evaluate,
+                                    first, last, capacity,
+                                    heaps + p * capacity, &counts[part]);
+        }
+    } else
+#endif
+    {
+        has_nan = select_range(n_groups, groups, to_evaluate,
+                               0, n_points, capacity, heaps, &counts[0]);
+    }
+
+    if (has_nan) {
+        free(heaps);
+        return 0;
+    }
+
+    /* A locally discarded point already has k better global-order keys. */
+    for (int part = 1; part < workers; part++) {
+        Neighbor *local = heaps + (size_t)part * capacity;
+        for (size_t j = 0; j < counts[part]; j++) {
+            offer_neighbor(heaps, &counts[0], capacity, local[j]);
+        }
+    }
+
+    for (size_t j = 0; j < counts[0]; j++) {
+        labels[j] = heaps[j].label;
+    }
+    for (size_t j = counts[0]; j < capacity; j++) {
+        labels[j] = -1;
+    }
+    free(heaps);
+    return 1;
+}
+
+static void select_labels_reference(int n_groups, Group *groups, int k,
+                                    Point to_evaluate, char *labels) {
+    float *distances = (float *)malloc(sizeof(float) * k);
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+    free(distances);
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * k);
+    size_t n_points = 0;
+    int count_valid = 1;
+    int i;
+
+    for (i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t)groups[i].length;
+            if (n_points > SIZE_MAX - length) {
+                count_valid = 0;
+                break;
+            }
+            n_points += length;
+        }
+    }
+
+    if (k <= 0 || !count_valid ||
+        !select_labels(n_groups, groups, k, to_evaluate, n_points, labels)) {
+        select_labels_reference(n_groups, groups, k, to_evaluate, labels);
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(labels);
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

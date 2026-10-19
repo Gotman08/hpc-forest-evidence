@@ -1,0 +1,45 @@
+param()
+$ErrorActionPreference='Stop'
+$taskBase='C:\Users\nicol\Documents\Codex\2026-10-15\cr'
+$taskOp=Join-Path $taskBase 'outputs\HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3\operations-parent-premier-roots-source110-r1'
+$taskRx=Join-Path $taskOp 'reception-roots-R7-zero-appel-preparee-r1'
+$taskPython=Join-Path $taskBase 'work/.venv/Scripts/python.exe'
+$taskReceiver=Join-Path $taskRx 'recevoir-metadonnees-R7-zero-appel-r3.py'
+function Task-Hash([string]$path){(Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()}
+if((Task-Hash $taskPython) -ne '819c07dbf55c179f77a71d6f041c74c57b18d86f637f5f5e76ea882a50c9ed8b'){throw 'Python pin'}
+if((Task-Hash $taskReceiver) -ne '7c3e924acb810cc1a80046e53f2f92519dc11ca9afa67961291dd50cddf81bfd'){throw 'Receiver pin'}
+if((Task-Hash (Join-Path $taskRx 'revue-code-independante-r1/REVUE-RECEPTEUR-R7-R3-PREPARATION-SCELLEE.json')) -ne '791f9aef907dedb71446604a289c068193d5f24dc86f315274303048c535f097'){throw 'Independent review pin'}
+$taskCapture=Join-Path $taskOp 'capturer-observations-parent.ps1'
+if((Task-Hash $taskCapture) -ne '7ea21440213aa3dd09711dd0023b6fdb70983c271e793c1efca2a07a9b6cb098'){throw 'Capture pin'}
+$taskObservation=Join-Path $taskOp 'observations-R7-reception-terminale-02'
+& $taskCapture -OutputDirectory $taskObservation
+$taskBundle=Get-Content -LiteralPath (Join-Path $taskRx 'ENTREES-R7-CHEMINS-REELS-NON-ADMISES-R4.json') -Raw|ConvertFrom-Json -AsHashtable
+$taskBundle.fresh_full_cim=@{path=(Join-Path $taskObservation 'CIM-PRIVE-FRAIS.json');sha256=$null}
+foreach($taskCell in $taskBundle.cells){
+  $taskArchiveDirectory=Split-Path -LiteralPath $taskCell.archive.path -Parent
+  $taskSidecars=@(Get-ChildItem -LiteralPath $taskArchiveDirectory -File|Where-Object{$_.FullName -ne $taskCell.archive.path})
+  if($taskSidecars.Count -ne 0){throw 'Unexpected received sidecar; review individually before admission'}
+  $taskCell.transfer_sidecars=@()
+}
+function Task-FillRefs($taskNode){
+ if($taskNode -is [System.Collections.IDictionary]){
+  if($taskNode.Count -eq 2 -and $taskNode.Contains('path') -and $taskNode.Contains('sha256')){
+   $taskPath=[string]$taskNode.path
+   if(-not [IO.Path]::IsPathRooted($taskPath) -or -not ([IO.Path]::GetFullPath($taskPath)).StartsWith($taskOp+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw 'Only reviewed operation evidence references'}
+   $taskDigest=Task-Hash $taskPath
+   if($null -ne $taskNode.sha256 -and $taskNode.sha256 -ne $taskDigest){throw 'Existing reference changed'}
+   $taskNode.sha256=$taskDigest
+  }else{foreach($taskKey in @($taskNode.Keys)){Task-FillRefs $taskNode[$taskKey]}}
+ }elseif($taskNode -is [System.Collections.IEnumerable] -and $taskNode -isnot [string]){
+  foreach($taskChild in $taskNode){Task-FillRefs $taskChild}
+ }
+}
+Task-FillRefs $taskBundle
+$taskInput=Join-Path $taskRx 'ENTREES-ROOT-01.json'
+$taskBytes=[Text.UTF8Encoding]::new($false,$true).GetBytes(($taskBundle|ConvertTo-Json -Depth 30)+[Environment]::NewLine)
+$taskFile=[IO.File]::Open($taskInput,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+try{$taskFile.Write($taskBytes,0,$taskBytes.Length);$taskFile.Flush($true)}finally{$taskFile.Dispose()}
+$taskInputSha=Task-Hash $taskInput
+& $taskPython -I -B $taskReceiver --input $taskInput --input-sha256 $taskInputSha --output-directory (Join-Path $taskRx 'execution-root-01')
+if($LASTEXITCODE -ne 0){throw 'Final receiver refused; preserve all initial outputs'}
+

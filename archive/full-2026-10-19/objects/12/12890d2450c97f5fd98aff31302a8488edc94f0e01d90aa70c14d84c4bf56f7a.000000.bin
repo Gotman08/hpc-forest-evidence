@@ -1,0 +1,149 @@
+"""One isolated local assembly; no compiler/CLI/model/socket/transport or job."""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import sys
+import tarfile
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+BASE = OUT.parents[2]
+OLD = OUT.parent
+PROJECT = BASE / "work/hpc-forest-primes-native-max-r2b/project"
+sys.path.insert(0, str(PROJECT / "src"))
+from hpc_forest import native_r2max as native  # noqa: E402
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": sha(path)}
+
+
+def save(name, value):
+    path = OUT / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    return ref(path)
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): sha(p) for p in sorted(root.rglob("*")) if p.is_file()
+            and not any(x in {"__pycache__", ".pytest_cache", ".ruff_cache"} for x in p.relative_to(root).parts)}
+
+
+origin = json.loads((OUT / "origine-preservee.json").read_text(encoding="utf8"))
+expected = origin["restored_source_files"]
+current = inventory(PROJECT)
+if len(expected) != 101 or inventory(BASE / "work/hpc-forest-primes-native-max-r2/project") != expected:
+    raise RuntimeError("Original r2 source inventory changed")
+if any(sha(Path(name)) != expected_sha for name, expected_sha in origin["original_files"].items()):
+    raise RuntimeError("Original r2 proof changed")
+older_origin = json.loads((OLD / "origine-et-preservation-avant.json").read_text(encoding="utf8"))
+if any(sha(Path(name)) != expected_sha for name, expected_sha in older_origin["original_files"].items()):
+    raise RuntimeError("Original r1b proof changed")
+unchanged = ("src/hpc_forest/core.py", "src/hpc_forest/primes_contract.py", "src/hpc_forest/contracts.py",
+             "src/hpc_forest/evaluator.py", "src/hpc_forest/r2max_trace_qualification.py")
+if any(current[name] != expected[name] for name in unchanged):
+    raise RuntimeError("Execution/contract/timing source changed")
+if inventory(OUT / "certified-preparation") != inventory(OLD / "certified-preparation"):
+    raise RuntimeError("Certified bytes changed")
+save("preservation-verifiee.json", {"schema": "hpc-forest-r2max-r2b-preservation-v1", "verified": True,
+     "original_r2_artifacts": origin["original_files"], "original_r2_sources": expected,
+     "original_r2_delivery_sha256": origin["original_r2_delivery_sha256"],
+     "original_r2_all_recorded_bytes_unchanged": True, "original_r1b_artifacts_unchanged": len(older_origin["original_files"]),
+     "unchanged_execution_source_files": {name: current[name] for name in unchanged}, "certified_preparation_unchanged": True})
+save("diff-source-r2-r2b.json", {"schema": "hpc-forest-r2max-r2b-source-diff-v1",
+     "parent_source_zip_sha256": origin["original_r2_source_zip_sha256"],
+     "changed": {name: {"before": expected[name], "after": current[name]} for name in expected if expected[name] != current.get(name)},
+     "added": {name: value for name, value in current.items() if name not in expected},
+     "removed": sorted(set(expected) - set(current)), "source_files": len(current),
+     "execution_oracle_flags_budgets_threshold_confirmations_unchanged": True})
+save("runtime-manifest-r2max.json", current)
+zpath = OUT / "HPC-Forest-Primes-Natif-MAX-r2b.zip"
+with zipfile.ZipFile(zpath, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    for name in current:
+        entry = zipfile.ZipInfo("HPC-Forest/" + name, (2026, 10, 18, 0, 0, 0))
+        entry.external_attr = 0o100644 << 16
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        archive.writestr(entry, (PROJECT / name).read_bytes())
+native.verify_runtime(zpath)
+plan = copy.deepcopy(json.loads((OLD / "native-max-plan.json").read_text(encoding="utf8")))
+plan.update(scope_id=native.SCOPE, created_utc=datetime.now(UTC).isoformat(), source_zip_sha256=sha(zpath),
+    status="local_proposal_not_native_admitted", parent_r2_source_zip_sha256=origin["original_r2_source_zip_sha256"],
+    parent_r2_plan_sha256=sha(OLD / "native-max-plan.json"), cells=native.CELLS, efforts=["max"], selected_cell=None,
+    automatic_extension=False, native_research_admitted=False, arm64_qualification_admitted=False,
+    immutable_initial_authorization_and_artifact_sha_required=True,
+    received_original_evaluator_member_links_required=True, required_admission_artifacts=sorted(native.ARTIFACTS))
+plan_ref = save("native-max-plan.json", plan)
+refs = {"plan": plan_ref, "source_zip": ref(zpath), "preparation_manifest": ref(OUT / "certified-preparation/prototype-manifest.json"),
+        "preparation_review": ref(OUT / "preparation-review-original.json")}
+for key, schema in native.SCHEMAS.items():
+    refs[key] = save("admissions-exemples-non-verifies/" + key + ".json", {"schema": schema, "scope_id": native.SCOPE,
+        "verified": False, "source_zip_sha256": sha(zpath), "plan_sha256": plan_ref["sha256"],
+        "preparation_manifest_sha256": native.PREPARATION_MANIFEST_SHA256, "evidence_refs": []})
+for key, schema in (("luna_first_start", "hpc-forest-primes-r2max-first-start-verified-v1"),
+                    ("luna_closure", "hpc-forest-primes-r2max-luna-closure-admission-v1")):
+    refs[key] = save("admissions-exemples-non-verifies/" + key + ".json", {"schema": schema, "verified": False,
+        "operator_bounded_acceptance": False, "model": "gpt-6-luna", "effort": "max", "session_id": native.LUNA_SESSION,
+        "job_id": "751992", "source_zip_sha256": native.LUNA_SOURCE, "plan_sha256": native.LUNA_PLAN,
+        "received_cohort_audited_with_explicit_raw_attribution_limit": False, "independent_performance_validation": False})
+model = next(iter(native.CELLS))
+authorization = {"schema": "hpc-forest-primes-r2max-authorization-v2", "scope_id": native.SCOPE,
+    "model": model, "effort": "max", "session_id": native.CELLS[model], "verified": False, "expires_at": 0,
+    "user_messages": [], "old_candidates_imported": False, "operator_algorithm_advice": False,
+    "native_calls_started_at_authorization": 0, "job_id": "NONSOUMIS",
+    "remote_root": "/scratch_p/nimarano/" + native.SCOPE + "-" + native.CELLS[model], "artifacts": refs}
+auth_ref = save("authorization-non-verifiee.json", authorization)
+try:
+    native.validate_receipt(Path(auth_ref["path"]), {native.SCOPE}, runtime=False, prepared=False)
+except native.InfrastructureError as error:
+    save("premier-refus-conserve.json", {"schema": "hpc-forest-r2max-r2b-unverified-proposal-refusal-v1",
+         "expected_refusal": True, "error_type": type(error).__name__, "error": str(error), "authorization": auth_ref,
+         "native_model_calls": 0, "jobs_submitted": 0})
+else:
+    raise RuntimeError("Unverified proposal unexpectedly admitted")
+save("schemas-recus-r2max.json", {"authorization_schema": "hpc-forest-primes-r2max-authorization-v2",
+    "authorization_fields": sorted(native.AUTHORIZATION_FIELDS), "exact_artifacts": sorted(native.ARTIFACTS),
+    "schemas": native.SCHEMAS, "common_proof_fields": sorted(native.COMMON_PROOF_FIELDS),
+    "extra_proof_fields": {key: sorted(fields) for key, fields in native.PROOF_FIELDS.items()},
+    "all_examples_verified_false": True, "production_admission": False})
+save("validation-locale.json", {"schema": "hpc-forest-r2max-r2b-neutral-validation-v1", "verified_local_only": True,
+    "neutral_python_tests_passed": 131, "tests": ref(OUT / "tests-final.log"), "first_tests": ref(OUT / "tests-premier.log"),
+    "ruff": "passed", "ruff_log": ref(OUT / "ruff-final.log"), "first_ruff": ref(OUT / "ruff-premier.log"),
+    "review_P1_authorization_substitution_closed_locally": True, "review_P1_received_trace_summary_only_closed_locally": True,
+    "production_receipts_fabricated": False, "local_c_cli_model_socket_romeo_executions": 0, "jobs_submitted": 0,
+    "arm64_qualification_admitted": False, "native_research_admitted": False, "independent_review_still_required": True})
+payload = {p.relative_to(OUT).as_posix(): p for p in sorted(OUT.rglob("*")) if p.is_file()}
+payload.update({"HPC-Forest/" + name: PROJECT / name for name in current if name.startswith(("src/", "examples/"))})
+manifest_ref = save("proposal-bundle-manifest.json", {"schema": "hpc-forest-r2max-proposal-bundle-manifest-v3",
+    "private_audit_only_never_model_context": True, "files": {name: sha(path) for name, path in payload.items()}})
+payload["proposal-bundle-manifest.json"] = Path(manifest_ref["path"])
+bundle = OUT / "hpc-forest-primes-native-max-r2b-proposition.tar.gz"
+with tarfile.open(bundle, "x:gz") as archive:
+    for name, path in sorted(payload.items()):
+        archive.add(path, arcname=name, recursive=False)
+with tarfile.open(bundle, "r:gz") as archive:
+    checked = {}
+    for member in archive.getmembers():
+        if not member.isfile() or member.name in checked or member.name not in payload:
+            raise RuntimeError("Unsafe or duplicate proposal member")
+        checked[member.name] = hashlib.sha256(archive.extractfile(member).read()).hexdigest()
+    if checked != {name: sha(path) for name, path in payload.items()}:
+        raise RuntimeError("Assembled payload bytes differ")
+save("LIVRAISON-LOCALE.json", {"schema": "hpc-forest-primes-r2max-r2b-local-proposal-delivery-v1",
+    "status": "qualified_locally_only_not_native_admitted", "source_zip": ref(zpath), "plan": plan_ref, "bundle": ref(bundle),
+    "bundle_manifest": manifest_ref, "source_files_verified": len(current), "bundle_regular_members_verified": len(payload),
+    "neutral_python_tests_passed": 131, "ruff": "passed", "native_research_admitted": False,
+    "arm64_qualification_admitted": False, "source_r2_and_r1b_artifacts_unchanged": True,
+    "local_c_cli_model_socket_romeo_executions": 0, "jobs_submitted": 0,
+    "independent_review_still_required": True, "new_allocated_qualification_and_reception_required": True})
+print(json.dumps({"source_zip": ref(zpath), "plan": plan_ref, "bundle": ref(bundle),
+                  "source_files": len(current), "bundle_members": len(payload)}, indent=2))

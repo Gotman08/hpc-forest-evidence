@@ -1,0 +1,125 @@
+"""Observe the existing Luna xhigh job; no submit, generation, receipt or stop."""
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import os
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+JOB = "749940"
+KEY = "coverage-gpt-6-luna-xhigh"
+SESSION = "fb704484f3a5459ca3a4a358d2208a0b"
+SOURCE = "cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+RELAY = "-m hpc_forest.matrix_worker"
+
+
+def verify_cell(state, current):
+    if state.get("source_zip_sha256") != SOURCE or state.get("current_key") != KEY:
+        raise RuntimeError("Wrong frozen source or current group")
+    cells = [c for c in state["queue"] if c["key"] == KEY]
+    if len(cells) != 1:
+        raise RuntimeError("Expected the unique already submitted group")
+    cell = cells[0]
+    if (cell.get("job_id") != JOB or cell.get("session_id") != SESSION
+            or cell.get("state") != "working" or cell.get("model") != "gpt-6-luna"
+            or cell.get("effort") != "xhigh"):
+        raise RuntimeError("Group binding differs; do not recreate it")
+    saved = cell["worker_identity"]
+    if current is None or any(current.get(k) != saved.get(k) for k in FIELDS):
+        raise RuntimeError("Relay exited or its full identity changed")
+    command = current.get("CommandLine", "")
+    if (RELAY not in command or SESSION not in command
+            or cell["channel"] not in command):
+        raise RuntimeError("Relay command differs from the existing group")
+    return cell
+
+
+def record_status(state, cell, status):
+    if status.get("ok") is not True or str(status.get("job_id")) != JOB:
+        raise RuntimeError("No current scheduler observation of this job")
+    cell["scheduler"] = status
+    if status.get("finished"):
+        state.update(stage="awaiting_audited_reception_after_strict_dispatch",
+                     recovery_next_action=("Receive deliveries, archive and efficiency; restore with official sources; "
+                                           "audit read-only and reconcile before any owned relay stop; "
+                                           "then continue this same R1 queue"))
+        return True
+    return False
+
+
+class ReadOnlyRpc:
+    def __init__(self, rpc):
+        self.rpc = rpc
+
+    async def call(self, tool_name, **arguments):
+        if tool_name not in {"job_status", "job_efficiency"} or str(arguments.get("job_id")) != JOB:
+            raise RuntimeError("Observer permits only status/accounting reads of the existing job")
+        return await self.rpc.call(tool_name, **arguments)
+
+
+def verify_relay_pair(expected, reader):
+    if len(expected) != 2 or expected[1]["ParentProcessId"] != expected[0]["ProcessId"]:
+        raise RuntimeError("Expected launcher/real-Python identities are not bound")
+    for saved in expected:
+        current = reader(saved["ProcessId"])
+        if current is None or any(saved.get(k) != current.get(k) for k in FIELDS):
+            raise RuntimeError("Relay exited or its full launcher/real-Python identity changed")
+
+
+async def watch():
+    spec = importlib.util.spec_from_file_location("r1_observation_legacy", ROOT / "coordonner-matrice.py")
+    legacy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(legacy)
+    with legacy.FileLock(ROOT / "coordinator.lock"):
+        async with legacy.module.ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+            coordinator = legacy.Coordinator(ReadOnlyRpc(rpc))
+            cell = next(c for c in coordinator.state["queue"] if c["key"] == KEY)
+            expected_pair = json.loads((HERE / "relais-attendu.json").read_text())
+            verify_relay_pair(expected_pair, legacy.process_identity)
+            identity = legacy.process_identity(cell["worker_identity"]["ProcessId"])
+            verify_cell(coordinator.state, identity)
+            if legacy.file_digest(ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip") != SOURCE:
+                raise RuntimeError("Frozen R1 archive changed")
+            owned = legacy.process_identity(os.getpid())
+            coordinator.state.update(stage="running_current_group_observation_recovered", error=None,
+                                     strict_coordinator_identity=owned,
+                                     recovery_incident={"path": str(HERE), "job_id": JOB, "session_id": SESSION,
+                                                        "observer_only": True, "worker_restarted": False,
+                                                        "submission_replayed": False})
+            legacy.atomic_json(HERE / "identites-verifiees.json", {"observer": owned, "relay": identity})
+            coordinator.save()
+            failures = 0
+            while True:
+                try:
+                    status = await coordinator.scheduler(JOB)
+                    terminal = record_status(coordinator.state, cell, status)
+                    failures = 0
+                    if not terminal:
+                        verify_relay_pair(expected_pair, legacy.process_identity)
+                        verify_cell(coordinator.state, legacy.process_identity(identity["ProcessId"]))
+                    coordinator.save()
+                    if terminal:
+                        return
+                except Exception as exc:
+                    failures += 1
+                    event = {"utc_epoch": time.time(), "consecutive_failures": failures,
+                             "error": str(exc)[:6000], "submission_retried": False,
+                             "worker_restarted": False}
+                    with (HERE / "erreurs-observation.jsonl").open("a", encoding="utf8") as log:
+                        log.write(json.dumps(event, ensure_ascii=True) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    if failures >= 3 or "Relay exited" in str(exc):
+                        coordinator.state.update(stage="attention_required", error=str(exc)[:6000])
+                        coordinator.save()
+                        raise
+                await asyncio.sleep(30)
+
+
+if __name__ == "__main__":
+    asyncio.run(watch())

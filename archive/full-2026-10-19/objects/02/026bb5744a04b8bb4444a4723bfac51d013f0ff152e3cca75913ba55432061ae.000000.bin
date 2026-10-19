@@ -1,0 +1,170 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+
+class FastInput {
+    static constexpr std::size_t capacity = 1u << 16;
+    unsigned char buffer_[capacity];
+    std::size_t position_ = 0;
+    std::size_t available_ = 0;
+
+    int read_char() {
+        if (position_ == available_) {
+            available_ = std::fread(buffer_, 1, capacity, stdin);
+            position_ = 0;
+            if (available_ == 0) {
+                return EOF;
+            }
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    int next_int() {
+        int c = read_char();
+        while (c != EOF && c <= ' ') {
+            c = read_char();
+        }
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') {
+            c = read_char();
+        }
+        std::uint32_t magnitude = 0;
+        while (c >= '0' && c <= '9') {
+            magnitude = magnitude * 10u + static_cast<std::uint32_t>(c - '0');
+            c = read_char();
+        }
+        const std::int64_t value = static_cast<std::int64_t>(magnitude);
+        return static_cast<int>(negative ? -value : value);
+    }
+};
+
+static inline void add_row(std::int64_t* __restrict__ columns,
+                           const int* __restrict__ row, int n) {
+    for (int j = 0; j < n; ++j) {
+        columns[j] += row[j];
+    }
+}
+
+static inline void advance_row(std::int64_t* __restrict__ columns,
+                               const int* __restrict__ incoming,
+                               int* __restrict__ outgoing,
+                               int n, bool retain_incoming) {
+    if (retain_incoming) {
+        for (int j = 0; j < n; ++j) {
+            const int value = incoming[j];
+            columns[j] += static_cast<std::int64_t>(value) - outgoing[j];
+            outgoing[j] = value;
+        }
+    } else {
+        for (int j = 0; j < n; ++j) {
+            columns[j] += static_cast<std::int64_t>(incoming[j]) - outgoing[j];
+        }
+    }
+}
+
+static inline std::int64_t horizontal_max(const std::int64_t* columns,
+                                          int n, int s) {
+    std::int64_t sum = 0;
+    for (int j = 0; j < s; ++j) {
+        sum += columns[j];
+    }
+    std::int64_t best = sum;
+    constexpr int block = 32;
+    int j = s;
+
+    // Scan neighboring blocks independently, then join their prefix summaries.
+    for (; j + 4 * block <= n; j += 4 * block) {
+        const std::int64_t* entering = columns + j;
+        const std::int64_t* leaving = columns + j - s;
+        std::int64_t prefix0 = 0;
+        std::int64_t prefix1 = 0;
+        std::int64_t prefix2 = 0;
+        std::int64_t prefix3 = 0;
+        std::int64_t max0 = 0;
+        std::int64_t max1 = 0;
+        std::int64_t max2 = 0;
+        std::int64_t max3 = 0;
+
+        for (int k = 0; k < block; ++k) {
+            prefix0 += entering[k] - leaving[k];
+            prefix1 += entering[block + k] - leaving[block + k];
+            prefix2 += entering[2 * block + k] - leaving[2 * block + k];
+            prefix3 += entering[3 * block + k] - leaving[3 * block + k];
+            max0 = std::max(max0, prefix0);
+            max1 = std::max(max1, prefix1);
+            max2 = std::max(max2, prefix2);
+            max3 = std::max(max3, prefix3);
+        }
+
+        const std::int64_t offset2 = prefix0 + prefix1;
+        const std::int64_t offset3 = offset2 + prefix2;
+        const std::int64_t block_best = std::max(
+            std::max(max0, prefix0 + max1),
+            std::max(offset2 + max2, offset3 + max3));
+        best = std::max(best, sum + block_best);
+        sum += offset3 + prefix3;
+    }
+
+    for (; j < n; ++j) {
+        sum += columns[j] - columns[j - s];
+        if (sum > best) {
+            best = sum;
+        }
+    }
+    return best;
+}
+
+int main() {
+    FastInput input;
+    const int n = input.next_int();
+    const int s = input.next_int();
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const int moves = n - s;
+    const int history_rows = std::min(s, moves);
+    const std::size_t row_size = static_cast<std::size_t>(n);
+    const std::size_t history_size =
+        static_cast<std::size_t>(history_rows) * row_size;
+    std::unique_ptr<int[]> history(new int[history_size]);
+    std::unique_ptr<int[]> staged(new int[n]);
+    std::unique_ptr<std::int64_t[]> columns(new std::int64_t[n]());
+
+    for (int r = 0; r < s; ++r) {
+        int* destination = r < history_rows
+            ? history.get() + static_cast<std::size_t>(r) * row_size
+            : staged.get();
+        for (int j = 0; j < n; ++j) {
+            destination[j] = input.next_int();
+        }
+        add_row(columns.get(), destination, n);
+    }
+
+    std::int64_t best = horizontal_max(columns.get(), n, s);
+    int slot = 0;
+    for (int r = s; r < n; ++r) {
+        for (int j = 0; j < n; ++j) {
+            staged[j] = input.next_int();
+        }
+        int* outgoing = history.get() + static_cast<std::size_t>(slot) * row_size;
+        // Only rows before n-s can subsequently leave a vertical window.
+        advance_row(columns.get(), staged.get(), outgoing, n, r < moves);
+        const std::int64_t candidate = horizontal_max(columns.get(), n, s);
+        if (candidate > best) {
+            best = candidate;
+        }
+        ++slot;
+        if (slot == history_rows) {
+            slot = 0;
+        }
+    }
+
+    std::printf("%lld\n", static_cast<long long>(best));
+    return 0;
+}

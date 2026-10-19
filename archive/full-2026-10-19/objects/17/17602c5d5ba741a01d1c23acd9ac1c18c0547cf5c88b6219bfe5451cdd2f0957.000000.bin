@@ -1,0 +1,190 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+namespace {
+using word = std::uint32_t;
+using wide = std::uint64_t;
+constexpr wide MOD = 1000000007ULL;
+constexpr int BATCH = 16;
+
+word dot_mod(const word* a, const word* b, int count) {
+    wide sum = 0;
+    int i = 0;
+    // (MOD-1) + 16*(MOD-1)^2 fits in uint64_t.
+    for (; i + BATCH <= count; i += BATCH) {
+        wide block = 0;
+        for (int j = 0; j < BATCH; ++j)
+            block += wide(a[i + j]) * b[i + j];
+        sum = (sum + block) % MOD;
+    }
+    if (i < count) {
+        for (; i < count; ++i)
+            sum += wide(a[i]) * b[i];
+        sum %= MOD;
+    }
+    return static_cast<word>(sum);
+}
+
+word power_mod(word base, wide exponent) {
+    wide result = 1;
+    while (exponent != 0) {
+        if (exponent & 1)
+            result = result * base % MOD;
+        base = static_cast<word>(wide(base) * base % MOD);
+        exponent >>= 1;
+    }
+    return static_cast<word>(result);
+}
+
+wide polynomial_work(int n, wide exponent, int top_bit) {
+    wide cost = 0;
+    int degree = 0;
+    for (int bit = top_bit; bit >= 0; --bit) {
+        const wide width = static_cast<wide>(degree) + 1;
+        cost += width * (width + 1) / 2;
+        const int squared_degree = 2 * degree;
+        if (squared_degree >= n)
+            cost += wide(squared_degree - n + 1) * n;
+        degree = std::min(squared_degree, n - 1);
+        if ((exponent >> bit) & 1) {
+            if (degree == n - 1)
+                cost += n;
+            else
+                ++degree;
+        }
+    }
+    return cost;
+}
+
+word direct_term(const std::vector<word>& initial,
+                 const std::vector<word>& coefficient, wide steps) {
+    const int n = static_cast<int>(initial.size());
+    // Duplicate the ring so each chronological window is contiguous.
+    std::vector<word> history(2 * n);
+    std::copy(initial.begin(), initial.end(), history.begin());
+    std::copy(initial.begin(), initial.end(), history.begin() + n);
+    int first = 0;
+    word value = initial.back();
+    for (wide step = 0; step < steps; ++step) {
+        value = dot_mod(history.data() + first, coefficient.data(), n);
+        history[first] = value;
+        history[first + n] = value;
+        if (++first == n)
+            first = 0;
+    }
+    return value;
+}
+
+word polynomial_term(const std::vector<word>& initial,
+                     const std::vector<word>& coefficient,
+                     wide exponent, int top_bit) {
+    const int n = static_cast<int>(initial.size());
+    std::vector<word> residue(n, 0);
+    std::vector<word> reversed(n);
+    std::vector<wide> work(2 * n - 1);
+    residue[0] = 1;
+    int degree = 0;
+
+    for (int bit = top_bit; bit >= 0; --bit) {
+        for (int i = 0; i <= degree; ++i)
+            reversed[i] = residue[degree - i];
+
+        const int squared_degree = 2 * degree;
+        for (int k = 0; k <= squared_degree; ++k) {
+            const int first = std::max(0, k - degree);
+            const int pairs = (k + 1) / 2 - first;
+            // Each off-diagonal product is computed only once. Both
+            // dot-product inputs advance through contiguous storage.
+            const word cross = dot_mod(residue.data() + first,
+                                       reversed.data() + degree - k + first,
+                                       pairs);
+            wide value = 2 * wide(cross);
+            if ((k & 1) == 0) {
+                value += wide(residue[k / 2]) * residue[k / 2];
+                work[k] = value % MOD;
+            } else {
+                work[k] = value >= MOD ? value - MOD : value;
+            }
+        }
+
+        // x^n = coefficient[0] + ... + coefficient[n-1]*x^(n-1).
+        // Every surviving entry receives at most BATCH products between
+        // normalizations, so the same uint64_t bound as dot_mod applies.
+        for (int top = squared_degree; top >= n;) {
+            const int bottom = std::max(n, top - (BATCH - 1));
+            for (int k = top; k >= bottom; --k) {
+                const word factor = static_cast<word>(work[k] % MOD);
+                if (factor == 0)
+                    continue;
+                wide* target = work.data() + k - n;
+                for (int j = 0; j < n; ++j)
+                    target[j] += wide(factor) * coefficient[j];
+            }
+            // Only this contiguous surviving window was modified.
+            for (int j = bottom - n; j < bottom; ++j)
+                work[j] %= MOD;
+            top = bottom - 1;
+        }
+
+        degree = std::min(squared_degree, n - 1);
+        for (int i = 0; i <= degree; ++i)
+            residue[i] = static_cast<word>(work[i]);
+
+        if ((exponent >> bit) & 1) {
+            // A set exponent bit requires only multiplication by x.
+            if (degree < n - 1) {
+                for (int j = degree + 1; j > 0; --j)
+                    residue[j] = residue[j - 1];
+                residue[0] = 0;
+                ++degree;
+            } else {
+                const word leading = residue[n - 1];
+                for (int j = n - 1; j > 0; --j)
+                    residue[j] = static_cast<word>(
+                        (wide(leading) * coefficient[j] + residue[j - 1]) % MOD);
+                residue[0] = static_cast<word>(wide(leading) * coefficient[0] % MOD);
+            }
+        }
+    }
+    return dot_mod(residue.data(), initial.data(), degree + 1);
+}
+} // namespace
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n;
+    wide h;
+    if (!(std::cin >> n >> h))
+        return 0;
+
+    std::vector<word> initial(n), coefficient(n);
+    for (int i = 0; i < n; ++i)
+        std::cin >> initial[i];
+    for (int i = 0; i < n; ++i)
+        std::cin >> coefficient[n - 1 - i];
+
+    word answer;
+    if (h <= static_cast<wide>(n)) {
+        answer = initial[static_cast<std::size_t>(h - 1)];
+    } else if (n == 1) {
+        answer = static_cast<word>(wide(initial[0]) *
+                                   power_mod(coefficient[0], h - 1) % MOD);
+    } else {
+        const wide exponent = h - 1;
+        int top_bit = 0;
+        for (wide remaining = exponent; remaining > 1; remaining >>= 1)
+            ++top_bit;
+        const wide steps = h - n;
+        if (steps * static_cast<wide>(n) <= polynomial_work(n, exponent, top_bit))
+            answer = direct_term(initial, coefficient, steps);
+        else
+            answer = polynomial_term(initial, coefficient, exponent, top_bit);
+    }
+
+    std::cout << answer << '\n';
+    return 0;
+}

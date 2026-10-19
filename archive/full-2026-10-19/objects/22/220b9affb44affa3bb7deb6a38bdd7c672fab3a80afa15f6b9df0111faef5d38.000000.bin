@@ -1,0 +1,194 @@
+"""Seal the audited Sol receipt, continuation and visually reviewed local edition."""
+from __future__ import annotations
+
+import hashlib
+import json
+import tomllib
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+WORKSPACE = STUDY.parents[1]
+COMPARE = STUDY.parent / "HPC-Forest-Harnais-Comparaison-r1"
+EDITORIAL = STUDY / "edition-professionnelle"
+VERSION = STUDY / "versions/20261017-avant-couverture-sol-max-professionnelle"
+
+
+def read(p):
+    return json.loads(p.read_text(encoding="utf-8-sig"))
+
+
+def sha(p):
+    with p.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def save(p, value):
+    p.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def frozen(zip_path, project, expected, count):
+    assert sha(zip_path) == expected
+    with zipfile.ZipFile(zip_path) as z:
+        files = [i for i in z.infolist() if not i.is_dir()]
+        assert len(files) == count
+        for item in files:
+            assert item.filename.startswith("HPC-Forest/")
+            path = project / item.filename.removeprefix("HPC-Forest/")
+            assert path.resolve().is_relative_to(project.resolve()) and not path.is_symlink()
+            assert path.read_bytes() == z.read(item)
+    return count
+
+
+def main():
+    now = datetime.now(UTC).isoformat()
+    quality = read(EDITORIAL / "controle-qualite.json")
+    assert quality["visual_review_completed"] and quality["visually_reviewed_pages"] == 214
+    assert not quality["known_visual_defects"] and quality["all_current_page_content_visually_reviewed"]
+    for doc in quality["documents"]:
+        assert sha(STUDY / (doc["name"] + ".pdf")) == doc["pdf_sha256"]
+    audit = read(EDITORIAL / "audit-calculs.json")
+    assert audit["verified"] and audit["registry_count"] == 107 and audit["research_confirmation_rows"] == 91
+    for rel, digest in audit["frozen_data_files"].items():
+        assert sha(EDITORIAL / "donnees" / rel) == digest, rel
+    for path, info in audit["sources"].items():
+        p = Path(path)
+        if p.name not in {"ID.md", "coordinator-state.json", "MATRICE.json", "current-job.json"}:
+            assert sha(p) == info["sha256"], path
+    preserved = read(VERSION / "PRESERVATION.json")
+    assert preserved["copied_files"] == 2488
+    for rel, digest in preserved["files"].items():
+        assert sha(VERSION / rel) == digest, rel
+    for rel, digest in preserved["extra_snapshots"].items():
+        assert sha(VERSION / rel) == digest
+    restored = read(HERE / "inventaire-apres-audit.json")
+    assert len(restored) == 9268
+    for rel, info in restored.items():
+        p = HERE / "restauration-neuve" / rel
+        assert p.stat().st_size == info["bytes"] and sha(p) == info["sha256"], rel
+    assert frozen(STUDY / "HPC-Forest-Archives-Modele-Mere-r1.zip", WORKSPACE / "work/marathon-archive-mother-r1/project",
+        "cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18", 90) == 90
+    assert frozen(COMPARE / "HPC-Forest-Harnais-Comparaison-r1.zip", WORKSPACE / "work/hpc-forest-harnais-comparaison-r1/project/HPC-Forest",
+        "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb", 94) == 94
+    assert sha(COMPARE / "codex-natif-r7/validation-locale.json") == "cf8a0f56e824435183dad7866c8dc3df40ce90bfdf40db9f4b816e4dd01804c9"
+    live = read(HERE / "cim-final.json")
+    before_live = read(HERE / "cim-apres-continuation.json")
+    assert len(live) == len(before_live) == 8
+    fields = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+    assert all(any(all(p[k] == q[k] for k in fields) for q in live) for p in before_live)
+    states = read(HERE / "statuts-finaux.json")
+    assert {s["job_id"] for s in states} == {"749940", "749843"}
+    assert all(s["state"] == "RUNNING" and s["observation"]["current_state_observed"] for s in states)
+    state = read(STUDY / "coordinator-state.json")
+    assert not state.get("error") and state["current_key"] == "coverage-gpt-6-luna-xhigh"
+    active = next(g for g in state["queue"] if g["key"] == state["current_key"])
+    assert active["job_id"] == "749940" and active["state"] == "working"
+    previous_state = read(HERE / "coordinator-avant-admission.json")
+    old_cells = {g["key"]: g for g in previous_state["queue"]}
+    assert all(g == old_cells[g["key"]] for g in state["queue"] if g["key"] not in {"coverage-gpt-6.1-sol-max", active["key"]})
+    assert sum(g["state"] == "received_and_audited" for g in state["queue"]) == 24
+    assert sum(g["state"] == "not_started" for g in state["queue"]) == 15
+    folder = STUDY / "runs" / active["key"]
+    request = read(folder / "job-request.json")
+    assert (request["arch"], request["cpus_per_task"], request["mem_gb"], request["gpus_per_node"], request["time_limit"]) == ("armgpu", 4, 16, 0, "11:00:00")
+    ready = read(folder / "worker/worker-ready.json")
+    assert ready["model"] == "gpt-6-luna" and ready["reasoning_effort"] == "xhigh"
+    assert ready["session_id"] == "fb704484f3a5459ca3a4a358d2208a0b" and ready["pid"] == 4952
+    assert sha(Path(ready["codex_executable"])) == "e98c516f1c8935789aabe9122ee7e05ec4c3efd1ba6acf179242e031c495b99e"
+    for link, proof in [("audit", "audit-initial.json"), ("supplemental_audit", "audit-complementaire.json"),
+                        ("reconciliation", "reconciliation-livraisons.json"), ("owned_stop", "owned-worker-stopped.json")]:
+        assert read(HERE / "reception-verifiee.json")[link]["sha256"] == sha(HERE / proof)
+    continuation = {"verified": True, "verified_utc": now, "same_queue": True, "received_groups": 24, "received_cells": 76,
+        "new_group": active["key"], "job_id": "749940", "session_id": ready["session_id"],
+        "native_workers": 2, "first_refused_attempt_before_any_remote_submission": True,
+        "first_refusal_proof_sha256": sha(HERE / "reprise-avant-soumission-verifiee.json"),
+        "validation_sha256": sha(HERE / "validation-dispatch-r2.json"), "neutral_tests": 12,
+        "coordinator_pids": [50696, 55100], "worker_pids": [3496, 4952],
+        "source_only_coordinator_and_relay_identities_unchanged": True,
+        "current_identity_census_sha256": sha(HERE / "cim-final.json"), "live_scheduler_sha256": sha(HERE / "statuts-finaux.json"),
+        "no_replay_of_started_generation": True, "dispatcher_does_not_receive_or_stop": True,
+        "expected_terminal_stage": "awaiting_audited_reception_after_strict_dispatch"}
+    save(HERE / "continuation-verifiee.json", continuation)
+    automation_path = Path("C:/Users/nicol/.codex/automations/terminer-les-essais-deepseek-sur-romeo/automation.toml")
+    automation = tomllib.loads(automation_path.read_text(encoding="utf-8"))
+    before = tomllib.loads((HERE / "guides-avant/automation-avant.toml").read_text(encoding="utf-8"))
+    changed = {k for k in set(automation) | set(before) if automation.get(k) != before.get(k)}
+    assert changed <= {"prompt", "updated_at"}
+    assert automation["status"] == "ACTIVE" and automation["rrule"] == "FREQ=MINUTELY;INTERVAL=15"
+    assert automation["prompt"] == (COMPARE / "SUIVI-AUTOMATISE-ACTUEL.md").read_text(encoding="utf-8")
+    assert "\ufffd" not in automation["prompt"]
+    save(HERE / "suivi-automatise-verifie.json", {"verified": True, "status": "ACTIVE", "verified_utc": now,
+        "changed_fields": sorted(changed), "rrule": automation["rrule"], "target_thread_id": automation["target_thread_id"],
+        "prompt_sha256": hashlib.sha256(automation["prompt"].encode()).hexdigest(),
+        "unchanged_notifications_suppressed": True, "closed_campaigns_not_repolled": True})
+    old_edition = read(VERSION / "edition-professionnelle/manifeste-edition.json")
+    files = {STUDY / rel for rel in old_edition["files"] if not rel.startswith("edition-professionnelle/controle-rendu/")}
+    files |= {p for p in EDITORIAL.iterdir() if p.is_file() and p.suffix in {".py", ".md", ".json"} and p.name != "manifeste-edition.json"}
+    files |= {p for p in (EDITORIAL / "donnees").iterdir() if p.is_file()}
+    files |= {p for p in (EDITORIAL / "figures").rglob("*") if p.is_file()}
+    files |= {p for p in Path(quality["contact_sheets"][0]).parent.iterdir() if p.is_file()}
+    for name in ("resultats-couverture-sol-max.json", "BILAN-COUVERTURE-SOL-MAX.md", "comparabilite-couvertures-luna-astra-terra-sol-max.json",
+                 "details-missions-couverture-sol-max.json", "arbres-couverture-sol-max.json", "jetons-par-appel-couverture-sol-max.csv"):
+        files.add(STUDY / name)
+    files.discard(EDITORIAL / "manifeste-edition.json")
+    manifest = {"schema": "hpc-forest-professional-edition-delivery-v1", "verified_utc": now,
+        "authors": ["Nicolas Marano", "Romain Despoullain"], "main_pages": 16, "main_figures": 7,
+        "supplement_pages": 198, "supplement_figures": 166, "registry_count": 107, "principal_received_results": 91,
+        "raw_cpu_timings": 11575, "all_pages_visually_reviewed": True, "visually_reviewed_pages": 214,
+        "reviewed_draft_contact_sheets": 36, "final_unchanged_page_render_hashes": 211, "reinspected_changed_pages": 3,
+        "previous_version_preserved_under": "versions/20261017-avant-couverture-sol-max-professionnelle",
+        "previous_version_files_reverified": 2488, "admitted_new_cohort": "Sol MAX 749415: fourteen closed finite-contract searches",
+        "native_closed_observed_invocations": 896, "native_closed_known_exact_tokens": 20058982,
+        "native_closed_unmetered_invocations": 81, "terra_expired_unanswered_request_unknown_consumption": 1,
+        "gpt96_expired_without_native_invocation": 2, "sol_expired_without_native_invocation": 3,
+        "sol_restoration_files_including_manifest_unchanged": 9268, "new_candidate_executions": 0,
+        "new_candidate_compilations": 0, "model_calls_for_editorial_work": 0,
+        "public_repository_or_private_kit_updated": False, "live_ID_updated_after_document_snapshot": True,
+        "automation_prompt_verified": True, "automation_status": "ACTIVE",
+        "files": {p.relative_to(STUDY).as_posix(): sha(p) for p in sorted(files)}}
+    save(EDITORIAL / "manifeste-edition.json", manifest)
+    save(HERE / "admission-article-recue.json", {"verified": True, "verified_utc": now,
+        "prior_reception_receipt_sha256": sha(HERE / "reception-verifiee.json"), "article_admission_pending": False,
+        "admissions_sha256": sha(EDITORIAL / "admissions.json"), "arithmetic_audit_sha256": sha(EDITORIAL / "audit-calculs.json"),
+        "quality_control_sha256": sha(EDITORIAL / "controle-qualite.json"), "delivery_manifest": {
+            "path": str(EDITORIAL / "manifeste-edition.json"), "sha256": sha(EDITORIAL / "manifeste-edition.json")},
+        "main_pages": 16, "supplement_pages": 198, "visually_reviewed_pages": 214, "public_publication": False})
+    old_comparison = read(HERE / "guides-avant/MANIFEST-LIVRAISON.json")
+    differences = [n for n, digest in old_comparison["files"].items() if sha(COMPARE / n) != digest]
+    allowed = {"REPRISE.md", "COORDINATION-SOURCE-ONLY.md", "SUIVI-AUTOMATISE-ACTUEL.md", "suivi-a-faire.json", "ETAT-ACTUEL.md"}
+    assert set(differences) <= allowed, differences
+    for name in differences:
+        assert sha(HERE / "guides-avant" / name) == old_comparison["files"][name]
+    save(COMPARE / "dernier-arrete-verifie.json", {"verified": True, "verified_utc": now,
+        "closed_sol_receipt": {"path": str(HERE / "reception-verifiee.json"), "sha256": sha(HERE / "reception-verifiee.json")},
+        "r1_continuation": {"path": str(HERE / "continuation-verifiee.json"), "sha256": sha(HERE / "continuation-verifiee.json")},
+        "professional_manifest_sha256": sha(EDITORIAL / "manifeste-edition.json"), "source_only_final_results_received": False})
+    static = {COMPARE / n for n in old_comparison["files"]}
+    static |= {COMPARE / "ETAT-ACTUEL.md", COMPARE / "dernier-arrete-verifie.json"}
+    comparison = {**{k: v for k, v in old_comparison.items() if k != "files"}, "observed_utc": now,
+        "scope": "Sol MAX closed/audited; same R1 queue continues Luna xhigh; first source-only group still running",
+        "prior_manifest_files_verified_before_updates": len(old_comparison["files"]),
+        "prior_files_still_identical": len(old_comparison["files"]) - len(differences), "backed_up_guides_updated": differences,
+        "previous_manifest_preserved_under": str(HERE / "guides-avant"), "existing_R1_next_group_job_id": "749940",
+        "current_R1_worker_pids": [3496, 4952], "current_R1_observer_pids": [50696, 55100],
+        "Sol_MAX_closed_job_id": "749415", "professional_main_pages": 16, "professional_supplement_pages": 198,
+        "professional_visually_reviewed_pages": 214, "automation_prompt_verified": True,
+        "files": {p.relative_to(COMPARE).as_posix(): sha(p) for p in sorted(static)}}
+    save(COMPARE / "MANIFEST-LIVRAISON.json", comparison)
+    save(HERE / "integrite-apres-edition.json", {"verified": True, "verified_utc": now,
+        "sol_restored_files_including_manifest_unchanged": 9268, "previous_edition_files_unchanged": 2488,
+        "source_files_verified": {"R1": 90, "source_only": 94}, "source_only_first_reception_still_pending": True,
+        "article_delivery_manifest_sha256": sha(EDITORIAL / "manifeste-edition.json"),
+        "comparison_delivery_manifest_sha256": sha(COMPARE / "MANIFEST-LIVRAISON.json"),
+        "new_model_calls_for_reception_or_article": 0, "new_candidate_executions_for_reception_or_article": 0})
+    for base, doc in ((STUDY, manifest), (COMPARE, comparison)):
+        assert all(sha(base / n) == digest for n, digest in doc["files"].items())
+    print(json.dumps({"verified": True, "article_files": len(manifest["files"]), "comparison_files": len(static),
+        "restored_files_unchanged": 9268, "preserved_version_files": 2488, "automation_verified": True,
+        "pages_reviewed": 214, "R1_current_job": "749940", "source_only_current_job": "749843"}))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,419 @@
+#include "knn.h"
+#include <float.h>
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+enum {
+    KNN_TILE_POINTS = 256,
+    KNN_RADIX_BITS = 11,
+    KNN_RADIX_BUCKETS = 1 << KNN_RADIX_BITS
+};
+
+static char knn_vote(const size_t *counts) {
+    char winner = (char)-1;
+    size_t best = 0;
+
+    for (int i = 0; i <= UCHAR_MAX; i++) {
+        char label = (char)(unsigned char)i;
+        if (counts[i] > best ||
+            (counts[i] == best && best != 0 && label < winner)) {
+            winner = label;
+            best = counts[i];
+        }
+    }
+    return winner;
+}
+
+static char knn_insertion_fallback(int n_groups, Group *groups, int k,
+                                   Point target) {
+    char *labels = (char *)malloc((size_t)k * sizeof(*labels));
+    float *distances = (float *)malloc((size_t)k * sizeof(*distances));
+    float block_distances[KNN_TILE_POINTS];
+    size_t counts[UCHAR_MAX + 1] = {0};
+
+    if (labels == NULL || distances == NULL) {
+        free(labels);
+        free(distances);
+        on_error();
+    }
+
+    for (int i = 0; i < k; i++) {
+        labels[i] = (char)-1;
+        distances[i] = -1.0f;
+    }
+
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length;) {
+            int count = g.length - j;
+            if (count > KNN_TILE_POINTS) count = KNN_TILE_POINTS;
+            const Point *points = g.points + j;
+            const float cutoff = distances[k - 1];
+            const int have_cutoff = cutoff != -1.0f;
+            int any_candidate = 0;
+
+#ifdef _OPENMP
+#pragma omp simd reduction(|:any_candidate)
+#endif
+            for (int b = 0; b < count; b++) {
+                float d = euclidean_distance_no_sqrt(target, points[b]);
+                int retain = !have_cutoff || !(d >= cutoff);
+                block_distances[b] = retain ? d : -1.0f;
+                any_candidate |= retain;
+            }
+
+            if (any_candidate) {
+                for (int b = 0; b < count; b++) {
+                    float d = block_distances[b];
+                    if (d == -1.0f) continue;
+                    float current_cutoff = distances[k - 1];
+                    if (current_cutoff != -1.0f && d >= current_cutoff) continue;
+
+                    for (int x = 0; x < k; x++) {
+                        if (d < distances[x] || distances[x] == -1.0f) {
+                            for (int y = k - 1; y > x; y--) {
+                                distances[y] = distances[y - 1];
+                                labels[y] = labels[y - 1];
+                            }
+                            distances[x] = d;
+                            labels[x] = g.label;
+                            break;
+                        }
+                    }
+                }
+            }
+            j += count;
+        }
+    }
+
+    for (int i = 0; i < k; i++) counts[(unsigned char)labels[i]]++;
+    free(labels);
+    free(distances);
+    return knn_vote(counts);
+}
+
+static int knn_distance_keys(Point target, const Point *points, int count,
+                             uint32_t *keys, uint32_t lower, uint32_t upper,
+                             int *any_candidate) {
+    float distances[KNN_TILE_POINTS];
+
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int i = 0; i < count; i++) {
+        distances[i] = euclidean_distance_no_sqrt(target, points[i]);
+    }
+
+    int invalid = 0;
+    int any = 0;
+#ifdef _OPENMP
+#pragma omp simd reduction(|:invalid, any)
+#endif
+    for (int i = 0; i < count; i++) {
+        uint32_t bits;
+        memcpy(&bits, &distances[i], sizeof(bits));
+        uint32_t magnitude = bits & UINT32_C(0x7fffffff);
+        uint32_t key = magnitude == 0 ? UINT32_C(0) : bits;
+        invalid |= magnitude > UINT32_C(0x7f800000) ||
+                   ((bits & UINT32_C(0x80000000)) != 0 && magnitude != 0);
+        keys[i] = key;
+        any |= key >= lower && key <= upper;
+    }
+    *any_candidate = any;
+    return !invalid;
+}
+
+static int knn_first_group(const size_t *offsets, int n_groups,
+                            size_t position) {
+    int low = 0;
+    int high = n_groups;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        if (offsets[middle + 1] <= position) low = middle + 1;
+        else high = middle;
+    }
+    return low;
+}
+
+static int knn_histogram(int n_groups, const Group *groups,
+                         const size_t *offsets, size_t total,
+                         size_t block_size, int workers, Point target,
+                         uint32_t prefix, uint32_t prefix_mask, int shift,
+                         size_t *bins) {
+    size_t blocks = total / block_size + (total % block_size != 0);
+    uint32_t upper = prefix | ~prefix_mask;
+    int invalid = 0;
+#ifndef _OPENMP
+    (void)workers;
+#endif
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(workers) if(workers > 1) reduction(|:invalid)
+#endif
+    {
+        size_t local_bins[KNN_RADIX_BUCKETS] = {0};
+        uint32_t keys[KNN_TILE_POINTS];
+
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (size_t block = 0; block < blocks; block++) {
+            if (invalid) continue;
+            size_t begin = block * block_size;
+            size_t remaining = total - begin;
+            size_t end = begin + (remaining < block_size ? remaining : block_size);
+            int first_group = knn_first_group(offsets, n_groups, begin);
+
+            for (int group = first_group;
+                 group < n_groups && offsets[group] < end && !invalid; group++) {
+                size_t point = begin > offsets[group] ? begin - offsets[group] : 0;
+                size_t stop = offsets[group + 1] < end ? offsets[group + 1] : end;
+                stop -= offsets[group];
+
+                while (point < stop) {
+                    size_t left = stop - point;
+                    int count = left > KNN_TILE_POINTS ? KNN_TILE_POINTS : (int)left;
+                    int any_candidate;
+                    if (!knn_distance_keys(target, groups[group].points + point,
+                                           count, keys, prefix, upper,
+                                           &any_candidate)) {
+                        invalid = 1;
+                        break;
+                    }
+                    if (any_candidate) {
+                        for (int b = 0; b < count; b++) {
+                            if ((keys[b] & prefix_mask) == prefix) {
+                                local_bins[(keys[b] >> shift) &
+                                           (KNN_RADIX_BUCKETS - 1)]++;
+                            }
+                        }
+                    }
+                    point += (size_t)count;
+                }
+            }
+        }
+
+#ifdef _OPENMP
+#pragma omp critical(knn_histogram_merge)
+#endif
+        {
+            for (int b = 0; b < KNN_RADIX_BUCKETS; b++) bins[b] += local_bins[b];
+        }
+    }
+    return !invalid;
+}
+
+static int knn_count_selected(int n_groups, const Group *groups,
+                              const size_t *offsets, size_t total,
+                              size_t block_size, int workers, Point target,
+                              uint32_t cutoff, size_t *counts,
+                              size_t *equal_counts) {
+    size_t blocks = total / block_size + (total % block_size != 0);
+    int invalid = 0;
+#ifndef _OPENMP
+    (void)workers;
+#endif
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(workers) if(workers > 1) reduction(|:invalid)
+#endif
+    {
+        size_t local_counts[UCHAR_MAX + 1] = {0};
+        uint32_t keys[KNN_TILE_POINTS];
+
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (size_t block = 0; block < blocks; block++) {
+            if (invalid) continue;
+            size_t begin = block * block_size;
+            size_t remaining = total - begin;
+            size_t end = begin + (remaining < block_size ? remaining : block_size);
+            int first_group = knn_first_group(offsets, n_groups, begin);
+
+            for (int group = first_group;
+                 group < n_groups && offsets[group] < end && !invalid; group++) {
+                size_t point = begin > offsets[group] ? begin - offsets[group] : 0;
+                size_t stop = offsets[group + 1] < end ? offsets[group + 1] : end;
+                stop -= offsets[group];
+                size_t below = 0;
+                size_t equal = 0;
+
+                while (point < stop) {
+                    size_t left = stop - point;
+                    int count = left > KNN_TILE_POINTS ? KNN_TILE_POINTS : (int)left;
+                    int any_candidate;
+                    if (!knn_distance_keys(target, groups[group].points + point,
+                                           count, keys, UINT32_C(0), cutoff,
+                                           &any_candidate)) {
+                        invalid = 1;
+                        break;
+                    }
+                    if (any_candidate) {
+#ifdef _OPENMP
+#pragma omp simd reduction(+:below, equal)
+#endif
+                        for (int b = 0; b < count; b++) {
+                            below += keys[b] < cutoff;
+                            equal += keys[b] == cutoff;
+                        }
+                    }
+                    point += (size_t)count;
+                }
+
+                local_counts[(unsigned char)groups[group].label] += below;
+                if (equal != 0) {
+#ifdef _OPENMP
+#pragma omp atomic update
+#endif
+                    equal_counts[group] += equal;
+                }
+            }
+        }
+
+#ifdef _OPENMP
+#pragma omp critical(knn_count_merge)
+#endif
+        {
+            for (int label = 0; label <= UCHAR_MAX; label++) {
+                counts[label] += local_counts[label];
+            }
+        }
+    }
+    return !invalid;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    size_t counts[UCHAR_MAX + 1] = {0};
+    size_t total = 0;
+
+    if (k <= 0) return (char)-1;
+
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t)groups[i].length;
+            if (length > SIZE_MAX - total) {
+                return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+            }
+            total += length;
+        }
+    }
+
+    if ((size_t)k >= total) {
+        for (int i = 0; i < n_groups; i++) {
+            if (groups[i].length > 0) {
+                counts[(unsigned char)groups[i].label] += (size_t)groups[i].length;
+            }
+        }
+        counts[(unsigned char)(char)-1] += (size_t)k - total;
+        return knn_vote(counts);
+    }
+
+    if (sizeof(float) != sizeof(uint32_t) || FLT_RADIX != 2 ||
+        FLT_MANT_DIG != 24 || FLT_MAX_EXP != 128 ||
+        (size_t)n_groups > SIZE_MAX / sizeof(size_t) - 1) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t *offsets = (size_t *)malloc(((size_t)n_groups + 1) * sizeof(*offsets));
+    size_t *equal_counts = (size_t *)calloc((size_t)n_groups, sizeof(*equal_counts));
+    if (offsets == NULL || equal_counts == NULL) {
+        free(offsets);
+        free(equal_counts);
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    offsets[0] = 0;
+    for (int i = 0; i < n_groups; i++) {
+        size_t length = groups[i].length > 0 ? (size_t)groups[i].length : 0;
+        offsets[i + 1] = offsets[i] + length;
+    }
+
+    int workers = 1;
+#ifdef _OPENMP
+    workers = omp_get_max_threads();
+    size_t max_workers = total / 4096;
+    if ((size_t)workers > max_workers) workers = (int)max_workers;
+    if (workers < 1) workers = 1;
+#endif
+    size_t block_size = total / ((size_t)workers * 8);
+    if (block_size < 1024) block_size = 1024;
+    if (block_size > 16384) block_size = 16384;
+
+    size_t rank = (size_t)k;
+    size_t take_equal = 0;
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    uint32_t cutoff = 0;
+
+    for (int shift = 22; shift >= 0; shift -= KNN_RADIX_BITS) {
+        size_t bins[KNN_RADIX_BUCKETS] = {0};
+        if (!knn_histogram(n_groups, groups, offsets, total, block_size,
+                           workers, to_evaluate, prefix, prefix_mask, shift,
+                           bins)) {
+            free(offsets);
+            free(equal_counts);
+            return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+        }
+
+        int bucket = 0;
+        while (bucket < KNN_RADIX_BUCKETS && rank > bins[bucket]) {
+            rank -= bins[bucket];
+            bucket++;
+        }
+        if (bucket == KNN_RADIX_BUCKETS) {
+            free(offsets);
+            free(equal_counts);
+            return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+        }
+
+        prefix |= (uint32_t)bucket << shift;
+        prefix_mask |= (uint32_t)(KNN_RADIX_BUCKETS - 1) << shift;
+        cutoff = prefix;
+        take_equal = rank;
+        if (rank == bins[bucket]) {
+            /* The entire remaining prefix interval is selected. */
+            cutoff = prefix | ~prefix_mask;
+            break;
+        }
+    }
+
+    if (!knn_count_selected(n_groups, groups, offsets, total, block_size,
+                            workers, to_evaluate, cutoff, counts, equal_counts)) {
+        free(offsets);
+        free(equal_counts);
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    /* Within a group all boundary ties have the same label. */
+    for (int i = 0; i < n_groups && take_equal != 0; i++) {
+        size_t take = equal_counts[i] < take_equal ? equal_counts[i] : take_equal;
+        counts[(unsigned char)groups[i].label] += take;
+        take_equal -= take;
+    }
+
+    free(offsets);
+    free(equal_counts);
+    return knn_vote(counts);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

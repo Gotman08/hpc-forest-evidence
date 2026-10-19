@@ -1,0 +1,321 @@
+"""Export de figures uniquement : lecture de résultats reçus, aucune expérience.
+
+Python local utilisé : Python313 avec Matplotlib3.10.8. Aucun appel de modèle,
+processus de recherche, test scientifique, compilation ou modification de source.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+from datetime import UTC, datetime
+import hashlib
+import json
+import math
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, Patch
+from matplotlib.ticker import MultipleLocator
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[1]
+STUDY = BASE / "outputs/HPC-Forest-Etude-2020-2024-r1"
+PREP = BASE / "outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3"
+OP = PREP / "operations-parent-premier-roots-source110-r1"
+MODELS = [
+    ("luna", "gpt-6-luna", "Luna", "#1f77b4"),
+    ("astra", "gpt-6-astra", "Astra", "#ff7f0e"),
+    ("terra", "gpt-5.6-terra", "Terra", "#2ca02c"),
+    ("sol", "gpt-6.1-sol", "Sol", "#9467bd"),
+]
+INK, MUTED, GRID, PAPER = "#17243a", "#59677a", "#e4eaf1", "#f3f6fa"
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class Inputs:
+    def __init__(self):
+        self.refs = {}
+
+    def read(self, path, expected=None):
+        path = Path(path).resolve(strict=True)
+        require(path.is_relative_to(BASE) and not path.is_symlink(), "source locale ordinaire requise")
+        raw = path.read_bytes()
+        checksum = hashlib.sha256(raw).hexdigest()
+        require(expected is None or checksum == expected, "SHA source différent : " + path.name)
+        self.refs[str(path)] = {"path": str(path), "sha256": checksum, "bytes": len(raw)}
+        return json.loads(raw.decode("utf-8-sig")), self.refs[str(path)]
+
+    def unchanged(self):
+        require(all(sha(path) == ref["sha256"] for path, ref in self.refs.items()), "une source a changé durant l’export")
+
+
+def load_data():
+    inputs = Inputs()
+    rows, subjects = [], None
+    for slug, model, label, color in MODELS:
+        value, source = inputs.read(STUDY / ("resultats-couverture-" + slug + "-max.json"))
+        received = value["rows"]
+        names = [row["subject"] for row in received]
+        require(len(received) == len(set(names)) == 14, "quatorze sujets distincts par couverture")
+        require(subjects is None or subjects == names, "ordre des sujets différent")
+        subjects = names
+        for row in received:
+            require(row["model"] == model and row["effort"] == "max", "uniquement cellules MAX du bon modèle")
+            gain = row["gain_fraction"]
+            require(type(gain) in (int, float) and math.isfinite(gain) and 0 <= gain <= 1, "gain fractionnel hors échelle")
+            confirmation = row["confirmation"]
+            require(math.isclose(gain, confirmation["improvement_fraction"], abs_tol=1e-12), "gain et confirmation différents")
+            rows.append({"revision": "R1", "subject": row["subject"], "model": model, "model_label": label,
+                "effort": "max", "gain_fraction": gain, "gain_percent": gain * 100,
+                "reference_seconds": confirmation["reference_seconds"], "mean_seconds": confirmation["mean_seconds"],
+                "baseline_retained": confirmation["is_baseline"], "job_id": str(row["job_id"]),
+                "status": "received_R1_result", "source": source, "archive_sha256": value["archive_sha256"],
+                "confirmation_digest": confirmation["evaluation_digest"]})
+    count, count_ref = inputs.read(STUDY / "resultats-vingt-couples-count.json")
+    count_rows = [row for row in count["rows"] if row["effort"] == "max"]
+    require(count["subject"] == "2023-count" and len(count_rows) == 4
+            and {row["model"] for row in count_rows} == {item[1] for item in MODELS}, "quatre count MAX requis")
+    labels = {model: label for _, model, label, _ in MODELS}
+    for row in count_rows:
+        _, audit_ref = inputs.read(row["audit_path"], row["audit_sha256"])
+        gain = row["gain_fraction"]
+        confirmation = row["confirmation"]
+        require(0 <= gain <= 1 and math.isclose(gain, confirmation["improvement_fraction"], abs_tol=1e-12), "count gain différent")
+        rows.append({"revision": "R1", "subject": "2023-count", "model": row["model"], "model_label": labels[row["model"]],
+            "effort": "max", "gain_fraction": gain, "gain_percent": gain * 100,
+            "reference_seconds": confirmation["reference_seconds"], "mean_seconds": confirmation["mean_seconds"],
+            "baseline_retained": confirmation["is_baseline"], "job_id": str(row["job_id"]),
+            "status": "received_R1_result", "source": count_ref, "audit": audit_ref,
+            "archive_sha256": row["archive_sha256"], "confirmation_digest": confirmation["evaluation_digest"]})
+    subjects = [*subjects, "2023-count"]
+    require(len(rows) == len({(r["subject"], r["model"]) for r in rows}) == 60, "60cellules uniques requises")
+
+    r2_path = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r1/reception-finale-751992/reception-finale-bornee.json"
+    luna, luna_ref = inputs.read(r2_path, "bc6fdfd229ff3ffaca95d80ae86960bcc74846f3f96b1fea55bbcb69039692ce")
+    require(luna["independent_performance_audit_verified"] is False and luna["lineage_and_five_confirmations_verified"] is True,
+            "le résultat R2 Luna doit rester provisoire")
+    r2g_path = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g/RECEPTION-FINALE-ET-CLOTURE-VERIFIEE.json"
+    r2g, r2g_ref = inputs.read(r2g_path)
+    recon, recon_ref = inputs.read(r2g["reconciliation"]["path"], r2g["reconciliation"]["sha256"])
+    require(recon["received_invocations"] == 10 and recon["exact_known_invocations"] == 7
+            and recon["exact_known_tokens"] == 146676 and recon["unmeasured_invocations"] == 3
+            and recon["exact_total_tokens"] is None and r2g["five_confirmations_verified"] is False
+            and r2g["independent_performance_verified"] is False and r2g["pipeline_complete"] is False,
+            "R2g reste clos partiel, sans gain final admissible ni total exact")
+    r3, r3_ref = inputs.read(OP / "reception-roots-R7-zero-appel-preparee-r1/execution-root-01/RECONCILIATION-TROIS-ROOTS-ZERO-APPEL.json")
+    require(r3["prepared_requests"] == 3 and all(r3[key] == 0 for key in ("published_requests", "native_invocations", "native_model_calls", "responses", "deliveries")),
+            "statut R7 attendu à zéro appel")
+    controller, controller_ref = inputs.read(BASE / "outputs/HPC-Forest-R5-Evaluation-r1/resultats-controleur.json",
+        "3b4202b065c186515bf85915ef2d6faeec253002a5315289eb5c025483eeb302")
+    require(controller["scope"] == "fixed_synthetic_trace_controller_overhead_only"
+            and controller["native_search_cells_run"] == 0 and controller["program_speedup_established"] is False
+            and controller["learning_gain_established"] is False, "contrôleur synthétique seulement")
+    comparisons = [row for row in controller["comparisons"] if row["comparison"] == "same_r5_pipeline"]
+    require(len(comparisons) == 2 and {row["trials"] for row in comparisons} == {8, 32}
+            and all(row["program_speedup_demonstrated"] is False for row in comparisons), "comparaison contrôleur homogène requise")
+    data = {"schema": "hpc-forest-plot-all-revisions-evidence-v1", "created_utc": datetime.now(UTC).isoformat(),
+        "R1": {"subjects": subjects, "subjects_count": 15, "received_max_cells": 60, "rows": rows,
+               "metric": "100 * gain_fraction : réduction du temps par rapport à la référence de la cellule",
+               "aggregate_mean_computed": False, "error_bars_estimated": False},
+        "R2": {"provisional_luna": {"reported_by_checker_only": True, "independent_performance_verified": False,
+               "gain_percent": 100 * luna["reported_result_from_frozen_checker"]["improvement_fraction"],
+               "reference_seconds": luna["reported_result_from_frozen_checker"]["reference_seconds"],
+               "mean_seconds": luna["reported_result_from_frozen_checker"]["mean_seconds"],
+               "confirmation_candidates": luna["confirmation_candidates"], "measurements_per_confirmation": luna["measurements_per_confirmation"],
+               "source": luna_ref},
+               "R2g": {"state": "clos partiel", "received_invocations": 10, "known_exact_tokens": 146676,
+               "measured_invocations": 7, "unmeasured_invocations": 3, "exact_total_tokens": None,
+               "performance_admitted": False, "source": r2g_ref, "reconciliation": recon_ref}},
+        "R3_R4b": {"state": "parcours en qualification", "R7_prepared_requests": 3, "R7_native_calls": 0,
+                    "scientific_gain_established": False, "source": r3_ref,
+                    "limit": "zéro concerne les trois stages R7 clos ; ne supprime aucun ancien négatif R3"},
+        "R5": {"state": "recherche native non lancée", "native_search_cells_run": 0,
+               "HPC_program_gain_established": False, "learning_gain_established": False,
+               "controller_only": {"scope": controller["scope"], "job_id": str(controller["job_id"]),
+               "measured_cycles": controller["measured_cycles"], "comparisons": comparisons, "source": controller_ref}},
+        "limits": ["Les états R2/R3/R5 ne sont pas des gains nuls : les performances admissibles y sont absentes ou provisoires.",
+                   "Le résultat R2 Luna est déclaré par le checker ; son attribution/performance indépendante n’est pas validée.",
+                   "Les réductions R5 concernent uniquement le coût d’un contrôleur sur trace synthétique.",
+                   "Chaque cellule possède sa propre référence ; aucune moyenne entre sujets, aucun classement causal, aucune incertitude statistique inventée.",
+                   "Quicksort : conformité algorithmique complète non établie ; astérisque de réserve sur les figures.",
+                   "Le logiciel de figure ne rejoue aucune recherche, mesure, modèle ou test scientifique."]}
+    return data, inputs
+
+
+def percent(value, digits=1):
+    return f"{value:.{digits}f}".replace(".", ",") + " %"
+
+
+def setup_style():
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 12, "axes.labelcolor": INK,
+        "text.color": INK, "xtick.color": MUTED, "ytick.color": INK, "axes.edgecolor": GRID,
+        "pdf.fonttype": 42, "ps.fonttype": 42, "svg.fonttype": "none", "figure.facecolor": PAPER,
+        "savefig.facecolor": PAPER})
+
+
+def r1_plot(ax, data, *, standalone=False):
+    subjects = data["R1"]["subjects"]
+    table = {(row["subject"], row["model"]): row for row in data["R1"]["rows"]}
+    n = len(subjects)
+    for index, subject in enumerate(subjects):
+        if index % 2 == 0:
+            ax.axhspan(index - .48, index + .48, color="#f5f8fc", zorder=0)
+    for k, (_, model, label, color) in enumerate(MODELS):
+        positions = [index + (k - 1.5) * .19 for index in range(n)]
+        values = [table[(subject, model)]["gain_percent"] for subject in subjects]
+        ax.barh(positions, values, height=.155, color=color, label=label, zorder=3)
+        for position, value in zip(positions, values):
+            inside = value >= 92
+            ax.text(value - .9 if inside else value + .8, position, percent(value),
+                    va="center", ha="right" if inside else "left", fontsize=10.5 if standalone else 10,
+                    color="white" if inside else color, fontweight="bold", zorder=4)
+    labels = [subject.replace("-", "  ·  ", 1) + (" *" if subject == "2020-quicksort" else "") for subject in subjects]
+    ax.set(yticks=range(n), yticklabels=labels, xlim=(0, 100), ylim=(n - .45, -.65))
+    ax.tick_params(axis="y", length=0, pad=13, labelsize=12.5 if standalone else 12)
+    ax.tick_params(axis="x", length=0, pad=9, labelsize=11)
+    ax.xaxis.set_major_locator(MultipleLocator(20))
+    ax.xaxis.set_major_formatter(lambda value, _pos: f"{int(value)} %")
+    ax.grid(axis="x", color=GRID, lw=.8, zorder=1)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_xlabel("Réduction du temps d’exécution par rapport à la référence (%)", labelpad=15, fontsize=12)
+    ax.legend(handles=[Patch(facecolor=color, label=label) for _, _, label, color in MODELS],
+              ncol=4, loc="lower left", bbox_to_anchor=(0, 1.018), frameon=False,
+              handlelength=1.1, handleheight=.9, columnspacing=2.2, fontsize=13)
+
+
+def card(fig, rectangle, tag, title, *, accent="#cbd5e1"):
+    ax = fig.add_axes(rectangle)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    box = FancyBboxPatch((0, 0), 1, 1, boxstyle="round,pad=0.012,rounding_size=0.025",
+        linewidth=.9, edgecolor="#dce4ed", facecolor="white", transform=ax.transAxes, clip_on=False)
+    ax.add_patch(box)
+    ax.plot([0, .09], [.89, .89], color=accent, lw=4, solid_capstyle="round")
+    ax.text(.12, .89, tag, fontsize=12, fontweight="bold", color=MUTED, va="center")
+    ax.text(.055, .74, title, fontsize=18, fontweight="bold", va="center")
+    return ax
+
+
+def full_figure(data):
+    fig = plt.figure(figsize=(21, 16.4))
+    fig.text(.045, .956, "HPC-Forest", fontsize=31, fontweight="bold")
+    fig.text(.045, .926, "Résultats et avancement · toutes les révisions", fontsize=20, color=MUTED)
+    fig.text(.955, .953, "MAX UNIQUEMENT", ha="right", fontsize=13, fontweight="bold", color="#64748b")
+    fig.text(.955, .929, "Instantané du 18 octobre 2026", ha="right", fontsize=12, color=MUTED)
+    fig.text(.145, .878, "R1  ·  15 sujets / 60 cellules reçues", fontsize=19, fontweight="bold")
+    ax = fig.add_axes([.145, .125, .515, .715], facecolor="white")
+    r1_plot(ax, data)
+    fig.text(.145, .078, "Chaque cellule possède sa propre référence ; 0,0 % : référence conservée.", fontsize=11, color=MUTED)
+    fig.text(.145, .059, "Une graine par cellule ; aucun classement causal ni moyenne globale.", fontsize=11, color=MUTED)
+    fig.text(.145, .041, "* Quicksort : conformité algorithmique complète non établie.", fontsize=11, color=MUTED)
+
+    r2 = card(fig, [.714, .659, .247, .224], "R2 · RECHERCHE NATIVE", "Résultat provisoire", accent="#d8b477")
+    gain = data["R2"]["provisional_luna"]["gain_percent"]
+    r2.text(.055, .59, "Luna · gain déclaré par le checker", fontsize=12.2)
+    r2.barh([.45], [gain / 100 * .89], left=.055, height=.115, facecolor="#dbeaf6",
+            edgecolor=MODELS[0][3], hatch="////", linewidth=.8)
+    r2.text(.065, .45, percent(gain, 2), va="center", fontsize=17, fontweight="bold", color="#185b8b")
+    r2.text(.055, .30, "Audit indépendant de performance\nnon validé · 3 candidats × 5 mesures", fontsize=11.3, color="#8a5d27", va="top", linespacing=1.4)
+    r2.text(.055, .09, "R2g : 10 livraisons, clôture partielle ;\n7 usages mesurés, 3 non mesurés.", fontsize=11.1, color=MUTED, va="center", linespacing=1.35)
+
+    r3 = card(fig, [.714, .451, .247, .178], "R3 / R4b · MÈRE DYNAMIQUE", "Parcours en qualification", accent="#88a9d1")
+    r3.text(.055, .50, "0 appel de modèle", fontsize=23, fontweight="bold")
+    r3.text(.055, .32, "sur les trois stages R7 clos", fontsize=12.5, color=MUTED)
+    r3.text(.055, .13, "Aucun gain scientifique reçu pour R7.\nQualifications mécaniques ≠ performance.", fontsize=11.5, va="center", color=MUTED, linespacing=1.4)
+
+    r5 = card(fig, [.714, .287, .247, .134], "R5 · RECHERCHE NATIVE", "Non lancée", accent="#a8b2c1")
+    r5.text(.055, .43, "0 cellule de recherche native", fontsize=14, fontweight="bold")
+    r5.text(.055, .15, "Gains HPC et apprentissage non établis.", fontsize=11.7, color=MUTED)
+
+    overhead = card(fig, [.714, .078, .247, .181], "MESURE DISTINCTE", "Contrôleur synthétique", accent="#7c8b9f")
+    overhead.text(.055, .60, "Réduction du temps par cycle", fontsize=11.5, color=MUTED)
+    for y, row in zip((.43, .25), sorted(data["R5"]["controller_only"]["comparisons"], key=lambda r: r["trials"])):
+        value = row["controller_time_reduction_percent"]
+        overhead.barh([y], [.64], left=.25, height=.105, color="#eef1f5")
+        overhead.barh([y], [value / 100 * .64], left=.25, height=.105, color="#7e8ca0")
+        overhead.text(.055, y, str(row["trials"]) + " cycles", va="center", fontsize=11.2, color=MUTED)
+        overhead.text(.92, y, percent(value, 2), va="center", ha="right", fontsize=11.5, fontweight="bold")
+    overhead.text(.055, .07, "Même pipeline R5 · aucune accélération HPC prouvée", fontsize=9.4, color=MUTED)
+    fig.text(.045, .022, "Barres colorées : résultats R1 par cellule. Hachures : déclaration provisoire R2. Gris : contrôleur uniquement.",
+             fontsize=11, color=MUTED)
+    return fig
+
+
+def r1_figure(data):
+    fig = plt.figure(figsize=(16.4, 16))
+    fig.text(.055, .953, "HPC-Forest · R1 MAX", fontsize=29, fontweight="bold")
+    fig.text(.055, .923, "15 sujets · 4 modèles · 60 cellules reçues", fontsize=18, color=MUTED)
+    ax = fig.add_axes([.205, .115, .738, .735], facecolor="white")
+    r1_plot(ax, data, standalone=True)
+    fig.text(.205, .068, "Chaque cellule possède sa propre référence ; 0,0 % : référence conservée.", fontsize=11.5, color=MUTED)
+    fig.text(.205, .045, "Une graine par cellule ; aucun classement causal ni moyenne globale.", fontsize=11.5, color=MUTED)
+    fig.text(.205, .022, "* Quicksort : conformité algorithmique complète non établie.", fontsize=11.5, color=MUTED)
+    return fig
+
+
+def export_figure(fig, target):
+    for extension in ("png", "pdf", "svg"):
+        fig.savefig(target.with_suffix("." + extension), dpi=300, facecolor=PAPER,
+                    metadata={"Creator": "HPC-Forest / Matplotlib"} if extension == "pdf" else None)
+    fig.savefig(target.with_name(target.name + "-apercu").with_suffix(".png"), dpi=105, facecolor=PAPER)
+    plt.close(fig)
+
+
+def write_json(path, value):
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    args = parser.parse_args()
+    output = args.output_directory.resolve()
+    require(output.parent == HERE and not output.exists(), "nouveau dossier direct d’export requis")
+    data, inputs = load_data()
+    output.mkdir()
+    setup_style()
+    export_figure(full_figure(data), output / "HPC-Forest-toutes-revisions")
+    export_figure(r1_figure(data), output / "HPC-Forest-R1-MAX-15-sujets")
+    write_json(output / "donnees-et-etats.json", data)
+    fields = ["revision", "subject", "model", "effort", "gain_fraction", "gain_percent", "reference_seconds", "mean_seconds", "baseline_retained", "job_id", "source_path", "source_sha256"]
+    with (output / "donnees-R1-MAX.csv").open("x", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, delimiter=";")
+        writer.writeheader()
+        for row in data["R1"]["rows"]:
+            writer.writerow({**{key: row[key] for key in fields if key in row}, "source_path": row["source"]["path"], "source_sha256": row["source"]["sha256"]})
+    with (output / "donnees-controleur-R5-seulement.csv").open("x", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["comparison", "trials", "reference_ms", "candidate_ms", "controller_time_reduction_percent", "program_speedup_demonstrated"], delimiter=";")
+        writer.writeheader()
+        for row in data["R5"]["controller_only"]["comparisons"]:
+            writer.writerow({key: row[key] for key in writer.fieldnames})
+    inputs.unchanged()
+    write_json(output / "PROVENANCE.json", {"schema": "hpc-forest-plot-provenance-v1", "created_utc": data["created_utc"],
+        "exporter": {"path": str(Path(__file__)), "sha256": sha(__file__)}, "matplotlib_version": matplotlib.__version__,
+        "source_inputs_before_after_equal": True, "sources": list(inputs.refs.values()), "R1_cells": 60,
+        "palette": {label: color for _, _, label, color in MODELS}, "no_scientific_execution": True,
+        "no_global_mean_or_invented_error_bars": True, "limits": data["limits"]})
+    (output / "PROVENANCE.md").write_text("# Provenance du graphique\n\n"
+        "R1 : quatre couvertures de14sujets MAX et quatre count MAX reçus, soit15sujets/60cellules. Gains repris cellule par cellule ; les audits count sont rehashés.\n\n"
+        "R2 : Luna751992 est une déclaration du checker (88,21%), avec3candidats×5mesures ; audit indépendant de performance non validé. R2g est clos partiel :10livraisons,7usages mesurés/146676jetons connus et3usages non mesurés, sans total exact ni gain final admis.\n\n"
+        "R3/R4b : état de qualification ; les trois stages R7 sont clos à zéro appel, sans effacer les anciens négatifs R3. R5 : zéro cellule de recherche native. Les deux réductions grises R5 mesurent seulement un contrôleur sur trace synthétique, même pipeline, aucun gain HPC ou apprentissage établi.\n\n"
+        "Chaque cellule R1 possède sa propre référence ; aucune inférence de classement causal. Quicksort porte un astérisque : conformité algorithmique complète non établie. Les labels8/32cycles du contrôleur reprennent les deux configurations de la trace, conservées sous le champ source trials dans les données exactes.\n\n"
+        "Les sources sont hachées avant/après ; JSON et CSV conservent les valeurs exactes. Affichage arrondi en français. Aucun modèle, mesure, test scientifique ou article n’est relancé/modifié. Aucune moyenne globale et aucune barre d’erreur inventée.\n", encoding="utf8")
+    print(json.dumps({"output_directory": str(output), "R1_subjects": 15, "R1_cells": 60, "sources_unchanged": True}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

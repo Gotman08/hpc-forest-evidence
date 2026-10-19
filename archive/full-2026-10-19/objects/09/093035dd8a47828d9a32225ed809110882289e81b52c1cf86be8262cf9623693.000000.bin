@@ -1,0 +1,139 @@
+#include <iostream>
+#include <vector>
+#include <cstdio>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+
+static inline int64x2_t maximum_i64(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+static inline std::int64_t horizontal_maximum(
+    const std::int64_t* columns, int n, int s) {
+    std::int64_t window = 0;
+    for (int col = 0; col < s; ++col) {
+        window += columns[col];
+    }
+    std::int64_t maximum = window;
+    int col = s;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const int64x2_t zero = vdupq_n_s64(0);
+    int64x2_t carry = vdupq_n_s64(window);
+    int64x2_t maximum0 = carry;
+    int64x2_t maximum1 = carry;
+    int64x2_t maximum2 = carry;
+    int64x2_t maximum3 = carry;
+
+    for (; col + 7 < n; col += 8) {
+        int64x2_t prefix0 = vsubq_s64(
+            vld1q_s64(columns + col),
+            vld1q_s64(columns + col - s));
+        int64x2_t prefix1 = vsubq_s64(
+            vld1q_s64(columns + col + 2),
+            vld1q_s64(columns + col - s + 2));
+        int64x2_t prefix2 = vsubq_s64(
+            vld1q_s64(columns + col + 4),
+            vld1q_s64(columns + col - s + 4));
+        int64x2_t prefix3 = vsubq_s64(
+            vld1q_s64(columns + col + 6),
+            vld1q_s64(columns + col - s + 6));
+
+        // Form eight inclusive delta prefixes with a balanced scan.
+        prefix0 = vaddq_s64(prefix0, vextq_s64(zero, prefix0, 1));
+        prefix1 = vaddq_s64(prefix1, vextq_s64(zero, prefix1, 1));
+        prefix2 = vaddq_s64(prefix2, vextq_s64(zero, prefix2, 1));
+        prefix3 = vaddq_s64(prefix3, vextq_s64(zero, prefix3, 1));
+
+        prefix1 = vaddq_s64(prefix1, vdupq_laneq_s64(prefix0, 1));
+        prefix3 = vaddq_s64(prefix3, vdupq_laneq_s64(prefix2, 1));
+        const int64x2_t lower_total = vdupq_laneq_s64(prefix1, 1);
+        prefix2 = vaddq_s64(prefix2, lower_total);
+        prefix3 = vaddq_s64(prefix3, lower_total);
+
+        prefix0 = vaddq_s64(prefix0, carry);
+        prefix1 = vaddq_s64(prefix1, carry);
+        prefix2 = vaddq_s64(prefix2, carry);
+        prefix3 = vaddq_s64(prefix3, carry);
+        carry = vdupq_laneq_s64(prefix3, 1);
+
+        maximum0 = maximum_i64(maximum0, prefix0);
+        maximum1 = maximum_i64(maximum1, prefix1);
+        maximum2 = maximum_i64(maximum2, prefix2);
+        maximum3 = maximum_i64(maximum3, prefix3);
+    }
+
+    const int64x2_t maxima = maximum_i64(
+        maximum_i64(maximum0, maximum1),
+        maximum_i64(maximum2, maximum3));
+    const std::int64_t lane0 = vgetq_lane_s64(maxima, 0);
+    const std::int64_t lane1 = vgetq_lane_s64(maxima, 1);
+    maximum = lane0 > lane1 ? lane0 : lane1;
+    window = vgetq_lane_s64(carry, 0);
+#endif
+
+    for (; col < n; ++col) {
+        window += columns[col] - columns[col - s];
+        if (window > maximum) maximum = window;
+    }
+    return maximum;
+}
+
+int main() {
+    int n, s;
+    if (!(std::cin >> n >> s)) return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::vector<int> matrix(static_cast<std::size_t>(n) * n);
+    for (std::size_t index = 0; index < matrix.size(); ++index) {
+        std::scanf("%d", &matrix[index]);
+    }
+
+    std::vector<std::int64_t> column_sums(n, 0);
+    std::int64_t* const columns = column_sums.data();
+
+    for (int row = 0; row < s; ++row) {
+        const int* const values = matrix.data()
+            + static_cast<std::size_t>(row) * n;
+#if defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+        for (int col = 0; col < n; ++col) {
+            columns[col] += static_cast<std::int64_t>(values[col]);
+        }
+    }
+
+    std::int64_t maximum = std::numeric_limits<std::int64_t>::lowest();
+    const int last_top = n - s;
+    for (int top = 0; top <= last_top; ++top) {
+        if (top != 0) {
+            const int* const incoming = matrix.data()
+                + static_cast<std::size_t>(top + s - 1) * n;
+            const int* const outgoing = matrix.data()
+                + static_cast<std::size_t>(top - 1) * n;
+#if defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+            for (int col = 0; col < n; ++col) {
+                columns[col] += static_cast<std::int64_t>(incoming[col])
+                    - static_cast<std::int64_t>(outgoing[col]);
+            }
+        }
+
+        const std::int64_t row_maximum = horizontal_maximum(columns, n, s);
+        if (row_maximum > maximum) maximum = row_maximum;
+    }
+
+    std::printf("%lld\n", static_cast<long long>(maximum));
+    return 0;
+}

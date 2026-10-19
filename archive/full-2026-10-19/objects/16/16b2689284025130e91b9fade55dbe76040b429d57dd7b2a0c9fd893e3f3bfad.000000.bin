@@ -1,0 +1,379 @@
+"""Fictitious local receipt tests; no transport, executable, candidate or model."""
+import copy
+import importlib.util
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
+SPEC = importlib.util.spec_from_file_location("source_only_terra_receipt_neutral", Path(__file__).with_name("reconcilier-source-only-terra.py"))
+reader = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(reader)
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf8")
+
+
+class ReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="terra-reconciliation-neutral-")
+        self.addCleanup(self.temp.cleanup)
+        self.workspace = Path(self.temp.name)
+        self.root = self.workspace / "results-750831"
+        self.worker = self.workspace / "worker"
+        self.worker.mkdir()
+        self.incident = self.workspace / "incident"
+        self.incident.mkdir()
+        self.manifest = self.incident / "inventory.json"
+        self.group = dict(reader.GROUP)
+        self.nonce = reader.INTERRUPTED_NONCE
+        self.folder = self.worker / self.nonce
+        self.request = {
+            "protocol": "hpc-forest-codex-mailbox-v1", "nonce": self.nonce,
+            "session_id": self.group["session_id"], "model": self.group["model"],
+            "reasoning_effort": self.group["effort"], "kind": "source-proposal",
+            "expires_at": 1, "messages": [{"role": "system", "content": "neutral"},
+                                         {"role": "user", "content": "neutral data"}],
+        }
+        self.reference = self.root / "neutral/logs/neutral-h01/codex-request.json"
+        self.references = {self.nonce: [{"path": self.reference, "subject": "neutral",
+                                       "role": "A", "category": "children"}]}
+
+    def seal(self):
+        entries = []
+        for path in self.worker.rglob("*"):
+            if path.is_file():
+                name = path.relative_to(self.workspace)
+                dest = self.incident / "before" / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, dest)
+                entries.append({"path": str(name), "copy": str(dest.relative_to(self.incident)),
+                                "sha256": reader.sha(path), "bytes": path.stat().st_size})
+        write(self.manifest, entries)
+
+    def build(self, *, local=True, claim=True, invocation=True, response=None, updates=None):
+        self.request.update(updates or {})
+        archived = self.root / "mailbox/requests" / (self.nonce + ".request.json")
+        write(archived, self.request)
+        write(self.reference, self.request)
+        if local:
+            write(self.folder / "downloaded-request.json", self.request)
+            if claim:
+                write(self.folder / "generation-claimed.json",
+                      {"request_sha256": reader.sha(archived), "claimed_at": 1})
+            if invocation:
+                instructions = self.folder / "instructions.txt"
+                instructions.write_text("neutral", encoding="utf8")
+                write(self.folder / "request.json", self.request)
+                configs = [
+                    'model_reasoning_effort="max"', 'forced_login_method="chatgpt"',
+                    'web_search="disabled"', "project_doc_max_bytes=0",
+                    "features.shell_tool=false", "features.unified_exec=false", "features.apps=false",
+                    "features.plugins=false", "features.memories=false", "features.multi_agent=false",
+                    "features.skill_search=false", "model_instructions_file=" + json.dumps(str(instructions)),
+                ]
+                argv = ["never-executed-neutral-cli", "exec", "--model", self.group["model"],
+                        "--ignore-user-config", "--strict-config", "--ephemeral", "--sandbox", "read-only"]
+                for config in configs:
+                    argv.extend(["--config", config])
+                write(self.folder / "invocation.json", {
+                    "argv": argv, "model": self.group["model"], "reasoning_effort": self.group["effort"],
+                    "request_sha256": reader.sha(archived), "source_execution_allowed": False})
+                if response == "exact":
+                    write(self.folder / "codex.jsonl", {
+                        "type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 4}})
+                else:
+                    write(self.folder / "codex.jsonl", {"type": "thread.started"})
+            if response is not None:
+                if response == "expiry":
+                    usage = {"tokens": 0, "token_accounting": "exact", "llm_calls": 0}
+                    error = "Request expired before generation"
+                elif response == "exact":
+                    usage = {"tokens": 14, "token_accounting": "exact", "llm_calls": 1,
+                             "codex_jsonl_sha256": reader.sha(self.folder / "codex.jsonl")}
+                    error = None
+                else:
+                    usage = {"tokens": 196608, "token_accounting": "upper_bound", "llm_calls": 1,
+                             "codex_jsonl_sha256": reader.sha(self.folder / "codex.jsonl")}
+                    error = "neutral interface failure"
+                envelope = {key: self.request[key] for key in
+                            ("protocol", "nonce", "session_id", "model", "reasoning_effort")}
+                envelope.update(request_sha256=reader.sha(archived), usage=usage, error=error)
+                write(self.folder / "response.json", envelope)
+                response_path = self.folder / "response.json"
+                ready = {"sha256": reader.sha(response_path), "bytes": response_path.stat().st_size}
+                write(self.folder / "response-ready.json", ready)
+                write(self.folder / "delivered.json", {
+                    "request_sha256": reader.sha(archived), "response_sha256": reader.sha(response_path)})
+                write(self.root / "mailbox/responses" / (self.nonce + ".response.json"), envelope)
+                write(self.root / "mailbox/responses" / (self.nonce + ".ready.json"), ready)
+        self.seal()
+
+    def reconcile(self, *, group=None, now=100):
+        preserved = reader.Preservation(self.workspace, self.incident, self.worker, self.manifest)
+        return reader.reconcile(self.root, self.worker, self.group if group is None else group,
+                                preserved, now=now, references=self.references)
+
+    def test_interrupted_claim_remains_unknown_and_undelivered(self):
+        self.build()
+        result = self.reconcile()
+        record = result["records"][0]
+        self.assertEqual(record["status"], "interrupted_claim_unknown")
+        self.assertIsNone(record["known_exact_tokens"])
+        self.assertFalse(record["delivery_verified"])
+        self.assertTrue(record["native_invocation_observed"])
+        self.assertEqual(result["requests_with_unknown_consumption"], 1)
+        self.assertFalse(result["total_exact_consumption_available"])
+        self.assertFalse((self.folder / "response.json").exists())
+        self.assertNotIn("journal_usage", record["native_trace"])
+
+    def test_interrupted_claim_does_not_infer_total_from_partial_journal(self):
+        self.build()
+        write(self.folder / "codex.jsonl", {
+            "type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 4}})
+        self.seal()
+        result = self.reconcile()
+        self.assertIsNone(result["records"][0]["known_exact_tokens"])
+        self.assertEqual(result["requests_with_unknown_consumption"], 1)
+        self.assertFalse(result["total_exact_consumption_available"])
+
+    def test_wrong_job_rejected(self):
+        self.build()
+        with self.assertRaises(ValueError):
+            self.reconcile(group={**self.group, "job_id": "750205"})
+
+    def test_wrong_group_session_rejected(self):
+        self.build()
+        with self.assertRaises(ValueError):
+            self.reconcile(group={**self.group, "session_id": "a" * 32})
+
+    def test_wrong_request_nonce_rejected(self):
+        self.build(updates={"nonce": "a" * 32})
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_wrong_request_session_rejected(self):
+        self.build(updates={"session_id": "a" * 32})
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_wrong_request_identity_rejected(self):
+        self.build(updates={"model": "gpt-6-astra"})
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_wrong_archive_job_rejected(self):
+        self.build()
+        self.root = self.workspace / "results-750205"
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_wrong_claim_request_sha_rejected(self):
+        self.build()
+        write(self.folder / "generation-claimed.json", {"request_sha256": "a" * 64})
+        self.seal()
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_changed_request_rejected(self):
+        self.build()
+        write(self.folder / "downloaded-request.json", {**self.request, "expires_at": 2})
+        self.seal()
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_altered_preserved_journal_rejected(self):
+        self.build()
+        (self.folder / "codex.jsonl").write_text("changed", encoding="utf8")
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_altered_preserved_copy_rejected(self):
+        self.build()
+        copied = self.incident / "before/worker" / self.nonce / "codex.jsonl"
+        copied.write_text("changed", encoding="utf8")
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_interrupted_claim_contradictory_response_rejected(self):
+        self.build()
+        write(self.root / "mailbox/responses" / (self.nonce + ".response.json"), {"error": "contradiction"})
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_active_unanswered_request_rejected(self):
+        self.build(local=False, updates={"expires_at": 1000})
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_active_interrupted_request_rejected(self):
+        self.build(updates={"expires_at": 1000})
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_expired_without_cache_is_unknown_not_proven_zero(self):
+        self.build(local=False)
+        record = self.reconcile()["records"][0]
+        self.assertEqual(record["status"], "expired_unanswered_no_local_invocation_evidence")
+        self.assertIsNone(record["known_exact_tokens"])
+        self.assertFalse(record["invocation_absence_proven"])
+        self.assertEqual(record["consumption"], "unknown")
+
+    def test_explicit_zero_call_expiry_is_distinguished(self):
+        self.build(claim=False, invocation=False, response="expiry")
+        result = self.reconcile()
+        self.assertEqual(result["expired_without_native_invocation_proven"], 1)
+        self.assertEqual(result["requests_with_unknown_consumption"], 0)
+        self.assertEqual(result["records"][0]["known_exact_tokens"], 0)
+
+    def test_bound_exact_response(self):
+        self.build(response="exact")
+        result = self.reconcile()
+        self.assertEqual(result["known_exact_tokens"], 14)
+        self.assertEqual(result["verified_deliveries"], 1)
+        self.assertEqual(result["by_role"]["children"]["known_exact_tokens"], 14)
+
+    def test_response_journal_binding_rejected(self):
+        self.build(response="exact")
+        response = copy.deepcopy(reader.load(self.folder / "response.json"))
+        response["usage"]["codex_jsonl_sha256"] = "f" * 64
+        write(self.folder / "response.json", response)
+        path = self.folder / "response.json"
+        ready = {"sha256": reader.sha(path), "bytes": path.stat().st_size}
+        write(self.folder / "response-ready.json", ready)
+        write(self.folder / "delivered.json", {
+            "request_sha256": reader.sha(self.folder / "downloaded-request.json"),
+            "response_sha256": reader.sha(path)})
+        write(self.root / "mailbox/responses" / (self.nonce + ".response.json"), response)
+        write(self.root / "mailbox/responses" / (self.nonce + ".ready.json"), ready)
+        self.seal()
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_contradictory_archived_response_rejected(self):
+        self.build(response="exact")
+        write(self.root / "mailbox/responses" / (self.nonce + ".response.json"), {"other": "response"})
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_reservation_never_becomes_exact_consumption(self):
+        self.build(response="bounded")
+        result = self.reconcile()
+        self.assertIsNone(result["records"][0]["known_exact_tokens"])
+        self.assertEqual(result["requests_with_unknown_consumption"], 1)
+        self.assertFalse(result["total_exact_consumption_available"])
+
+    def test_invocation_without_claim_rejected(self):
+        self.build(claim=False)
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+    def test_other_unanswered_nonce_rejected(self):
+        self.nonce = "a" * 32
+        self.folder = self.worker / self.nonce
+        self.request["nonce"] = self.nonce
+        self.references = {self.nonce: [{"path": self.reference, "subject": "neutral",
+                                       "role": "A", "category": "children"}]}
+        self.build()
+        with self.assertRaises(ValueError):
+            self.reconcile()
+
+
+class LegacySOInterruptionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="so-legacy-interruption-neutral-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.legacy = self.root / "legacy"
+        self.nonce = reader.LEGACY_INTERRUPTED_NONCE
+        self.folder = self.root / "worker" / self.nonce
+        self.copies = self.legacy / "caches-avant/source_only" / self.nonce
+        self.response = {
+            "error": "Worker interrupted after claiming this request; not replayed",
+            "infrastructure_error": True,
+            "usage": {"llm_calls": 1, "token_accounting": "upper_bound", "tokens": 196608}}
+
+    def build(self, journal=True):
+        write(self.folder / "downloaded-request.json", {"nonce": self.nonce, "neutral": True})
+        write(self.folder / "generation-claimed.json",
+              {"request_sha256": reader.sha(self.folder / "downloaded-request.json")})
+        if journal:
+            write(self.folder / "invocation.json", {"neutral": True})
+            write(self.folder / "codex.jsonl", {"type": "thread.started"})
+        hashes = {}
+        for path in self.folder.iterdir():
+            destination = self.copies / path.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+            hashes[self.nonce + "/" + path.name] = reader.sha(path)
+        self.proof = {"verified": True, "lanes": {"source_only": {
+            "job_id": reader.GROUP["job_id"], "session_id": reader.GROUP["session_id"],
+            "claimed_without_response": [self.nonce], "worker_files": hashes}}}
+        write(self.legacy / "preservation-verifiee.json", self.proof)
+        write(self.legacy / "verification-reprise.json", {
+            "verified": True, "source_only_pending_claim_delivered": True,
+            "same_source_only_job": reader.GROUP["job_id"], "claimed_generations_replayed": 0,
+            "preservation_receipt_sha256": reader.sha(self.legacy / "preservation-verifiee.json")})
+
+    def check(self, *, nonce=None, group=None, response=None):
+        return reader.verify_legacy_interruption(
+            self.response if response is None else response, self.folder,
+            self.nonce if nonce is None else nonce, reader.GROUP if group is None else group, self.legacy)
+
+    def test_original_receipt_and_copies_bind_interruption(self):
+        self.build()
+        self.assertEqual(self.check()["consumption"], "unknown")
+
+    def test_missing_journal_is_not_invented(self):
+        self.build(journal=False)
+        result = self.check()
+        self.assertNotIn("codex.jsonl", result["files"])
+        self.assertEqual(result["consumption"], "unknown")
+
+    def test_wrong_nonce_rejected(self):
+        self.build()
+        with self.assertRaises(ValueError):
+            self.check(nonce="a" * 32)
+
+    def test_wrong_job_or_session_rejected(self):
+        self.build()
+        for key in ("job_id", "session_id"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.check(group={**reader.GROUP, key: "wrong"})
+
+    def test_changed_current_journal_rejected(self):
+        self.build()
+        (self.folder / "codex.jsonl").write_text("changed", encoding="utf8")
+        with self.assertRaises(ValueError):
+            self.check()
+
+    def test_changed_legacy_claim_rejected(self):
+        self.build()
+        (self.copies / "generation-claimed.json").write_text("changed", encoding="utf8")
+        with self.assertRaises(ValueError):
+            self.check()
+
+    def test_changed_original_receipt_rejected(self):
+        self.build()
+        self.proof["lanes"]["source_only"]["session_id"] = "wrong"
+        write(self.legacy / "preservation-verifiee.json", self.proof)
+        with self.assertRaises(ValueError):
+            self.check()
+
+    def test_wrong_error_rejected(self):
+        self.build()
+        with self.assertRaises(ValueError):
+            self.check(response={**self.response, "error": "other"})
+
+    def test_exact_zero_is_never_assigned_to_interruption(self):
+        self.build()
+        with self.assertRaises(ValueError):
+            self.check(response={**self.response,
+                                 "usage": {"llm_calls": 0, "token_accounting": "exact", "tokens": 0}})
+
+
+if __name__ == "__main__":
+    unittest.main()

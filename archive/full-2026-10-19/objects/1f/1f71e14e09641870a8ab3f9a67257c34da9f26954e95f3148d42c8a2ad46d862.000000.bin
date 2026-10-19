@@ -1,0 +1,85 @@
+"""Preserve the stopped transport and verify cache/source bindings, without inference."""
+import hashlib
+import importlib.util
+import json
+import shutil
+import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+WORKER = ROOT / "runs/coverage-gpt-6-astra-xhigh/worker"
+OLD = ROOT / "receptions/coverage-luna-xhigh-749940"
+HELPER = ROOT / "reprises/incident-liaison-20261016T1656/reprendre-relais-r1.py"
+SESSION = "2bd8b683b45b41c8b48ec38708f46bab"
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def save(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    before = HERE / "avant"
+    assert not before.exists(), "Do not replace the original incident evidence."
+    before.mkdir()
+    script = """[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Depth 5 -Compress"""
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True, capture_output=True, text=True, encoding="utf-8", timeout=30)
+    rows = json.loads(result.stdout)
+    save(before / "cim-complet.json", rows)
+    expected = read(OLD / "cim-scellement.json")
+    fields = ["ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate"]
+    for previous in expected:
+        matches = [row for row in rows if all(row[key] == previous[key] for key in fields)]
+        if previous["ProcessId"] in {50900, 52600, 49776, 57560}:
+            assert not matches, "Former R1 process still present; do not duplicate."
+        else:
+            assert len(matches) == 1, "Source-only identity changed; re-inspect."
+    cache_files = {path.relative_to(WORKER).as_posix(): sha(path) for path in WORKER.rglob("*") if path.is_file() and path.name != "worker.lock"}
+    for name, digest in cache_files.items():
+        target = before / "cache" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(WORKER / name, target)
+        assert sha(target) == digest
+    for source, name in [(ROOT / "coordinator-state.json", "coordinator-state.json"), (OLD / "coordinateur-prochain.stderr.log", "coordinateur.stderr.log"), (OLD / "erreurs-prochain.jsonl", "erreurs-coordinateur.jsonl"), (ROOT / "runs/coverage-gpt-6-astra-xhigh/worker-lancement.json", "worker-lancement.json")]:
+        shutil.copy2(source, before / name)
+    spec = importlib.util.spec_from_file_location("verified_recovery_helper", HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    receipt_path = ROOT / "runs/coverage-gpt-6-astra-xhigh/autorisation.json"
+    receipt = helper.validate_receipt(receipt_path, {helper.SCOPE})
+    assert receipt["session_id"] == SESSION and receipt["model"] == "gpt-6-astra" and receipt["effort"] == "xhigh"
+    helper.install_identity(receipt["model"], receipt["effort"], receipt_path)
+    count = helper.frozen_source(Path(receipt["source_zip"]["path"]), helper.PROJECT, receipt["source_zip"]["sha256"])
+    assert count == 90
+    delivered = helper.cache_state(WORKER, SESSION)
+    pending = []
+    for folder in sorted(WORKER.iterdir()):
+        if not folder.is_dir() or folder.name in delivered or not (folder / "downloaded-request.json").exists():
+            continue
+        pending.append({"nonce": folder.name, "claimed": (folder / "generation-claimed.json").exists(),
+            "has_response": (folder / "response.json").exists(), "response_sha256": sha(folder / "response.json") if (folder / "response.json").exists() else None})
+    state = read(ROOT / "coordinator-state.json")
+    assert state["current_key"] == "coverage-gpt-6-astra-xhigh" and state["stage"] == "attention_required"
+    save(HERE / "inventaire-local-avant.json", cache_files)
+    save(HERE / "inspection-avant.json", {"verified": True, "observed_utc": datetime.now(UTC).isoformat(), "job_id": "750205", "session_id": SESSION,
+        "old_r1_coordinator_and_relay_absent": True, "source_only_four_identities_unchanged": True, "cache_files_preserved": len(cache_files),
+        "verified_previously_delivered_responses": len(delivered), "pending_cached_requests": pending,
+        "frozen_r1_source_files": count, "source_zip_sha256": receipt["source_zip"]["sha256"], "helper_sha256": sha(HELPER),
+        "transport_failure": "upload_to_romeo during raw log delivery; observer refused the missing relay three times", "low_level_cause_or_update_causality_established": False,
+        "generation_replayed": False, "worker_started": False, "submission_started": False})
+    print(json.dumps({"verified": True, "cache_files": len(cache_files), "delivered": len(delivered), "pending": pending, "sources": count}))
+
+
+if __name__ == "__main__":
+    main()

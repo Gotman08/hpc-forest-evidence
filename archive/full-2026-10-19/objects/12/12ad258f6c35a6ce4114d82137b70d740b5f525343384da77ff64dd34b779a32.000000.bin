@@ -1,0 +1,92 @@
+"""Actual pinned TreeQuest ask/tell with owned checkpoints, not a UCT substitute."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import importlib.metadata
+import pickle
+import threading
+
+import numpy as np
+import treequest
+
+from .contracts import EvolutionError, identifier, number
+
+RNG_LOCK = threading.Lock()
+
+
+class ABPolicy:
+    def __init__(self, journal):
+        self.journal = journal
+        self.version = importlib.metadata.version("treequest")
+        if self.version != "0.3.2":
+            raise EvolutionError("R5 requires its pinned TreeQuest 0.3.2")
+        self.algo = treequest.ABMCTSA()
+
+    def _save(self, key, value):
+        raw = pickle.dumps(value, protocol=5)
+        self.journal.set(key, {"version": self.version, "sha256": hashlib.sha256(raw).hexdigest(),
+                               "owned_checkpoint": base64.b64encode(raw).decode()})
+
+    def _load(self, key):
+        record = self.journal.get(key)
+        if record is None:
+            return None
+        raw = base64.b64decode(record["owned_checkpoint"], validate=True)
+        if record["version"] != self.version or hashlib.sha256(raw).hexdigest() != record["sha256"]:
+            raise EvolutionError("Owned TreeQuest checkpoint changed")
+        # Only run on a locally created, controller-owned R5 journal. Reports never unpickle.
+        return pickle.loads(raw)
+
+    def ask(self, island: str, actions: list[str], seed: int):
+        identifier(island)
+        if not actions or len(set(actions)) != len(actions):
+            raise EvolutionError("TreeQuest needs distinct actions")
+        pending_key = "ab-pending:" + island
+        pending = self._load(pending_key)
+        if pending is not None:
+            if pending["actions"] != actions:
+                raise EvolutionError("Cannot change actions during an outstanding TreeQuest trial")
+            return pending["trial"]
+        key = "ab-state:" + island
+        current = self._load(key)
+        state, rng = current if current else (self.algo.init_tree(), np.random.RandomState(seed).get_state())
+        before = pickle.dumps(state, protocol=5)
+        with RNG_LOCK:
+            external = np.random.get_state()
+            try:
+                np.random.set_state(rng)
+                state, trial = self.algo.ask(state, actions)
+                updated_rng = np.random.get_state()
+            finally:
+                np.random.set_state(external)
+        self._save(pending_key, {"actions": actions, "before": before, "state": state,
+                                 "rng": updated_rng, "trial": trial})
+        return trial
+
+    def finish(self, island: str, program_id: str, depth: int, quality: float | None):
+        identifier(island)
+        identifier(program_id)
+        if quality is not None:
+            number(quality, "quality", maximum=1)
+        pending_key = "ab-pending:" + island
+        pending = self._load(pending_key)
+        if pending is None:
+            if self.journal.get("ab-finished:" + island) == program_id:
+                return False
+            raise EvolutionError("No outstanding TreeQuest selection")
+        if quality is None:
+            state = pickle.loads(pending["before"])
+        else:
+            state = self.algo.tell(pending["state"], pending["trial"].trial_id,
+                                   ({"program_id": program_id, "depth": depth}, quality))
+        self.journal.db.execute("BEGIN IMMEDIATE")
+        try:
+            self._save("ab-state:" + island, (state, pending["rng"]))
+            self.journal.set("ab-finished:" + island, program_id)
+            self.journal.db.execute("DELETE FROM meta WHERE key=?", (pending_key,))
+            self.journal.db.execute("COMMIT")
+        except BaseException:
+            self.journal.db.execute("ROLLBACK")
+            raise
+        return True

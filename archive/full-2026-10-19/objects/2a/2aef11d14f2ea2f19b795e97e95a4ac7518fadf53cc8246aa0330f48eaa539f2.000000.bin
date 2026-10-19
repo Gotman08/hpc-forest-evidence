@@ -1,0 +1,103 @@
+"""Verify the delivered bytes and exercise the canonical CLI without any model service."""
+from __future__ import annotations
+
+import hashlib
+import importlib.metadata
+import json
+import os
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+WORKSPACE = HERE.parent.parent
+PROJECT = WORKSPACE / "outputs/HPC-Forest"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): sha(p) for p in root.rglob("*") if p.is_file()}
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def cli(arguments, receipt_name):
+    environment = dict(os.environ, PYTHONPATH=str(PROJECT / "src"), PYTHONUTF8="1")
+    result = subprocess.run([sys.executable, "-m", "hpc_forest", *arguments], cwd=WORKSPACE,
+                            env=environment, capture_output=True)
+    (HERE / (receipt_name + ".stdout")).write_bytes(result.stdout)
+    (HERE / (receipt_name + ".stderr")).write_bytes(result.stderr)
+    if result.returncode:
+        raise RuntimeError("CLI verification failed: " + receipt_name)
+    return json.loads(result.stdout)
+
+
+def main():
+    delivery = json.loads((HERE / "integration-verifiee.json").read_bytes())
+    manifest = json.loads((HERE / "manifeste-source-r5.json").read_bytes())
+    for row in manifest:
+        if sha(PROJECT / row["path"]) != row["sha256"]:
+            raise RuntimeError("Canonical source changed: " + row["path"])
+    bundle = Path(delivery["bundle"])
+    if sha(bundle) != delivery["sha256"]:
+        raise RuntimeError("Delivered source archive changed")
+    with zipfile.ZipFile(bundle) as archive:
+        if set(archive.namelist()) != {r["path"] for r in manifest} or archive.testzip() is not None:
+            raise RuntimeError("Source archive inventory or CRC failed")
+        for row in manifest:
+            if hashlib.sha256(archive.read(row["path"])).hexdigest() != row["sha256"]:
+                raise RuntimeError("Archived source bytes differ: " + row["path"])
+    checks = {}
+    for strategy in ("ab-mcts", "population"):
+        root = HERE / "demos" / strategy
+        result = cli(["evolution-demo", str(root), "--strategy", strategy, "--trials", "6"],
+                     "cli-demo-" + strategy)
+        if (result["costs"]["missions"] != 9 or result["costs"]["model_calls_known"] != 0
+                or len(result["programs"]) != 6 or result["native_runtime_admitted"] is not False):
+            raise RuntimeError("Synthetic CLI counts or admission flags differ")
+        before = inventory(root)
+        status = cli(["evolution-status", str(root)], "cli-status-" + strategy)
+        cli(["evolution-report", str(root), str(HERE / ("rapport-demo-" + strategy + ".md"))],
+            "cli-report-" + strategy)
+        after = inventory(root)
+        if before != after or status["history_digest"] != result["history_digest"]:
+            raise RuntimeError("Read-only status/report modified the source journal or evidence")
+        checks[strategy] = {"programs": 6, "workflow_steps": 3, "missions": 9,
+                            "model_calls": 0, "tokens": 0, "native_runtime_admitted": False,
+                            "inventory_unchanged_after_status_report": True,
+                            "files": len(before), "inventory_sha256": hashlib.sha256(
+                                json.dumps(before, sort_keys=True).encode()).hexdigest()}
+    junit = ET.parse(HERE / "tests-complets-final.xml").getroot()
+    cases = list(junit.iter("testcase"))
+    skipped = [case for case in cases if case.find("skipped") is not None]
+    failures = [case for case in cases if case.find("failure") is not None or case.find("error") is not None]
+    if failures:
+        raise RuntimeError("Full regression suite did not pass")
+    versions = {name: importlib.metadata.version(name) for name in ("treequest", "numpy", "pytest", "ruff")}
+    result = {"schema": "hpc-forest-r5-software-validation-v1", "utc": datetime.now(timezone.utc).isoformat(),
+              "source_files_verified_canonical_and_archive": len(manifest), "source_sha256": sha(bundle),
+              "full_suite": {"cases": len(cases), "passed": len(cases) - len(skipped),
+                             "skipped": len(skipped), "failures": 0,
+                             "junit_sha256": sha(HERE / "tests-complets-final.xml")},
+              "new_r5_tests": sum("test_evolution_" in c.get("classname", "") for c in cases),
+              "skip_causes": [case.find("skipped").get("message") for case in skipped],
+              "demos": checks, "versions": versions,
+              "historical_regression_uses_local_msvc_fixtures": True,
+              "contest_candidates_compiled_or_measured": False,
+              "new_native_model_calls": 0, "new_hpc_jobs": 0, "llm_weights_trained": False,
+              "native_adapter_qualified": False, "arm64_preflight_performed": False,
+              "performance_benefit_demonstrated": False}
+    save(HERE / "validation-verifiee.json", result)
+    print(json.dumps(result, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

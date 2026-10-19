@@ -1,0 +1,160 @@
+"""Read/hash/parse frozen data only. Never import or execute reviewed code."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import shlex
+import tarfile
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ADAPTERS = HERE.parent
+PREP = ADAPTERS.parent
+BASE = PREP.parent.parent
+ROOT = ADAPTERS / "revision-r5-G-recu-avant-Q"
+SOURCE = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN = "d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27"
+COMPONENTS = "1e60da6d5b51afaf3c857b1ba215927e7e1201c297241afd6390212a89d5e449"
+
+
+def need(value, reason):
+    if not value:
+        raise ValueError(reason)
+
+
+def raw(path):
+    path = Path(path)
+    need(path.is_file() and not any(p.is_symlink() or p.is_junction() for p in (path, *path.parents)),
+         "Ordinary frozen file required")
+    return path.read_bytes()
+
+
+def sha(path):
+    return hashlib.sha256(raw(path)).hexdigest()
+
+
+def ref(path, expected=None):
+    path = Path(path).resolve()
+    checksum = sha(path)
+    need(expected is None or checksum == expected, "Frozen pin differs: " + str(path))
+    return {"path": str(path), "sha256": checksum}
+
+
+def read(path):
+    return json.loads(raw(path))
+
+
+def check_junit(artifact, count):
+    checked = ref(artifact["path"], artifact["sha256"])
+    cases = list(ET.fromstring(raw(artifact["path"])).iter("testcase"))
+    need(len(cases) == len({(c.get("classname"), c.get("name")) for c in cases}) == count
+         and all(all(c.find(k) is None for k in ("failure", "error", "skipped")) for c in cases),
+         "Received local neutral XML differs")
+    return {"artifact": checked, "cases": count, "reexecuted": False}
+
+
+manifest_ref = ref(ROOT / "COMPONENTS.json", COMPONENTS)
+manifest = read(manifest_ref["path"])
+pins = manifest["code_pins"]
+need(len(pins) == 62 and manifest["source_zip_sha256"] == SOURCE and manifest["plan_sha256"] == PLAN,
+     "Exact current62 source110 integration required")
+files = {p.relative_to(ROOT).as_posix(): sha(p) for p in ROOT.rglob("*") if p.is_file()}
+need(files == {**pins, "COMPONENTS.json": COMPONENTS}, "Closed63-file tree differs")
+for name in pins:
+    if name.endswith(".py"):
+        ast.parse(raw(ROOT / name), filename=name)
+old = ADAPTERS / "revision-r4-facades-cloture-observer"
+old_pins = read(old / "COMPONENTS.json")["code_pins"]
+changed = sorted(name for name in pins if sha(old / name) != pins[name])
+need(set(pins) == set(old_pins) and changed == ["launcher/pins-source-plan.json", "reader/pins-source-plan.json"],
+     "Only the reviewed G-binding data delta is allowed")
+for name in changed:
+    previous, current = read(old / name), read(ROOT / name)
+    need(previous.pop("latest_native_generation_closure") is None, "Prior G pin must be null")
+    latest = current.pop("latest_native_generation_closure")
+    need(previous == current and latest["sha256"] == "d4c74352d28555ba3a476273af51b1d7791c328fa37addcee580318aedbc6df4",
+         "Unexpected semantic pin delta")
+    ref(latest["path"], latest["sha256"])
+source_pins = read(ROOT / "launcher/pins-source-plan.json")
+source_zip = ref(source_pins["source_zip"]["path"], SOURCE)
+plan_ref = ref(source_pins["plan"]["path"], PLAN)
+plan = read(plan_ref["path"])
+runtime_ref = ref(source_pins["source_manifest"]["path"], "66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766")
+runtime = read(runtime_ref["path"])
+source_root = Path(source_pins["source_project"])
+actual = {p.relative_to(source_root).as_posix(): sha(p) for p in source_root.rglob("*") if p.is_file()}
+with zipfile.ZipFile(source_zip["path"]) as archive:
+    members = [m for m in archive.infolist() if not m.is_dir()]
+    zipped = {m.filename.removeprefix("HPC-Forest/"): hashlib.sha256(archive.read(m)).hexdigest() for m in members}
+    need(len(members) == len(zipped) == 110 and all(m.filename.startswith("HPC-Forest/") for m in members),
+         "Exact110 source ZIP required")
+need(actual == runtime == zipped and len(actual) == 110, "Source110 differs from ZIP/runtime manifest")
+registry = read(ROOT / "launcher/COMMANDES-PROPOSEES.json")
+models = ("gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-terra")
+slugs = {"gpt-6.1-sol": "sol-max", "gpt-6-astra": "astra-max", "gpt-5.6-terra": "terra-max"}
+command_sha, command_rows, normalized = {}, [], set()
+for model in models:
+    for phase in ("roots", "advice", "harvest"):
+        session = plan["contract_cells"][model][phase]
+        key = model + ":" + phase
+        directory = ROOT / "launcher" / slugs[model] / phase
+        command = raw(directory / "commande-allouee.sh").decode("utf8")
+        job = read(directory / "job-prepare-propose.json")
+        row = registry["commands"][key]
+        need(shlex.split(job["command"]) == ["bash", "-lc", command], "Actual command quoting differs")
+        need(all(job[k] == v for k, v in {"arch": "armgpu", "cpus_per_task": 4, "mem_gb": 16,
+             "gpus_per_node": 0, "time_limit": "01:00:00", "workdir": "/scratch_p/nimarano", "spack_packages": []}.items()),
+             "Closed native technical allocation proposal differs")
+        need(row["session_id"] == session and row["model"] == model and row["phase"] == phase
+             and row["command_sha256"] == sha(directory / "commande-allouee.sh")
+             and row["job_request_sha256"] == sha(directory / "job-prepare-propose.json"), "Command registry differs")
+        need(all(token in command for token in (SOURCE, PLAN, "test ! -e \"$driver\"", "test ! -e \"$native_root\"",
+             "test ! -e \"$admission_root\"", "mechanical-reception-native.json", "--model " + model,
+             "--effort max --phase " + phase, "--cpu-bind=cores")), "Required source/phase/freshness command guards differ")
+        normalized.add(command.replace(model, "MODEL").replace(session, "SESSION").replace("--phase " + phase, "--phase PHASE").replace("stage-lane-r3-" + phase, "stage-lane-r3-PHASE"))
+        command_sha[key] = sha(directory / "commande-allouee.sh")
+        command_rows.append({"model": model, "phase": phase, "session_id": session,
+            "command": ref(directory / "commande-allouee.sh"), "job_proposal": ref(directory / "job-prepare-propose.json"),
+            "shell_decode_equals_actual_script": True})
+need(len(normalized) == 1 and len(command_sha) == 9, "Nine commands differ beyond model/phase/session")
+with tarfile.open(ROOT / "launcher/native-interface-models-max-r3.tar.gz") as archive:
+    members = archive.getmembers()
+    need(len(members) == 3 and all(m.isfile() for m in members)
+         and {m.name for m in members} == {"remote_stage.py", "cell_selection.py", "stage-manifest.json"}, "Closed stage members differ")
+    packed = {m.name: archive.extractfile(m).read() for m in members}
+    need(all(packed[name] == raw(ROOT / "launcher" / name) for name in ("remote_stage.py", "cell_selection.py")), "Stage code differs")
+    need(json.loads(packed["stage-manifest.json"]) == {name: hashlib.sha256(packed[name]).hexdigest() for name in ("remote_stage.py", "cell_selection.py")}, "Stage manifest differs")
+validation = read(ADAPTERS / "VALIDATION-CORRECTION-FACADES-R4.json")
+local_tests = [check_junit(validation[key], count) for key, count in
+    (("adapter_facade_junit", 73), ("observer_local_junit", 5), ("Q_guard_junit", 10))]
+source_evidence_ref = ref(PREP / "revue-independante-source-r1/OCTETS-DELTA-ET-187-PREUVES-VERIFIES.json",
+    "c53f5c408ad4d00a54406a85f59fc65a738d8e7dc5ea2d5b45f9379e8bf5cc6d")
+latest = {}
+for observed in read(source_evidence_ref["path"])["received_test_observations"]:
+    item = observed["artifact"]
+    ref(item["path"], item["sha256"])
+    for case in ET.fromstring(raw(item["path"])).iter("testcase"):
+        latest[(case.get("classname"), case.get("name"))] = all(case.find(k) is None for k in ("failure", "error", "skipped"))
+need(len(latest) == 187 and all(latest.values()), "Received source187 latest cases differ")
+review_refs = [ref(PREP / "revue-independante-source-r1/REVUE-INDEPENDANTE-SOURCE-R3-R4B110.json", "58a08df4fcccdf9b91a39ddacecb95f65b66fb90855298a470e40e01ec1bab2d"),
+    ref(ADAPTERS / "revue-independante-port-r4/REVUE-INDEPENDANTE-PORT-CORRIGE-R4.json", "020243ef8edae8a14666e637e6aafce0d18b763a95cbd3d675c3824700d9810e"),
+    ref(ADAPTERS / "revue-final-g-lie-avant-q/REVUE-FINALE-G-LIE-AVANT-Q.json", "71a190d413baed4978194f071b3737a4033d1794ee6af08027fff431946e678a")]
+result = {"schema": "hpc-forest-r3-integration62-command9-frozen-inspection-v1", "verified_static_bytes_only": True,
+    "components_manifest": manifest_ref, "reviewed_files": pins, "source_zip": source_zip, "plan": plan_ref,
+    "runtime_manifest": runtime_ref, "source_exact_files": 110, "candidate_exact_files": 63,
+    "all62_component_pins_rehashed": True, "all_python_components_AST_parsed_only": True,
+    "changed_since_independently_reviewed_R4": changed, "other60_components_byte_identical": True,
+    "command_sha256_by_cell": command_sha, "nine_commands": command_rows,
+    "command_shell_quoting_and_registry_exact": True, "stage_three_regular_members_match_current_code": True,
+    "received_local_neutral_evidence": local_tests, "source187_evidence": source_evidence_ref,
+    "latest_distinct_source_cases_passed": len(latest), "prior_independent_reviews": review_refs,
+    "Q_reception_or_target_or_reference_contract_admitted": False, "native_generation_admitted": False,
+    "candidate_or_source_imported_or_executed": False, "tests_reexecuted": False,
+    "live_cache_CIM_MCP_network_CLI_compiler_model_or_stop_used": False}
+with (HERE / "INTEGRITE-62-COMPOSANTS-9-COMMANDES.json").open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+print(json.dumps({"component_pins": 62, "commands": 9, "source_files": 110, "received_source_cases": 187,
+    "received_adapter_OBS_Q_cases": [73, 5, 10], "no_execution": True}))

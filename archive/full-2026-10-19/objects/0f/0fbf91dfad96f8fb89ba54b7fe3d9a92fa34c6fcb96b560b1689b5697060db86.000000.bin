@@ -1,0 +1,180 @@
+"""Bind actual new reviewed source evidence locally; never submit or run the shell."""
+
+import argparse
+import ast
+import hashlib
+import json
+from pathlib import Path
+from types import ModuleType
+
+HERE = Path(__file__).resolve().parent
+TEMPLATE_SHA = "1b75ea64cbac624c2411c320294c2c9f476e249ec033aa591fa78a9e07a4cbef"
+CELLS = {"gpt-6-astra": '110cefccf16b439eb226e475c875c8df',
+         "gpt-5.6-terra": '5d8811082a1842f5836a2bdda982500f',
+         "gpt-6.1-sol": '13eaca4e39cf4147a3f677a32fb5a52d'}
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def require(value, reason):
+    if not value:
+        raise RuntimeError(reason)
+
+
+def referenced(value):
+    require(isinstance(value, dict) and set(value) == {"path", "sha256"}, "Exact artifact reference required")
+    path = Path(value["path"])
+    require(path.is_absolute() and path.is_file() and not path.is_symlink()
+            and sha(path) == value["sha256"], "Actual immutable referenced bytes required")
+    return path, json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def write(path, value):
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--input-sha256", required=True)
+    args = parser.parse_args()
+    require(sha(args.input) == args.input_sha256, "Input digest changed")
+    inputs = json.loads(args.input.read_text(encoding="utf-8-sig"))
+    require(set(inputs) == {"schema", "source_delivery", "source_review", "neutral_test_review", "bindings"}
+            and inputs["schema"] == "hpc-forest-r2g-zero-model-render-input-v1", "Closed render input required")
+    delivery_path, delivery = referenced(inputs["source_delivery"])
+    source_review_path, review = referenced(inputs["source_review"])
+    test_review_path, tests = referenced(inputs["neutral_test_review"])
+    bindings = inputs["bindings"]
+    require(isinstance(bindings, dict), "New source-bound bindings required; no placeholders")
+    require(review.get("verified") is True and review.get("blocking_findings") == []
+            and review.get("native_research_admitted") is False,
+            "Received independent source review required before rendering")
+    require(tests.get("verified") is True and tests.get("blocking_findings") == []
+            and tests.get("native_research_admitted") is False,
+            "Actual independent neutral test review required")
+    for field in ("source_zip_sha256", "plan_sha256", "bundle_sha256", "delivery_sha256"):
+        binding_field = "payload_sha256" if field == "bundle_sha256" else field
+        expected = sha(delivery_path) if field == "delivery_sha256" else bindings.get(binding_field)
+        require(isinstance(expected, str) and review.get(field) == expected and tests.get(field) == expected,
+                "Source review does not bind the new immutable artifact: " + field)
+    require(tests.get("source_zip_sha256") == bindings.get("source_zip_sha256"),
+            "Neutral review must identify the same new source ZIP")
+    require(tests.get("source_review_sha256") == sha(source_review_path),
+            "Neutral review must bind the exact independent source review")
+    historical_r2d = {"source_zip_sha256": "13ccaf7c74d13db246d1127a25c511bc03d7989ba9097eb6ad7b4f681c0a0a46",
+                      "plan_sha256": "5e052db689fc423720be60dab97fbca70c82b64487d02d3d8fe2d0f796d9c96c",
+                      "payload_sha256": "afef88fa43a3c48597f4326c8dd214d9c0aba87ff3c82a552405aac899f3c3a3"}
+    require(all(bindings.get(key) != value for key, value in historical_r2d.items()),
+            "Historical R2d source/plan/payload may not qualify the new R2g source")
+    historical_r2e = {"source_zip_sha256": "f15b840cca876a4c465775f5553a0eaa539a9b98e56fe942136a1fcbde9b86b9",
+        "plan_sha256": "4b430e181948e55e463dfd1e60bdce96308a9190534734feb22354e4116ebde9",
+        "payload_sha256": "f0fde673bb8c9f89dd51c0774e78aa6b3282ec725dc8914e44f1ac45c3697139"}
+    require(all(bindings.get(key) != value for key, value in historical_r2e.items()),
+        "Closed R2e source/plan/payload are historical; newly corrected R2f bytes require a new qualification")
+    historical_r2f = {"source_zip_sha256": "47f97afabcd6d10c5e95a1dc3aae0a34b0841183919785a6bd62d58aa1e90d75",
+        "plan_sha256": "8d91ebe83ab550ad50acc330f830e1bc86bcc67f66b88054538df6b394558450",
+        "payload_sha256": "232c714734ae1c60dca8b45f3c04f5739625cffcbcfeedfbc317f767380248f6"}
+    require(all(bindings.get(key) != value for key, value in historical_r2f.items()),
+        "R2f source/plan/payload remain historical; the distinct R2g host contract requires new received Q")
+    suite_counts = tests.get("neutral_suite_counts")
+    require(isinstance(suite_counts, dict), "Actual explicit suite counts required")
+    require(bindings.get("delivery_sha256") == sha(delivery_path)
+            and bindings.get("integration_review_sha256") == sha(source_review_path),
+            "Actual source delivery/review pins changed")
+    for key, binding_key in (("source_zip", "source_zip_sha256"), ("plan", "plan_sha256"),
+                             ("bundle", "payload_sha256"), ("bundle_manifest", "bundle_manifest_sha256"),
+                             ("runtime_manifest", "runtime_manifest_sha256")):
+        value = delivery.get(key)
+        require(isinstance(value, dict) and value.get("sha256") == bindings.get(binding_key),
+                "New source delivery lacks exact artifact: " + key)
+        artifact_path = Path(value["path"])
+        require(artifact_path.is_file() and not artifact_path.is_symlink()
+                and sha(artifact_path) == value["sha256"], "Changed delivered artifact: " + key)
+    runtime = json.loads(Path(delivery["runtime_manifest"]["path"]).read_text(encoding="utf-8"))
+    require(len(runtime) == bindings.get("source_member_count"), "Actual source member count required")
+    require(all("tests/" + name in runtime for name in suite_counts),
+            "Every neutral suite must be in the new sealed source manifest")
+    require(tests.get("neutral_suite_sha256") == {name: runtime["tests/" + name] for name in suite_counts},
+            "Independent neutral suite digests must match the sealed source")
+    plan = json.loads(Path(delivery["plan"]["path"]).read_text(encoding="utf-8"))
+    require(plan.get("scope_id") == "hpc-forest-primes-native-max-r2g" and plan.get("cells") == CELLS
+            and plan.get("efforts") == ["max"] and plan.get("automatic_extension") is False
+            and plan.get("native_research_admitted") is False
+            and plan.get("search_seconds_ceiling") == 1800 and plan.get("tokens_ceiling") == 1500000
+            and plan.get("shared_harness_generation_seconds") == 600 and plan.get("confirmation_seconds") == 120
+            and plan.get("maximum_program_missions") == 8 and plan.get("maximum_mother_calls") == 2,
+            "Actual unchanged-budget fresh R2g MAX plan required")
+    template = HERE / "qualification-wrapper-r2g-template.py"
+    require(sha(template) == TEMPLATE_SHA, "Reviewed local template changed before import")
+    text = template.read_text(encoding="utf-8")
+    pinned = {key: value for key, value in bindings.items()
+              if key not in {"schema", "status", "scope_id", "payload_root"}}
+    text = text.replace("PINNED = {}", "PINNED = " + repr(pinned), 1)
+    text = text.replace("NEUTRAL_TESTS = {}", "NEUTRAL_TESTS = " + repr(suite_counts), 1)
+    compile(text, "<source-bound-zero-model-wrapper>", "exec")
+    module = ModuleType("r2g_zero_model_proposal_only")
+    # Only the pinned local template plus JSON literals is compiled; no received source is imported.
+    exec(compile(text, "<pinned-local-wrapper-bound-in-memory>", "exec"), module.__dict__)  # noqa: S102
+    module.validate_bindings(bindings)
+    _, source_bytes = module.validate_bundle(bindings, Path(delivery["bundle"]["path"]))
+    source_identity = {}
+    for node in ast.parse(source_bytes["src/hpc_forest/native_r2max.py"].decode("utf-8")).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id in {"SCOPE", "CELLS"}):
+            require(node.targets[0].id not in source_identity, "Duplicate native source identity literal")
+            source_identity[node.targets[0].id] = ast.literal_eval(node.value)
+    require(source_identity == {"SCOPE": "hpc-forest-primes-native-max-r2g", "CELLS": CELLS},
+            "Actual source bytes must implement the fresh R2g scope and sessions; metadata alone is insufficient")
+    out = HERE / "rendu-source-liee"
+    require(not out.exists() and not out.is_symlink(), "Preserve any previous rendering")
+    out.mkdir()
+    wrapper = out / "qualification-wrapper-r2g.py"
+    wrapper.write_text(text, encoding="utf-8", newline="\n")
+    wrapper_sha = sha(wrapper)
+    write(out / "bindings-proposees.json", bindings)
+    body = text.split('\nif __name__ == "__main__":', 1)[0]
+    deadline = int(module.DEADLINE.timestamp())
+    header = f'''set -euo pipefail
+[[ ${{SLURM_JOB_ID:-}} =~ ^[0-9]+$ ]] || {{ echo 'Existing Slurm allocation required' >&2; exit 70; }}
+[[ ${{SLURM_JOB_NUM_NODES:-}} == 1 && ${{SLURM_NTASKS:-}} == 1 && ${{SLURM_CPUS_PER_TASK:-}} == 4 && ${{SLURM_MEM_PER_NODE:-}} == 16384 ]] || {{ echo 'Exact 1node/1task/4CPU/16Gi required' >&2; exit 71; }}
+[[ ${{SLURM_RESTART_COUNT:-0}} == 0 ]] || {{ echo 'No replay allowed' >&2; exit 72; }}
+[[ ${{SLURM_GPUS:-0}} == 0 && ${{SLURM_GPUS_PER_NODE:-0}} == 0 && ${{SLURM_JOB_GPUS:-0}} == 0 && ${{SLURM_STEP_GPUS:-0}} == 0 && -z ${{CUDA_VISIBLE_DEVICES:-}} ]] || {{ echo 'Zero GPU required' >&2; exit 73; }}
+[[ $(uname -s) == Linux && $(uname -m) =~ ^(aarch64|arm64)$ ]] || {{ echo 'ARM64 Linux required' >&2; exit 74; }}
+[[ $(( $(date -u +%s) + 1800 + 10800 )) -lt {deadline} ]] || {{ echo 'Exclusive deadline reserve refused' >&2; exit 75; }}
+export PYTHONDONTWRITEBYTECODE=1
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=4
+srun --nodes=1 --ntasks=1 --cpus-per-task=4 --mem=16G --cpu-bind=cores --time=00:30:00 {module.PYTHON} -I -B - <<'R2G_ALLOCATED_OFFICIAL_QUALIFICATION_ONLY'
+'''
+    footer = "\nraise SystemExit(main(json.loads(" + repr(json.dumps(bindings, sort_keys=True)) + ")))\nR2G_ALLOCATED_OFFICIAL_QUALIFICATION_ONLY\n"
+    command = out / "commande-allouee-proposee.sh"
+    command.write_text(header + body + footer, encoding="utf-8", newline="\n")
+    write(out / "arguments-job-prepare-proposes.json", {
+        "name": "hpc-forest-primes-r2g-zero-model", "arch": "armgpu", "nodes": 1,
+        "ntasks_per_node": 1, "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0,
+        "time_limit": "00:30:00", "cpu_bind": "cores", "spack_packages": [], "modules": [],
+        "workdir": "/scratch_p/nimarano", "redirect_caches": False,
+        "command": command.read_text(encoding="utf-8"),
+    })
+    write(out / "PROPOSITION-PREPAREE-NON-SOUMISE.json", {
+        "schema": "hpc-forest-r2g-zero-model-local-qualification-proposal-v1", "prepared_only": True,
+        "native_research_admitted": False, "job_prepare_called": False, "job_submitted": False,
+        "remote_upload_performed": False, "native_model_calls": 0,
+        "source_review": {"path": str(source_review_path), "sha256": sha(source_review_path)},
+        "neutral_review": {"path": str(test_review_path), "sha256": sha(test_review_path)},
+        "wrapper": {"path": str(wrapper), "sha256": wrapper_sha},
+        "command": {"path": str(command), "sha256": sha(command)},
+        "independent_envelope_review_required_before_transport": True,
+        "qualification_reference_compilation_only_under_allocation": True,
+        "new_oracle_or_candidate_or_API_or_authentication": False,
+        "one_srun_only_no_nested_srun_in_job_script": True,
+    })
+    print(json.dumps({"prepared_only": True, "native": False, "command_sha256": sha(command)}))
+
+
+if __name__ == "__main__":
+    main()

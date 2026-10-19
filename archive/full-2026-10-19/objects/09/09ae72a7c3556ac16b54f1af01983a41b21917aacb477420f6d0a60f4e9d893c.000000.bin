@@ -1,0 +1,640 @@
+"""Independent cold-only SO751592 audit; stdlib, no subprocess/imported controller/C/CLI.
+
+Every output is exclusive and confined to this directory. The executable phase is
+enabled only after the baseline and reconciliation deliveries are SHA-bound.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import math
+import re
+import sqlite3
+import statistics
+import tarfile
+import zipfile
+import zlib
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+RX = HERE.parent
+COMPARE = RX.parents[1]
+ROOT = RX / "restauration-neuve/results-751592"
+SOURCE = COMPARE / "HPC-Forest-Harnais-Comparaison-r1.zip"
+ARCHIVE = RX / "archive/results-751592.tar.gz"
+ARCHIVE_SHA = "ddbf1cee532bf87cbd842d7c3d0d565f75f7d890b03841e1d9f9f2d7cf9b1af5"
+SOURCE_SHA = "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb"
+BASELINE_SHA = "185df0597b79f1994d0583764ef66f7ac127fbdea887b041d1a831e9d46fb482"
+GROUP_SHA = "96461b4ee439f441687927dd9ebad0647fcc747dd4ec3243d9327dbda805b98e"
+SESSION = "665743a02b824021a697b6a4884a667c"
+MODEL = "gpt-6.1-sol"
+JOB = "751592"
+SCHEMA = "hpc-forest-harness-comparison-20261016-r1"
+OUTPUT_PREFIX = ""
+
+
+def need(condition, code):
+    if not condition:
+        raise ValueError(code)
+
+
+def sha(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def sha_bytes(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def pairs(items):
+    value = {}
+    for key, item in items:
+        need(key not in value, "duplicate_json_member")
+        value[key] = item
+    return value
+
+
+def decode(raw):
+    value = json.loads(raw, object_pairs_hook=pairs,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite_json")))
+    json.dumps(value, allow_nan=False)
+    return value
+
+
+def load(path):
+    return decode(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+
+
+def digest(value):
+    return sha_bytes(canonical(value))
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def bound(item):
+    need(isinstance(item, dict) and set(item) == {"path", "sha256"}, "closed_reference_required")
+    path = Path(item["path"])
+    need(path.is_absolute() and path.is_file() and not path.is_symlink()
+         and not any(getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents)), "regular_reference_required")
+    need(sha(path) == item["sha256"], "reference_sha_changed")
+    return path
+
+
+def inventory(root):
+    need(root.is_dir() and not root.is_symlink() and not getattr(root, "is_junction", lambda: False)(), "ordinary_received_root_required")
+    result = {}
+    for path in sorted(root.rglob("*")):
+        need(not path.is_symlink() and not getattr(path, "is_junction", lambda: False)(), "received_alias_refused")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = {"bytes": path.stat().st_size, "sha256": sha(path)}
+        else:
+            need(path.is_dir(), "received_special_file_refused")
+    return result
+
+
+class LooseGit:
+    """Read and authenticate Git objects directly; never invoke git or a candidate."""
+
+    def __init__(self, repo):
+        self.gitdir = repo / ".git"
+        need(self.gitdir.is_dir() and not self.gitdir.is_symlink(), "central_loose_git_required")
+        self.cache = {}
+
+    def object(self, oid):
+        need(isinstance(oid, str) and re.fullmatch("[0-9a-f]{40}", oid), "git_object_id_required")
+        if oid not in self.cache:
+            path = self.gitdir / "objects" / oid[:2] / oid[2:]
+            need(path.is_file() and not path.is_symlink(), "loose_git_object_unavailable_no_fallback")
+            raw = zlib.decompress(path.read_bytes())
+            need(hashlib.sha1(raw).hexdigest() == oid, "git_object_sha1_changed")
+            header, content = raw.split(b"\0", 1)
+            kind, size = header.split(b" ")
+            need(int(size) == len(content), "git_object_size_changed")
+            self.cache[oid] = kind, content
+        return self.cache[oid]
+
+    def sources(self, commit, *, source_only=True, decode_utf8=True):
+        kind, raw = self.object(commit)
+        need(kind == b"commit" and raw.startswith(b"tree "), "git_commit_required")
+        tree = raw.splitlines()[0][5:].decode("ascii")
+        result = {}
+
+        def visit(oid, prefix):
+            kind, content = self.object(oid)
+            need(kind == b"tree", "git_tree_required")
+            offset = 0
+            while offset < len(content):
+                zero = content.index(b"\0", offset)
+                mode, name = content[offset:zero].split(b" ", 1)
+                child = content[zero + 1:zero + 21].hex()
+                need(len(child) == 40, "incomplete_git_tree_entry")
+                offset = zero + 21
+                text = name.decode("utf8")
+                need(text not in {"", ".", ".."} and "/" not in text and "\\" not in text, "unsafe_git_tree_name")
+                path = prefix + text
+                if mode in {b"40000", b"040000"}:
+                    if not source_only or path == "src" or path.startswith("src/"):
+                        visit(child, path + "/")
+                elif not source_only or path.startswith("src/"):
+                    need(mode in {b"100644", b"100755"}, "nonregular_git_source")
+                    kind, blob = self.object(child)
+                    need(kind == b"blob", "git_source_blob_required")
+                    result[path] = blob.decode("utf8") if decode_utf8 else blob
+            need(offset == len(content), "git_tree_trailing_data")
+
+        visit(tree, "")
+        need(result, "git_source_tree_empty")
+        return result
+
+
+def verify_configuration(config):
+    need(config["backend"] == "codex" and config["codex"]["model"] == MODEL
+         and config["codex"]["reasoning_effort"] == "max" and config["codex"]["session_id"] == SESSION,
+         "wrong_subject_identity")
+    need(config["harness"] == {"enabled": False} and config.get("native_codex_agent", {}).get("enabled", False) is False,
+         "wrong_source_only_treatment")
+    need(config["seed"] == 23 and config["minimum_gain"] == 0.03
+         and config["schedule"] == {"cycles": 1, "trials_per_role_per_cycle": 2, "integrations_per_cycle": 2}, "changed_scientific_protocol")
+    expected = {"wall_seconds": 1800, "tokens": 1500000, "generation_seconds": 600,
+                "confirmation_seconds": 120, "max_depth": 6, "max_workers": 1,
+                "infrastructure_retries": 0, "search_slots": 11, "mission_tokens": 196608, "confirmation_slots": 3}
+    need(all(type(config["budget"][k]) is int and config["budget"][k] == v for k, v in expected.items()), "changed_budget")
+    need(config["protocol"]["repetitions"] == 3 and config["protocol"]["confirmation_repetitions"] == 5
+         and config["protocol"]["environment"]["CUDA_VISIBLE_DEVICES"] == "", "changed_measurement_protocol")
+
+
+def verify_subject(slug, baseline, prepared, reference, runtime_digest):
+    campaign = ROOT / slug
+    db_path = campaign / "registry.sqlite3"
+    need(not any(Path(str(db_path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")), "database_not_cold")
+    db = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        metadata_rows = list(db.execute("SELECT key,value FROM metadata"))
+        need(len({r["key"] for r in metadata_rows}) == len(metadata_rows), "duplicate_metadata_key")
+        meta = {r["key"]: decode(r["value"]) for r in metadata_rows}
+        config = meta["config"]
+        verify_configuration(config)
+        frozen = {p.relative_to(campaign / "trusted").as_posix(): sha(p) for p in (campaign / "trusted").rglob("*")
+                  if p.is_file() and "__pycache__" not in p.parts}
+        need(frozen == meta["manifest"], "protected_contract_files_changed")
+        need(meta["identity"]["controller_implementation"] == runtime_digest and
+             digest({"protocol": config["protocol"], "manifest": frozen, "target": meta["identity"]}) == meta["protocol_id"], "runtime_or_protocol_digest_changed")
+        contract = load(campaign / "trusted/contract.json")
+        reference_contract = load(bound(reference["contract"]))
+        bound(reference["audit"])
+        left, right = decode(json.dumps(contract)), decode(json.dumps(reference_contract))
+        left["benchmark"].pop("reference_seconds", None)
+        right["benchmark"].pop("reference_seconds", None)
+        need(canonical(left) == canonical(right), "reference_contract_changed_beyond_reference_seconds")
+        need({"-Werror=uninitialized", "-Werror=maybe-uninitialized"} <= set(contract["compiler_flags"])
+             and contract["comparison"]["mode"] == "bytes", "weakened_correctness_contract")
+        need(all(sha(campaign / "repo/src" / name) == value for name, value in prepared["official_source_hashes"].items()), "official_source_changed")
+        trials = list(db.execute("SELECT * FROM trials ORDER BY created,id"))
+        need(len(trials) <= 8 and len({row["id"] for row in trials}) == len(trials), "trial_cap_or_duplicate")
+        mother_slots = db.execute("SELECT count(*) FROM slots WHERE purpose LIKE 'mother:%'").fetchone()[0]
+        need(mother_slots <= 2, "mother_slot_cap")
+        repo, earlier, statuses, roles, missions, writes = LooseGit(campaign / "repo"), {}, collections.Counter(), collections.Counter(), {}, 0
+        baseline_payload = db.execute("SELECT payload FROM evaluations WHERE experiment_id='baseline-e1' AND phase='search'").fetchone()
+        need(baseline_payload is not None, "search_baseline_required")
+        baseline_commit = decode(baseline_payload[0])["commit"]
+        official_tree = {p.relative_to(campaign / "repo").as_posix(): p.read_bytes().decode("utf8") for p in (campaign / "repo/src").rglob("*") if p.is_file()}
+        need(repo.sources(baseline_commit) == official_tree, "baseline_commit_not_official_initial_sources")
+        initial_non_source = {name: raw for name, raw in repo.sources(baseline_commit, source_only=False, decode_utf8=False).items() if not name.startswith("src/")}
+        known_commits = {baseline_commit}
+        for row in trials:
+            mission, outcome = decode(row["mission"]), decode(row["result"])
+            need(mission["id"] == row["id"], "mission_id_changed")
+            parent = mission["parent_id"]
+            need(parent is None or parent in earlier, "parent_not_earlier")
+            need(mission["depth"] == (earlier[parent][0]["depth"] + 1 if parent else 1), "parent_depth_changed")
+            need(all(source in earlier and earlier[source][1]["correct"] is True for source in mission["sources"]), "integration_source_not_earlier_correct")
+            need(row["role"] in {"A", "B", "C", "G"}, "unknown_trial_role")
+            roles[row["role"]] += 1
+            statuses[outcome["status"]] += 1
+            need(mission["base_commit"] in known_commits, "base_commit_not_from_current_campaign")
+            original = repo.sources(mission["base_commit"])
+            call = campaign / "logs" / row["id"]
+            need(not (call / "node-harness.json").exists(), "unexpected_internal_harness")
+            request_file = call / "codex-request.json"
+            if request_file.exists():
+                req = load(request_file)
+                remote = ROOT / "mailbox/requests" / (req["nonce"] + ".request.json")
+                need(req["model"] == MODEL and req["reasoning_effort"] == "max" and req["session_id"] == SESSION
+                     and canonical(req) == canonical(load(remote)), "mission_request_binding_changed")
+                need(req["mission_id"] == row["id"], "request_mission_changed")
+                missions[req["nonce"]] = {"subject": slug, "role": row["role"], "mission_id": row["id"]}
+            applied = call / "agent-result.json"
+            if applied.exists():
+                data = load(applied)
+                for change in data["files"]:
+                    path = PurePosixPath(change["path"])
+                    need(change["path"].startswith("src/") and ".." not in path.parts and not path.is_absolute(), "source_write_escape")
+                    original[change["path"]] = change["content"]
+                    writes += 1
+            if outcome.get("commit"):
+                need(repo.sources(outcome["commit"]) == original, "applied_sources_do_not_match_outcome_commit")
+                unchanged = {name: raw for name, raw in repo.sources(outcome["commit"], source_only=False, decode_utf8=False).items() if not name.startswith("src/")}
+                need(unchanged == initial_non_source, "non_source_repository_contract_changed")
+                known_commits.add(outcome["commit"])
+            if outcome["status"] == "valid":
+                need(outcome["correct"] is True and len(outcome["times"]) == 3 and all(math.isfinite(t) and t > 0 for t in outcome["times"])
+                     and math.isclose(statistics.mean(outcome["times"]), outcome["mean_seconds"], rel_tol=1e-12), "invalid_search_measurements")
+            earlier[row["id"]] = mission, outcome
+        need(all(n <= 2 for n in roles.values()), "role_trial_cap")
+        for path in sorted((campaign / "logs").glob("mother-*/request.json")):
+            req = load(path)
+            remote = ROOT / "mailbox/requests" / (req["nonce"] + ".request.json")
+            need(req["model"] == MODEL and req["reasoning_effort"] == "max" and req["session_id"] == SESSION
+                 and req["meta_role"] in {"mother-preparation", "mother-synthesis"}, "mother_identity_changed")
+            if remote.exists():
+                need(canonical(req) == canonical(load(remote)) and req["nonce"] not in missions, "mother_request_collision")
+                missions[req["nonce"]] = {"subject": slug, "role": req["meta_role"], "mission_id": req["mission_id"]}
+        evaluations = [{**dict(row), "outcome": decode(row["payload"])} for row in db.execute("SELECT * FROM evaluations")]
+        confirmations = [row for row in evaluations if row["phase"] == "confirmation"]
+        plan = meta["confirmation_plan:1"]
+        need(len({row["experiment_id"] for row in confirmations}) == len(confirmations)
+             and {row["id"] for row in plan} == {row["experiment_id"] for row in confirmations}, "confirmation_plan_mismatch")
+        commits = {row["id"]: row["commit"] for row in plan}
+        winner, valid, rejected = meta["best_confirmed"], [], []
+        for evaluation in confirmations:
+            outcome = evaluation["outcome"]
+            need(outcome["commit"] == commits[evaluation["experiment_id"]], "confirmation_commit_changed")
+            if outcome["correct"] is True:
+                need(outcome["status"] == "valid" and len(outcome["times"]) == 5
+                     and all(math.isfinite(t) and t > 0 for t in outcome["times"])
+                     and math.isclose(statistics.mean(outcome["times"]), outcome["mean_seconds"], rel_tol=1e-12), "five_confirmations_invalid")
+                valid.append(evaluation)
+            else:
+                need(outcome["correct"] is False and outcome["status"] == "incorrect" and outcome["times"] == []
+                     and outcome["mean_seconds"] is None and outcome["score"] == 0, "negative_confirmation_promoted")
+                need(evaluation["experiment_id"] != winner["experiment_id"], "incorrect_finalist_retained")
+                rejected.append(evaluation)
+        baselines = [row for row in valid if row["experiment_id"].startswith("baseline-")]
+        need(len(baselines) == 1, "single_confirmed_baseline_required")
+        reference_seconds = baselines[0]["outcome"]["mean_seconds"]
+        eligible = [row for row in valid if row is baselines[0] or 1 - row["outcome"]["mean_seconds"] / reference_seconds >= .03]
+        chosen = min(eligible, key=lambda row: row["outcome"]["mean_seconds"])
+        need(chosen["experiment_id"] == winner["experiment_id"] and chosen["outcome"]["commit"] == winner["commit"]
+             and math.isclose(winner["reference_seconds"], reference_seconds, rel_tol=1e-12)
+             and math.isclose(winner["mean_seconds"], chosen["outcome"]["mean_seconds"], rel_tol=1e-12)
+             and digest(chosen["outcome"]) == winner["evaluation_digest"], "best_eligible_confirmation_selection_changed")
+        with zipfile.ZipFile(campaign / "submission.zip") as package:
+            need(package.testzip() is None, "submission_crc_failure")
+            submitted = decode(package.read("HPC_FOREST_MANIFEST.json"))
+            need(submitted["commit"] == winner["commit"] and canonical(submitted["confirmation"]) == canonical(chosen["outcome"]), "submission_manifest_changed")
+            git_files = repo.sources(winner["commit"], source_only=False, decode_utf8=False)
+            regular = [item for item in package.infolist() if not item.is_dir()]
+            need(len(regular) == len({item.filename for item in regular}) and
+                 {item.filename for item in regular} == set(git_files) | {"HPC_FOREST_MANIFEST.json"} and
+                 all(package.read(name) == raw for name, raw in git_files.items()), "submission_source_bytes_do_not_match_confirmed_commit")
+        topology = load(ROOT / (slug + "-progress.json"))
+        trees = {row["role"]: row for row in db.execute("SELECT role,sha256,checkpoint FROM trees")}
+        for tree in topology["trees"]:
+            checkpoint = trees[tree["role"]]
+            need(sha_bytes(checkpoint["checkpoint"]) == checkpoint["sha256"] == tree["checkpoint_sha256"], "tree_checkpoint_changed")
+            ids = {node["id"] for node in tree["nodes"]}
+            need(all((node["id"] in earlier or node["depth"] == 0) and (node["parent"] is None or node["parent"] in ids) for node in tree["nodes"]), "tree_contains_foreign_node")
+        need(len(trials) == baseline["trials"] and dict(statuses) == baseline["statuses"] and writes == baseline["source_writes_verified"], "independent_counts_disagree_with_baseline")
+        return {"subject": slug, "verified": True, "trials": len(trials), "roles": dict(roles), "statuses": dict(statuses),
+                "source_writes_verified": writes, "protected_files": len(frozen), "official_source_files": len(prepared["official_source_hashes"]),
+                "confirmation_records": len(confirmations), "valid_confirmations": len(valid), "negative_confirmations": len(rejected),
+                "retained_baseline": winner["is_baseline"], "scored_nodes": topology["scored_nodes"],
+                "git_objects_authenticated": len(repo.cache), "missions": missions}
+    finally:
+        db.close()
+
+
+def verify_mailbox(missions, payloads):
+    requests = sorted((ROOT / "mailbox/requests").glob("*.request.json"))
+    need(len(requests) == len({p.name for p in requests}) and len(requests) == len(missions), "published_request_mission_coverage_differs")
+    records = []
+    for path in requests:
+        nonce = path.name.removesuffix(".request.json")
+        need(re.fullmatch("[0-9a-f]{32}", nonce) and nonce in missions, "unknown_request_nonce_or_role")
+        request, request_sha = load(path), sha(path)
+        need(request["protocol"] == "hpc-forest-codex-mailbox-v1" and request["nonce"] == nonce
+             and request["session_id"] == SESSION and request["model"] == MODEL and request["reasoning_effort"] == "max"
+             and request["kind"] == "source-proposal" and request["mission_id"] == missions[nonce]["mission_id"], "wrong_request_identity")
+        captured = payloads[nonce]
+        invocation_path = captured.get("invocation.json")
+        journal = captured.get("codex.jsonl")
+        response_path = captured["response.json"]
+        record = {"nonce": nonce, **missions[nonce], "request_sha256": request_sha,
+                  "native_invocation_observed": invocation_path is not None, "known_exact_tokens": None,
+                  "reported_completed_turns": 0, "preinvocation_zero_claimed": False,
+                  "diagnostic_non_json_lines": 0, "blank_lines": 0, "native_error_items": 0}
+        response = load(response_path)
+        if response is not None:
+            need(response["protocol"] == "hpc-forest-codex-mailbox-v1" and response["nonce"] == nonce
+                 and response["session_id"] == SESSION and response["request_sha256"] == request_sha
+                 and response["model"] == MODEL and response["reasoning_effort"] == "max", "response_identity_changed")
+        if invocation_path is not None:
+            invocation = load(invocation_path)
+            argv = invocation["argv"]
+            need(invocation["request_sha256"] == request_sha and invocation["source_execution_allowed"] is False
+                 and argv.count("--model") == 1 and argv[argv.index("--model") + 1] == MODEL,
+                 "invocation_identity_changed")
+            required = {'model_reasoning_effort="max"', 'forced_login_method="chatgpt"', 'web_search="disabled"',
+                        'project_doc_max_bytes=0', 'features.shell_tool=false', 'features.unified_exec=false',
+                        'features.apps=false', 'features.plugins=false', 'features.memories=false',
+                        'features.multi_agent=false', 'features.skill_search=false'}
+            keys = [argv[i + 1].split("=", 1)[0] for i, arg in enumerate(argv) if arg == "--config"]
+            need(len(keys) == len(set(keys)) and required <= set(argv)
+                 and all(flag in argv for flag in ("--ignore-user-config", "--strict-config", "--ephemeral"))
+                 and argv[argv.index("--sandbox") + 1] == "read-only"
+                 and not {"-c", "--enable", "--full-auto", "--dangerously-bypass-approvals-and-sandbox"}.intersection(argv), "unexpected_cli_tools_or_override")
+            need(journal is not None and journal.is_file(), "invocation_without_preserved_journal")
+            usages = []
+            for line in journal.read_text(encoding="utf8", errors="strict").splitlines():
+                if not line:
+                    record["blank_lines"] += 1
+                    continue
+                try:
+                    event = decode(line)
+                except json.JSONDecodeError:
+                    need(re.match(r"^20\d\d-\d\d-\d\dT.*\bWARN\b", line), "unclassified_non_json_native_line")
+                    record["diagnostic_non_json_lines"] += 1
+                    continue
+                need(isinstance(event, dict), "journal_event_not_object")
+                if event.get("type") in {"item.started", "item.updated", "item.completed"}:
+                    kind = event.get("item", {}).get("type")
+                    need(kind in {None, "agent_message", "reasoning", "error"}, "tool_used_in_source_only_treatment")
+                    record["native_error_items"] += int(kind == "error")
+                if event.get("type") == "turn.completed":
+                    usage = event.get("usage")
+                    need(isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("input_tokens", "output_tokens")), "malformed_completed_usage")
+                    for key, whole in (("cached_input_tokens", "input_tokens"), ("cache_write_input_tokens", "input_tokens"), ("reasoning_output_tokens", "output_tokens")):
+                        need(key not in usage or (type(usage[key]) is int and 0 <= usage[key] <= usage[whole]), "malformed_usage_subdivision")
+                    usages.append(usage)
+            record["reported_completed_turns"] = len(usages)
+            if usages:
+                record["known_exact_tokens"] = sum(u["input_tokens"] + u["output_tokens"] for u in usages)
+            if response is not None:
+                usage = response.get("usage", {})
+                need(usage.get("codex_jsonl_sha256") == sha(journal), "response_journal_sha_differs")
+                if usage.get("token_accounting") == "exact":
+                    need(record["known_exact_tokens"] is not None and usage.get("tokens") == record["known_exact_tokens"], "response_exact_usage_differs")
+            record["journal_sha256"] = sha(journal)
+        elif response is not None:
+            usage = response.get("usage", {})
+            record["preinvocation_zero_claimed"] = (response.get("error") == "Request expired before native invocation"
+                and usage.get("token_accounting") == "exact" and type(usage.get("llm_calls")) is int and usage["llm_calls"] == 0
+                and type(usage.get("tokens")) is int and usage["tokens"] == 0)
+            # This is not yet a proof of absence. The separate strict copied-cache
+            # reconciliation must establish the pre-invocation branch before 0.
+        records.append(record)
+    return records
+
+
+def verify_archive_and_source():
+    need(sha(ARCHIVE) == ARCHIVE_SHA and sha(SOURCE) == SOURCE_SHA, "archive_or_frozen_source_sha_changed")
+    proof = load(RX / "archive-trois-sha-verifies.json")
+    announce = load(bound(proof["producer_announcement"]))
+    download = load(bound(proof["remote_and_download_receipt"]))
+    need(bound(proof["local_archive"]) == ARCHIVE and announce["sha256"] == ARCHIVE_SHA
+         and download["ok"] is True and download["verifie"] is True and download["transport"] == "scp"
+         and all(download[k] == ARCHIVE_SHA for k in ("remote_sha256", "empreinte_locale", "empreinte_distante"))
+         and announce["archive"] == download["downloaded"] and download["bytes"] == ARCHIVE.stat().st_size,
+         "announced_remote_local_three_sha_not_equal")
+    with tarfile.open(ARCHIVE, "r:gz") as stream:
+        members = stream.getmembers()
+        need(len({m.name.casefold() for m in members}) == len(members), "duplicate_archive_member")
+        for member in members:
+            p = PurePosixPath(member.name)
+            need(not p.is_absolute() and ".." not in p.parts and "\\" not in member.name
+                 and (member.isfile() or member.isdir()), "unsafe_or_nonregular_archive_member")
+        manifest_raw = stream.extractfile("manifest.json").read()
+        manifest = decode(manifest_raw)
+        need(canonical(manifest) == canonical(load(RX / "restauration-neuve/manifest-verifie.json")), "restore_manifest_structure_differs_from_archive")
+        need(manifest["format"] == "marathon22-lossless-evidence-v1" and len(manifest["runs"]) == 1
+             and manifest["runs"][0]["name"] == ROOT.name, "wrong_lossless_run")
+        official_root = COMPARE.parent / "HPC-Forest-Etude-2020-2024-r1/sources-officielles-restauration"
+        expected, official_zips, checked_blobs = {}, {}, set()
+        for name, value in manifest["official_archives"].items():
+            path = official_root / name
+            need(path.resolve().is_relative_to(official_root.resolve()) and sha(path) == value, "official_zip_changed")
+            official_zips[name] = path
+        for entry in manifest["files"]:
+            path = PurePosixPath(entry["path"])
+            need(not path.is_absolute() and ".." not in path.parts and "\\" not in str(path)
+                 and path.parts[0] == ROOT.name and len(path.parts) > 1, "manifest_escape")
+            relative = PurePosixPath(*path.parts[1:]).as_posix()
+            need(relative not in expected and relative.casefold() not in {x.casefold() for x in expected}, "duplicate_manifest_entry")
+            expected[relative] = {"bytes": entry["bytes"], "sha256": entry["sha256"]}
+            if "official" in entry:
+                spec = entry["official"]
+                with zipfile.ZipFile(official_zips[spec["archive"]]) as source:
+                    raw = source.read(spec["member"])
+                need(sha_bytes(raw) == entry["sha256"] and len(raw) == entry["bytes"], "official_manifest_member_mismatch")
+            elif entry["blob"] not in checked_blobs:
+                blob = stream.getmember(entry["blob"])
+                need(blob.isfile() and sha_bytes(stream.extractfile(blob).read()) == entry["sha256"], "archive_blob_changed")
+                checked_blobs.add(entry["blob"])
+        need(inventory(ROOT) == expected, "restoration_not_exact_archive_inventory")
+    with zipfile.ZipFile(SOURCE) as source:
+        entries = [m for m in source.infolist() if not m.is_dir()]
+        need(len(entries) == 94 and len({m.filename.casefold() for m in entries}) == len(entries), "frozen_source94_inventory_changed")
+        runtime = {m.filename.removeprefix("HPC-Forest/src/hpc_forest/"): sha_bytes(source.read(m))
+                   for m in entries if m.filename.startswith("HPC-Forest/src/hpc_forest/") and m.filename.endswith(".py")}
+    return digest(runtime), {"restored_files": len(expected), "official_archives": len(official_zips),
+                             "source_zip_files": len(entries), "runtime_implementation_sha256": digest(runtime),
+                             "raw_archive_manifest_sha256": sha_bytes(manifest_raw),
+                             "restorer_serialized_manifest_sha256": sha(RX / "restauration-neuve/manifest-verifie.json"),
+                             "manifest_structures_identical": True}
+
+
+def verify_capture(missions):
+    path = RX / "reconciliation-livraisons-r1/capture-01/PRESERVATION-PAR-NONCE.json"
+    need(sha(path) == "394e77b7139d64710ae4bda97d3a6772a08d97256bb73511def4169882fd93ea", "sealed_nonce_capture_changed")
+    capture = load(path)
+    need(capture["schema"] == "hpc-forest-source-only-finished-nonce-preservation-v1" and capture["verified"] is True
+         and capture["session_id"] == SESSION and str(capture["job_id"]) == JOB
+         and capture["before_after_SHA_identical"] is True and capture["nonce_names_before_after_identical"] is True
+         and capture["orphan_nonce_directories"] == capture["nonterminal_nonce_directories"] == capture["conflicts"] == []
+         and all(capture[k] is False for k in ("worker_lock_opened_or_copied", "database_or_database_locks_opened_or_copied",
+                 "complete_live_cache_snapshot", "resume_events_stream_opened_or_copied")), "capture_scope_or_closure_wrong")
+    payloads = collections.defaultdict(dict)
+    for name, value in capture["files"].items():
+        parts = PurePosixPath(name).parts
+        need(len(parts) == 2 and parts[0] in missions and "\\" not in name and value["finished_nonce_only"] is True, "foreign_captured_nonce")
+        path = bound(value["preserved"])
+        need(path.resolve().is_relative_to(RX.resolve()) and sha(path) == value["sha256"]
+             and path.stat().st_size == value["bytes"], "preserved_payload_not_immutable_received_bytes")
+        payloads[parts[0]][parts[1]] = path
+    need(set(payloads) == set(missions) and len(payloads) == capture["nonce_directory_count"], "capture_nonce_coverage_differs")
+    required = {"generation-claimed.json", "download-receipt.json", "downloaded-request.json", "response.json", "response-ready.json", "delivered.json"}
+    invocation_files = {"invocation.json", "codex.jsonl", "codex.jsonl.json", "request.json", "instructions.txt", "output-schema.json"}
+    for nonce, files in payloads.items():
+        need(required <= set(files) and set(files) <= required | invocation_files | {"agent-result.json"}, "captured_file_set_not_closed")
+        request_path = ROOT / "mailbox/requests" / (nonce + ".request.json")
+        request_sha, response_sha = sha(request_path), sha(files["response.json"])
+        need(sha(files["downloaded-request.json"]) == request_sha, "downloaded_request_not_archived_request")
+        claim, ready, delivery = (load(files[n]) for n in ("generation-claimed.json", "response-ready.json", "delivered.json"))
+        need(claim["request_sha256"] == request_sha and delivery["request_sha256"] == request_sha
+             and ready["sha256"] == delivery["response_sha256"] == response_sha
+             and ready["bytes"] == files["response.json"].stat().st_size, "claim_ready_delivery_sha_chain_broken")
+        download = load(files["download-receipt.json"])
+        need(download["ok"] is True and download["verifie"] is True and download["transport"] == "scp"
+             and all(download[k] == request_sha for k in ("remote_sha256", "empreinte_locale", "empreinte_distante")), "request_download_receipt_wrong")
+        remote_prefix = "/nimarano/hpc-forest-gpt61sol-max-harness-comparison-20261016-r1-source-only-" + MODEL + "-max-" + SESSION
+        need(download["downloaded"].endswith(remote_prefix + "/run/results-" + JOB + "/mailbox/requests/" + nonce + ".request.json"), "download_wrong_job_session_channel")
+        response = load(files["response.json"])
+        if "invocation.json" in files:
+            need(invocation_files <= set(files) and canonical(load(files["request.json"])) == canonical(load(request_path)), "incomplete_invocation_or_semantic_request_mismatch")
+            sidecar, invocation = load(files["codex.jsonl.json"]), load(files["invocation.json"])
+            need(sidecar["argv"] == invocation["argv"] and type(sidecar["returncode"]) is int
+                 and type(sidecar["timed_out"]) is bool and math.isfinite(sidecar["seconds"]) and sidecar["seconds"] >= 0,
+                 "native_sidecar_not_bound")
+            if response.get("error") is None:
+                need("agent-result.json" in files and canonical(load(files["agent-result.json"])) == canonical(response["data"]), "normal_response_not_exact_agent_result")
+        else:
+            need(not (set(files) & invocation_files) and "agent-result.json" not in files, "orphan_invocation_payload")
+        for filename, archive_name in (("response.json", nonce + ".response.json"), ("invocation.json", nonce + ".invocation.json"),
+                                       ("codex.jsonl", nonce + ".codex.jsonl"), ("codex.jsonl.json", nonce + ".codex.jsonl.json")):
+            folder = "responses" if filename == "response.json" else "logs"
+            archived = ROOT / "mailbox" / folder / archive_name
+            if archived.exists():
+                need(filename in files and sha(archived) == sha(files[filename]), "archive_and_nonce_payload_conflict")
+    for name, value in capture["top_identity_metadata"].items():
+        path = bound(value["preserved"])
+        need(path.resolve().is_relative_to(RX.resolve()) and sha(path) == value["sha256"], "captured_owner_sha_changed")
+        identity = load(path)
+        need(identity["session_id"] == SESSION, "captured_top_session_wrong")
+        if name in {"OWNER.json", "worker-ready.json"}:
+            need(identity["model"] == MODEL and identity["reasoning_effort"] == "max", "captured_top_model_wrong")
+    return payloads
+
+
+def verify_ledger(records, payloads, expected_sha):
+    path = RX / "reconciliation-livraisons-r1/RECONCILIATION-LIVRAISONS.json"
+    need(sha(path) == expected_sha, "final_reconciliation_sha_not_expected")
+    ledger = load(path)
+    need(ledger["schema"] == "hpc-forest-source-only-native-delivery-reconciliation-v1"
+         and ledger["all_started_calls_reconciled"] is True and ledger["unknown_invocations"] == 0,
+         "final_reconciliation_not_closed_metadata")
+    indexed = {r["nonce"]: r for r in ledger["records"]}
+    need(len(indexed) == len(ledger["records"]) == len(records), "ledger_duplicate_or_uncovered_nonce")
+    for record in records:
+        row, files = indexed[record["nonce"]], payloads[record["nonce"]]
+        need(all(row[k] == record[k] for k in ("subject", "role", "request_sha256", "native_invocation_observed")), "ledger_identity_role_or_invocation_disagrees")
+        need(row["response_sha256"] == sha(files["response.json"]), "ledger_response_sha_differs")
+        need(set(row["payload_refs"]) == set(files) and all(bound(row["payload_refs"][n]) == p for n, p in files.items()), "ledger_payload_refs_differ_from_capture")
+        if not record["native_invocation_observed"]:
+            need(record["preinvocation_zero_claimed"] and row["not_called_before_expiry"] is True, "zero_without_explicit_preinvocation_proof")
+            record["known_exact_tokens"] = 0
+        measured = record["known_exact_tokens"] is not None
+        need(row["usage_measured"] is measured and row["known_exact_tokens"] == record["known_exact_tokens"]
+             and row["unknown_consumption"] is (record["known_exact_tokens"] is None), "ledger_known_unknown_consumption_disagrees")
+    known = sum(r["known_exact_tokens"] for r in records if r["known_exact_tokens"] is not None)
+    unknown = sum(r["known_exact_tokens"] is None for r in records)
+    need(ledger["known_exact_tokens"] == known and ledger["requests_with_unknown_consumption"] == unknown
+         and ledger["exact_consumption_tokens_total"] is None, "ledger_totals_or_global_null_disagrees")
+    return {"requests": len(records), "native_invocations_observed": sum(r["native_invocation_observed"] for r in records),
+            "usage_measured_invocations": sum(r["reported_completed_turns"] > 0 for r in records),
+            "expired_before_invocation_proven": sum(not r["native_invocation_observed"] for r in records),
+            "known_exact_tokens": known, "requests_with_unknown_consumption": unknown,
+            "exact_consumption_tokens_total": None, "role_requests": dict(collections.Counter(r["role"] for r in records)),
+            "diagnostic_non_json_lines": sum(r["diagnostic_non_json_lines"] for r in records),
+            "native_error_items": sum(r["native_error_items"] for r in records)}
+
+
+def save(name, value):
+    with (HERE / (OUTPUT_PREFIX + name)).open("x", encoding="utf8") as output:
+        output.write(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def main():
+    global OUTPUT_PREFIX
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reconciliation-sha256", required=True)
+    parser.add_argument("--passage", required=True)
+    args = parser.parse_args()
+    need(re.fullmatch("passage-[0-9]{2}", args.passage), "safe_unique_passage_name_required")
+    OUTPUT_PREFIX = args.passage + "-"
+    with (HERE / (OUTPUT_PREFIX + "audit_independant.py")).open("x", encoding="utf8") as saved_source:
+        saved_source.write(Path(__file__).read_text(encoding="utf8"))
+    before = inventory(RX / "restauration-neuve")
+    capture_before = inventory(RX / "reconciliation-livraisons-r1/capture-01")
+    save("inventaire-independant-avant.json", before)
+    save("inventaire-capture-avant.json", capture_before)
+    try:
+        need(sha(RX / "audit-initial.json") == BASELINE_SHA and sha(RX / "groupe-exact.json") == GROUP_SHA, "sealed_baseline_or_group_changed")
+        need(before == load(RX / "inventaire-avant-audit.json") == load(RX / "inventaire-apres-audit.json"), "baseline_inventory_already_changed")
+        runtime, archive_checks = verify_archive_and_source()
+        group, baseline = load(RX / "groupe-exact.json"), load(RX / "audit-initial.json")
+        subjects = group["subjects"]
+        need(len(subjects) == len(set(subjects)) == 15 and group["model"] == MODEL
+             and group["effort"] == "max" and group["session_id"] == SESSION, "wrong_group")
+        references = load(COMPARE / "contrats-reference.json")
+        prepared = load(ROOT / "prepared-manifest.json")
+        results, missions = [], {}
+        initial = {r["subject"]: r for r in baseline["subjects"]}
+        for slug in subjects:
+            p = prepared["records"][slug]["prepared"]
+            need(p["ready"] is True and type(p["manual_algorithm_changes"]) is int and p["manual_algorithm_changes"] == 0
+                 and ("mother_may_change_tests" not in p or p["mother_may_change_tests"] is False), "unqualified_official_preparation")
+            result = verify_subject(slug, initial[slug], p, references["subjects"][slug], runtime)
+            need(not set(missions).intersection(result["missions"]), "nonce_reused_across_subjects")
+            missions.update(result.pop("missions"))
+            results.append(result)
+        payloads = verify_capture(missions)
+        records = verify_mailbox(missions, payloads)
+        costs = verify_ledger(records, payloads, args.reconciliation_sha256)
+        status, roles = collections.Counter(), collections.Counter()
+        for result in results:
+            status.update(result["statuses"])
+            roles.update(result["roles"])
+        report = {"schema": "hpc-forest-source-only-independent-cold-audit-v1", "verified": True,
+                  "observed_utc": datetime.now(timezone.utc).isoformat(), "scope_id": SCHEMA,
+                  "verification_scope": "cold archived protocol/source/lineage/recorded 3+5 evaluations/submission bytes and preserved finished-nonce delivery/usage metadata",
+                  "job_id": JOB, "session_id": SESSION, "model": MODEL, "effort": "max",
+                  "archive_sha256": ARCHIVE_SHA, "source_zip_sha256": SOURCE_SHA, "archive_checks": archive_checks,
+                  "baseline": ref(RX / "audit-initial.json"), "reconciliation": ref(RX / "reconciliation-livraisons-r1/RECONCILIATION-LIVRAISONS.json"),
+                  "subjects": results, "subject_count": len(results), "missions": sum(r["trials"] for r in results),
+                  "mission_statuses": dict(status), "mission_roles_deduplicated": dict(roles),
+                  "scored_nodes": sum(r["scored_nodes"] for r in results), "retained_baselines": sum(r["retained_baseline"] for r in results),
+                  "final_modified_programs": sum(not r["retained_baseline"] for r in results), "costs": costs,
+                  "native_codex_treatment_admitted": False, "r3_normal_admitted": False,
+                  "independent_execution_or_performance_audit_verified": False, "causal_advantage_verified": False,
+                  "model_calls": 0, "candidate_executions_or_compilations": 0, "cli_or_subprocess_calls": 0,
+                  "live_cache_read": False, "worker_lock_or_live_database_read": False, "stop_performed_or_authorized_by_this_reader": False,
+                  "limits": ["Checks authenticate recorded outcomes and submitted source bytes; candidates were never rerun.",
+                             "Recorded stdout/binary/input provenance and physical hosted model weights are not independently certified.",
+                             "Known token sum excludes unknown consumption; total exact consumption stays null.",
+                             "ABC mission counts already exclude G; G is counted once. Mother calls are separate.",
+                             "Reference comparisons exclude only benchmark.reference_seconds; timing cohorts are never pooled.",
+                             "Operational live lock/DB/stream were excluded explicitly; no complete live cache snapshot is claimed."]}
+        report["limits"].append("One preserved local delivery postdates archive capture; remote readback of that response is not certified by this audit.")
+        save("ledger-independant-par-nonce.json", records)
+    except Exception as error:
+        save("PREMIER-REFUS.json", {"verified": False, "error_type": type(error).__name__, "error": str(error),
+                                    "script": ref(Path(__file__)), "reconciliation_sha256_expected": args.reconciliation_sha256,
+                                    "no_live_action": True})
+        raise
+    finally:
+        after = inventory(RX / "restauration-neuve")
+        capture_after = inventory(RX / "reconciliation-livraisons-r1/capture-01")
+        save("inventaire-independant-apres.json", after)
+        save("inventaire-capture-apres.json", capture_after)
+        need(before == after and capture_before == capture_after, "cold_evidence_mutated_during_audit")
+    report["restored_files_unchanged"] = len(before)
+    report["preserved_capture_files_unchanged"] = len(capture_before)
+    report["script"] = ref(Path(__file__))
+    save("AUDIT-INDEPENDANT.json", report)
+    print(json.dumps({k: report[k] for k in ("verified", "subject_count", "missions", "mission_statuses", "costs")}))
+
+
+if __name__ == "__main__":
+    main()

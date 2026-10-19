@@ -1,0 +1,244 @@
+"""Allocated official target profile only: no tests, reference campaigns or model."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import io
+import json
+import os
+import platform
+import re
+import stat
+import sys
+import tarfile
+import time
+import traceback
+import zipfile
+from pathlib import Path, PurePosixPath
+
+SHARED = '/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-qualification-20261018-eaff9217499f'
+DRIVER = '/scratch_p/nimarano/hpc-forest-r4b-target-profile-source110-20261018-r1'
+SOURCE = 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48'
+PLAN = 'd08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27'
+RUNTIME = '66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766'
+COMPONENTS = '1e60da6d5b51afaf3c857b1ba215927e7e1201c297241afd6390212a89d5e449'
+TARGET_MODULE = '0257e9c22f43a489bf4c2af8ec7b982d8a5ac6d652844ae227826041beac4783'
+Q_PINS = {'q753709-qualification.json': '520573e89fb4505e791a0b70a4a97ee6d59db149af5d79f6af535aabd747724f',
+    'q753709-bootstrap-allocation.json': '3a749cb4a40d718f1006ca2313734793796e3b90c560ec87d75550ab45d540b0',
+    'q753709-bindings.json': '93241a738d3eff2bb3501b4df631e9f059a7666ed566df52f90538276d2c53e7'}
+DEADLINE = 1793487600
+
+
+def need(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read_regular(path):
+    before = path.lstat()
+    need(stat.S_ISREG(before.st_mode) and before.st_size <= 32 * 1024**2, 'Bounded regular input only')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    same = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    try:
+        need(same(os.fstat(fd)) == same(before), 'Input changed before open')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            raw = stream.read(before.st_size + 1)
+        need(len(raw) == before.st_size and same(os.fstat(fd)) == same(before)
+             and same(path.lstat()) == same(before), 'Input changed while read')
+        return raw
+    finally:
+        os.close(fd)
+
+
+def decode(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, 'Duplicate JSON member')
+            result[key] = value
+        return result
+    return json.loads(raw.decode('utf8'), object_pairs_hook=pairs,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+
+
+def allocation_guard(*, now=None):
+    now = time.time() if now is None else now
+    need(now + 600 + 10800 < DEADLINE, 'Ten-minute maximum plus three-hour audit strictly before deadline')
+    need(platform.machine().lower() == 'aarch64' and os.name == 'posix', 'ARM64 POSIX allocation required')
+    for name, value in {'SLURM_CPUS_PER_TASK': '4', 'SLURM_NTASKS': '1', 'SLURM_JOB_NUM_NODES': '1', 'SLURM_MEM_PER_NODE': '16384'}.items():
+        need(os.environ.get(name) == value, 'Exact4CPU/1task/1node/16GiB allocation required')
+    job = os.environ.get('SLURM_JOB_ID', '')
+    need(re.fullmatch('[0-9]+', job) and job != '753709', 'New allocated target-profile job required')
+    need(not os.environ.get('SLURM_JOB_GPUS', '') and not os.environ.get('SLURM_STEP_GPUS', '')
+         and os.environ.get('SLURM_GPUS', '0') == '0' and os.environ.get('SLURM_GPUS_ON_NODE', '0') == '0', 'Zero GPU allocation required')
+    affinity = sorted(os.sched_getaffinity(0))
+    need(len(affinity) == 4, 'Exactly four bound CPU identities required')
+    return {'slurm_job_id': job, 'architecture': 'ARM64', 'cpu_cores': 4, 'tasks': 1, 'nodes': 1,
+        'allocated_memory_mib': 16384, 'allocated_gpus': 0, 'affinity_cpu_ids': affinity}
+
+
+def inventory(root):
+    need(root.is_dir() and not root.is_symlink(), 'Real source/output directory required')
+    result = {}
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs:
+            need(stat.S_ISDIR((Path(directory) / name).lstat().st_mode), 'Directory link/special refused')
+        for name in files:
+            path = Path(directory) / name
+            result[path.relative_to(root).as_posix()] = digest(read_regular(path))
+    return result
+
+
+def verify_shared(root):
+    need(str(root) == SHARED, 'Only exact shared official source root admitted')
+    raw = {name: read_regular(root / name) for name in ('project.zip', 'dynamic-plan.json', 'runtime-manifest.json')}
+    need(digest(raw['project.zip']) == SOURCE and digest(raw['dynamic-plan.json']) == PLAN
+         and digest(raw['runtime-manifest.json']) == RUNTIME, 'ExactZIP/plan/runtime required before source import')
+    expected = decode(raw['runtime-manifest.json'])
+    need(isinstance(expected, dict) and len(expected) == 110, 'Exact110source manifest required')
+    with zipfile.ZipFile(io.BytesIO(raw['project.zip'])) as archive:
+        entries = archive.infolist(); zipped = {}
+        for entry in entries:
+            need(not entry.is_dir() and entry.filename.startswith('HPC-Forest/')
+                 and not stat.S_ISLNK(entry.external_attr >> 16), 'Regular official ZIP member only')
+            name = entry.filename.removeprefix('HPC-Forest/'); relative = PurePosixPath(name)
+            need(not relative.is_absolute() and relative.as_posix() == name and '..' not in relative.parts
+                 and '\\' not in name and name not in zipped, 'Exact source ZIP path required')
+            zipped[name] = digest(archive.read(entry))
+        need(len(entries) == 110 and zipped == expected, 'ZIP110/runtime mismatch')
+    actual = inventory(root)
+    exact = {'project/' + name: value for name, value in expected.items()}
+    exact.update({name: digest(value) for name, value in raw.items()})
+    need(len(actual) == 113 and actual == exact, 'All113 official shared bytes and no extras required')
+    plan = decode(raw['dynamic-plan.json'])
+    need(plan['scope_id'] == 'hpc-forest-dynamic-independent-roots-r4b-max' and plan['source_zip_sha256'] == SOURCE,
+         'Exact R4b MAX source110 plan required')
+    need(expected['src/hpc_forest/target_profile.py'] == TARGET_MODULE, 'Official target module changed')
+    return actual
+
+
+def verify_Q(root):
+    docs = {}
+    for name, expected in Q_PINS.items():
+        raw = read_regular(root / name)
+        need(digest(raw) == expected, 'Received original Q evidence changed')
+        docs[name] = decode(raw)
+    q, allocation, binding = (docs[name] for name in Q_PINS)
+    need(q.get('verified') is True and q.get('native_model_calls') == 0
+         and q.get('source_file_count') == 110 and q.get('adapter_components_manifest_sha256') == COMPONENTS
+         and q.get('source_zip_sha256') == SOURCE and q.get('plan_sha256') == PLAN
+         and q.get('allocation', {}).get('slurm_job_id') == '753709'
+         and allocation.get('slurm_job_id') == '753709' and allocation.get('guard_before_any_extraction') is True
+         and binding.get('adapter_components_manifest_sha256') == COMPONENTS
+         and binding.get('source_zip_sha256') == SOURCE and binding.get('plan_sha256') == PLAN,
+         'Exact three already-received mechanical Q identities required; no replay')
+    return {name: expected for name, expected in Q_PINS.items()}
+
+
+def validate_profile(value, allocation):
+    need(value.get('schema') == 'hpc-forest-target-profile-v1' and all(value.get(k) == allocation[k]
+        for k in ('slurm_job_id', 'architecture', 'cpu_cores', 'tasks', 'nodes', 'allocated_memory_mib', 'allocated_gpus')),
+        'Profile belongs to another allocation')
+    need(value.get('verified_capabilities') == ['cpu', 'c', 'cxx', 'openmp']
+         and value.get('operator_algorithm_advice') is False and set(value.get('compilers', {})) == {'gcc', 'g++'},
+         'Only official CPU/C/CXX/OpenMP probes required')
+    for item in value['compilers'].values():
+        need(type(item.get('probe_returncode')) is int and item['probe_returncode'] == 0 and item.get('probe_stdout') == '4\n'
+             and isinstance(item.get('path'), str) and Path(item['path']).is_absolute()
+             and all(re.fullmatch('[0-9a-f]{64}', item.get(k, '')) for k in ('sha256', 'probe_binary_sha256')),
+             'Both actual official neutral compiler/runtime records required')
+    unsigned = {k: v for k, v in value.items() if k != 'profile_digest'}
+    need(digest(json.dumps(unsigned, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()) == value.get('profile_digest'),
+         'Official target profile digest changed')
+    return value
+
+
+def save(path, value):
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--driver', required=True)
+    parser.add_argument('--shared', required=True)
+    args = parser.parse_args()
+    allocation = allocation_guard()  # Before file I/O, source import or any compiler action.
+    need(args.driver == DRIVER and args.shared == SHARED, 'Exact new driver and shared official source only')
+    root, shared = Path(args.driver), Path(args.shared)
+    need(root == Path(__file__).parent and root.is_dir() and not root.is_symlink(), 'Expected fresh packet extraction root required')
+    output = root / 'profile-proof'; output.mkdir(exist_ok=False)
+    record = {'schema': 'hpc-forest-source110-current-target-profile-qualification-v1', 'verified': False,
+        'source_zip_sha256': SOURCE, 'plan_sha256': PLAN, 'component_manifest_sha256': COMPONENTS,
+        'allocation': allocation, 'official_prepare_target_profile_calls': 0,
+        'reference_campaigns_reexecuted': 0, 'neutral_tests_reexecuted': 0, 'native_model_calls': 0,
+        'CLI_or_installation_executed': False, 'source_modified': False, 'native_generation_admitted': False,
+        'scientific_performance_or_method_R5_admission': False}
+    exitcode, before = 1, None
+    try:
+        before = verify_shared(shared)
+        save(output / 'official113-before.json', before)
+        record['original_Q_pins'] = verify_Q(root)
+        need(not any(name == 'hpc_forest' or name.startswith('hpc_forest.') for name in sys.modules), 'No preloaded other project source permitted')
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(shared / 'project/src'))
+        # Standard per-process scratch selection, not a source monkeypatch. The official temporary probe cleans itself.
+        temporary = output / 'temporary-neutral-probes'; temporary.mkdir()
+        os.environ['TMPDIR'] = str(temporary)
+        target = importlib.import_module('hpc_forest.target_profile')
+        need(Path(target.__file__).resolve() == (shared / 'project/src/hpc_forest/target_profile.py').resolve()
+             and digest(read_regular(Path(target.__file__))) == TARGET_MODULE, 'Actual imported target module origin differs')
+        record['official_prepare_target_profile_calls'] = 1
+        save(output / 'official-probe-intention.json', {**record, 'two_official_neutral_compilers': ['gcc', 'g++'],
+            'no_retry': True, 'no_source_function_or_subprocess_monkeypatch': True})
+        profile = target.prepare_target_profile()  # The one permitted official call; two neutral OpenMP probes only.
+        validate_profile(profile, allocation)
+        save(output / 'target-profile.json', profile)
+        after = verify_shared(shared)
+        save(output / 'official113-after.json', after)
+        need(after == before, 'All113 original bytes must remain unchanged')
+        record.update(verified=True, official113_before_after_identical=True,
+            target_profile_sha256=digest(read_regular(output / 'target-profile.json')),
+            target_profile_digest=profile['profile_digest'], two_successful_official_compiler_records=True)
+        exitcode = 0
+    except BaseException as exc:  # noqa: BLE001 -- one-shot receipt preserves failures and never retries.
+        record.update(error_type=type(exc).__name__, error=str(exc), automatic_retry_allowed=False,
+            official_helper_does_not_expose_captured_compiler_stderr_on_exception=True)
+        with (output / 'FIRST-FAILURE.txt').open('x', encoding='utf8') as stream:
+            traceback.print_exc(file=stream)
+        if before is not None:
+            try:
+                after = verify_shared(shared); save(output / 'official113-after-failure.json', after)
+                record['official113_before_after_identical'] = after == before
+            except BaseException as check:  # noqa: BLE001 -- record the inventory failure, never repair it.
+                record['post_failure_inventory_error'] = str(check)
+    finally:
+        save(output / 'target-qualification.json', record)
+        archived = inventory(output)  # No pytest fixtures, links or special members allowed.
+        archive = root / ('target-profile-results-' + allocation['slurm_job_id'] + '.tar.gz')
+        with archive.open('xb') as destination, tarfile.open(fileobj=destination, mode='w:gz') as packed:
+            for name in sorted(archived):
+                raw = read_regular(output / name)
+                need(digest(raw) == archived[name], 'Output changed before archive')
+                item = tarfile.TarInfo('profile-proof/' + name); item.size = len(raw); item.mode = 0o600; item.mtime = 0
+                packed.addfile(item, io.BytesIO(raw))
+        need(inventory(output) == archived, 'Output changed during archive')
+        save(root / 'profile-proof-inventory.json', archived)
+        envelope = {'schema': 'hpc-forest-source110-target-profile-envelope-v1', 'verified': exitcode == 0,
+            'archive': {'path': str(archive), 'sha256': digest(read_regular(archive)), 'bytes': archive.stat().st_size},
+            'qualification': {'path': str(output / 'target-qualification.json'), 'sha256': digest(read_regular(output / 'target-qualification.json'))},
+            'output_inventory': {'path': str(root / 'profile-proof-inventory.json'), 'sha256': digest(read_regular(root / 'profile-proof-inventory.json'))},
+            'source_zip_sha256': SOURCE, 'plan_sha256': PLAN, 'slurm_job_id': allocation['slurm_job_id'],
+            'neutral_tests_or_references_or_models_reexecuted': False, 'native_generation_admitted': False}
+        save(root / 'target-profile-envelope.json', envelope)
+        print(json.dumps(envelope), flush=True)
+    return exitcode
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

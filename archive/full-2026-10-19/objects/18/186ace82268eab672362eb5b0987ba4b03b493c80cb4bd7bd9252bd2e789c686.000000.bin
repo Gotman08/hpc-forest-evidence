@@ -1,0 +1,74 @@
+"""Neutral delta envelope tests: every subprocess is mocked."""
+import importlib.util
+import json
+import os
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("q_delta", HERE / "qualification-wrapper.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+class LaneDeltaTests(unittest.TestCase):
+    def test_guard_precedes_any_process(self):
+        with patch.object(mod, "allocation_guard", side_effect=RuntimeError("NO ALLOCATION")), patch.object(mod.subprocess, "run") as run:
+            with self.assertRaises(RuntimeError):
+                mod.run_lane_delta_tests(HERE / "NOT_CREATED", HERE / "NOT_CREATED")
+            run.assert_not_called()
+
+    def test_timeout_preserves_partial_streams_without_retry(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as temp:
+            root = Path(temp)
+            timeout = mod.subprocess.TimeoutExpired("MOCK_ONLY", 120, output=b"PARTIAL_OUT", stderr=b"PARTIAL_ERR")
+            with patch.object(mod, "allocation_guard", return_value={}), patch.object(mod, "deadline_guard"), patch.object(mod.subprocess, "run", side_effect=timeout) as run:
+                with self.assertRaises(RuntimeError):
+                    mod.run_lane_delta_tests(root, root / "extraction")
+                self.assertEqual(run.call_count, 1)
+            self.assertEqual((root / "lane-delta.stdout").read_bytes(), b"PARTIAL_OUT")
+            self.assertEqual((root / "lane-delta.stderr").read_bytes(), b"PARTIAL_ERR")
+            metadata = json.loads((root / "lane-delta-process.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["returncode"], 124)
+            self.assertTrue(metadata["timed_out"])
+            self.assertFalse(metadata["retry"])
+
+    def test_exact_junit_and_returncode_required(self):
+        for tests, skipped, code, accepted in ((36, 0, 0, True), (35, 0, 0, False), (36, 1, 0, False), (36, 0, 1, False)):
+            with self.subTest(tests=tests, skipped=skipped, code=code), tempfile.TemporaryDirectory(dir=HERE) as temp:
+                root = Path(temp)
+                (root / "lane-delta.xml").write_text(f'<testsuites><testsuite tests="{tests}" skipped="{skipped}" failures="0" errors="0"/></testsuites>', encoding="utf-8")
+                result = SimpleNamespace(stdout=b"MOCK_OUT", stderr=b"MOCK_ERR", returncode=code)
+                with patch.object(mod, "allocation_guard", return_value={}), patch.object(mod, "deadline_guard"), patch.object(mod.subprocess, "run", return_value=result) as run:
+                    if accepted:
+                        self.assertEqual(mod.run_lane_delta_tests(root, root / "extraction")["passed"], 36)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            mod.run_lane_delta_tests(root, root / "extraction")
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(run.call_args.kwargs["timeout"], 120)
+                    self.assertIn("--noconftest", run.call_args.args[0])
+
+    def test_fixture_link_is_metadata_and_not_archived_as_file(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as temp:
+            root = Path(temp)
+            link = root / "fixture-current"
+            link.write_bytes(b"MOCK_LINK_NOT_FOLLOWED")
+            (root / "regular.txt").write_bytes(b"REGULAR")
+            with patch.object(mod.Path, "is_symlink", lambda self: self == link), patch.object(mod.os, "readlink", return_value="OUTSIDE_NOT_READ"), patch.dict(os.environ, {"SLURM_JOB_ID": "999999"}), patch("builtins.print"):
+                mod.preserve_envelope(root, {"passed": False})
+            with tarfile.open(root / "envelope-results-999999.tar.gz", "r:gz") as archive:
+                names = archive.getnames()
+            self.assertNotIn("qualification-envelope/fixture-current", names)
+            self.assertIn("qualification-envelope/regular.txt", names)
+            links = json.loads((root / "fixture-links-metadata.json").read_text(encoding="utf-8"))
+            self.assertFalse(links["links_followed"])
+            self.assertEqual(links["links"][0]["target"], "OUTSIDE_NOT_READ")
+
+
+if __name__ == "__main__":
+    unittest.main()

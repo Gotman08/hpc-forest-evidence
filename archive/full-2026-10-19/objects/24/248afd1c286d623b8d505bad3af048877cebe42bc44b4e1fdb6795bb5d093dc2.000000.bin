@@ -1,0 +1,259 @@
+#include "knn.h"
+#include <omp.h>
+#include <string.h>
+
+// Heap entry for top-k selection
+typedef struct {
+    float dist;
+    long idx;
+    char label;
+} HeapEntry;
+
+static int compare_entries(const void *a, const void *b) {
+    const HeapEntry *ea = (const HeapEntry *)a;
+    const HeapEntry *eb = (const HeapEntry *)b;
+    if (ea->dist < eb->dist) return -1;
+    if (ea->dist > eb->dist) return 1;
+    if (ea->idx < eb->idx) return -1;
+    if (ea->idx > eb->idx) return 1;
+    return 0;
+}
+
+static int compare_chars(const void *a, const void *b) {
+    return *(const char *)a - *(const char *)b;
+}
+
+static inline int worse_entry(const HeapEntry *a, const HeapEntry *b) {
+    if (a->dist != b->dist) return a->dist > b->dist;
+    return a->idx > b->idx;
+}
+
+static inline void swap_entries(HeapEntry *a, HeapEntry *b) {
+    HeapEntry t = *a; *a = *b; *b = t;
+}
+
+static inline void sift_up(HeapEntry *heap, int pos) {
+    while (pos > 0) {
+        int parent = (pos - 1) / 2;
+        if (worse_entry(&heap[pos], &heap[parent])) {
+            swap_entries(&heap[pos], &heap[parent]);
+            pos = parent;
+        } else break;
+    }
+}
+
+static inline void sift_down(HeapEntry *heap, int start, int end) {
+    int root = start;
+    while (1) {
+        int child = 2 * root + 1;
+        if (child > end) break;
+        int right = child + 1;
+        if (right <= end && worse_entry(&heap[right], &heap[child])) child = right;
+        if (worse_entry(&heap[root], &heap[child])) {
+            swap_entries(&heap[root], &heap[child]);
+            root = child;
+        } else break;
+    }
+}
+
+static inline void heap_push(HeapEntry *heap, int *n, HeapEntry e) {
+    int i = (*n)++;
+    heap[i] = e;
+    sift_up(heap, i);
+}
+
+static inline void heap_replace_root(HeapEntry *heap, int n, HeapEntry e) {
+    heap[0] = e;
+    sift_down(heap, 0, n - 1);
+}
+
+void on_error() {
+    printf("Invalid input file.\n");
+    exit(1);
+}
+
+Point parse_point() {
+    float x, y;
+    if (scanf(" (%f ,%f) ", &x, &y) != 2) on_error();
+    Point p = {x, y};
+    return p;
+}
+
+int parse_k() {
+    int k;
+    if (scanf(" k=%d ", &k) != 1) on_error();
+    return k;
+}
+
+Dataset *parse_dataset() {
+    int n_groups;
+    if (scanf(" n_groups=%d ", &n_groups) != 1) on_error();
+
+    Group *groups = (Group *)malloc(sizeof(Group) * n_groups);
+    size_t total = 0;
+
+    for (int i = 0; i < n_groups; ++i) {
+        char label;
+        int length;
+        if (scanf(" label=%c ", &label) != 1) on_error();
+        if (scanf(" length=%d ", &length) != 1) on_error();
+
+        groups[i].label = label;
+        groups[i].length = length;
+        groups[i].points = (Point *)malloc(sizeof(Point) * length);
+        for (int j = 0; j < length; ++j) {
+            groups[i].points[j] = parse_point();
+        }
+        total += length;
+    }
+
+    Dataset *ds = (Dataset *)malloc(sizeof(Dataset));
+    ds->n = (int)total;
+
+    // Allocate aligned arrays for SIMD distance computation
+    if (posix_memalign((void **)&ds->xs, 64, total * sizeof(float)) != 0) {
+        ds->xs = (float *)malloc(total * sizeof(float));
+    }
+    if (posix_memalign((void **)&ds->ys, 64, total * sizeof(float)) != 0) {
+        ds->ys = (float *)malloc(total * sizeof(float));
+    }
+    ds->labels = (char *)malloc(total * sizeof(char));
+
+    size_t pos = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        char lab = groups[i].label;
+        for (int j = 0; j < groups[i].length; ++j) {
+            ds->xs[pos] = groups[i].points[j].x;
+            ds->ys[pos] = groups[i].points[j].y;
+            ds->labels[pos] = lab;
+            pos++;
+        }
+    }
+
+    // Free temporary group storage
+    for (int i = 0; i < n_groups; ++i) {
+        free(groups[i].points);
+    }
+    free(groups);
+
+    return ds;
+}
+
+char knn(Dataset *ds, int k, Point to_evaluate) {
+    int n = ds->n;
+    float px = to_evaluate.x;
+    float py = to_evaluate.y;
+
+    if (k <= 0 || n == 0) on_error();
+
+    // Allocate aligned distance array
+    float *dists = NULL;
+    if (posix_memalign((void **)&dists, 64, n * sizeof(float)) != 0) {
+        dists = (float *)malloc(n * sizeof(float));
+    }
+
+    #pragma omp parallel for simd schedule(static) aligned(ds->xs, ds->ys, dists: 64)
+    for (int i = 0; i < n; ++i) {
+        float dx = ds->xs[i] - px;
+        float dy = ds->ys[i] - py;
+        dists[i] = dx * dx + dy * dy;
+    }
+
+    int nthreads = omp_get_max_threads();
+    HeapEntry **heaps = (HeapEntry **)malloc(nthreads * sizeof(HeapEntry *));
+    int *heap_counts = (int *)calloc(nthreads, sizeof(int));
+    for (int t = 0; t < nthreads; ++t) {
+        heaps[t] = (HeapEntry *)malloc(k * sizeof(HeapEntry));
+    }
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        HeapEntry *heap = heaps[tid];
+        int cnt = 0;
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            float d = dists[i];
+            if (cnt < k) {
+                HeapEntry e = {d, i, ds->labels[i]};
+                heap_push(heap, &cnt, e);
+            } else {
+                HeapEntry e = {d, i, ds->labels[i]};
+                if (!worse_entry(&e, &heap[0])) {
+                    heap_replace_root(heap, k, e);
+                }
+            }
+        }
+        heap_counts[tid] = cnt;
+    }
+
+    // Collect all candidates from per-thread heaps
+    int total_candidates = 0;
+    for (int t = 0; t < nthreads; ++t) {
+        total_candidates += heap_counts[t];
+    }
+    HeapEntry *all = (HeapEntry *)malloc(total_candidates * sizeof(HeapEntry));
+    int pos = 0;
+    for (int t = 0; t < nthreads; ++t) {
+        memcpy(all + pos, heaps[t], heap_counts[t] * sizeof(HeapEntry));
+        pos += heap_counts[t];
+    }
+
+    // Sort by distance then index to preserve tie-breaking semantics
+    qsort(all, total_candidates, sizeof(HeapEntry), compare_entries);
+
+    int m = (total_candidates < k) ? total_candidates : k;
+    char *result_labels = (char *)malloc(m * sizeof(char));
+    for (int i = 0; i < m; ++i) {
+        result_labels[i] = all[i].label;
+    }
+
+    // Count frequencies exactly as the original sequential implementation
+    qsort(result_labels, m, sizeof(char), compare_chars);
+
+    char most_frequent = result_labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < m; ++i) {
+        if (result_labels[i] != result_labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = result_labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == m - 1 && current_frequency > most_frequent_count) {
+            most_frequent = result_labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    // Cleanup
+    free(dists);
+    for (int t = 0; t < nthreads; ++t) free(heaps[t]);
+    free(heaps);
+    free(heap_counts);
+    free(all);
+    free(result_labels);
+
+    return most_frequent;
+}
+
+int main() {
+    Dataset *ds = parse_dataset();
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(ds, k, to_evaluate));
+
+    free(ds->xs);
+    free(ds->ys);
+    free(ds->labels);
+    free(ds);
+    return 0;
+}

@@ -1,0 +1,117 @@
+"""One new own inert NTFS file only; inspect metadata, never any received file."""
+import ctypes
+from ctypes import wintypes
+from datetime import UTC, datetime
+import hashlib
+import importlib.util
+import json
+import msvcrt
+import os
+from pathlib import Path
+import sys
+
+HERE = Path(__file__).resolve().parent
+R2 = HERE.parent / "lecteur-r2/restaurer-livraison-reguliere-froide-r2.py"
+assert hashlib.sha256(R2.read_bytes()).hexdigest() == "0a0440425164586836e8951266638142ed6c7fe15347b4ac03109e5cfb9575e9"
+spec = importlib.util.spec_from_file_location("own_reader_r2_definitions_for_metadata_fixture", R2)
+reader = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(reader)  # Trusted definitions only; no main.
+assert os.name == "nt"
+folder = HERE / "fixture-NTFS-metadata-seulement"
+folder.mkdir(exist_ok=False)
+path = folder / "inert-file.bin"
+path.write_bytes(b"only own newly created inert bytes\n")
+
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+create = kernel.CreateFileW
+create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+create.restype = wintypes.HANDLE
+close = kernel.CloseHandle
+close.argtypes = [wintypes.HANDLE]
+close.restype = wintypes.BOOL
+set_time = kernel.SetFileTime
+set_time.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+                     ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME)]
+set_time.restype = wintypes.BOOL
+get_info = kernel.GetFileInformationByHandleEx
+get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+get_info.restype = wintypes.BOOL
+
+
+class BasicInfo(ctypes.Structure):
+    _fields_ = [("CreationTime", ctypes.c_longlong), ("LastAccessTime", ctypes.c_longlong),
+                ("LastWriteTime", ctypes.c_longlong), ("ChangeTime", ctypes.c_longlong),
+                ("FileAttributes", wintypes.DWORD)]
+
+
+def basic(fd):
+    value = BasicInfo()
+    if not get_info(msvcrt.get_osfhandle(fd), 0, ctypes.byref(value), ctypes.sizeof(value)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return {name: getattr(value, name) for name in
+            ("CreationTime", "LastWriteTime", "ChangeTime", "FileAttributes")}
+
+
+def unix_ns(filetime):
+    return (filetime - 116444736000000000) * 100
+
+
+desired_ns = int(datetime(2001, 1, 1, tzinfo=UTC).timestamp()) * 1_000_000_000
+desired_ticks = desired_ns // 100 + 116444736000000000
+creation = wintypes.FILETIME(desired_ticks & 0xFFFFFFFF, desired_ticks >> 32)
+handle = create(str(path), 0x100 | 0x80, 0x1 | 0x2 | 0x4, None, 3, 0x00200000, None)
+if handle == ctypes.c_void_p(-1).value:
+    raise ctypes.WinError(ctypes.get_last_error())
+try:
+    if not set_time(handle, ctypes.byref(creation), None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+finally:
+    close(handle)
+before_path = path.lstat()
+fd = reader.open_nofollow_read(path)
+try:
+    before_fd = os.fstat(fd)
+    before_native = basic(fd)
+    after_fd = os.fstat(fd)
+    after_native = basic(fd)
+    after_path = path.lstat()
+finally:
+    os.close(fd)
+fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns", "st_file_attributes")
+path_values = {name: getattr(before_path, name) for name in fields}
+fd_values = {name: getattr(before_fd, name) for name in fields}
+assert path_values == {name: getattr(after_path, name) for name in fields}
+assert fd_values == {name: getattr(after_fd, name) for name in fields}
+assert before_native == after_native
+cross = tuple(name for name in fields if name != "st_ctime_ns")
+assert all(path_values[name] == fd_values[name] for name in cross)
+assert path_values["st_ctime_ns"] == unix_ns(before_native["CreationTime"]) == desired_ns
+assert fd_values["st_ctime_ns"] == unix_ns(before_native["ChangeTime"])
+assert path_values["st_ctime_ns"] != fd_values["st_ctime_ns"]
+assert path_values["st_mtime_ns"] == unix_ns(before_native["LastWriteTime"])
+filesystem = ctypes.create_unicode_buffer(64)
+volume = kernel.GetVolumeInformationW
+volume.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.c_void_p,
+                   ctypes.c_void_p, ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD]
+volume.restype = wintypes.BOOL
+if not volume(path.anchor, None, 0, None, None, None, filesystem, len(filesystem)):
+    raise ctypes.WinError(ctypes.get_last_error())
+assert filesystem.value == "NTFS"
+result = {"schema": "hpc-forest-Q753709-own-NTFS-CPython-ctime-semantics-v1",
+    "verified": True, "fixture": str(path), "python_executable": sys.executable,
+    "python_version": sys.version, "filesystem": filesystem.value,
+    "metadata_only_after_own_fixture_creation": True, "received_file_content_or_metadata_read": False,
+    "set_file_time_only_on_this_own_fixture": True, "creation_time_deliberately_set_unix_ns": desired_ns,
+    "path_lstat": path_values, "held_fd_fstat": fd_values, "native_FILE_BASIC_INFO": before_native,
+    "observed_exact_mapping_on_this_runtime": {"lstat_st_ctime_ns": "FILE_BASIC_INFO.CreationTime",
+         "fstat_st_ctime_ns": "FILE_BASIC_INFO.ChangeTime", "mtime_ns": "FILE_BASIC_INFO.LastWriteTime"},
+    "each_API_full_baseline_stable_before_after": True, "native_times_stable_before_after": True,
+    "cross_identity_fields_equal_except_different_ctime_semantics": list(cross),
+    "numeric_tolerance_used": False, "main_or_archive_or_265tests_executed": False,
+    "evidence_kind": "Direct measurement on one new local file, not a universal CPython/Windows claim"}
+out = HERE / "PREUVE-NTFS-CPYTHON-CTIME-NEUTRE.json"
+with out.open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(result, stream, indent=2, ensure_ascii=True); stream.write("\n")
+print(json.dumps({"path": str(out), "sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
+                  "exact_semantics_confirmed": True}))

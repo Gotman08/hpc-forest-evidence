@@ -1,0 +1,105 @@
+"""Compare recorded observer/process metadata only; no module import, process probe or worker access."""
+import hashlib
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+ROOT = OUT.parent
+COMPARE = ROOT.parents[1]
+BASE = COMPARE.parents[1]
+OBS = COMPARE / "reprises/bascule-max-r2-20261017/observateur-r5"
+HELPER = BASE / "outputs/HPC-Forest-Etude-2020-2024-r1/receptions/coverage-terra-xhigh-750909/continuation-cli-r1/coordonner-prochain-cli-r1.py"
+EXPECTED_HELPER = "4df5b26caa0b68b610ffa3015c372e8f61107e457a1d3a1a0063d2726479195a"
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size}
+
+
+def same_recorded_cim(a, b):
+    if b is None:
+        return False
+    return all(a.get(key) == b.get(key) for key in ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine")) and int(datetime.fromisoformat(a["CreationDate"]).timestamp() * 1000) == int(datetime.fromisoformat(b["CreationDate"]).timestamp() * 1000)
+
+
+admission_path = OBS / "admission-observateur-max4.json"
+effective_path = OBS / "admission-effective-1792285148883538500.json"
+cim_path = ROOT / "cim-controle-source-only-01.json"
+routes_path = OBS.parent / "observateur-r4/routes-r2-max.json"
+stop_path = ROOT / "fermeture-r2-main-only-verifiee.json"
+admission, effective, census, bundle, stopped = map(read, (admission_path, effective_path, cim_path, routes_path, stop_path))
+assert census["complete_census"] is True and len(census["rows"]) == census["rows_count"]
+rows = {row["ProcessId"]: row for row in census["rows"]}
+assert sha(HELPER) == EXPECTED_HELPER
+assert sha(admission_path) == effective["admission_sha256"]
+comparisons = []
+for expected in admission["relay_identities"]:
+    actual = rows.get(expected["ProcessId"])
+    match = same_recorded_cim(expected, actual)
+    assert match
+    comparisons.append({"process_id": expected["ProcessId"], "present": actual is not None,
+        "first_four_fields_exactly_equal": all(expected[key] == actual[key] for key in ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine")),
+        "creation_expected_text": expected["CreationDate"], "creation_current_text": actual["CreationDate"],
+        "creation_exact_datetime_equal": datetime.fromisoformat(expected["CreationDate"]) == datetime.fromisoformat(actual["CreationDate"]),
+        "same_cim_equivalent_to_frozen_helper": match})
+routes = []
+for item in bundle["routes"]:
+    path = Path(item["path"])
+    assert sha(path) == item["sha256"]
+    route = read(path)
+    routes.append({"route": ref(path), "job_id": route["job_id"], "model": route["model"],
+        "session_id": route["session_id"], "pair_current": [{"process_id": row["ProcessId"],
+            "present_in_current_recorded_census": row["ProcessId"] in rows,
+            "same_cim_equivalent": same_recorded_cim(row, rows.get(row["ProcessId"]))} for row in route["relay_identities"]]})
+assert len(routes) == 3 and all(not row["present_in_current_recorded_census"] for route in routes for row in route["pair_current"])
+stderr_path = OBS / "observer.stderr.log"
+stderr = stderr_path.read_text(encoding="utf-8-sig")
+assert "secondary = verify_secondary_route(route, sessions, rows, admission)" in stderr
+assert 'verify_pair(route["relay_identities"], rows)' in stderr
+assert "Source-only relay exited or complete identity changed" in stderr
+refusal_paths = sorted(OBS.glob("refus-*.json"))
+refusals = [{"proof": ref(path), **read(path)} for path in refusal_paths]
+assert [row["consecutive"] for row in refusals] == [1, 2, 3]
+first_at = refusals[0]["at"]
+actions = [{"job_id": action["job_id"], "process_id": action["identity"]["ProcessId"],
+    "action": action["action"], "at_utc": action["at_utc"]} for action in stopped["actions"]]
+assert all(datetime.fromisoformat(action["at_utc"]).timestamp() < first_at for action in actions)
+observer_id = effective["observer"]["ProcessId"]
+observer_current = rows.get(observer_id)
+assert observer_current is None
+evidence = [ref(path) for path in [OBS / "observer-max4-r5.py", HELPER, admission_path, effective_path, cim_path,
+    routes_path, stop_path, stderr_path, OBS / "derniere-observation.json"]]
+report = {"schema": "hpc-forest-passive-observer-r5-recorded-metadata-diagnosis-v1", "verified": True,
+    "scope": "Recorded local metadata/code diagnosis only; not scientific R5, no live process/job observation",
+    "created_at": datetime.now(UTC).isoformat(), "source_only_job_id": "751592", "source_only_comparisons": comparisons,
+    "source_only_same_cim_failure_established": False, "admission_bytes_equal_effective_start_pin": True,
+    "frozen_helper_sha256_unchanged": True, "utf8_or_time_parse_error_established": False,
+    "actual_failure_call_path": ["watch", "census_guard", "verify_secondary_route", "verify_r2_route", "verify_pair"],
+    "actual_failure_actor": "An R2 route pair deliberately closed after terminal reception, not the source-only relay",
+    "misleading_message": "verify_pair is shared by SO and R2 but always says Source-only relay exited or complete identity changed",
+    "code_references": {"verify_pair_generic_message": "observer-max4-r5.py:128-132", "r2_caller": "observer-max4-r5.py:340",
+        "all_routes_revalidated": "observer-max4-r5.py:396", "route_check_before_terminal_r2_poll_skip": "observer-max4-r5.py:499-512",
+        "same_cim": "coordonner-prochain-cli-r1.py:114-116"},
+    "old_route_bundle_still_contains_three_closed_R2_routes": routes,
+    "main_stop_actions_recorded": actions, "consecutive_refusals": refusals,
+    "source_only_last_observation": ref(OBS / "derniere-observation.json"),
+    "recorded_census_at": census["captured_at_utc"], "r5_observer_main_pid": observer_id,
+    "r5_main_absent_in_parent_recorded_census": True,
+    "recommended_parent_next_step": "Freshly prove whole previous r5 reader absence; new isolated admission naming it, SO same job/session/worker and empty secondary routes. Resume only passive reader after review, never restart scientific worker",
+    "no_existing_code_admission_routes_or_workers_changed": True, "no_cache_response_or_lock_opened": True,
+    "no_process_probe_start_stop_restart_or_ROMEO_or_model_action": True, "evidence_refs": evidence}
+path = OUT / "DIAGNOSTIC-OBSERVATEUR-R5.json"
+with path.open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+print(json.dumps({"report": str(path), "sha256": sha(path), "SO_same_cim_both_true": True,
+    "admission_unchanged": True, "failure_is_R2_route_pair": True, "no_worker_action": True}))

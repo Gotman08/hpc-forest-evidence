@@ -1,0 +1,215 @@
+"""Closed Sol source-only accounting from immutable received metadata only."""
+from __future__ import annotations
+
+import json
+from collections import Counter
+from pathlib import Path
+
+JOB = "751592"
+SESSION = "665743a02b824021a697b6a4884a667c"
+MODEL = "gpt-6.1-sol"
+CAMPAIGN = "comparaison-source-only/sol-max-751592"
+COHORT = "source_only_sol_max_fifteen_subjects"
+ROLES = {"mother-preparation": "mère", "mother-synthesis": "mère",
+         "A": "enfant", "B": "enfant", "C": "enfant", "G": "intégration"}
+PINS = {
+    "receipt": "6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7",
+    "independent_audit": "c1eba0cfe33307451489eb7e3abc9bf0910f963328564e80eb68de42e47c9328",
+    "reconciliation": "0ed5c437d3737ec9a970a4183b3e80ce996e87a7f655e5fba9965a979682def8",
+    "nonce_ledger": "e59648ab81c4ad5dd18a4332eecda57c136e7299afae501673df9b4dad913504",
+    "late_remote_readback": "a62a6cdec8849d5e6f9b6f4c9a60013c4a843d2645ba170e347f780ad67e362c",
+    "normalization": "37d1f016096ae5b325de3da00322511047ecbcceb36bf9b281ec411a9d292b5a",
+}
+USAGE_KEYS = {"input_tokens", "output_tokens", "cached_input_tokens",
+              "cache_write_input_tokens", "reasoning_output_tokens"}
+
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def classify(item):
+    for key in ("native_invocation_observed", "usage_measured", "unknown_consumption",
+                "not_called_before_expiry", "archived_response_present", "late_local_delivery_only"):
+        require(type(item[key]) is bool, "Nonboolean closed-call fact")
+    require(item["role"] in ROLES, "Unknown source-only role")
+    exact = item["known_exact_tokens"]
+    if item["not_called_before_expiry"]:
+        require(not item["native_invocation_observed"] and item["usage_measured"]
+                and not item["unknown_consumption"] and type(exact) is int and exact == 0
+                and item["response_error_class"] == "expired_before_invocation",
+                "Zero-call expiry is not proven")
+        return "expired_before_invocation_proven"
+    require(item["native_invocation_observed"], "Unclassified non-invocation")
+    if not item["usage_measured"]:
+        require(exact is None and item["unknown_consumption"]
+                and item.get("usage_subdivisions") is None, "Unknown usage became a total")
+        return "unmeasured"
+    usage = item.get("usage_subdivisions")
+    require(type(exact) is int and exact >= 0 and not item["unknown_consumption"]
+            and type(usage) is dict and set(usage) == USAGE_KEYS
+            and all(type(v) is int and v >= 0 for v in usage.values()), "Bad exact usage")
+    require(exact == usage["input_tokens"] + usage["output_tokens"]
+            and usage["cached_input_tokens"] <= usage["input_tokens"]
+            and usage["cache_write_input_tokens"] <= usage["input_tokens"]
+            and usage["reasoning_output_tokens"] <= usage["output_tokens"],
+            "Subdivisions contradict total or were counted twice")
+    return "exact"
+
+
+def closed_sol_accounting(cohort, admissions, *, read, record, save, sha):
+    require(__debug__, "Never audit under Python -O")
+    reviewed = [x for x in admissions["reviewed_new_cohorts"] if x["cohort"] == COHORT]
+    require(len(reviewed) == 1, "Sol needs exactly one explicit admission")
+    artifacts = reviewed[0]["artifacts"]
+    require(set(artifacts) == set(PINS), "Unexpected Sol admission artifact set")
+    folder = Path(artifacts["receipt"]["path"]).parent.resolve()
+    values = {}
+    for name, expected in PINS.items():
+        item = artifacts[name]
+        require(type(item) is dict and set(item) == {"path", "sha256"}
+                and item["sha256"] == expected, "Wrong scoped Sol artifact")
+        path = Path(item["path"])
+        require(not path.is_symlink() and path.resolve(strict=True).is_relative_to(folder)
+                and sha(path) == expected, "Changed/out-of-scope closed artifact")
+        values[name] = read(path)
+    receipt, audit, recon, ledger = (values[x] for x in
+                                    ("receipt", "independent_audit", "reconciliation", "nonce_ledger"))
+    for value in (receipt, audit, recon):
+        require(value["verified"] is True and str(value["job_id"]) == JOB
+                and value["session_id"] == SESSION and value["model"] == MODEL
+                and value["effort"] == "max", "Closed Sol identity differs")
+    require(receipt["schema"] == "hpc-forest-source-only-sol-max-final-reception-v1"
+            and audit["schema"] == "hpc-forest-source-only-independent-cold-audit-v1"
+            and recon["schema"] == "hpc-forest-source-only-native-delivery-reconciliation-v1"
+            and ledger["schema"] == "hpc-forest-source-only-nonce-ledger-v1",
+            "Do not reinterpret an older receipt schema")
+    require(receipt["scientific_reception_verified"] is True
+            and receipt["independent_audit_verified"] is True
+            and receipt["all_started_calls_reconciled"] is True
+            and receipt["all124_deliveries_archive_or_fresh_remote_readback_supported"] is True
+            and recon["all_started_call_states_terminal"] is True
+            and recon["source_only_protocol94_verified"] is True
+            and recon["all_cli_source_execution_allowed_false"] is True
+            and recon["all_mother_child_G_requested_model_effort_same"] is True
+            and recon["cache_and_reasoning_subdivisions_not_added_again"] is True
+            and recon["all_published_requests_have_bound_local_delivery_receipt"] is True
+            and type(recon["unknown_invocations"]) is int and recon["unknown_invocations"] == 0
+            and recon["unresolved"] == []
+            and recon["total_exact_consumption_available"] is False
+            and recon["exact_consumption_tokens_total"] is None,
+            "Closed-call reconciliation incomplete")
+    require(audit["independent_execution_or_performance_audit_verified"] is False
+            and audit["physical_backend_model_identity_independently_attested"] is False
+            and audit["native_codex_treatment_admitted"] is False and audit["r3_normal_admitted"] is False,
+            "Archived source-only facts were promoted to another treatment")
+    late = values["late_remote_readback"]
+    require(late["schema"] == "hpc-forest-sol-max-late-remote-readback-v1"
+            and late["verified"] is True and late["all_124_deliveries_readback_supported"] is True
+            and late["archive_not_modified"] is True and late["new_inference_or_replay"] is False,
+            "Late negative delivery lacks its genuine readback")
+    normalized = values["normalization"]["exports"]["results"]
+    require(sha(Path(normalized["path"])) == normalized["sha256"]
+            and cohort == read(Path(normalized["path"])), "Normalized Sol cohort differs")
+    require(ledger["job_id"] == JOB and ledger["session_id"] == SESSION
+            and ledger["records"] == recon["records"], "Ledger binding differs")
+    records = ledger["records"]
+    require(len(records) == len({x["nonce"] for x in records}) == 124, "Duplicate/missing nonces")
+    cold_roots = (folder / "restauration-neuve", folder / "reconciliation-livraisons-r1/capture-01/pieces-supplementaires",
+                  folder / "livraison-tardive-distante-r1")
+
+    def cold_reference(item):
+        require(type(item) is dict and set(item) == {"path", "sha256"}, "Nonclosed payload reference")
+        path = Path(item["path"])
+        require(not path.is_symlink() and any(path.resolve(strict=True).is_relative_to(root)
+                    for root in cold_roots) and sha(path) == item["sha256"], "Cold bytes changed or escaped")
+        record(path)  # Hash/record only: never decode model payload or consult original worker.
+
+    calls = []
+    for item in records:
+        state = classify(item)
+        for evidence in [*item["payload_refs"].values(), item["archive_request"], item["subject_journal_request"]]:
+            cold_reference(evidence)
+        require(item["request_sha256"] == item["archive_request"]["sha256"], "Request digest differs")
+        usage = item.get("usage_subdivisions")
+        calls.append({"session_id": SESSION, "nonce": item["nonce"], "subject": item["subject"],
+                      "campaign": CAMPAIGN, "model": MODEL, "effort": "max", "job_id": JOB,
+                      "kind": ROLES[item["role"]], "role": item["role"], "state": state,
+                      "native_invocation_observed": item["native_invocation_observed"],
+                      "native_cli_invocation_observed": item["native_invocation_observed"],
+                      "backend_model_identity_independently_attested": False,
+                      "usage_measured": item["usage_measured"], "exact_total": item["known_exact_tokens"],
+                      "input_tokens": usage["input_tokens"] if usage else (0 if state.startswith("expired") else None),
+                      "output_tokens": usage["output_tokens"] if usage else (0 if state.startswith("expired") else None),
+                      "usage_subdivisions": usage, "request_sha256": item["request_sha256"],
+                      "response_sha256": item["response_sha256"], "delivery_verified": True,
+                      "late_originally_absent_from_archive": item["late_local_delivery_only"]})
+    require(Counter(x["state"] for x in calls) == {"exact": 111, "unmeasured": 10,
+                                                   "expired_before_invocation_proven": 3},
+            "Measured requests/invocations or expiries conflated")
+    require(sum(x["exact_total"] for x in calls if x["exact_total"] is not None) == 2676472
+            and sum(x["native_invocation_observed"] for x in calls) == 121, "Closed Sol totals differ")
+    for files in late["files"]:
+        require(files["received"]["sha256"] == files["source_preserved"]["sha256"], "Late bytes differ")
+        cold_reference(files["received"])
+        cold_reference(files["source_preserved"])
+    late_calls = [x for x in calls if x["late_originally_absent_from_archive"]]
+    require(len(late_calls) == 1 and late_calls[0]["nonce"] == late["nonce"]
+            and late_calls[0]["exact_total"] is None, "Late unknown was changed")
+    totals = {}
+    for row in cohort["rows"]:
+        selected = [x for x in calls if x["subject"] == row["subject"]]
+        totals[row["subject"]] = {
+            "native_calls": sum(x["native_invocation_observed"] for x in selected),
+            "known_exact_tokens": sum(x["exact_total"] for x in selected if x["exact_total"] is not None),
+            "unmetered_calls": sum(x["native_invocation_observed"] and x["exact_total"] is None for x in selected),
+            "published_requests": len(selected), "verified_deliveries": len(selected),
+            "expired_before_invocation": sum(x["state"] == "expired_before_invocation_proven" for x in selected),
+        }
+    require(len(totals) == 15 and set(totals) == {x["subject"] for x in calls}, "Subject coverage differs")
+    summary = {"published_requests": 124, "verified_deliveries": 124,
+               "native_invocations_observed": 121, "measured_native_invocations": 111,
+               "requests_with_exact_value_including_preinvocation_zero": 114,
+               "known_exact_tokens": 2676472, "unmeasured_native_invocations": 10,
+               "requests_with_unknown_consumption": 10, "expired_before_invocation_proven": 3,
+               "late_response_originally_absent_from_archive": 1,
+               "all124_deliveries_archive_or_remote_readback_supported": True}
+    save("couts-source-only-sol.json", {"schema": "closed-source-only-sol-editorial-accounting-v1",
+         "job_id": JOB, "session_id": SESSION, "artifacts": artifacts, "per_subject": totals,
+         "native_calls": calls, "request_summary": summary, "total_exact_consumption_available": False,
+         "exact_consumption_tokens_total": None, "reservations_are_not_consumption": True,
+         "cache_and_reasoning_subdivisions_already_included": True,
+         "detailed_role_totals": recon["by_role"], "no_live_worker_or_lock_read": True,
+         "backend_model_identity_independently_attested": False,
+         "independent_execution_or_performance_audit_verified": False})
+    return totals
+
+
+def self_test():
+    base = {"native_invocation_observed": True, "usage_measured": True, "unknown_consumption": False,
+            "not_called_before_expiry": False, "archived_response_present": True,
+            "late_local_delivery_only": False, "role": "G", "known_exact_tokens": 9,
+            "response_error_class": "none", "usage_subdivisions": {"input_tokens": 4, "output_tokens": 5,
+            "cached_input_tokens": 2, "cache_write_input_tokens": 1, "reasoning_output_tokens": 3}}
+    require(classify(base) == "exact", "Neutral exact check failed")
+    unknown = {**base, "usage_measured": False, "unknown_consumption": True,
+               "known_exact_tokens": None, "usage_subdivisions": None}
+    require(classify(unknown) == "unmeasured", "Neutral unknown check failed")
+    expiry = {**base, "native_invocation_observed": False, "not_called_before_expiry": True,
+              "known_exact_tokens": 0, "response_error_class": "expired_before_invocation",
+              "usage_subdivisions": None}
+    require(classify(expiry) == "expired_before_invocation_proven", "Neutral expiry check failed")
+    for invalid in ({**unknown, "known_exact_tokens": 0}, {**expiry, "native_invocation_observed": True},
+                    {**base, "usage_subdivisions": {**base["usage_subdivisions"], "extra": 0}},
+                    {**base, "native_invocation_observed": 1}, {**base, "role": "sister"}):
+        try:
+            classify(invalid)
+        except ValueError:
+            continue
+        raise AssertionError("Neutral contradiction accepted")
+    return 8
+
+
+if __name__ == "__main__":
+    print(json.dumps({"neutral_checks_passed": self_test(), "model_calls": 0, "live_cache_reads": 0}))

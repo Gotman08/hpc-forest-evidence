@@ -1,0 +1,159 @@
+"""Restaurer et auditer les seules preuves du prévol zéro modèle752369."""
+
+import hashlib
+import json
+import re
+import tarfile
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+PREP = HERE.parents[1]
+QUAL = PREP / "lancement-modeles-max-r2/qualification-stage-r1"
+ARCHIVE_SHA = "76cfe5cedcf00a00a1ea53f9fa6fd6cf124fa898b1874e4b91844da3d5c63e21"
+REPORT_SHA = "856b06914b96c8686df42ac5f49fd9de99aa0314fb319be7f7657abaf59fc1c8"
+SOURCE_SHA = "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3"
+PLAN_SHA = "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b"
+STAGE_SHA = "bdb27e9611d5e53048521a48563b0abd4bf55256ac4169d49d46941f1d2ba73a"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def read(path):
+    return json.loads(path.read_bytes())
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        assert not path.is_symlink() and not path.is_junction()
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = {"sha256": sha(path), "bytes": path.stat().st_size}
+    return result
+
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+
+
+def main():
+    archive_path = HERE / "preflight-results-752369.tar.gz"
+    report_path = HERE / "preflight.json"
+    assert sha(archive_path) == ARCHIVE_SHA and sha(report_path) == REPORT_SHA
+    download = read(HERE / "archive-download.json")
+    assert download["verifie"] is True
+    assert download["empreinte_distante"] == download["empreinte_locale"] == ARCHIVE_SHA
+    logs = read(HERE / "logs-announcement.json")
+    expected_archive = ("/scratch_p/nimarano/hpc-forest-dynamic-r4b-stage-preflight-20261018-r1-bdb27e9611d5/"
+                        "preflight-results-752369.tar.gz")
+    announcements = re.findall(r"(?m)^([0-9a-f]{64})  (\S+)$", logs["content"])
+    assert (ARCHIVE_SHA, expected_archive) in announcements
+    status, efficiency = read(HERE / "status-terminal.json"), read(HERE / "efficiency.json")
+    assert status["state"] == efficiency["state"] == "COMPLETED"
+    assert status["exit_code"] == efficiency["exit_code"] == "0:0"
+    assert status["job_id"] == efficiency["job_id"] == "752369"
+    assert status["observation"]["current_state_observed"] is True
+    assert efficiency["alloc_cpus"] == 4 and efficiency["alloc_gpus"] == 0
+    restored = HERE / "restauration-neuve-01"
+    assert not restored.exists()
+    expected_files = {"results-752369/preflight.json", "results-752369/driver/remote_stage.py",
+                      "results-752369/driver/cell_selection.py", "results-752369/driver/stage-manifest.json"}
+    expected_dirs = {"results-752369", "results-752369/driver"}
+    with tarfile.open(archive_path) as archive:
+        members = archive.getmembers()
+        assert len(members) == len({member.name for member in members}) == 6
+        assert {member.name for member in members if member.isfile()} == expected_files
+        assert {member.name for member in members if member.isdir()} == expected_dirs
+        assert all(member.isfile() or member.isdir() for member in members)
+        assert sum(member.size for member in members) < 10_000_000
+        restored.mkdir()
+        for member in members:
+            path = PurePosixPath(member.name)
+            assert not path.is_absolute() and ".." not in path.parts
+            target = restored.joinpath(*path.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("xb") as stream:
+                    stream.write(archive.extractfile(member).read())
+    before = inventory(restored)
+    save("inventaire-avant-audit.json", before)
+    actual_report = restored / "results-752369/preflight.json"
+    assert actual_report.read_bytes() == report_path.read_bytes()
+    report = read(actual_report)
+    assert report["schema"] == "hpc-forest-dynamic-r4b-external-stage-zero-model-preflight-v1"
+    assert report["verified"] is True and report["error_class"] is None
+    assert report["source_zip_sha256"] == SOURCE_SHA and report["plan_sha256"] == PLAN_SHA
+    assert report["stage_archive_sha256"] == STAGE_SHA
+    assert report["blocked_events"] == []
+    for key in ("native_model_calls", "C_compilations", "CLI_or_RPC_calls"):
+        assert type(report[key]) is int and report[key] == 0
+    for key in ("native_generation_admitted", "normal_first_start_verified", "performance_verified",
+                "hardware_isolation_verified", "native_contracts_verified"):
+        assert report[key] is False
+    allocation = report["allocation"]
+    assert allocation["slurm_job_id"] == "752369" and allocation["architecture"] == "ARM64"
+    assert allocation["cpu_cores"] == 4 and allocation["tasks"] == allocation["nodes"] == 1
+    assert allocation["allocated_memory_mib"] == 16384 and allocation["allocated_gpus"] == 0
+    assert len(set(report["cpu_affinity"])) == len(report["cpu_affinity"]) == 4
+    source = PREP / "revision-source-r4b/revision-r2/HPC-Forest-Mere-Dynamique-R4b-MAX.zip"
+    plan_path = PREP / "revision-source-r4b/revision-r2/dynamic-plan-r4b-max.json"
+    assert sha(source) == SOURCE_SHA and sha(plan_path) == PLAN_SHA
+    with zipfile.ZipFile(source) as archive:
+        members = [member for member in archive.infolist() if not member.is_dir()]
+        expected = {member.filename.removeprefix("HPC-Forest/"): hashlib.sha256(archive.read(member)).hexdigest()
+                    for member in members}
+        assert len(members) == len(expected) == 103
+    assert report["source_inventory_before"] == report["source_inventory_after"] == expected
+    plan = read(plan_path)
+    cases = {(row["model"], row["phase"], row["session_id"]) for row in report["cases"]}
+    exact = {(model, phase, plan["contract_cells"][model][phase])
+             for model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-terra")
+             for phase in ("roots", "advice", "harvest")}
+    assert len(report["cases"]) == len(cases) == 9 and cases == exact
+    assert all(row["model_calls"] == 0 and row["request_schema_equal_to_frozen"] is True
+               and row["synthetic_target_only_no_compiler_capability_claim"] is True for row in report["cases"])
+    assert report["actual_frozen_roots_bounds"] == [1, 8]
+    assert len(report["detection_cases"]) == 6
+    proposal = read(QUAL / "PROPOSITION-PREFLIGHT.json")
+    packet = Path(proposal["packet"]["path"])
+    assert sha(packet) == proposal["packet"]["sha256"]
+    with tarfile.open(packet) as archive:
+        nested = archive.extractfile("native-interface-models-max-r2.tar.gz").read()
+    assert hashlib.sha256(nested).hexdigest() == STAGE_SHA
+    import io
+    with tarfile.open(fileobj=io.BytesIO(nested)) as stage_archive:
+        for name in ("remote_stage.py", "cell_selection.py", "stage-manifest.json"):
+            assert (restored / "results-752369/driver" / name).read_bytes() == stage_archive.extractfile(name).read()
+    after = inventory(restored)
+    save("inventaire-apres-audit.json", after)
+    assert before == after and sha(archive_path) == ARCHIVE_SHA and sha(report_path) == REPORT_SHA
+    save("audit-parent-verifie.json", {
+        "schema": "hpc-forest-external-stage-mechanical-reception-v1", "verified": True,
+        "verified_scope": "allocated pure external stage only, not native model/candidate admission",
+        "recorded_at_utc": datetime.now(UTC).isoformat(), "job_id": "752369",
+        "archive": ref(archive_path), "report": ref(report_path), "announced_remote_local_sha_equal": True,
+        "efficiency": ref(HERE / "efficiency.json"), "announcement": ref(HERE / "logs-announcement.json"),
+        "restored_regular_files": 4, "restored_directories": 2, "inventories_equal": True,
+        "inventory_before": ref(HERE / "inventaire-avant-audit.json"),
+        "inventory_after": ref(HERE / "inventaire-apres-audit.json"),
+        "source_103_equal_to_zip_before_after": True, "technical_cells_pure_rendered": 9,
+        "native_model_calls": 0, "C_compilations": 0, "native_generation_admitted": False,
+        "windows_worker_or_receiver_qualified": False, "normal_first_start_verified": False,
+        "scientific_performance_verified": False, "requires_independent_reception_audit": True,
+    })
+    print(json.dumps({"audit": ref(HERE / "audit-parent-verifie.json"), "model_calls": 0, "cells": 9}))
+
+
+if __name__ == "__main__":
+    main()

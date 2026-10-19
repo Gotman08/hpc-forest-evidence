@@ -1,0 +1,193 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include<arm_neon.h>
+#endif
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+typedef struct {
+  int *ids;
+  int *successor;
+  int *path;
+  float *cost;
+  unsigned char *valid;
+} CostCache;
+
+/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  Node* data = NULL;
+  FILE *fl = NULL;
+
+  if (fname == NULL)
+    fl = stdin;
+  else
+    fl = fopen(fname, "r");
+
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  // header
+  fscanf(fl, "%d %[^\n]", n, list);
+
+  if (*n > 0) {
+    data = (Node*) malloc ((*n)*sizeof(Node));
+    if(data == NULL){
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  for(int i = 0; i < *n; i++)
+    fscanf(fl, "%d %f %[^\n]", &data[i].id, &data[i].value, data[i].neighbors);
+
+  fclose(fl);
+  return data;
+}
+
+/* Returns the first matching index in the packed IDs, or -1 if not found. */
+int find_by_id(const int ids[], int id, int size){
+  int i = 0;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  const int32x4_t needle = vdupq_n_s32(id);
+
+  for(; size - i >= 16; i += 16) {
+    uint32x4_t m0 = vceqq_s32(vld1q_s32(ids + i), needle);
+    uint32x4_t m1 = vceqq_s32(vld1q_s32(ids + i + 4), needle);
+    uint32x4_t m2 = vceqq_s32(vld1q_s32(ids + i + 8), needle);
+    uint32x4_t m3 = vceqq_s32(vld1q_s32(ids + i + 12), needle);
+    uint32x4_t matches = vorrq_u32(vorrq_u32(m0, m1),
+                                  vorrq_u32(m2, m3));
+
+    /* SIMD only detects a matching block; ordered resolution keeps first-match semantics. */
+    if(vmaxvq_u32(matches) != 0) {
+      for(int j = 0; j < 16; j++)
+        if(ids[i + j] == id)
+          return i + j;
+    }
+  }
+#endif
+
+  while((i < size) && ids[i] != id)
+    i++;
+
+  if(i < size)
+    return i;
+
+  return -1;
+}
+
+/* Select using immediate values, preserving the original order and stopping ID. */
+static int select_successor(Node *g, const int *ids, int nd, int size) {
+  int next = -1;
+  float max = 0;
+  char aux[MAX];
+  char *auxptr = NULL;
+
+  strcpy(aux, g[nd].neighbors);
+  for(char *t = strtok_r(aux, " ", &auxptr);
+      t != NULL;
+      t = strtok_r(NULL, " ", &auxptr)) {
+    int id = atoi(t);
+    int d = find_by_id(ids, id, size);
+    if (d >= 0 && max < g[d].value) {
+      max = g[d].value;
+      /* Selecting ID -1 stops traversal even if that ID exists. */
+      next = (id == -1) ? -1 : d;
+    }
+  }
+
+  return next;
+}
+
+/* Discover an uncached path, then evaluate its dependent additions child-first. */
+float get_costly(Node *g, int id, int size, CostCache *cache) {
+  int root = find_by_id(cache->ids, id, size);
+  if(root < 0)
+    return 0;
+
+  int depth = 0;
+  int nd = root;
+
+  while(nd >= 0 && !cache->valid[nd]) {
+    int next = select_successor(g, cache->ids, nd, size);
+    cache->successor[nd] = next;
+    cache->path[depth++] = nd;
+    nd = next;
+  }
+
+  while(depth > 0) {
+    nd = cache->path[--depth];
+    int next = cache->successor[nd];
+    float r = g[nd].value;
+
+    /* A terminal value is copied, not added to zero. */
+    if(next >= 0)
+      r += cache->cost[next];
+
+    cache->cost[nd] = r;
+    cache->valid[nd] = 1;
+  }
+
+  return cache->cost[root];
+}
+
+/* Main program - calls read input, computes sum for each node in the list, prints output */
+int main() {
+  char *fileN = NULL;
+  char computelist[MAX];
+  int n = -1;
+  Node* input = NULL;
+  CostCache cache = {0};
+
+  input = read_input(fileN, &n, computelist);
+
+  if(n > 0) {
+    size_t count = (size_t)n;
+    cache.ids = (int*)malloc(count * sizeof(*cache.ids));
+    cache.successor = (int*)malloc(count * sizeof(*cache.successor));
+    cache.path = (int*)malloc(count * sizeof(*cache.path));
+    cache.cost = (float*)malloc(count * sizeof(*cache.cost));
+    cache.valid = (unsigned char*)calloc(count, sizeof(*cache.valid));
+    if(cache.ids == NULL || cache.successor == NULL || cache.path == NULL ||
+       cache.cost == NULL || cache.valid == NULL) {
+      fprintf(stderr, "Error!\n");
+      free(cache.ids);
+      free(cache.successor);
+      free(cache.path);
+      free(cache.cost);
+      free(cache.valid);
+      free(input);
+      return 1;
+    }
+
+    /* Keep the original node order while making ID comparisons contiguous. */
+    for(int i = 0; i < n; i++)
+      cache.ids[i] = input[i].id;
+  }
+
+  // process
+  for(char *c = strtok(computelist, " "); c != NULL; c = strtok(NULL, " "))
+    printf("%s: %f\n", c, get_costly(input, atoi(c), n, &cache));
+
+  free(cache.ids);
+  free(cache.successor);
+  free(cache.path);
+  free(cache.cost);
+  free(cache.valid);
+  free(input);
+
+  return 0;
+}

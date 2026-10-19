@@ -1,0 +1,265 @@
+"""Independent Q753285 cold audit; received archives are data, never imported."""
+import hashlib
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import tarfile
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+Q = HERE.parents[1]
+BASE = Q.parents[2]
+REL = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2e"
+RECEIVED = REL / "reception-Q753285"
+PROJECT = BASE / "work/hpc-forest-primes-natif-relance-r2e/project"
+SEALED = Q / "paquet-source-lie-r1"
+JOB = "753285"
+OUTER_SHA = "bef49822f6b834bc9f7a47096b800f40807a14746287a36b792666f6280a17c8"
+INNER_SHA = "a567f1de7878b23b168785d6eccef4c89cc5163831d51679e263b855a03f1b92"
+QUAL_SHA = "d8dd1cc172f411fef5a87be4af6d8e52c17586782a90cb7e14e115ba9a9aae00"
+SCOPE = "hpc-forest-primes-native-max-r2e"
+SOURCE_SHA = "f15b840cca876a4c465775f5553a0eaa539a9b98e56fe942136a1fcbde9b86b9"
+PLAN_SHA = "4b430e181948e55e463dfd1e60bdce96308a9190534734feb22354e4116ebde9"
+observed = {}
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+def read(path, expected=None):
+    assert path.is_file() and not path.is_symlink(), str(path)
+    raw = path.read_bytes()
+    checksum = digest(raw)
+    assert expected is None or checksum == expected, "Input SHA mismatch: " + str(path)
+    observed[path] = checksum
+    return raw
+
+def load(path, expected=None):
+    return json.loads(read(path, expected))
+
+def canonical(name):
+    path = PurePosixPath(name)
+    assert isinstance(name, str) and name and str(path) == name and not path.is_absolute()
+    assert not any(part in ("", ".", "..") for part in path.parts)
+    assert "\\" not in name and ":" not in name and all(ord(char) >= 32 for char in name)
+    return path
+
+def tar_members(raw, prefix):
+    assert len(raw) <= 64 * 1024**2
+    result, folded, total = {}, set(), 0
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+        for member in archive:
+            path = canonical(member.name)
+            assert member.isfile() and not member.issym() and not member.islnk()
+            assert path.parts[0] == prefix and len(path.parts) > 1
+            key = path.relative_to(prefix).as_posix()
+            assert key not in result and key.casefold() not in folded
+            total += member.size
+            assert 0 <= member.size <= 8 * 1024**2 and total <= 64 * 1024**2 and len(result) < 1000
+            stream = archive.extractfile(member)
+            assert stream is not None
+            value = stream.read(member.size + 1)
+            assert len(value) == member.size
+            result[key] = value
+            folded.add(key.casefold())
+    return result
+
+def inventory(folder):
+    result = {}
+    for path in sorted(folder.rglob("*")):
+        assert not path.is_symlink()
+        if path.is_file():
+            assert path.stat().st_nlink == 1
+            result[path.relative_to(folder).as_posix()] = digest(path.read_bytes())
+    return result
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=True) + "\n")
+
+submission = load(REL / "operations-parent-Q/submission.json")["structuredContent"]
+assert submission["ok"] is True and submission["submitted"] is True and submission["submission_observed"] is True
+assert submission["job_id"] == JOB
+status = load(RECEIVED / "statut-terminal.json", "48b0e4e8474df88de5b5b745bfd4efbb2e476f4465e2628823d08e2e0916e124")["structuredContent"]
+efficiency = load(RECEIVED / "efficacite.json", "5f7f062017fb9377eb10b7ea199ce05dd944bfae5c9bfa54b3177cb36573d9a7")["structuredContent"]
+assert status["job_id"] == efficiency["job_id"] == JOB
+assert status["state"] == efficiency["state"] == "COMPLETED" and status["exit_code"] == efficiency["exit_code"] == "0:0"
+assert status["finished"] is True and status["scheduler_success_observed"] is True
+assert efficiency["elapsed_seconds"] == 6 and efficiency["alloc_cpus"] == 4 and efficiency["alloc_gpus"] == 0 and efficiency["req_mem_mb"] == 16384
+transfer = load(RECEIVED / "archive-transfert.json", "1ad08697bd38e2692435aac0c3d975f4dce3538a1842881559482c67ba9d8128")["structuredContent"]
+announcement = load(RECEIVED / "archive-annoncee.json", "52005ae2fa0839f2d253d2570f540e163a2a480179aadf1da9cfde153efa6de4")["structuredContent"]
+sidecar = json.loads(announcement["content"])
+archive_path = RECEIVED / ("envelope-results-" + JOB + ".tar.gz")
+outer_raw = read(archive_path, OUTER_SHA)
+assert len(outer_raw) == transfer["bytes"] == sidecar["bytes"] == 852254
+assert transfer["verifie"] is True and transfer["ok"] is True
+assert sidecar["sha256"] == transfer["remote_sha256"] == transfer["empreinte_locale"] == transfer["empreinte_distante"] == OUTER_SHA
+assert transfer["downloaded"] == sidecar["path"] and Path(transfer["to"]).resolve() == archive_path.resolve()
+assert sidecar["passed"] is True and sidecar["native_model_calls"] == 0 and sidecar["native_research_admitted"] is False
+material = tar_members(outer_raw, "qualification-envelope")
+assert len(material) == 792
+restored = HERE / "restauration-froide-independante"
+restored.mkdir(exist_ok=False)
+for name, raw in material.items():
+    path = restored.joinpath(*canonical(name).parts)
+    assert path.resolve().is_relative_to(restored.resolve())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as stream:
+        stream.write(raw)
+before = inventory(restored)
+assert before == {name: digest(raw) for name, raw in material.items()}
+save("inventaire-avant-independant.json", before)
+envelope = json.loads(material["envelope-receipt.json"])
+assert envelope["passed"] is True and envelope["input_files_unchanged"] is True
+assert envelope["scope_id"] == SCOPE and envelope["qualification_launched_count"] == 1 and envelope["qualification_returncode"] == 0
+assert envelope["native_model_calls"] == 0 and envelope["native_research_admitted"] is False
+bindings = load(Q / "rendu-source-liee/bindings-proposees.json", "757234276dd7c0c9630bac11a24d95a4a65cf07e7e8aa0a4e1e0ad781910e18d")
+assert envelope["bindings"] == bindings
+assert bindings["source_zip_sha256"] == SOURCE_SHA and bindings["plan_sha256"] == PLAN_SHA
+assert bindings["payload_member_count"] == 181 and bindings["source_member_count"] == 108
+assert sidecar["path"] == bindings["remote_root"] + "/envelope-results-753285.tar.gz"
+expected_allocation = {"job_id": JOB, "architecture": "aarch64", "nodes": 1, "tasks": 1, "cpus_per_task": 4,
+                       "memory_mib": 16384, "gpus": 0, "affinity_cpu_count": 4}
+assert all(envelope["allocation"].get(key) == value for key, value in expected_allocation.items())
+assert len(set(envelope["allocation"]["affinity_cpu_ids"])) == 4
+counts = {"test_r2max_r2d_lane.py": 36, "test_owned_timeout_r2e.py": 6,
+          "test_codex_cli_diagnostics_r2e.py": 48, "test_first_batch_gate_r2e.py": 20}
+lane = envelope["lane_delta_tests"]
+assert lane["test_suites"] == counts and lane["passed"] == 110 and lane["executions"] == 1 and lane["returncode"] == 0 and lane["native_model_calls"] == 0
+suites = ET.fromstring(material["lane-delta.xml"]).findall(".//testsuite")
+assert sum(int(suite.get("tests", "0")) for suite in suites) == 110
+assert all(int(suite.get(key, "0")) == 0 for suite in suites for key in ("failures", "errors", "skipped"))
+assert digest(material["lane-delta.xml"]) == lane["junit_sha256"]
+assert material["lane-delta.stderr"] == material["qualification-launch.stderr"] == b""
+inputs_before = json.loads(material["input-inventory-before.json"])
+inputs_after = json.loads(material["input-inventory-after.json"])["files"]
+actual_inputs = {name.removeprefix("extraction/"): digest(raw) for name, raw in material.items() if name.startswith("extraction/")}
+assert inputs_before == inputs_after == actual_inputs and len(actual_inputs) == 181
+manifest_raw = material["extraction/proposal-bundle-manifest.json"]
+assert digest(manifest_raw) == bindings["bundle_manifest_sha256"]
+manifest = json.loads(manifest_raw)
+assert actual_inputs == {"proposal-bundle-manifest.json": digest(manifest_raw), **manifest["files"]}
+runtime_raw = material["extraction/runtime-manifest-r2max.json"]
+assert digest(runtime_raw) == bindings["runtime_manifest_sha256"]
+runtime = json.loads(runtime_raw)
+assert len(runtime) == 108
+assert runtime_raw == read(SEALED / "runtime-manifest-r2max.json", bindings["runtime_manifest_sha256"])
+source_raw = material["extraction/HPC-Forest-Primes-Natif-MAX-r2e.zip"]
+assert digest(source_raw) == SOURCE_SHA
+assert source_raw == read(SEALED / "HPC-Forest-Primes-Natif-MAX-r2e.zip", SOURCE_SHA)
+sources, folded = {}, set()
+with zipfile.ZipFile(io.BytesIO(source_raw)) as archive:
+    assert len(archive.infolist()) == 108
+    for member in archive.infolist():
+        path = canonical(member.filename)
+        assert path.parts[0] == "HPC-Forest" and len(path.parts) > 1
+        assert not member.is_dir() and ((member.external_attr >> 16) & 0o170000) in (0, 0o100000)
+        key = path.relative_to("HPC-Forest").as_posix()
+        assert key not in sources and key.casefold() not in folded
+        sources[key] = archive.read(member)
+        folded.add(key.casefold())
+assert {key: digest(raw) for key, raw in sources.items()} == runtime
+assert all(material["extraction/HPC-Forest/" + name] == raw for name, raw in sources.items())
+assert digest(material["extraction/native-max-plan.json"]) == PLAN_SHA
+assert material["extraction/native-max-plan.json"] == read(SEALED / "native-max-plan.json", PLAN_SHA)
+assert digest(material["extraction/certified-preparation/prototype-manifest.json"]) == "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+original = material["qualification-original.json"]
+assert digest(original) == QUAL_SHA and original == material["Q/qualification.json"] == read(RECEIVED / "qualification.json", QUAL_SHA)
+qualification = json.loads(original)
+assert qualification["verified"] is True and qualification["scope_id"] == SCOPE
+assert all(qualification["allocation"].get(key) == value for key, value in expected_allocation.items())
+assert qualification["source_zip_sha256"] == SOURCE_SHA and qualification["plan_sha256"] == PLAN_SHA
+assert qualification["reference_source_sha256"] == "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d"
+assert qualification["reference_outputs_all_certified_bytes"] is True and qualification["unique_certified_cases"] == 12
+assert qualification["native_model_calls"] == 0 and qualification["native_research_admitted"] is False
+inner_raw = material["Q.tar.gz"]
+assert digest(inner_raw) == INNER_SHA == envelope["qualification_archive_sha256"]
+assert inner_raw == read(RECEIVED / "qualification.tar.gz", INNER_SHA)
+inner = tar_members(inner_raw, "qualification")
+expected_inner = {"qualification.json": QUAL_SHA,
+                  **{"prepared/" + name: checksum for name, checksum in qualification["prepared_files"].items()},
+                  **{"official-evaluator-trace/" + name: checksum for name, checksum in qualification["official_evaluator_trace_files"].items()}}
+assert {name: digest(raw) for name, raw in inner.items()} == expected_inner
+assert inner["qualification.json"] == original
+for group, prefix in (("prepared_files", "prepared/"), ("official_evaluator_trace_files", "official-evaluator-trace/")):
+    assert {name.removeprefix("Q/" + prefix): digest(raw) for name, raw in material.items() if name.startswith("Q/" + prefix)} == qualification[group]
+    assert all(material["Q/" + prefix + name] == inner[prefix + name] for name in qualification[group])
+inner_sidecar = json.loads(material["Q-archive.json"])
+assert inner_sidecar["sha256"] == INNER_SHA and inner_sidecar["native_model_calls"] == 0
+identity = envelope["qualification_archive_identity"]
+assert identity["verified"] is True and identity["sha256"] == INNER_SHA and identity["bytes"] == len(inner_raw)
+assert identity["announced_path_original"] == inner_sidecar["path"] and identity["expected_path_original"] == bindings["remote_root"] + "/Q.tar.gz"
+assert envelope["prepared_root_original"] == qualification["prepared_root"]
+assert envelope["prepared_root_identity"]["announced_path_original"] == qualification["prepared_root"]
+assert envelope["prepared_root_identity"]["expected_path_original"] == bindings["remote_root"] + "/Q/prepared"
+assert envelope["prepared_root_identity"]["verified"] is True
+# Only the sealed LOCAL source may be imported after an exact current inventory.
+local_before = inventory(PROJECT)
+assert all(local_before.get(name) == checksum for name, checksum in runtime.items())
+assert all(name.startswith((".pytest_cache/", ".ruff_cache/")) for name in set(local_before) - set(runtime))
+assert not any(name == "hpc_forest" or name.startswith("hpc_forest.") for name in sys.modules)
+def blocked(*args, **kwargs):
+    raise AssertionError("Cold audit forbids process/signal/socket effects")
+class NoEffectsPopen(subprocess.Popen):
+    def __new__(cls, *args, **kwargs):
+        raise AssertionError("Cold audit forbids native process construction")
+class NoEffectsSocket(socket.socket):
+    def __new__(cls, *args, **kwargs):
+        raise AssertionError("Cold audit forbids native socket construction")
+subprocess.Popen = NoEffectsPopen
+socket.socket = NoEffectsSocket
+for name in ("run", "call", "check_call", "check_output"):
+    setattr(subprocess, name, blocked)
+for name in ("system", "kill", "killpg"):
+    setattr(os, name, blocked)
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(PROJECT / "src"))
+from hpc_forest import native_r2max as native
+assert Path(native.__file__).resolve() == (PROJECT / "src/hpc_forest/native_r2max.py").resolve()
+native.verify_qualification(qualification, SOURCE_SHA, prepared=False)
+prepared = native.verify_preparation(restored / "extraction/certified-preparation")
+native.verify_qualification_members(qualification, lambda name: inner["prepared/" + name], prepared)
+trace = native.verify_trace_members(qualification, lambda name: inner["official-evaluator-trace/" + name],
+                                    read_prepared_member=lambda name: inner["prepared/" + name])
+assert trace["original_archive_links_verified"] is True and trace["cluster_paths_followed_locally"] is False
+assert trace["phases"] == ["search", "confirmation"] and trace["evaluator_executions"] == 14 and trace["case_executions"] == 13
+parent = load(RECEIVED / "audit-natif-parent-r2.json", "0684b6483047b5e53fcf7cb5195e84a2a06379cea38b90cbdd3a4636530ba4ff")
+assert parent["verified"] is True and parent["job_id"] == JOB and parent["qualification_sha256"] == QUAL_SHA and parent["archive_sha256"] == INNER_SHA
+assert parent["trace_links"] == trace and parent["outer_archive_sha256"] == OUTER_SHA
+after = inventory(restored)
+assert before == after and inventory(PROJECT) == local_before
+assert all(digest(path.read_bytes()) == checksum for path, checksum in observed.items())
+save("inventaire-apres-independant.json", after)
+report = {
+    "schema": "hpc-forest-r2e-independent-cold-reception-review-v1", "scope_id": SCOPE,
+    "job_id": JOB, "verified": True, "verdict": "PASS_MECHANICAL_ZERO_MODEL_QUALIFICATION_ONLY", "blocking_findings": [],
+    "native_research_admitted": False, "outer_archive_sha256": OUTER_SHA, "outer_archive_bytes": len(outer_raw),
+    "inner_archive_sha256": INNER_SHA, "inner_archive_bytes": len(inner_raw), "qualification_sha256": QUAL_SHA,
+    "parent_audit_sha256": observed[RECEIVED / "audit-natif-parent-r2.json"],
+    "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA, "bundle_sha256": bindings["payload_sha256"],
+    "runtime_manifest_sha256": bindings["runtime_manifest_sha256"], "bundle_manifest_sha256": bindings["bundle_manifest_sha256"],
+    "triple_announced_remote_local_SHA_identical": True, "scheduler_state": status["state"],
+    "scheduler_exit_code": status["exit_code"], "scheduler_elapsed_seconds": efficiency["elapsed_seconds"],
+    "fresh_restored_files": len(material), "restored_inventory_before_after_identical": True,
+    "source_files_verified": 108, "exact_extraction_inventory_files": len(actual_inputs),
+    "neutral_cases_passed_once": 110, "neutral_suites": counts, "certified_unique_reference_cases": 12,
+    "original_receipt_and_inner_members_byte_identical": True, "trace_links": trace,
+    "zero_model_calls_recorded_and_reviewed_Q_command_excludes_CLI_and_authentication": True,
+    "original_cluster_paths_preserved_but_not_followed_locally": True,
+    "local_sealed_reader_imported_after_exact_108_file_verification": True,
+    "local_source_inventory_unchanged_after_reader_import": True,
+    "received_source_never_imported_or_executed": True,
+    "Q_tests_compilation_CLI_model_authentication_or_remote_actions_replayed": False,
+    "old_Q752606_archive_read_or_reaudited": False,
+    "input_file_sha256": {str(path): checksum for path, checksum in sorted(observed.items())},
+    "inventory_before_sha256": digest((HERE / "inventaire-avant-independant.json").read_bytes()),
+    "inventory_after_sha256": digest((HERE / "inventaire-apres-independant.json").read_bytes()),
+}
+save("REVUE-FROIDE-INDEPENDANTE-Q753285.json", report)
+print(json.dumps({"verdict": report["verdict"], "job_id": JOB, "restored_files": len(material), "source_files": 108,
+                  "neutral_tests": 110, "certified_cases": 12, "native_model_calls": 0,
+                  "report_sha256": digest((HERE / "REVUE-FROIDE-INDEPENDANTE-Q753285.json").read_bytes())}))

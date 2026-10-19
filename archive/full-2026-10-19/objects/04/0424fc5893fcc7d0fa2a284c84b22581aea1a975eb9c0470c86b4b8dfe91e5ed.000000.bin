@@ -1,0 +1,329 @@
+"""Cold JSON/XML/hash audit only; no received/source module, suite, probe or tool runs."""
+import ast
+import hashlib
+import io
+import json
+import os
+import stat
+import tarfile
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import UTC,datetime
+from pathlib import Path
+
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parent
+PREP=ROOT.parent.parent
+BASE=PREP.parents[1]
+RESTORE=HERE/'restauration-neuve-r1'
+R7=PREP/'adaptateurs-source110-r1/revision-r7-racines-techniques-neuves'
+SOURCE='eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48'
+PLAN='5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70'
+OLD_PLAN='d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27'
+COMPONENTS='dc64e1360ea8c7b061cbda5eb2dc638f7cb76d9f4264c2f062a495c62ba12f30'
+SCOPE='hpc-forest-dynamic-independent-roots-r4b-max'
+ARCHIVE='e4049069a9d0b2d6ffbdb75f8969bd70f71caa5bd4eb8cea12defe667efed4d2'
+QUALIFICATION='6bd2e78db4116df4ae73378e3d686ce7c4b8404afa0fa8b9e6a31091f7e61688'
+RAW_SOURCE=PREP/'qualification-allouee-source110-G-recu-r1/revue-resultats-Q753709-r1/lecteur-r4b/auditer-restauration-existante-r4b.py'
+def need(value,message):
+    if not value:raise ValueError(message)
+def sha(value):return hashlib.sha256(value).hexdigest()
+code=RAW_SOURCE.read_bytes();need(sha(code)=='5c1e1784574566a585e2d9cc50f85b52337d10d3109e449a4112581eae68f8d5','Qualified held IO')
+names={'need','ordinary','metadata','open_nofollow_read','cross_identity','validate_windows_mode_views','native_basic_info','raw','decode'}
+nodes=[n for n in ast.parse(code).body if isinstance(n,ast.FunctionDef) and n.name in names]
+need({n.name for n in nodes}==names,'Closed IO definitions')
+ns={'Path':Path,'os':os,'stat':stat,'json':json,'Q':BASE}
+exec(compile(ast.Module(body=nodes,type_ignores=[]),str(RAW_SOURCE),'exec'),ns)
+raw,decode=ns['raw'],ns['decode'];before={}
+def rb(path,expected=None):
+    path=Path(path);need(path.is_absolute() and path.is_relative_to(BASE/'outputs'),'Only named cold output evidence')
+    data=raw(path);checksum=sha(data)
+    need(expected is None or checksum==expected,'Pinned cold bytes changed: '+path.name)
+    need(str(path) not in before or before[str(path)]==checksum,'Changed during audit')
+    before[str(path)]=checksum
+    return data
+def obj(path,expected=None):return decode(rb(path,expected))
+def load(reference):
+    need(set(reference)=={'path','sha256'},'Closed evidence reference')
+    return obj(reference['path'],reference['sha256'])
+def ref(path):return {'path':str(path),'sha256':sha(rb(path))}
+def emit(name,value):
+    path=HERE/name;need(not path.exists(),'No prior receipt overwrite')
+    with path.open('xb') as stream:stream.write((json.dumps(value,ensure_ascii=False,indent=2)+'\n').encode());stream.flush();os.fsync(stream.fileno())
+    return ref(path)
+def unwrap(value):
+    value=value.get('result',value)
+    need(value.get('isError',False) is False,'Successful saved metadata')
+    if 'structuredContent' in value:
+        text=[b['text'] for b in value.get('content',[]) if b.get('type')=='text']
+        need(len(text)==1 and decode(text[0].encode())==value['structuredContent'],'Raw/structured equality')
+        return value['structuredContent']
+    return value
+def bound(value):
+    need(value['scope_id']==SCOPE and value['source_zip_sha256']==SOURCE and value['plan_sha256']==PLAN,'Exact R7 source/plan scope')
+def file(name):return RESTORE.joinpath(*name.split('/'))
+def data(name,expected=None):return rb(file(name),expected)
+def metadata(name,expected=None):return decode(data(name,expected))
+
+reception_ref=ref(HERE/'RECEPTION-REGULIERE-FROIDE-Q754424.json')
+reception=load(reception_ref)
+need(reception['verified_regular_byte_reception_only'] is True and reception['regular_members']==749
+     and reception['regular_bytes']==5536387 and reception['symlink_or_hardlink_or_special_recreated'] is False
+     and reception['input_inventory_before']==reception['input_inventory_after'],'Actual byte reception')
+for path,checksum in reception['input_inventory_before'].items():rb(path,checksum)
+inventory=load(reception['inventory_before_audit'])
+need(len(inventory)==749,'749 exact cold copies')
+for name,facts in inventory.items():
+    value=data(name,facts['sha256']);need(len(value)==facts['bytes'],'Actual copy byte size')
+regular_receipt=load(reception['regular_archive_receipt'])
+need({n:v['sha256'] for n,v in inventory.items()}==regular_receipt['archive_regular_members'],'Full copy equals original member receipt')
+rb(ROOT/'qualification-results-754424.tar.gz',ARCHIVE)
+envelope=load(reception['envelope'])
+remote_before=metadata('archive-metadata/inventory-before.json')
+remote_after=metadata('archive-metadata/inventory-after.json')
+need(remote_before==remote_after,'Full remote metadata/hash inventories before/after differ')
+payload=metadata('archive-metadata/payload-regular-members.json')
+links=metadata('archive-metadata/inert-links-metadata-only.json')
+need(len(payload)==745 and len(links)==65,'Actual regular payload and metadata-only link counts')
+regular={};link_records={}
+def inventory_record(name,value):
+    kind=value['kind']
+    if kind=='regular':
+        need(value['tar_member'] is True and name in inventory and value['sha256']==inventory[name]['sha256']
+             and value['bytes']==inventory[name]['bytes']==value['metadata']['size'],'Remote regular inventory exact bytes')
+        regular[name]=value['sha256']
+    elif kind=='symlink':
+        need(value['tar_member'] is False and value['target_followed'] is False and value['bytes_read'] is False
+             and name not in inventory,'Fixture link is metadata only')
+        link_records[name]=value
+    elif kind=='directory':need(value['tar_member'] is False and name not in inventory,'Remote directories not archived as data')
+    else:raise ValueError('Other source type not admitted')
+for prefix,entries in remote_before['trees'].items():
+    for name,value in entries.items():inventory_record(prefix+'/'+name,value)
+for name,value in remote_before['fixed'].items():
+    need(set(value)=={'metadata','sha256','bytes'} and stat.S_ISREG(value['metadata']['mode'])
+         and value['metadata']['nlink']==1 and name in inventory
+         and value['sha256']==inventory[name]['sha256']
+         and value['bytes']==value['metadata']['size']==inventory[name]['bytes'],
+         'Exact fixed regular-file metadata shape and bytes; no invented kind/tar flags')
+    regular[name]=value['sha256']
+need(regular==payload and link_records==links,'Complete remote inventories equal regular payload and65 inert links')
+extra={name:inventory[name]['sha256'] for name in inventory if name not in payload}
+need(set(extra)=={'archive-metadata/inventory-before.json','archive-metadata/inventory-after.json',
+                  'archive-metadata/inert-links-metadata-only.json','archive-metadata/payload-regular-members.json'},'Exactly four archive metadata data files')
+for name,record in links.items():
+    need(name.startswith('qualification-output/') and '-NEUTRAL-fixtures/' in name
+         and record['kind']=='symlink' and not file(name).exists() and not file(name).is_symlink(),'No fixture symlink recreated')
+
+qualification=metadata('qualification-output/qualification.json',QUALIFICATION);bound(qualification)
+need(qualification['schema']=='hpc-forest-lane-r2-zero-model-allocated-qualification-v1' and qualification['verified'] is True
+     and qualification['adapter_revision']=='r4b-source110-external-adapters-r2'
+     and type(qualification['native_model_calls']) is int and qualification['native_model_calls']==0
+     and type(qualification['source_file_count']) is int and qualification['source_file_count']==110
+     and type(qualification['allocated_contract_tests_returncode']) is int and qualification['allocated_contract_tests_returncode']==0
+     and qualification['adapter_components_manifest_sha256']==COMPONENTS,'Exact actual allocated Q result')
+for key in ['native_generation_admitted','normal_first_start_verified','independent_performance_audit_verified','scientific_budget_reset_or_recredit','reader_and_verifier_payload_executed_or_imported']:
+    need(qualification[key] is False,'Actual Q must not widen admission: '+key)
+for key in ['reference_contracts_reexecuted','candidate_compilations']:
+    need(type(qualification[key]) is int and qualification[key]==0,'No references/candidate computation replay')
+allocation=qualification['allocation']
+target={'architecture':'ARM64','cpu_cores':4,'tasks':1,'nodes':1,'allocated_memory_mib':16384,'allocated_gpus':0,'slurm_job_id':'754424'}
+need(all(type(allocation.get(k)) is type(v) and allocation[k]==v for k,v in target.items())
+     and allocation['affinity_cpu_count']==4 and len(set(allocation['affinity_cpu_ids']))==4,'Actual job754424 target allocation')
+started=metadata('qualification-output/qualification-started.json');bound(started)
+need(started['verified'] is False and started['qualification_attempt']==qualification['qualification_attempt']==1
+     and started['official_prepare_target_profile_calls']==0 and started['target_profile_verified'] is False
+     and started['started_at_utc']==qualification['started_at_utc'],'Actual started false/no replay intention')
+
+groups={'source-lane':(26,'source_lane_contract_tests'),'source-cli-privacy':(152,'source_cli_privacy_tests'),
+        'source-prior-privacy':(9,'source_prior_privacy_tests'),'adapter-portable':(73,'adapter_portable_tests'),
+        'observer-neutral':(5,'observer_neutral_tests'),'source-state-review':(9,'source_state_review_portable_tests')}
+triplets=[];identifiers=set()
+for group,(count,result_key) in groups.items():
+    intention=metadata('qualification-output/'+group+'-intention.json')
+    execution=metadata('qualification-output/'+group+'-execution.json')
+    xml=data('qualification-output/'+group+'-junit.xml')
+    need(b'<!DOCTYPE' not in xml and b'<!ENTITY' not in xml,'No XML entities or external references')
+    tree=ET.fromstring(xml);cases=list(tree.iter('testcase'))
+    need(len(cases)==count and len([n for n in tree.iter() if n.tag in {'failure','error','skipped'}])==0,'Actual distinct JUnit testcase/pass count')
+    for case in cases:
+        key=(case.attrib.get('classname'),case.attrib.get('name'))
+        need(all(isinstance(x,str) and x for x in key) and key not in identifiers,'Actual testcase unique identity across groups')
+        identifiers.add(key)
+    need(intention['maximum_run_count']==execution['run_count']==1 and intention['model_calls']==execution['model_calls']==0
+         and intention['timeout_seconds']==execution['timeout_seconds']==180 and intention['argv']==execution['argv']
+         and execution['returncode']==0 and execution['testcases']==count and execution['skipped']==0
+         and execution['junit_sha256']==sha(xml),'Intention/execution/JUnit exact triplet')
+    need(qualification[result_key]=={'passed':count,'failed':0} and all(type(v) is int for v in qualification[result_key].values())
+         and qualification['suite_results'][group]['details']=={'testcases':count,'skipped':0,'junit_sha256':sha(xml)}
+         and qualification['suite_results'][group]['returncode']==0,'Actual qualification matches raw suite result')
+    need(execution['argv'][:3]==['/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python','-I','-B']
+         and '-q' in execution['argv'] and 'no:cacheprovider' in execution['argv'],'Qualified isolated neutral Python/pytest argv')
+    triplets.append({'group':group,'passed':count,'failed':0,'intention':ref(file('qualification-output/'+group+'-intention.json')),
+                     'execution':ref(file('qualification-output/'+group+'-execution.json')),'junit':ref(file('qualification-output/'+group+'-junit.xml'))})
+need(len(identifiers)==274 and qualification['total_neutral_unique_count']==274
+     and qualification['source_neutral_unique_count']==187 and qualification['adapter_neutral_unique_count']==73
+     and qualification['observer_neutral_unique_count']==5 and qualification['source_state_review_portable_unique_count']==9,'Six distinct groups:265 plus9, never merged')
+
+source_manifest=metadata('source/runtime-manifest.json','66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766')
+need(len(source_manifest)==110 and source_manifest==metadata('qualification-output/source-before.json')==metadata('qualification-output/source-after.json'),'Exact110 source before/after')
+need({n[len('source/project/'):]:facts['sha256'] for n,facts in inventory.items() if n.startswith('source/project/')}==source_manifest,'Only exact110 received project files')
+source_zip=data('source/project.zip',SOURCE)
+with zipfile.ZipFile(io.BytesIO(source_zip)) as z:
+    entries=[i for i in z.infolist() if not i.is_dir()];need(len(entries)==110,'Official ZIP110 file count')
+    mapping={i.filename:i for i in entries}
+    need(len(mapping)==110,'No duplicate ZIP members')
+    prefix='HPC-Forest/'  # Exact prefix of the SHA-bound official eaff source ZIP.
+    need(set(mapping)=={prefix+n for n in source_manifest},'Official ZIP exact file set')
+    for name,checksum in source_manifest.items():
+        item=mapping[prefix+name];need(not stat.S_ISLNK(item.external_attr>>16),'No ZIP link source')
+        need(sha(z.read(item))==checksum==sha(data('source/project/'+name)),'Current source bytes equal official ZIP110')
+components=metadata('adapters/COMPONENTS.json',COMPONENTS);bound(components)
+need(len(components['code_pins'])==62,'Actual frozen62 component manifest')
+adapter_map={'COMPONENTS.json':COMPONENTS,**components['code_pins']}
+need(adapter_map==metadata('qualification-output/adapter-before.json')==metadata('qualification-output/adapter-after.json'),'Actual63 adapter members unchanged')
+need({n[len('adapters/'):]:facts['sha256'] for n,facts in inventory.items() if n.startswith('adapters/')}==adapter_map,'Only exact63 adapter files')
+for name,checksum in adapter_map.items():
+    need(sha(data('adapters/'+name))==checksum,'Received component bytes')
+    rb(R7/name,checksum)
+
+bindings=metadata('bindings.json');bound(bindings)
+need(bindings['adapter_components_manifest_sha256']==COMPONENTS and bindings['native_generation_admitted'] is False
+     and bindings['old_Q_promoted'] is False and bindings['source_state_review_case_count']==9
+     and bindings['total_neutral_case_count']==274,'Exact Q payload identity')
+packet_manifest=metadata('packet-manifest.json')
+need(len(packet_manifest)==6 and all(sha(data(name))==checksum for name,checksum in packet_manifest.items()),'Packet six immutable data/code files')
+upload=unwrap(obj(ROOT/'TRANSFERT-PAQUET-REEL.json'))
+packet=rb(upload['sent'],'657d17a1050247551e238fb7ba22bdc68c541479b6e18afd7ab0ae6a99488c4a')
+need(upload['verifie'] is True and upload['empreinte_locale']==upload['empreinte_distante']==upload['remote_sha256']==sha(packet)
+     and upload['bytes']==len(packet)==894816,'Actual packet upload three SHA')
+with tarfile.open(fileobj=io.BytesIO(packet),mode='r:gz') as t:
+    packet_entries=t.getmembers();need(len(packet_entries)==7 and all(m.isreg() and not m.linkname and not m.sparse for m in packet_entries),'Seven regular approved packet members')
+    need({m.name for m in packet_entries}==set(packet_manifest)|{'packet-manifest.json'},'Exact approved packet file set')
+    for member in packet_entries:need(t.extractfile(member).read()==data(member.name),'Actual Q payload equals approved packet byte-for-byte')
+for bundle,prefix,sha_key,count_key in [
+    ('source-bundle.tar.gz','source/','source_bundle_sha256','source_bundle_member_count'),
+    ('adapter-bundle.tar.gz','adapters/','adapter_bundle_sha256','adapter_bundle_member_count'),
+    ('review-payload.tar.gz','review-payload/','review_payload_bundle_sha256','review_payload_member_count')]:
+    value=data(bundle);need(sha(value)==bindings[sha_key],'Bundle binding')
+    with tarfile.open(fileobj=io.BytesIO(value),mode='r:gz') as t:
+        entries=t.getmembers();need(len(entries)==bindings[count_key],'Exact bundle member count')
+        seen=set()
+        for member in entries:
+            need(member.name not in seen and '..' not in Path(member.name).parts and not member.name.startswith('/')
+                 and not member.linkname and not member.sparse and (member.isdir() or member.isreg()),'Read-only bundle closed regular/directory set')
+            seen.add(member.name)
+            if member.isreg():need(t.extractfile(member).read()==data(prefix+member.name),'Unpacked payload equals bundle original bytes')
+review_payload_map=metadata('qualification-output/review-payload-before.json')
+need(review_payload_map==metadata('qualification-output/review-payload-after.json') and len(review_payload_map)==9,'Nine review payload files stable')
+need({n[len('review-payload/'):]:v['sha256'] for n,v in inventory.items() if n.startswith('review-payload/')}==review_payload_map==bindings['review_payload_files'],'Exact9 review payload members')
+
+profile=metadata('qualification-output/target-profile.json',qualification['target_profile_sha256'])
+need(profile['schema']=='hpc-forest-target-profile-v1' and all(type(profile[k]) is type(v) and profile[k]==v for k,v in target.items())
+     and profile['operator_algorithm_advice'] is False and profile['allocation_source']=='SLURM allocation environment, not node CPU count','Actual allocated Q target only')
+profile_body={k:v for k,v in profile.items() if k!='profile_digest'}
+need(sha(json.dumps(profile_body,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode())==profile['profile_digest']==qualification['target_profile_digest'],'Actual canonical profile digest')
+need(set(profile['compilers'])=={'gcc','g++'} and all(c['probe_returncode']==0 and c['probe_stdout']=='4\n' for c in profile['compilers'].values()),'Two actual received successful neutral probe records')
+official_intention=metadata('qualification-output/official-target-intention.json')
+need(official_intention['allocation']==allocation and official_intention['source_zip_sha256']==SOURCE and official_intention['plan_sha256']==PLAN
+     and official_intention['maximum_official_prepare_target_profile_calls']==1 and official_intention['two_expected_neutral_compilers']==['gcc','g++']
+     and official_intention['candidate_compilation_or_models']==0 and official_intention['no_retry_or_monkeypatch'] is True
+     and qualification['official_prepare_target_profile_calls']==1 and qualification['expected_official_neutral_compiler_probes']==2
+     and qualification['confirmed_successful_official_compiler_records']==2 and qualification['official_target_allocation_is_this_Q_job'] is True,'Actual official target intention/result provenance')
+
+# Explicit reference inheritance; no old Q replaces this real Q754424.
+prior_review_ref={'path':str(PREP/'qualification-cible-source110-r1/operations-parent-reelles-01/lecture-froide-r2/revue-independante-r2/revue-resultats-reels-r1/REVUE-REELLE-CIBLE-ET-REFERENCES-SOURCE110.json'),'sha256':'e1e42a4609e8441fcf5c7ada2b261de88a7a3ff762fd11b3aed2e375942830da'}
+heritage_ref={'path':str(PREP/'adaptateurs-source110-r1/revue-integration-source110-parent-r1/target-reference-heritage-r1/LIENS-HISTORIQUES-CIBLE-REFERENCES-SOURCE110.json'),'sha256':'11f33eba0b8af892c24009dad637795867eee0d1ed88f766ead2ac6163262113'}
+prior=load(prior_review_ref);heritage=load(heritage_ref)
+need(prior['verified'] is True and prior['reference_contracts_reviewed'] is True and prior['source_zip_sha256']==SOURCE
+     and prior['plan_sha256']==OLD_PLAN and heritage['verified_frozen_equality_and_reference_review_support_only'] is True,'Exact prior reference provenance')
+old_plan=load(heritage['plan_refs']['110']);new_plan=metadata('source/dynamic-plan.json',PLAN)
+need(heritage['plan_refs']['110']['sha256']==OLD_PLAN,'Old plan pin')
+rb(R7/'plan-technique-neuf/dynamic-plan-r4b-lane-r3-max-r7.json',PLAN)
+differences=[]
+def compare(a,b,path=()):
+    if type(a) is not type(b):differences.append({'path':list(path),'old':a,'new':b})
+    elif isinstance(a,dict):
+        need(set(a)==set(b),'Plan keys changed beyond three UUIDs')
+        for key in a:compare(a[key],b[key],path+(key,))
+    elif isinstance(a,list):
+        need(len(a)==len(b),'Plan list count changed')
+        for index,(x,y) in enumerate(zip(a,b)):compare(x,y,path+(index,))
+    elif a!=b:differences.append({'path':list(path),'old':a,'new':b})
+compare(old_plan,new_plan)
+expected_pairs={('3b1de5658e4641149b15a3bea4850239','80d47d8d3f8f4e35bc26ceb54d06e870'),
+                ('7b6c29c0e329400bb2be145b0e2dbe0a','29583a77237e4777aa09209331ec7ecd'),
+                ('bd2b3153a7544c909afbc19fe69902b4','3ae8341d27784c1bbd830ac19e4b77bc')}
+need(len(differences)==3 and {(d['old'],d['new']) for d in differences}==expected_pairs,'Only exact three technical roots UUID changes')
+equal_fields=['subjects','catalogued_subjects','exclusions','statements','candidate_resources','verified_capabilities','limits','seed']
+need(equal_fields==heritage['exact_equal_plan_fields_103_105_110'] and all(new_plan[k]==old_plan[k] for k in equal_fields),'All official/reference/target/budget fields unchanged')
+for reference in heritage['source_ZIP_refs'].values():rb(reference['path'],reference['sha256'])
+for key in ['historical_mechanical_audit','historical_qualification','historical_mechanical_reception','prior_official_contract_review_manifest','historical_target_profile']:
+    load(heritage[key])
+for name,checksum in heritage['protected_reference_target_preparation_modules_byte_identical'].items():
+    need(sha(data('source/project/'+name))==checksum,'Six exact inherited preparation/target/contract modules')
+contract_refs=heritage['sixteen_existing_finite_reference_contract_refs_rehashed']
+need(len(contract_refs)==16 and len({r['subject'] for r in contract_refs})==16 and len(new_plan['subjects'])==15
+     and len(new_plan['catalogued_subjects'])==19 and len(new_plan['exclusions'])==4,'16 finite contracts/15 admitted/19 catalogued/4 excluded')
+for record in contract_refs:load(record['contract'])
+need(set(new_plan['subjects'])=={r['subject'] for r in contract_refs}-{'2020-primes'}
+     and '2020-primes' in new_plan['exclusions'],'Ready prime contract remains excluded')
+need(profile['compilers']==heritage['historical_compiler_observations'],'Full current compiler records equal independently received reference provenance')
+historical_profile=load(heritage['historical_target_profile'])
+for key in ['architecture','cpu_cores','tasks','nodes','allocated_memory_mib','allocated_gpus','verified_capabilities','probe_source_sha256']:
+    need(profile[key]==historical_profile[key],'Reference target capability/source equality')
+need(profile['slurm_job_id']=='754424' and historical_profile['slurm_job_id']=='752235'
+     and profile['profile_digest']!=historical_profile['profile_digest'],'Historical job/digest never relabelled')
+
+inventory_after={name:{'bytes':len(value:=raw(file(name))),'sha256':sha(value)} for name in inventory}
+need(inventory_after==inventory,'All749 restored files unchanged through audit')
+after={path:sha(raw(Path(path))) for path in before};need(after==before,'All named original/cold evidence unchanged through audit')
+after_ref=emit('INVENTAIRE-RESTAURATION-APRES-AUDIT.json',inventory_after)
+target_reference={
+ 'schema':'hpc-forest-source110-r7-current-Q-target-and-reference-inheritance-review-v1','verified_metadata_only':True,
+ 'scope_id':SCOPE,'source_zip_sha256':SOURCE,'plan_sha256':PLAN,'adapter_components_manifest_sha256':COMPONENTS,
+ 'target_profile_verified':True,'reference_contracts_reviewed':True,'actual_Q_job_id':'754424',
+ 'actual_target_profile':ref(file('qualification-output/target-profile.json')),'profile_digest':profile['profile_digest'],
+ 'actual_official_target_intention':ref(file('qualification-output/official-target-intention.json')),
+ 'actual_successful_official_neutral_probe_records':2,'received_compilers':profile['compilers'],
+ 'prior_target_and_reference_review':prior_review_ref,'explicit_frozen_reference_heritage':heritage_ref,
+ 'equal_plan_fields':equal_fields,'only_plan_changes':differences,'protected_six_modules':heritage['protected_reference_target_preparation_modules_byte_identical'],
+ 'official_archive_URL_SHA_size_and_statement_pins_unchanged':True,'finite_contracts':contract_refs,
+ 'finite_contract_count':16,'current_plan_admitted_contracts':15,'catalogued_subjects':19,'exclusions':new_plan['exclusions'],
+ 'primes_finite_contract_ready_but_excluded':True,'historical_reference_execution_records_reviewed_previously':224,
+ 'reference_executions_rehashed_or_reexecuted_by_this_reviewer':0,'source103_105_or_old_Q_substituted_for_current_Q':False,
+ 'current_Q_profile_usable_as_future_native_allocation_profile':False,'future_native_stage_must_create_own_profile':True,
+ 'native_first_start_scientific_performance_pilot_extension_or_method_R5_admitted':False,
+ 'received_or_source_code_test_probe_compile_model_tool_or_process_executed_by_reviewer':False,
+ 'scope':'Actual new Q754424 profile plus explicit byte-equal16-reference inheritance for plan5c3c. No224reference execution replay and no scientific/performance promotion.'}
+target_reference_ref=emit('REVUE-CIBLE-ACTUELLE-ET-HERITAGE-REFERENCES-R7.json',target_reference)
+audit={
+ 'schema':'hpc-forest-dynamic-r4b-independent-mechanical-audit-v1','verified':True,'scope_id':SCOPE,
+ 'source_zip_sha256':SOURCE,'plan_sha256':PLAN,'qualification_sha256':QUALIFICATION,'archive_sha256':ARCHIVE,
+ 'adapter_components_manifest_sha256':COMPONENTS,'native_model_calls':0,'native_generation_admitted':False,
+ 'normal_first_start_verified':False,'reviewed_at_utc':datetime.now(UTC).isoformat(),'actual_Q_job_id':'754424',
+ 'reviewer':'prepare_r2g_owned_closure','qualification_packet_authored_by_reviewer':False,
+ 'prior_source_plan_review_authored_by_reviewer':{'path':str(R7/'revue-source110-plan-r7/REVUE-INDEPENDANTE-SOURCE110-PLAN-R7.json'),'sha256':'33b05b6825f1eb340073a63c13bdc1e11696db14b3e9b33ce48b3dcfcb0c326a'},
+ 'cold_byte_reception':reception_ref,'regular_files':749,'regular_bytes':5536387,'inert_link_metadata_records':65,
+ 'link_targets_followed_or_recreated':False,'source110_and_adapter62_exact_unchanged':True,
+ 'six_triplets':triplets,'source_neutral_cases':187,'adapter_neutral_cases':73,'observer_neutral_cases':5,
+ 'source_state_review_portable_additional_cases':9,'distinct_testcases_total':274,'base265_kept_distinct_from_additional9':True,
+ 'actual_Q_target_and_explicit_reference_review':target_reference_ref,
+ 'inventory_before':reception['inventory_before_audit'],'inventory_after':after_ref,
+ 'all_restored_and_named_original_evidence_unchanged':True,'input_inventory_before':before,'input_inventory_after':after,
+ 'received_or_source_code_tests_probes_compilers_CLI_MCP_CIM_models_or_processes_executed_by_reviewer':False,
+ 'scientific_performance_method_R5_or_future_native_allocation_admitted':False,
+ 'scope':'Real new Q754424 mechanical byte/JSON/XML audit only. Old Q753709/862 is not substituted. Native generation still requires all fresh observation, owner, private-policy, authorization and publication gates.'}
+audit_ref=emit('AUDIT-MECANIQUE-INDEPENDANT-Q754424-R7.json',audit)
+composite={
+ 'schema':'hpc-forest-dynamic-r4b-mechanical-reception-v1','verified':True,'scope_id':SCOPE,
+ 'source_zip_sha256':SOURCE,'plan_sha256':PLAN,'native_model_calls':0,
+ 'source_files_exact':True,'privacy_neutral_tests_passed':True,'target_profile_verified':True,'reference_contracts_reviewed':True,
+ 'archive':ref(ROOT/'qualification-results-754424.tar.gz'),'qualification':ref(file('qualification-output/qualification.json')),
+ 'independent_audit':audit_ref,'actual_target_and_reference_inheritance_review':target_reference_ref,
+ 'adapter_components_manifest_sha256':COMPONENTS,'slurm_job_id':'754424',
+ 'native_generation_admitted':False,'normal_first_start_verified':False,
+ 'independent_performance_scientific_or_method_R5_admission':False,
+ 'current_Q_target_is_not_a_future_native_allocation_profile':True}
+composite_ref=emit('RECEPTION-MECANIQUE-R7-Q754424-VERIFIEE.json',composite)
+print(json.dumps({'audit':audit_ref,'target_reference':target_reference_ref,'composite':composite_ref,'restored_files':749,'distinct_tests':274}))

@@ -1,0 +1,92 @@
+param(
+ [Parameter(Mandatory=$true)][string]$InputPath,
+ [Parameter(Mandatory=$true)][string]$InputSHA256,
+ [Parameter(Mandatory=$true)][string]$OutputDirectory
+)
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$taskHere=$PSScriptRoot
+$taskBase=Split-Path (Split-Path (Split-Path (Split-Path $taskHere)))
+$taskPython=Join-Path $taskBase 'work/.venv/Scripts/python.exe'
+$taskValidator=Join-Path $taskHere 'valider-lancement.py'
+$taskValidatorExpected='e6994f76597c4d1a1db71646e0c6bb0064b2280739c737647f3a545c5e16bdb4'
+function Write-NewJson([string]$Path,$Value){
+ $taskBytes=[Text.UTF8Encoding]::new($false).GetBytes(($Value|ConvertTo-Json -Depth 30))
+ $taskStream=[IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+ try{$taskStream.Write($taskBytes,0,$taskBytes.Length);$taskStream.Flush($true)}finally{$taskStream.Dispose()}
+}
+function Read-FullCensus([string]$Destination){
+ $taskRows=@(Get-CimInstance Win32_Process | ForEach-Object {
+  [ordered]@{ProcessId=[int]$_.ProcessId;ParentProcessId=[int]$_.ParentProcessId;ExecutablePath=$_.ExecutablePath;
+   CommandLine=$_.CommandLine;CreationDate=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')}else{$null})}
+ })
+ $taskCensus=[ordered]@{schema='hpc-forest-dynamic-r4b-full-cim-v1';complete_census=$true;strict_utf8_decoding=$true;
+  captured_at_utc=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ');rows_count=$taskRows.Count;rows=$taskRows}
+ Write-NewJson $Destination $taskCensus
+ return $taskCensus
+}
+if((Get-FileHash -LiteralPath $InputPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $InputSHA256){throw 'Changed launch input'}
+if((Get-FileHash -LiteralPath $taskValidator -Algorithm SHA256).Hash.ToLowerInvariant() -ne $taskValidatorExpected){throw 'Changed pure validator'}
+$taskOut=[IO.Path]::GetFullPath($OutputDirectory)
+if((Split-Path $taskOut) -ne $taskHere -or (Test-Path -LiteralPath $taskOut)){throw 'Exclusive new output directly under this helper required'}
+New-Item -ItemType Directory -Path $taskOut | Out-Null
+$taskBeforePath=Join-Path $taskOut 'cim-complet-avant.json'
+$null=Read-FullCensus $taskBeforePath
+$taskCensusSHA=(Get-FileHash -LiteralPath $taskBeforePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$taskPlanPath=Join-Path $taskOut 'plan-verifie-aucun-start.json'
+$taskResult=& $taskPython -I -B $taskValidator --input $InputPath --input-sha256 $InputSHA256 --census $taskBeforePath --census-sha256 $taskCensusSHA --output $taskPlanPath 2> (Join-Path $taskOut 'validation.stderr')
+$taskCode=$LASTEXITCODE
+[IO.File]::WriteAllText((Join-Path $taskOut 'validation.stdout'),($taskResult -join "`n"),[Text.UTF8Encoding]::new($false))
+if($taskCode -ne 0){throw 'Pure preflight refused; no worker has been started'}
+$taskPlan=Get-Content -LiteralPath $taskPlanPath -Raw | ConvertFrom-Json -DateKind String
+if($taskPlan.validated -ne $true -or $taskPlan.executed -ne $false -or @($taskPlan.workers).Count -ne 3){throw 'Invalid exact three-worker launch plan'}
+# All three immutable commands, receipts, CLI pins and cache absences are checked before any intention/start.
+foreach($taskCheck in $taskPlan.immutable_file_checks.PSObject.Properties){
+ if((Get-FileHash -LiteralPath $taskCheck.Name -Algorithm SHA256).Hash.ToLowerInvariant() -ne $taskCheck.Value.sha256){throw 'An immutable preflight input changed'}
+}
+foreach($taskWorker in $taskPlan.workers){
+ if(Test-Path -LiteralPath $taskWorker.cache){throw 'Existing cache: reconcile without replay'}
+ if(Test-Path -LiteralPath $taskWorker.intent_path){throw 'An earlier launch intention exists: reconcile, never retry blindly'}
+}
+# Intentions are durable and exclusive next to the actual produced argv, independent of this output name.
+foreach($taskWorker in $taskPlan.workers){
+ Write-NewJson $taskWorker.intent_path ([ordered]@{schema='hpc-forest-r2e-owned-launch-intent-v1';model=$taskWorker.model;
+  job_id=$taskWorker.job_id;session_id=$taskWorker.session_id;argv_ref=$taskWorker.argv_ref;
+  observed_at=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ');one_start_only=$true;retry_after_unknown_forbidden=$true})
+}
+$taskStarted=@()
+foreach($taskWorker in $taskPlan.workers){
+ if(Test-Path -LiteralPath $taskWorker.cache){throw 'Cache appeared after intention; do not start or retry'}
+ $taskArgs=@($taskWorker.spec.argv | Select-Object -Skip 1)
+ if(@($taskArgs | Where-Object {$_ -match '[\s"]'}).Count -gt 0){throw 'Unexpected noncanonical generated argv; no quoting fallback'}
+ $taskEnvironment=@{};foreach($taskProperty in $taskWorker.spec.environment.PSObject.Properties){$taskEnvironment[$taskProperty.Name]=$taskProperty.Value}
+ $taskStartUTC=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+ $taskProcess=Start-Process -FilePath $taskWorker.spec.argv[0] -ArgumentList $taskArgs -WorkingDirectory $taskWorker.spec.cwd -Environment $taskEnvironment -WindowStyle Hidden -RedirectStandardOutput (Join-Path $taskOut ($taskWorker.model+'.stdout.log')) -RedirectStandardError (Join-Path $taskOut ($taskWorker.model+'.stderr.log')) -PassThru
+ $taskObserved=[ordered]@{model=$taskWorker.model;job_id=$taskWorker.job_id;session_id=$taskWorker.session_id;
+  launcher_pid=$taskProcess.Id;started_at_lower_bound=$taskStartUTC;started=$true;argv_ref=$taskWorker.argv_ref}
+ Write-NewJson (Join-Path $taskOut ($taskWorker.model+'-launch-observed.json')) $taskObserved
+ $taskStarted+=@{worker=$taskWorker;observed=$taskObserved}
+}
+Start-Sleep -Milliseconds 300
+$taskAfterPath=Join-Path $taskOut 'cim-complet-apres.json'
+$taskAfter=Read-FullCensus $taskAfterPath
+$taskPairs=@()
+foreach($taskItem in $taskStarted){
+ $taskWorker=$taskItem.worker;$taskObserved=$taskItem.observed
+ $taskTail=@($taskWorker.spec.argv | Select-Object -Skip 1) -join ' '
+ $taskAllowedLines=@(($taskWorker.spec.argv[0]+' '+$taskTail),('"'+$taskWorker.spec.argv[0]+'" '+$taskTail))
+ $taskLauncher=@($taskAfter.rows | Where-Object {$_.ProcessId -eq $taskObserved.launcher_pid})
+ if($taskLauncher.Count -ne 1){throw 'Observed launcher absent: preserve receipts and reconcile; never auto-retry'}
+ $taskChildren=@($taskAfter.rows | Where-Object {$_.ParentProcessId -eq $taskObserved.launcher_pid -and $_.ExecutablePath -in $taskWorker.expected_executable_paths -and $_.CommandLine -in $taskAllowedLines})
+ if($taskChildren.Count -ne 1){throw 'Exact Python pair not proved; no adoption or retry'}
+ $taskPair=@($taskLauncher[0],$taskChildren[0])
+ foreach($taskRow in $taskPair){
+  if(-not $taskRow.ExecutablePath -or -not $taskRow.CommandLine -or -not $taskRow.CreationDate -or $taskRow.ExecutablePath -notin $taskWorker.expected_executable_paths -or $taskRow.CommandLine -notin $taskAllowedLines -or $taskRow.CreationDate -lt $taskObserved.started_at_lower_bound){throw 'Full owned executable/argv/creation identity differs; preserve and reconcile'}
+ }
+ $taskPairs+=[ordered]@{model=$taskWorker.model;job_id=$taskWorker.job_id;session_id=$taskWorker.session_id;full_identities=$taskPair}
+}
+Write-NewJson (Join-Path $taskOut 'LANCEMENTS-POSSEDES-RECUS.json') ([ordered]@{schema='hpc-forest-r2e-three-owned-worker-launch-reception-v1';verified=$true;
+ workers=$taskPairs;native_worker_count=3;maximum_native_workers=4;first_normal_or_evaluation_proved=$false;
+ before_census=$taskBeforePath;after_census=$taskAfterPath;foreign_processes_adopted_or_stopped=$false;
+ source_or_worker_modified=$false;no_automatic_retry=$true})
+Write-Output 'Three exact owned Python pairs received; first NORMAL/evaluation still require their native receipts.'

@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "/*\n    This program solves Laplace's equation on a regular 2D grid using simple Jacobi iteration.\n\n    The stencil calculation stops when  ( err >= CONV_THRESHOLD OR  iter > ITER_MAX )\n*/\n#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n#include <sys/time.h>\n#if defined(__aarch64__)\n#include <arm_neon.h>\n#endif\n\n#define CONV_THRESHOLD 1.0e-5f // threshold of convergence\n\n// matrix to be solved\ndouble **grid;\n\n// auxiliary matrix\ndouble **new_grid;\n\n// size of each side of the grid\nint size;\nint iter_max_num;\n\n// return the absolute value of a number\ndouble absolute(double num){\n    if(num < 0)\n        return -1.0 * num;\n    return num;\n}\n\n\n// allocate memory for the grid\nvoid allocate_memory(){\n    grid = (double **) malloc(size * sizeof(double *));\n    new_grid = (double **) malloc(size * sizeof(double *));\n\n    for(int i = 0; i < size; i++){\n        grid[i] = (double *) malloc(size * sizeof(double));\n        new_grid[i] = (double *) malloc(size * sizeof(double));\n    }\n}\n\n// initialize the grid\nvoid initialize_grid(){\n    int center = size / 2;\n    int linf = center - (size / 10);\n    int lsup = center + (size / 10);\n    for (int i = 0; i < size; i++){\n        for (int j = 0; j < size; j++){\n            // inicializa região de calor no centro do grid\n            if ( i >= linf && i <= lsup && j >= linf && j <= lsup)\n                grid[i][j] = 100;\n            else\n                grid[i][j] = 0;\n            new_grid[i][j] = 0.0;\n        }\n    }\n}\n\n// save the grid in a file\nvoid save_grid(){\n\n    for(int i = 0; i < size; i++){\n        for(int j = 0; j < size; j++){\n            fprintf(stdout, \"%lf \", grid[i][j]);\n        }\n        fprintf(stdout, \"\\n\");\n    }\n}\n\nint main(int argc, char *argv[]){\n\n    fscanf(stdin, \"%d\", &size);\n    fscanf(stdin, \"%d\", &iter_max_num);\n    \n    int hasError = 1;\n    int iter = 0;\n\n    struct timeval time_start;\n    struct timeval time_end;\n\n    // allocate memory to the grid (matrix)\n    allocate_memory();\n\n    // set grid initial conditions\n    initialize_grid();\n\n    //printf(\"Jacobi relaxation calculation: %d x %d grid\\n\", size, size);\n\n    // get the start time\n    //gettimeofday(&time_start, NULL);\n\n#if defined(__aarch64__)\n    const float64x2_t quarter = vdupq_n_f64(0.25);\n    const float64x2_t threshold = vdupq_n_f64((double)CONV_THRESHOLD);\n#endif\n\n    // Jacobi iteration\n    // This loop will end if either the maximum change reaches below a set threshold (convergence)\n    // or a fixed number of maximum iterations have completed\n    while ( hasError && iter < iter_max_num ) {\n\n        hasError = 0;\n#if defined(__aarch64__)\n        uint64x2_t errorMask = vdupq_n_u64(0);\n#endif\n        // calculates the Laplace equation to determine each cell's next value\n        for( int i = 1; i < size-1; i++) {\n            const double *restrict row = grid[i];\n            const double *restrict north = grid[i-1];\n            const double *restrict south = grid[i+1];\n            double *restrict next = new_grid[i];\n            int j = 1;\n\n#if defined(__aarch64__)\n            // Each lane follows the original east + west + north + south order.\n            // Both lanes are interior cells, including all shifted loads.\n            for(; j < size-2; j += 2) {\n                float64x2_t sum = vaddq_f64(vld1q_f64(row + j + 1),\n                                          vld1q_f64(row + j - 1));\n                sum = vaddq_f64(sum, vld1q_f64(north + j));\n                sum = vaddq_f64(sum, vld1q_f64(south + j));\n                float64x2_t updated = vmulq_f64(quarter, sum);\n                vst1q_f64(next + j, updated);\n\n                float64x2_t errorCurrent =\n                    vabsq_f64(vsubq_f64(updated, vld1q_f64(row + j)));\n                errorMask = vorrq_u64(errorMask,\n                                     vcgtq_f64(errorCurrent, threshold));\n            }\n#endif\n            // Scalar remainder, or the complete row on other architectures.\n            for(; j < size-1; j++) {\n                next[j] = 0.25 * (row[j+1] + row[j-1] +\n                                  north[j] + south[j]);\n\n                double errorCurrent = absolute(next[j] - row[j]);\n                hasError |= (errorCurrent > CONV_THRESHOLD);\n            }\n        }\n#if defined(__aarch64__)\n        // Only the convergence flags are reduced; floating-point sums are not.\n        hasError |= ((vgetq_lane_u64(errorMask, 0) |\n                      vgetq_lane_u64(errorMask, 1)) != 0);\n#endif\n        // copie the next values into the working array for the next iteration\n        for( int i = 1; i < size-1; i++) {\n            for( int j = 1; j < size-1; j++) {\n                grid[i][j] = new_grid[i][j];\n            }\n        }\n        iter++;\n    }\n\n    // get the end time\n    //gettimeofday(&time_end, NULL);\n\n    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +\n    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;\n\n    //save the final grid in file\n    save_grid();\n\n    //printf(\"\\nKernel executed in %lf seconds with %d iterations.\\n\", exec_time, iter);\n\n    return 0;\n}\n",
+        "path": "src/laplace_seq.c"
+      }
+    ],
+    "hypothesis": "Explicit two-lane ARM64 NEON stencil evaluation with a bitwise convergence-mask reduction may improve throughput without reassociating floating-point additions.",
+    "notes": "Not executed or measured. Preserves initialization, boundaries, promoted float threshold, copy-back, stopping behavior, and output formatting. No build or threading changes.",
+    "sources_kept": [],
+    "transformations": [
+      "Use restrict-qualified row pointers and an AArch64 NEON kernel preserving east-plus-west-plus-north-plus-south evaluation order.",
+      "Accumulate strict convergence comparisons using vector bitwise OR and reduce once per iteration.",
+      "Provide a scalar remainder for arbitrary sizes and a scalar fallback for other architectures."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "e8726858c3e9476495d38bc2930ac0ab",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "b9c0e500c7d9e08cf9efef55fd4d13cae195cb4ca5cf053cf41c1c6818802287",
+  "session_id": "aa970cf8bf5d4c1aaa0fdabb21d73a72",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "3839b18ab4aae9f272820b9795f666c9b7770148791b53db5439761ddced46e2",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 12487,
+        "output_tokens": 5670,
+        "reasoning_output_tokens": 3926
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 18157,
+    "tool_events": []
+  }
+}

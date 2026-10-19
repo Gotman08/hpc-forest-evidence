@@ -1,0 +1,286 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/* Positions and velocities of one body. */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+typedef struct { float x, y, z; } Position;
+
+static inline void finish_body(const Body *current, Body *next,
+                               float dt, int i,
+                               float fx, float fy, float fz,
+                               int integrate) {
+  const float vx = current[i].vx + dt*fx;
+  const float vy = current[i].vy + dt*fy;
+  const float vz = current[i].vz + dt*fz;
+  next[i].vx = vx;
+  next[i].vy = vy;
+  next[i].vz = vz;
+  if (integrate) {
+    next[i].x = current[i].x + vx*dt;
+    next[i].y = current[i].y + vy*dt;
+    next[i].z = current[i].z + vz*dt;
+  }
+}
+
+/* A null snapshot selects the allocation-failure path. */
+static inline void force_one(const Position *positions,
+                             const Body *current, Body *next,
+                             float dt, int n, int i, int integrate) {
+  const float x = positions != NULL ? positions[i].x : current[i].x;
+  const float y = positions != NULL ? positions[i].y : current[i].y;
+  const float z = positions != NULL ? positions[i].z : current[i].z;
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  for (int j = 0; j < n; ++j) {
+    const float sx = positions != NULL ? positions[j].x : current[j].x;
+    const float sy = positions != NULL ? positions[j].y : current[j].y;
+    const float sz = positions != NULL ? positions[j].z : current[j].z;
+    float dx = sx - x;
+    float dy = sy - y;
+    float dz = sz - z;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  finish_body(current, next, dt, i, fx, fy, fz, integrate);
+}
+
+/* Four targets share each compact source load, without reducing across j. */
+static inline void force_block(const Position *restrict positions,
+                               const Body *current, Body *next,
+                               float dt, int n, int i, int integrate) {
+  if (n - i < 4) {
+    for (int tail = i; tail < n; ++tail) {
+      force_one(positions, current, next, dt, n, tail, integrate);
+    }
+    return;
+  }
+
+  const float x[4] = {positions[i].x, positions[i+1].x,
+                      positions[i+2].x, positions[i+3].x};
+  const float y[4] = {positions[i].y, positions[i+1].y,
+                      positions[i+2].y, positions[i+3].y};
+  const float z[4] = {positions[i].z, positions[i+1].z,
+                      positions[i+2].z, positions[i+3].z};
+  float fx[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float fy[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float fz[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  const float64x2_t one = vdupq_n_f64(1.0);
+#endif
+
+  for (int j = 0; j < n; ++j) {
+    const float xj = positions[j].x;
+    const float yj = positions[j].y;
+    const float zj = positions[j].z;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    float dx[4], dy[4], dz[4], sqrd_dist[4];
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int lane = 0; lane < 4; ++lane) {
+      float ddx = xj - x[lane];
+      float ddy = yj - y[lane];
+      float ddz = zj - z[lane];
+      dx[lane] = ddx;
+      dy[lane] = ddy;
+      dz[lane] = ddz;
+      sqrd_dist[lane] = ddx*ddx + ddy*ddy + ddz*ddz + SOFTENING;
+    }
+
+    /* Match the double sqrt and division in 1 / sqrt(float). */
+    const float32x4_t distances = vld1q_f32(sqrd_dist);
+    const float64x2_t dist_lo = vcvt_f64_f32(vget_low_f32(distances));
+    const float64x2_t dist_hi = vcvt_f64_f32(vget_high_f32(distances));
+    const float64x2_t inv_lo = vdivq_f64(one, vsqrtq_f64(dist_lo));
+    const float64x2_t inv_hi = vdivq_f64(one, vsqrtq_f64(dist_hi));
+    float inv_dist[4];
+    vst1q_f32(inv_dist, vcombine_f32(vcvt_f32_f64(inv_lo),
+                                   vcvt_f32_f64(inv_hi)));
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int lane = 0; lane < 4; ++lane) {
+      float inv = inv_dist[lane];
+      float inv_dist3 = inv * inv * inv;
+      fx[lane] += dx[lane] * inv_dist3;
+      fy[lane] += dy[lane] * inv_dist3;
+      fz[lane] += dz[lane] * inv_dist3;
+    }
+#else
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int lane = 0; lane < 4; ++lane) {
+      float dx = xj - x[lane];
+      float dy = yj - y[lane];
+      float dz = zj - z[lane];
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      fx[lane] += dx * inv_dist3;
+      fy[lane] += dy * inv_dist3;
+      fz[lane] += dz * inv_dist3;
+    }
+#endif
+  }
+
+  for (int lane = 0; lane < 4; ++lane) {
+    finish_body(current, next, dt, i + lane,
+                fx[lane], fy[lane], fz[lane], integrate);
+  }
+}
+
+/* Preserve the force-only operation for independent and repeated calls. */
+void body_force(Body *p, float dt, int n) {
+  if (n <= 0) {
+    return;
+  }
+
+  const size_t count = (size_t)n;
+  Position *positions = NULL;
+  if (count <= (size_t)-1 / sizeof(*positions)) {
+    positions = (Position *)malloc(count * sizeof(*positions));
+  }
+  if (positions == NULL) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n >= 4)
+#endif
+    for (int i = 0; i < n; ++i) {
+      force_one(NULL, p, p, dt, n, i, 0);
+    }
+    return;
+  }
+
+  for (int i = 0; i < n; ++i) {
+    positions[i].x = p[i].x;
+    positions[i].y = p[i].y;
+    positions[i].z = p[i].z;
+  }
+
+  const int nblocks = n / 4 + (n % 4 != 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (nblocks >= 4)
+#endif
+  for (int block = 0; block < nblocks; ++block) {
+    force_block(positions, p, p, dt, n, 4 * block, 0);
+  }
+  free(positions);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+  Body *scratch = NULL;
+  Position *positions = NULL;
+  Body *result = bodies;
+
+  if (nbodies > 0) {
+    const size_t count = (size_t)nbodies;
+    if (count <= (size_t)-1 / sizeof(*scratch) &&
+        count <= (size_t)-1 / sizeof(*positions)) {
+      scratch = (Body *)malloc(count * sizeof(*scratch));
+      positions = (Position *)malloc(count * sizeof(*positions));
+    }
+  }
+
+  if (scratch != NULL && positions != NULL) {
+    const int nblocks = nbodies / 4 + (nbodies % 4 != 0);
+#ifdef _OPENMP
+#pragma omp parallel if (nblocks >= 4)
+#endif
+    {
+      Body *current = bodies;
+      Body *next = scratch;
+
+      for (int iter = 0; iter < N_ITER; ++iter) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < nbodies; ++i) {
+          positions[i].x = current[i].x;
+          positions[i].y = current[i].y;
+          positions[i].z = current[i].z;
+        }
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int block = 0; block < nblocks; ++block) {
+          force_block(positions, current, next, DT,
+                      nbodies, 4 * block, 1);
+        }
+
+        Body *temporary = current;
+        current = next;
+        next = temporary;
+      }
+    }
+    if (N_ITER % 2 != 0) {
+      result = scratch;
+    }
+  } else {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      body_force(bodies, DT, nbodies);
+      for (int i = 0; i < nbodies; ++i) {
+        bodies[i].x += bodies[i].vx * DT;
+        bodies[i].y += bodies[i].vy * DT;
+        bodies[i].z += bodies[i].vz * DT;
+      }
+    }
+  }
+
+  write_dataset(nbodies, result);
+  free(positions);
+  free(scratch);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

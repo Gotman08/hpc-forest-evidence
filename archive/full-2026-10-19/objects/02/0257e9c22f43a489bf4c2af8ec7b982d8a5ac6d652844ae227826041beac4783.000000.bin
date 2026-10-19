@@ -1,0 +1,112 @@
+"""Allocation facts and neutral toolchain probes, never optimization suggestions."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+from .core import InfrastructureError, digest, file_digest
+
+
+def allocation_facts():
+    job = os.environ.get("SLURM_JOB_ID", "")
+    if not job.isdigit() or platform.machine().lower() != "aarch64":
+        raise InfrastructureError("Target preparation requires an ARM64 allocation")
+    try:
+        cpus = int(os.environ["SLURM_CPUS_PER_TASK"])
+        tasks = int(os.environ.get("SLURM_NTASKS", "1"))
+        nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", "1"))
+        node_memory = os.environ.get("SLURM_MEM_PER_NODE")
+        memory = int(node_memory) if node_memory else int(os.environ["SLURM_MEM_PER_CPU"]) * cpus
+        per_cpu_memory = os.environ.get("SLURM_MEM_PER_CPU")
+        if node_memory and per_cpu_memory and memory != int(per_cpu_memory) * cpus:
+            raise ValueError("Conflicting node and per-CPU memory")
+    except (KeyError, ValueError) as exc:
+        raise InfrastructureError("Allocated CPU/memory facts are absent or ambiguous") from exc
+    gpu_fields = {k: os.environ.get(k, "") for k in
+                  ["SLURM_JOB_GPUS", "SLURM_STEP_GPUS", "SLURM_GPUS", "SLURM_GPUS_ON_NODE"]}
+    # JOB/STEP_GPUS contain device IDs: "0" means one device, never zero devices.
+    device_ids = [gpu_fields[k] for k in ["SLURM_JOB_GPUS", "SLURM_STEP_GPUS"]]
+    counts = [gpu_fields[k] for k in ["SLURM_GPUS", "SLURM_GPUS_ON_NODE"]]
+    if any(v not in {"", "N/A"} for v in device_ids) or any(v not in {"", "0", "N/A"} for v in counts):
+        raise InfrastructureError("This target contract admits zero allocated GPU only")
+    if cpus != 4 or tasks != 1 or nodes != 1 or memory != 16384:
+        raise InfrastructureError("This experiment requires four allocated CPUs, one task/node, 16 GiB")
+    return {"slurm_job_id": job, "architecture": "ARM64", "cpu_cores": cpus,
+            "tasks": tasks, "nodes": nodes, "allocated_memory_mib": memory,
+            "allocated_gpus": 0, "gpu_allocation_environment": gpu_fields,
+            "allocation_source": "SLURM allocation environment, not node CPU count"}
+
+
+def prepare_target_profile():
+    """Compile/run a neutral OpenMP interface probe only inside its allocation."""
+    allocation = allocation_facts()
+    compilers = {}
+    code = ('#include <stdio.h>\n#include <omp.h>\nint main(void){int n=0;\n'
+            '#pragma omp parallel shared(n)\n{\n#pragma omp single\nn=omp_get_num_threads();\n}\n'
+            'printf("%d\\n",n);return 0;}\n')
+    with tempfile.TemporaryDirectory(prefix="forest-target-probe-") as directory:
+        folder = Path(directory)
+        for name, suffix in [("gcc", "c"), ("g++", "cpp")]:
+            executable = shutil.which(name)
+            if not executable:
+                raise InfrastructureError("The prepared target compiler is unavailable: " + name)
+            source, binary = folder / ("probe." + suffix), folder / ("probe-" + suffix)
+            source.write_text(code, encoding="utf8")
+            build = subprocess.run([executable, "-O0", "-fopenmp", str(source), "-o", str(binary)],
+                                   capture_output=True, timeout=30, check=False)
+            if build.returncode:
+                raise InfrastructureError("The neutral OpenMP compiler probe failed: " + name)
+            env = {**os.environ, "OMP_NUM_THREADS": "4", "OMP_DYNAMIC": "FALSE", "CUDA_VISIBLE_DEVICES": ""}
+            result = subprocess.run([str(binary)], env=env, capture_output=True, timeout=10, check=False)
+            if result.returncode or result.stdout != b"4\n":
+                raise InfrastructureError("The neutral OpenMP runtime probe failed: " + name)
+            version = subprocess.run([executable, "--version"], capture_output=True,
+                                     timeout=10, check=True).stdout.decode(errors="replace").splitlines()[0]
+            compilers[name] = {"path": executable, "sha256": file_digest(Path(executable)),
+                               "version": version, "probe_returncode": result.returncode,
+                               "probe_stdout": result.stdout.decode(), "probe_binary_sha256": file_digest(binary)}
+    value = {"schema": "hpc-forest-target-profile-v1", **allocation,
+             "verified_capabilities": ["cpu", "c", "cxx", "openmp"],
+             "compilers": compilers, "probe_source_sha256": hashlib.sha256(code.encode()).hexdigest(),
+             "operator_algorithm_advice": False}
+    value["profile_digest"] = digest(value)
+    return value
+
+
+def target_context(config):
+    """Fail closed if facts are stale, forged, or inconsistent with the allocation."""
+    value = config.get("target_profile")
+    if not isinstance(value, dict) or value.get("schema") != "hpc-forest-target-profile-v1":
+        raise InfrastructureError("A verified target profile is required before dynamic generation")
+    unsigned = {k: v for k, v in value.items() if k != "profile_digest"}
+    if digest(unsigned) != value.get("profile_digest"):
+        raise InfrastructureError("Target profile digest changed")
+    current = allocation_facts()
+    if any(value.get(k) != v for k, v in current.items()):
+        raise InfrastructureError("Target profile belongs to a different allocation")
+    expected = {"cpu", "c", "cxx", "openmp"}
+    if (set(value.get("verified_capabilities", [])) != expected
+            or set(config["dynamic_mother"]["verified_capabilities"]) != expected):
+        raise InfrastructureError("Unsupported capabilities cannot enter a dynamic root")
+    if config["protocol"]["environment"].get("CUDA_VISIBLE_DEVICES") != "":
+        raise InfrastructureError("Candidate GPU access must be explicitly disabled")
+    if config["protocol"]["environment"].get("OMP_NUM_THREADS") != "4":
+        raise InfrastructureError("Candidate threads differ from the allocation")
+    compilers = value.get("compilers", {})
+    for name in ["gcc", "g++"]:
+        item = compilers.get(name, {})
+        path = Path(item.get("path", ""))
+        if (not path.is_file() or file_digest(path) != item.get("sha256")
+                or item.get("probe_returncode") != 0 or item.get("probe_stdout") != "4\n"):
+            raise InfrastructureError("The verified compiler or its neutral probe changed: " + name)
+    compiler = config.get("compiler")
+    if compiler and (compiler.get("path") != compilers["gcc"]["path"]
+                     or compiler.get("sha256") != compilers["gcc"]["sha256"]):
+        raise InfrastructureError("Controller compiler differs from the verified profile")
+    return json.loads(json.dumps(value))

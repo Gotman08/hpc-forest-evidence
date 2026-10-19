@@ -1,0 +1,248 @@
+"""Neutral tests only; no actual CLI, model, process launch or ROMEO call."""
+import ast
+import copy
+import importlib.util
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("source_only_dispatch_tested", HERE / "coordonner-prochain-source-only-cli-r1.py")
+d = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(d)
+
+
+def group():
+    return {"key": d.KEY, "session_id": d.SESSION, "arm": "source-only", "model": d.MODEL,
+            "effort": d.EFFORT, "state": "planned_not_submitted", "job_maximum_seconds": d.MAXIMUM,
+            "subjects": [str(n) for n in range(15)]}
+
+
+def state():
+    previous = [{"key": f"closed{n}", "arm": "source-only", "state": "received_and_audited",
+                 "subjects": [str(m) for m in range(15)]} for n in range(3)]
+    return {"source_zip_sha256": d.SOURCE, "error": None, "queue": previous + [group()]}
+
+
+def deployment():
+    return {"scope_id": d.SCOPE, "source_zip_sha256": d.SOURCE, "input_manifest_sha256": "inputs",
+            "source_files_verified": 94, "original_preparation_files_verified": 609,
+            "all_copied_bytes_verified": True, "model_calls": 0, "candidate_compilations_or_executions": 0,
+            "old_candidates_imported": False}
+
+
+def process(session, pid, command="hpc_forest.matrix_worker"):
+    return {"ProcessId": pid, "ParentProcessId": 100, "ExecutablePath": "C:/python.exe",
+            "CommandLine": f"python.exe -m {command} --session-id {session}",
+            "CreationDate": "2026-10-17T20:00:00+00:00"}
+
+
+class Policies(unittest.TestCase):
+    def test_expected_next(self):
+        self.assertEqual(d.choose_next(state())["key"], d.KEY)
+
+    def test_45_received_required(self):
+        s = state(); s["queue"].pop(0)
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_partial_received_group_refused(self):
+        s = state(); s["queue"][0]["subjects"].pop()
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_uncertain_submission_refused(self):
+        s = state(); s["queue"][-1]["state"] = "submitting"
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_error_blocks(self):
+        s = state(); s["error"] = "unreconciled"
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_wrong_source(self):
+        s = state(); s["source_zip_sha256"] = "changed"
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_wrong_session(self):
+        s = state(); s["queue"][-1]["session_id"] = "a" * 32
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_wrong_arm(self):
+        s = state(); s["queue"][-1]["arm"] = "codex-native"
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_wrong_effort(self):
+        s = state(); s["queue"][-1]["effort"] = "xhigh"
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_wrong_model(self):
+        s = state(); s["queue"][-1]["model"] = "another"
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_existing_job_no_resubmit(self):
+        s = state(); s["queue"][-1]["job_id"] = "123"
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_existing_launch_no_restart(self):
+        s = state(); s["queue"][-1]["worker_launch_attempt"] = {"pid": 1}
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_duplicate_subjects(self):
+        s = state(); s["queue"][-1]["subjects"] = ["same"] * 15
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_maximum_nine_hours(self):
+        s = state(); s["queue"][-1]["job_maximum_seconds"] = 39600
+        with self.assertRaises(RuntimeError):
+            d.choose_next(s)
+
+    def test_deadline_exclusive(self):
+        with self.assertRaises(RuntimeError):
+            d.deadline_guard(d.shared.DEADLINE - d.MAXIMUM - d.shared.AUDIT_RESERVE)
+
+    def test_deadline_earlier(self):
+        d.deadline_guard(d.shared.DEADLINE - d.MAXIMUM - d.shared.AUDIT_RESERVE - 1)
+
+    def test_official_deployment(self):
+        d.deployment_guard(deployment(), {"sha256": "inputs"})
+
+    def test_candidate_import_refused(self):
+        proof = deployment(); proof["old_candidates_imported"] = True
+        with self.assertRaises(RuntimeError):
+            d.deployment_guard(proof, {"sha256": "inputs"})
+
+    def test_fewer_official_inputs_refused(self):
+        proof = deployment(); proof["original_preparation_files_verified"] = 608
+        with self.assertRaises(RuntimeError):
+            d.deployment_guard(proof, {"sha256": "inputs"})
+
+    def test_mutated_source_refused(self):
+        proof = deployment(); proof["source_zip_sha256"] = "other"
+        with self.assertRaises(RuntimeError):
+            d.deployment_guard(proof, {"sha256": "inputs"})
+
+    def test_model_probe_in_deployment_refused(self):
+        proof = deployment(); proof["model_calls"] = 1
+        with self.assertRaises(RuntimeError):
+            d.deployment_guard(proof, {"sha256": "inputs"})
+
+    def test_compilation_in_deployment_refused(self):
+        proof = deployment(); proof["candidate_compilations_or_executions"] = 1
+        with self.assertRaises(RuntimeError):
+            d.deployment_guard(proof, {"sha256": "inputs"})
+
+    def test_process_local_environment(self):
+        original = {"PATH": "original", "KEEP": "value"}
+        env = d.child_environment(original)
+        self.assertEqual(original, {"PATH": "original", "KEEP": "value"})
+        self.assertTrue(env["PATH"].startswith(str(d.CLI.parent)))
+        self.assertEqual(env["PYTHONPATH"], str(d.PROJECT / "src"))
+        self.assertEqual(env["PYTHONOPTIMIZE"], "0")
+
+    def test_no_forbidden_legacy_calls(self):
+        text = (HERE / "coordonner-prochain-source-only-cli-r1.py").read_text()
+        calls = [node for node in ast.walk(ast.parse(text)) if isinstance(node, ast.Call)]
+        forbidden = {"receive", "stop_after_audit", "_kill_owned", "kill", "killpg", "terminate", "worker", "submit"}
+        self.assertFalse(any(isinstance(n.func, ast.Attribute) and n.func.attr in forbidden for n in calls))
+        self.assertNotIn("taskkill", text.lower())
+        self.assertNotIn("Coordinator(None)", text)
+
+    def test_structured_reference(self):
+        with tempfile.TemporaryDirectory() as folder:
+            expected = Path(folder) / "audit.json"; expected.write_text("audit")
+            receipt = {"baseline_audit": {"path": str(expected), "sha256": d.digest(expected)}}
+            d.previous_bound_reference(receipt, "baseline_audit", expected)
+
+    def test_misplaced_hash_not_a_reference(self):
+        with tempfile.TemporaryDirectory() as folder:
+            expected = Path(folder) / "audit.json"; expected.write_text("audit")
+            receipt = {"unrelated": {"path": str(expected), "sha256": d.digest(expected)}}
+            with self.assertRaises(RuntimeError):
+                d.previous_bound_reference(receipt, "baseline_audit", expected)
+
+    def test_reference_wrong_path_same_bytes_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            expected = Path(folder) / "audit.json"; expected.write_text("audit")
+            other = Path(folder) / "other.json"; other.write_text("audit")
+            receipt = {"baseline_audit": {"path": str(other), "sha256": d.digest(expected)}}
+            with self.assertRaises(RuntimeError):
+                d.previous_bound_reference(receipt, "baseline_audit", expected)
+
+    def test_previous_wrong_session_refused(self):
+        receipt = {"job_id": "750831", "session_id": "f" * 32, "source_zip_sha256": d.SOURCE,
+                   "all_outcomes_accounted_for": True, "coverage_and_final_confirmations_verified": True,
+                   "deliveries_reconciled": True, "read_only_file_verification_before_and_after": True}
+        with self.assertRaises(RuntimeError):
+            d.previous_identity_guard(receipt)
+
+    def test_previous_strict_identity_accepted(self):
+        receipt = {"job_id": "750831", "session_id": "15219a6fd62b4dcb91b395dcd4ae03d5",
+                   "source_zip_sha256": d.SOURCE, "all_outcomes_accounted_for": True,
+                   "coverage_and_final_confirmations_verified": True, "deliveries_reconciled": True,
+                   "read_only_file_verification_before_and_after": True}
+        d.previous_identity_guard(receipt)
+        receipt["deliveries_reconciled"] = False
+        with self.assertRaises(RuntimeError):
+            d.previous_identity_guard(receipt)
+
+    def test_previous_absence_empty_identities_refused(self):
+        with self.assertRaises(RuntimeError):
+            d.previous_absence_identities({"recorded_identities": [], "recorded_process_ids_checked": [404]})
+
+    def test_previous_absence_empty_checked_ids_refused(self):
+        with self.assertRaises(RuntimeError):
+            d.previous_absence_identities({"recorded_identities": [process("e" * 32, 404)],
+                                          "recorded_process_ids_checked": []})
+
+
+class Capacity(unittest.TestCase):
+    def setup_fake(self, actual=True):
+        own_r1 = process(d.shared.SESSION, 101)
+        current = {"key": d.shared.KEY, "session_id": d.shared.SESSION, "model": d.shared.MODEL,
+                   "effort": d.shared.EFFORT, "state": "working", "worker_identity": own_r1}
+        r1 = {"source_zip_sha256": d.shared.SOURCE, "current_key": current["key"], "queue": [current]}
+        ready = {"session_id": d.shared.SESSION, "pid": 101,
+                 "codex_cli_version": d.shared.CLI_VERSION, "codex_executable": str(d.CLI)}
+        rows = [own_r1] if actual else []
+        return r1, ready, rows
+
+    def test_current_r1_full_identity_and_ready(self):
+        r1, ready, rows = self.setup_fake()
+        def fake_read(path):
+            return ready if str(path).endswith("worker-ready.json") else r1
+        with patch.object(d.shared, "census", return_value=rows), patch.object(d, "read", side_effect=fake_read), \
+                patch.object(d, "previous_receipt_guard", return_value=({}, {"recorded_identities": [process("e" * 32, 404)], "recorded_process_ids_checked": [404]})), \
+                patch.object(Path, "is_file", return_value=True):
+            self.assertEqual(d.live_guard()[2]["session_id"], d.shared.SESSION)
+
+    def test_missing_r1_relay_blocks_initial_admission(self):
+        r1, _ready, rows = self.setup_fake(actual=False)
+        with patch.object(d.shared, "census", return_value=rows), patch.object(d, "read", return_value=r1), self.assertRaises(RuntimeError):
+            d.live_guard()
+
+    def test_third_native_session_blocks(self):
+        r1, _ready, rows = self.setup_fake()
+        rows.append(process("f" * 32, 303))
+        with patch.object(d.shared, "census", return_value=rows), patch.object(d, "read", return_value=r1), self.assertRaises(RuntimeError):
+            d.live_guard()
+
+    def test_reused_r1_identity_blocks(self):
+        r1, _ready, rows = self.setup_fake()
+        r1 = copy.deepcopy(r1); r1["queue"][0]["worker_identity"]["CreationDate"] = "2026-10-16T20:00:00+00:00"
+        with patch.object(d.shared, "census", return_value=rows), patch.object(d, "read", return_value=r1), self.assertRaises(RuntimeError):
+            d.live_guard()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,228 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <vector>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+struct alignas(16) PackedColumns {
+    std::int64_t lane[4];
+};
+
+template<int Batch>
+static void prepare_batch(const int* matrix, int n, int s, int top,
+                          int window_count, std::int64_t* columns,
+                          PackedColumns* packed) {
+    const int* entering[4] = {};
+    const int* leaving[4] = {};
+    for (int lane = 1; lane < Batch; ++lane) {
+        entering[lane] = matrix + static_cast<std::size_t>(top + lane + s - 1) * n;
+        leaving[lane] = matrix + static_cast<std::size_t>(top + lane - 1) * n;
+    }
+
+    const bool advance = top + Batch < window_count;
+    const int* next_entering = nullptr;
+    const int* next_leaving = nullptr;
+    if (advance) {
+        next_entering = matrix + static_cast<std::size_t>(top + Batch + s - 1) * n;
+        next_leaving = matrix + static_cast<std::size_t>(top + Batch - 1) * n;
+    }
+
+    for (int col = 0; col < n; ++col) {
+        std::int64_t value = columns[col];
+        packed[col].lane[0] = value;
+        for (int lane = 1; lane < Batch; ++lane) {
+            value += static_cast<std::int64_t>(entering[lane][col])
+                   - static_cast<std::int64_t>(leaving[lane][col]);
+            packed[col].lane[lane] = value;
+        }
+        // Inactive lanes duplicate a valid row, so they cannot change the maximum.
+        for (int lane = Batch; lane < 4; ++lane)
+            packed[col].lane[lane] = value;
+
+        if (advance) {
+            columns[col] = value
+                         + static_cast<std::int64_t>(next_entering[col])
+                         - static_cast<std::int64_t>(next_leaving[col]);
+        }
+    }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline int64x2_t maximum_lanes(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+static std::int64_t scan_batch(const PackedColumns* packed, int n, int s) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    int64x2_t partial01_0 = vdupq_n_s64(0);
+    int64x2_t partial01_1 = vdupq_n_s64(0);
+    int64x2_t partial01_2 = vdupq_n_s64(0);
+    int64x2_t partial01_3 = vdupq_n_s64(0);
+    int64x2_t partial23_0 = vdupq_n_s64(0);
+    int64x2_t partial23_1 = vdupq_n_s64(0);
+    int64x2_t partial23_2 = vdupq_n_s64(0);
+    int64x2_t partial23_3 = vdupq_n_s64(0);
+
+    int col = 0;
+    // Independent partial sums shorten the first-window reduction chains.
+    for (; col + 3 < s; col += 4) {
+        partial01_0 = vaddq_s64(partial01_0, vld1q_s64(packed[col].lane));
+        partial23_0 = vaddq_s64(partial23_0, vld1q_s64(packed[col].lane + 2));
+        partial01_1 = vaddq_s64(partial01_1, vld1q_s64(packed[col + 1].lane));
+        partial23_1 = vaddq_s64(partial23_1, vld1q_s64(packed[col + 1].lane + 2));
+        partial01_2 = vaddq_s64(partial01_2, vld1q_s64(packed[col + 2].lane));
+        partial23_2 = vaddq_s64(partial23_2, vld1q_s64(packed[col + 2].lane + 2));
+        partial01_3 = vaddq_s64(partial01_3, vld1q_s64(packed[col + 3].lane));
+        partial23_3 = vaddq_s64(partial23_3, vld1q_s64(packed[col + 3].lane + 2));
+    }
+    int64x2_t sum01 = vaddq_s64(vaddq_s64(partial01_0, partial01_1),
+                              vaddq_s64(partial01_2, partial01_3));
+    int64x2_t sum23 = vaddq_s64(vaddq_s64(partial23_0, partial23_1),
+                              vaddq_s64(partial23_2, partial23_3));
+    for (; col < s; ++col) {
+        sum01 = vaddq_s64(sum01, vld1q_s64(packed[col].lane));
+        sum23 = vaddq_s64(sum23, vld1q_s64(packed[col].lane + 2));
+    }
+
+    int64x2_t best01_0 = sum01;
+    int64x2_t best01_1 = sum01;
+    int64x2_t best01_2 = sum01;
+    int64x2_t best01_3 = sum01;
+    int64x2_t best23_0 = sum23;
+    int64x2_t best23_1 = sum23;
+    int64x2_t best23_2 = sum23;
+    int64x2_t best23_3 = sum23;
+
+    // Keep the rolling sums ordered, but distribute maxima across four chains.
+    // Each vector lane still represents an independent top-left row.
+    for (; col + 3 < n; col += 4) {
+        const PackedColumns* entering = packed + col;
+        const PackedColumns* leaving = packed + col - s;
+        const int64x2_t delta01_0 = vsubq_s64(vld1q_s64(entering[0].lane),
+                                             vld1q_s64(leaving[0].lane));
+        const int64x2_t delta23_0 = vsubq_s64(vld1q_s64(entering[0].lane + 2),
+                                             vld1q_s64(leaving[0].lane + 2));
+        const int64x2_t delta01_1 = vsubq_s64(vld1q_s64(entering[1].lane),
+                                             vld1q_s64(leaving[1].lane));
+        const int64x2_t delta23_1 = vsubq_s64(vld1q_s64(entering[1].lane + 2),
+                                             vld1q_s64(leaving[1].lane + 2));
+        const int64x2_t delta01_2 = vsubq_s64(vld1q_s64(entering[2].lane),
+                                             vld1q_s64(leaving[2].lane));
+        const int64x2_t delta23_2 = vsubq_s64(vld1q_s64(entering[2].lane + 2),
+                                             vld1q_s64(leaving[2].lane + 2));
+        const int64x2_t delta01_3 = vsubq_s64(vld1q_s64(entering[3].lane),
+                                             vld1q_s64(leaving[3].lane));
+        const int64x2_t delta23_3 = vsubq_s64(vld1q_s64(entering[3].lane + 2),
+                                             vld1q_s64(leaving[3].lane + 2));
+
+        sum01 = vaddq_s64(sum01, delta01_0);
+        sum23 = vaddq_s64(sum23, delta23_0);
+        best01_0 = maximum_lanes(best01_0, sum01);
+        best23_0 = maximum_lanes(best23_0, sum23);
+
+        sum01 = vaddq_s64(sum01, delta01_1);
+        sum23 = vaddq_s64(sum23, delta23_1);
+        best01_1 = maximum_lanes(best01_1, sum01);
+        best23_1 = maximum_lanes(best23_1, sum23);
+
+        sum01 = vaddq_s64(sum01, delta01_2);
+        sum23 = vaddq_s64(sum23, delta23_2);
+        best01_2 = maximum_lanes(best01_2, sum01);
+        best23_2 = maximum_lanes(best23_2, sum23);
+
+        sum01 = vaddq_s64(sum01, delta01_3);
+        sum23 = vaddq_s64(sum23, delta23_3);
+        best01_3 = maximum_lanes(best01_3, sum01);
+        best23_3 = maximum_lanes(best23_3, sum23);
+    }
+    for (; col < n; ++col) {
+        const int64x2_t enter01 = vld1q_s64(packed[col].lane);
+        const int64x2_t enter23 = vld1q_s64(packed[col].lane + 2);
+        const int64x2_t leave01 = vld1q_s64(packed[col - s].lane);
+        const int64x2_t leave23 = vld1q_s64(packed[col - s].lane + 2);
+        sum01 = vaddq_s64(sum01, vsubq_s64(enter01, leave01));
+        sum23 = vaddq_s64(sum23, vsubq_s64(enter23, leave23));
+        best01_0 = maximum_lanes(best01_0, sum01);
+        best23_0 = maximum_lanes(best23_0, sum23);
+    }
+
+    const int64x2_t best01 = maximum_lanes(maximum_lanes(best01_0, best01_1),
+                                          maximum_lanes(best01_2, best01_3));
+    const int64x2_t best23 = maximum_lanes(maximum_lanes(best23_0, best23_1),
+                                          maximum_lanes(best23_2, best23_3));
+    const int64x2_t best = maximum_lanes(best01, best23);
+    return std::max(vgetq_lane_s64(best, 0), vgetq_lane_s64(best, 1));
+#else
+    std::int64_t sums[4] = {};
+    for (int col = 0; col < s; ++col)
+        for (int lane = 0; lane < 4; ++lane)
+            sums[lane] += packed[col].lane[lane];
+
+    std::int64_t best[4] = {sums[0], sums[1], sums[2], sums[3]};
+    for (int col = s; col < n; ++col) {
+        for (int lane = 0; lane < 4; ++lane) {
+            sums[lane] += packed[col].lane[lane] - packed[col - s].lane[lane];
+            best[lane] = std::max(best[lane], sums[lane]);
+        }
+    }
+    return *std::max_element(best, best + 4);
+#endif
+}
+
+int main() {
+    int n, s;
+    if (std::scanf("%d%d", &n, &s) != 2)
+        return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::vector<int> matrix(static_cast<std::size_t>(n) * n);
+    for (std::size_t i = 0; i < matrix.size(); ++i)
+        std::scanf("%d", &matrix[i]);
+
+    std::vector<std::int64_t> columns(n, 0);
+    for (int row = 0; row < s; ++row) {
+        const int* values = matrix.data() + static_cast<std::size_t>(row) * n;
+        for (int col = 0; col < n; ++col)
+            columns[col] += static_cast<std::int64_t>(values[col]);
+    }
+
+    std::vector<PackedColumns> packed(n);
+    const int window_count = n - s + 1;
+    std::int64_t answer = std::numeric_limits<std::int64_t>::lowest();
+    for (int top = 0; top < window_count; top += 4) {
+        const int batch = std::min(4, window_count - top);
+        switch (batch) {
+        case 1:
+            prepare_batch<1>(matrix.data(), n, s, top, window_count,
+                             columns.data(), packed.data());
+            break;
+        case 2:
+            prepare_batch<2>(matrix.data(), n, s, top, window_count,
+                             columns.data(), packed.data());
+            break;
+        case 3:
+            prepare_batch<3>(matrix.data(), n, s, top, window_count,
+                             columns.data(), packed.data());
+            break;
+        case 4:
+            prepare_batch<4>(matrix.data(), n, s, top, window_count,
+                             columns.data(), packed.data());
+            break;
+        }
+        answer = std::max(answer, scan_batch(packed.data(), n, s));
+    }
+
+    std::printf("%lld\n", static_cast<long long>(answer));
+    return 0;
+}

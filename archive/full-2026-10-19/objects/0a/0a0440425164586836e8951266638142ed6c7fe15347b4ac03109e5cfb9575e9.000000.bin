@@ -1,0 +1,277 @@
+"""Future cold regular-only delivery restoration; never execute source or recreate links.
+
+This preparation is not a received archive, remote SHA proof, or full Q admission.
+"""
+import argparse
+import io
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import tarfile
+
+HERE = Path(__file__).resolve().parent
+REVIEW = HERE.parent
+Q = REVIEW.parent
+BASE = Path("C:/Users/nicol/Documents/Codex/2026-10-15/cr")
+SOURCE = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN = "d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27"
+COMPONENTS = "1e60da6d5b51afaf3c857b1ba215927e7e1201c297241afd6390212a89d5e449"
+SIDE = {"source_entire_inventory_before": "source-entire-inventory-before.json",
+        "source_entire_inventory_after": "source-entire-inventory-after.json",
+        "regular_archive_members": "archive-regular-members.json",
+        "inert_symlinks_only": "inert-symlink-metadata-only.json",
+        "existing_qualification_validation": "EXISTING-QUALIFICATION-VERIFIED.json"}
+
+
+def need(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def ordinary(path):
+    original = Path(path)
+    need(".." not in original.parts, "Parent traversal refused BEFORE filesystem access")
+    path = Path(os.path.abspath(original))
+    boundary = Path(os.path.abspath(Q))
+    need(path.is_relative_to(boundary), "All delivery inputs/restorations must remain inside this Q reception")
+    need(not path.anchor.startswith("\\\\") and all(":" not in x for x in path.parts[1:]), "UNC/ADS refused")
+    for part in (path, *path.parents):
+        if part.exists() or part.is_symlink():
+            info = part.lstat()
+            need(not stat.S_ISLNK(info.st_mode) and not
+                 (getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 1024)),
+                 "Existing symlink/reparse path refused")
+    need(path.resolve(strict=False) == path and path.resolve(strict=False).is_relative_to(boundary.resolve(strict=True)),
+         "Canonical boundary or parent alias changed")
+    return path
+
+
+def metadata(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, getattr(info, "st_file_attributes", None))
+
+
+def open_nofollow_read(path):
+    """One regular-file handle only; never follow a leaf reparse point."""
+    if os.name != "nt":
+        need(hasattr(os, "O_NOFOLLOW"), "No no-follow read API available")
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    info = kernel.GetFileInformationByHandleEx
+    info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    info.restype = wintypes.BOOL
+    class AttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+    # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, OPEN_REPARSE_POINT|SEQUENTIAL_SCAN.
+    handle = create(str(path), 0x80000000, 0x1, None, 3, 0x00200000 | 0x08000000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        tag = AttributeTagInfo()
+        if not info(handle, 9, ctypes.byref(tag), ctypes.sizeof(tag)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        need(not tag.FileAttributes & (0x400 | 0x10), "Opened reparse point/directory refused BEFORE read")
+        fd = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | os.O_BINARY)
+        handle = None  # fd now exclusively owns this same native handle.
+        return fd
+    finally:
+        if handle is not None:
+            close(handle)
+
+
+def raw(path):
+    p = ordinary(path)
+    before = p.lstat()
+    need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= 2 * 1024**3,
+         "Bounded regular evidence required")
+    fd = open_nofollow_read(p)
+    try:
+        need(metadata(os.fstat(fd)) == metadata(before), "Held input object differs BEFORE read")
+        ordinary(p)  # Parent/leaf aliases remain refused before the first byte.
+        with os.fdopen(fd, "rb") as stream:
+            fd = None
+            need(metadata(os.fstat(stream.fileno())) == metadata(before), "Held input object changed before read")
+            value = stream.read(before.st_size + 1)
+            need(metadata(os.fstat(stream.fileno())) == metadata(before) and len(value) == before.st_size,
+                 "Held input bytes or metadata changed during read")
+            need(metadata(p.lstat()) == metadata(before), "Input path replaced after read")
+            ordinary(p)  # Recheck every existing parent/reparse alias while the handle is still held.
+        need(metadata(p.lstat()) == metadata(before), "Input path changed after handle close")
+        ordinary(p)
+        return value
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def decode(value):
+    def pairs(items):
+        out = {}
+        for key, child in items:
+            need(key not in out, "Duplicate JSON member")
+            out[key] = child
+        return out
+    return json.loads(value.decode("utf-8-sig"), object_pairs_hook=pairs,
+                      parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+
+
+def member_name(name):
+    p = PurePosixPath(name)
+    need(name and not p.is_absolute() and p.as_posix() == name and "\\" not in name
+         and not any(x in {"", ".", ".."} or ":" in x or x.rstrip(" .") != x
+                     or re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", x)
+                     for x in p.parts), "Unsafe/nonportable archive member; preserve archive, never repair name")
+    return p
+
+
+def inventory(root):
+    result = {}
+    for folder, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs:
+            ordinary(Path(folder) / name)
+        for name in files:
+            p = Path(folder) / name
+            value = raw(p)
+            result[p.relative_to(root).as_posix()] = {"sha256": digest(value), "bytes": len(value)}
+    return result
+
+
+def save(path, value):
+    with ordinary(path).open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=True); stream.write("\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--receipt-sha256", required=True)
+    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--sidecar-directory", type=Path, required=True)
+    parser.add_argument("--restoration", type=Path, required=True)
+    args = parser.parse_args()
+    receipt_raw = raw(args.receipt)
+    need(digest(receipt_raw) == args.receipt_sha256, "Actual receipt pin changed")
+    receipt = decode(receipt_raw)
+    need(receipt["schema"] == "hpc-forest-Q753709-existing-byte-delivery-only-v1"
+         and receipt["verified_delivery_only"] is True and receipt["source_test_job_id"] == "753709"
+         and receipt["source_zip_sha256"] == SOURCE and receipt["plan_sha256"] == PLAN
+         and receipt["adapter_components_manifest_sha256"] == COMPONENTS
+         and receipt["source_before_after_identical"] is True
+         and receipt["symlinks_followed_or_archived"] is False
+         and receipt["other_special_types_admitted"] is False
+         and receipt["tests_reexecuted"] == receipt["native_model_calls"] == 0
+         and receipt["source_imported"] is False and receipt["native_generation_admitted"] is False
+         and receipt["scientific_or_performance_admission"] is False,
+         "Exact delivery-only metadata boundary differs")
+    inputs = {str(args.receipt.absolute()): digest(receipt_raw)}
+    sidecars = {}
+    for field, filename in SIDE.items():
+        announced = receipt[field]
+        need(PurePosixPath(announced["path"]).name == filename, "Sidecar basename differs")
+        path = args.sidecar_directory / filename
+        value = raw(path)
+        need(digest(value) == announced["sha256"] and len(value) == announced["bytes"], "Sidecar SHA/bytes differ")
+        inputs[str(path.absolute())] = digest(value)
+        sidecars[field] = decode(value)
+    before, after = sidecars["source_entire_inventory_before"], sidecars["source_entire_inventory_after"]
+    need(before == after, "Entire original source inventory changed during delivery")
+    regular = {name: row["sha256"] for name, row in before.items() if row["kind"] == "regular"}
+    links = {name: row for name, row in before.items() if row["kind"] == "symlink"}
+    need(regular == sidecars["regular_archive_members"] and links == sidecars["inert_symlinks_only"]
+         and len(regular) == receipt["regular_files_archived"]
+         and len(links) == receipt["symlink_metadata_records"], "Closed regular/link manifest coverage differs")
+    for name, row in before.items():
+        member_name(name)
+        need(row["kind"] in {"regular", "directory", "symlink"}, "Special input kind refused")
+        if row["kind"] == "symlink":
+            need(row["target_followed"] is False and row["tar_member"] is False and row["bytes_read"] is False,
+                 "Recorded link must be metadata only")
+        elif row["kind"] == "directory":
+            need(row["tar_member"] is False, "Directory header outside regular-only contract")
+    validation = sidecars["existing_qualification_validation"]
+    need(validation["already_completed_unique_cases"] == 265 and validation["tests_executed_by_delivery"] == 0
+         and validation["received_source_code_imported"] is False
+         and validation["models_CLI_compilation_installation_or_transport_executed"] == 0,
+         "Delivery reexecuted work or promoted runtime")
+    archive_raw = raw(args.archive)
+    need(digest(archive_raw) == receipt["archive"]["sha256"] and len(archive_raw) == receipt["archive"]["bytes"],
+         "Announced/local archive SHA/size differ")
+    inputs[str(args.archive.absolute())] = digest(archive_raw)
+    restore = ordinary(args.restoration)
+    need(restore.is_relative_to(HERE) and not restore.exists(), "Exclusive new restoration under reviewer folder required")
+    expected = {}
+    normalized_names = set()
+    with tarfile.open(fileobj=io.BytesIO(archive_raw), mode="r:gz") as stream:
+        members = []
+        need(len(regular) <= 100000, "Expected regular member bound exceeded")
+        for member in stream:
+            need(len(members) < len(regular), "Too many archive members")
+            members.append(member)
+            member_name(member.name)
+            need(member.isfile() and not member.issym() and not member.islnk(), "Tar links/directories/special headers refused")
+            need(member.name in regular and member.name not in expected and member.name.casefold() not in normalized_names,
+                 "Unexpected/duplicate/Windows-case-colliding member")
+            need(0 <= member.size <= 128 * 1024**2 and member.size == before[member.name]["bytes"], "Member size differs")
+            normalized_names.add(member.name.casefold())
+            expected[member.name] = {"sha256": regular[member.name], "bytes": member.size}
+        need(len(members) == len(regular), "Regular member count differs")
+        need(set(expected) == set(regular) and sum(v["bytes"] for v in expected.values()) <= 2 * 1024**3,
+             "Archive regular membership or size bound differs")
+        need(not any(str(parent) in expected for name in expected for parent in PurePosixPath(name).parents if str(parent) != "."),
+             "Regular file is another member's parent")
+        restore.mkdir(exist_ok=False)
+        save(restore.parent / (restore.name + "-INTENTION.json"), {"receipt_sha256": args.receipt_sha256,
+            "archive_sha256": digest(archive_raw), "links_recreated": False, "received_code_executed": False})
+        for member in members:
+            value = stream.extractfile(member).read(128 * 1024**2 + 1)
+            need(len(value) == member.size and digest(value) == regular[member.name], "Regular archive bytes differ")
+            target = ordinary(restore / Path(*PurePosixPath(member.name).parts))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as output:
+                output.write(value)
+        # Never use extract/extractall, and never create/follow a path from link_target.
+    actual = inventory(restore)
+    need(actual == expected, "Full fresh regular restoration differs")
+    for path, digest_before in inputs.items():
+        need(digest(raw(path)) == digest_before, "Received delivery input changed during audit")
+    old_inputs = Q / "reception-fichiers-reguliers"
+    for folder, _, files in os.walk(old_inputs):
+        for name in files:
+            path = Path(folder) / name
+            relative = path.relative_to(old_inputs).as_posix()
+            need(relative in actual and digest(raw(path)) == actual[relative]["sha256"],
+                 "Fresh recovered bytes differ from previous36 regular receipts")
+    save(restore.parent / (restore.name + "-AUDIT-RESTAURATION.json"), {
+        "schema": "hpc-forest-Q753709-independent-regular-delivery-restoration-v1",
+        "verified_regular_restoration": True, "archive_sha256_announced_equals_local": True,
+        "remote_recalculated_archive_SHA_evidence_validated_by_this_reader": False,
+        "regular_files": len(actual), "regular_bytes": sum(v["bytes"] for v in actual.values()),
+        "inert_symlink_records": len(links), "links_recreated_or_followed": False,
+        "old_partial_archive_preserved_as_opaque_bytes_only": True,
+        "all_prior36_regular_receipts_equal_recovered_bytes": True,
+        "complete_Q_or_native_generation_admitted": False,
+        "tests_code_models_CLI_or_jobs_executed": False,
+        "limits": "A separate real remote SHA check and complete parent/independent Q admission are still required. Link records are JSON data only; no link or old partial archive is executed or recursively opened."})
+    print(json.dumps({"regular_restoration": str(restore), "files": len(actual), "links_recreated": False,
+                      "complete_Q_admitted": False}))
+
+
+if __name__ == "__main__":
+    main()

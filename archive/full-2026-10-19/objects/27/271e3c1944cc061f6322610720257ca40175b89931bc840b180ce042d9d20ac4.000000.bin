@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\nstatic float *allocate_positions(int n) {\n  if (n <= 0) {\n    return NULL;\n  }\n  const size_t count = (size_t)n;\n  if (count > ((size_t)-1) / (3 * sizeof(float))) {\n    return NULL;\n  }\n  return (float *)malloc(3 * count * sizeof(float));\n}\n\n/* Called collectively by the current OpenMP team. */\nstatic void pack_positions_work(const Body *p, float *positions, int n) {\n  const size_t count = (size_t)n;\n  float *x = positions;\n  float *y = x + count;\n  float *z = y + count;\n\n  #pragma omp for schedule(static)\n  for (int i = 0; i < n; ++i) {\n    x[i] = p[i].x;\n    y[i] = p[i].y;\n    z[i] = p[i].z;\n  }\n}\n\n/* Allocation-failure path, also called collectively. */\nstatic void body_force_scalar_work(Body *p, float dt, int n) {\n  #pragma omp for schedule(static)\n  for (int i = 0; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; ++j) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/* Four independent targets share packed source-coordinate loads. */\n#if defined(__GNUC__) && !defined(__clang__)\n__attribute__((optimize(\"no-math-errno\")))\n#endif\nstatic void body_force_work(Body *p, const float *positions, float dt, int n) {\n  const size_t count = (size_t)n;\n  const float *px = positions;\n  const float *py = px + count;\n  const float *pz = py + count;\n  const int nblocks = n / 4 + (n % 4 != 0);\n\n  #pragma omp for schedule(static)\n  for (int block = 0; block < nblocks; ++block) {\n    const int i = 4 * block;\n\n    if (n - i >= 4) {\n      float x[4], y[4], z[4];\n      float fx[4] = {0.0f};\n      float fy[4] = {0.0f};\n      float fz[4] = {0.0f};\n\n      for (int lane = 0; lane < 4; ++lane) {\n        x[lane] = px[i + lane];\n        y[lane] = py[i + lane];\n        z[lane] = pz[i + lane];\n      }\n\n      int j = 0;\n      for (; n - j >= 2; j += 2) {\n        const float j0x = px[j];\n        const float j0y = py[j];\n        const float j0z = pz[j];\n        const float j1x = px[j + 1];\n        const float j1y = py[j + 1];\n        const float j1z = pz[j + 1];\n\n        #pragma omp simd simdlen(4)\n        for (int lane = 0; lane < 4; ++lane) {\n          float dx0 = j0x - x[lane];\n          float dy0 = j0y - y[lane];\n          float dz0 = j0z - z[lane];\n          float dx1 = j1x - x[lane];\n          float dy1 = j1y - y[lane];\n          float dz1 = j1z - z[lane];\n          float sqrd_dist0 = dx0*dx0 + dy0*dy0 + dz0*dz0 + SOFTENING;\n          float sqrd_dist1 = dx1*dx1 + dy1*dy1 + dz1*dz1 + SOFTENING;\n          float inv_dist0 = 1 / sqrt(sqrd_dist0);\n          float inv_dist1 = 1 / sqrt(sqrd_dist1);\n          float inv_dist30 = inv_dist0 * inv_dist0 * inv_dist0;\n          float inv_dist31 = inv_dist1 * inv_dist1 * inv_dist1;\n\n          fx[lane] += dx0 * inv_dist30;\n          fy[lane] += dy0 * inv_dist30;\n          fz[lane] += dz0 * inv_dist30;\n          fx[lane] += dx1 * inv_dist31;\n          fy[lane] += dy1 * inv_dist31;\n          fz[lane] += dz1 * inv_dist31;\n        }\n      }\n\n      if (j < n) {\n        const float jx = px[j];\n        const float jy = py[j];\n        const float jz = pz[j];\n\n        #pragma omp simd simdlen(4)\n        for (int lane = 0; lane < 4; ++lane) {\n          float dx = jx - x[lane];\n          float dy = jy - y[lane];\n          float dz = jz - z[lane];\n          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n          float inv_dist = 1 / sqrt(sqrd_dist);\n          float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n          fx[lane] += dx * inv_dist3;\n          fy[lane] += dy * inv_dist3;\n          fz[lane] += dz * inv_dist3;\n        }\n      }\n\n      for (int lane = 0; lane < 4; ++lane) {\n        p[i + lane].vx += dt*fx[lane];\n        p[i + lane].vy += dt*fy[lane];\n        p[i + lane].vz += dt*fz[lane];\n      }\n    } else {\n      for (int k = i; k < n; ++k) {\n        const float x = px[k];\n        const float y = py[k];\n        const float z = pz[k];\n        float fx = 0.0f;\n        float fy = 0.0f;\n        float fz = 0.0f;\n\n        for (int j = 0; j < n; ++j) {\n          float dx = px[j] - x;\n          float dy = py[j] - y;\n          float dz = pz[j] - z;\n          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n          float inv_dist = 1 / sqrt(sqrd_dist);\n          float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n          fx += dx * inv_dist3;\n          fy += dy * inv_dist3;\n          fz += dz * inv_dist3;\n        }\n\n        p[k].vx += dt*fx;\n        p[k].vy += dt*fy;\n        p[k].vz += dt*fz;\n      }\n    }\n  }\n}\n\n/* Independent calls own their scratch storage and OpenMP team. */\nvoid body_force(Body *p, float dt, int n) {\n  if (n <= 0) {\n    return;\n  }\n\n  float *positions = allocate_positions(n);\n  #pragma omp parallel\n  {\n    if (positions != NULL) {\n      pack_positions_work(p, positions, n);\n      body_force_work(p, positions, dt, n);\n    } else {\n      body_force_scalar_work(p, dt, n);\n    }\n  }\n  free(positions);\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n  float *positions = allocate_positions(nbodies);\n\n  /* Keep one team and refresh packed positions during integration.\n   * Implicit barriers separate packing, force updates and integration.\n   */\n  #pragma omp parallel\n  {\n    float *x = positions;\n    float *y = positions != NULL ? positions + (size_t)nbodies : NULL;\n    float *z = positions != NULL ? y + (size_t)nbodies : NULL;\n\n    if (positions != NULL) {\n      pack_positions_work(bodies, positions, nbodies);\n    }\n\n    for (int iter = 0; iter < N_ITER; iter++) {\n      if (positions != NULL) {\n        body_force_work(bodies, positions, DT, nbodies);\n      } else {\n        body_force_scalar_work(bodies, DT, nbodies);\n      }\n\n      #pragma omp for schedule(static)\n      for (int i = 0; i < nbodies; i++) {\n        bodies[i].x += bodies[i].vx * DT;\n        bodies[i].y += bodies[i].vy * DT;\n        bodies[i].z += bodies[i].vz * DT;\n\n        if (positions != NULL) {\n          x[i] = bodies[i].x;\n          y[i] = bodies[i].y;\n          z[i] = bodies[i].z;\n        }\n      }\n    }\n  }\n\n  free(positions);\n  write_dataset(nbodies, bodies);\n\n  free(bodies);\n\n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "Packed four-target SIMD scans with two-source unrolling and a persistent OpenMP team should reduce memory traffic and expose independent square roots while preserving source accumulation order.",
+    "notes": "Retains C's persistent team, not its incompatible three-target granularity. Includes scalar tails and allocation-failure handling. No commands or measurements executed.",
+    "sources_kept": [
+      "926a3fce86184851",
+      "74bf1adb0e85409d",
+      "92a0d0ccb34f4812"
+    ],
+    "transformations": [
+      "Pack positions into three contiguous arrays and share source loads across four targets, with scalar handling for incomplete target blocks.",
+      "Unroll the SIMD source loop by two, calculate independent distances, and accumulate contributions in ascending source order with an odd-source tail.",
+      "Use static OpenMP worksharing within one team across all timesteps, retaining phase barriers and refreshing packed coordinates during position integration."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "bd63581d54944b5db4c48ae034deffd9",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "6ae7ab5ae5f64e64c6c35d3d4462d382f42cb68b9e5af62abd5da1f52a29912e",
+  "session_id": "e102a585de23492ca9019858dac5af4d",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "08450232cbb44c0789bcbdeb85f23a77fb3554beb1fdccaa0be55b9b7978aec8",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 22317,
+        "output_tokens": 9719,
+        "reasoning_output_tokens": 6732
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 32036,
+    "tool_events": []
+  }
+}

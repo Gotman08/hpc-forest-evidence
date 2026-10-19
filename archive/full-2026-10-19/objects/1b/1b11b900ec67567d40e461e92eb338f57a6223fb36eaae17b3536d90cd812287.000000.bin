@@ -1,0 +1,113 @@
+"""Prepare an exact passive-reader copy and true recorded absence admission; never start it."""
+import copy
+import hashlib
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+ROOT = OUT.parent
+COMPARE = ROOT.parents[1]
+BASE = COMPARE.parents[1]
+PREVIOUS = COMPARE / "reprises/bascule-max-r2-20261017/observateur-r5"
+CODE_SHA = "af70c4b7c206e394f2aec0abb66db04ac2c921544a7f8d562395cf13f5180124"
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def save(name, value):
+    with (OUT / name).open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+paths = [PREVIOUS / "observer-max4-r5.py", PREVIOUS / "validation-locale.json",
+    PREVIOUS / "admission-observateur-max4.json", PREVIOUS / "reprise-verifiee-parent.json"]
+preserved_before = {str(path): sha(path) for path in paths}
+delivery = read(PREVIOUS / "LIVRAISON-OBSERVATEUR-R5.json")
+validation = read(paths[1])
+assert sha(paths[0]) == validation["observer_sha256"] == delivery["observer"]["sha256"] == CODE_SHA
+assert sha(paths[1]) == delivery["validation"]["sha256"]
+assert validation["ok"] is True
+assert OUT.parents[2] == COMPARE
+for name in ["observer-max4-r5.py", "validation-locale.json"]:
+    with (OUT / name).open("xb") as stream:
+        stream.write((PREVIOUS / name).read_bytes())
+assert sha(OUT / "observer-max4-r5.py") == CODE_SHA
+assert sha(OUT / "validation-locale.json") == sha(paths[1])
+admission = read(paths[2])
+receipt = read(paths[3])
+census_path = ROOT / "cim-controle-source-only-01.json"
+census = read(census_path)
+assert census["complete_census"] is True and census["rows_count"] == len(census["rows"])
+previous = receipt["observer_full_identities"]
+assert [row["ProcessId"] for row in previous] == [32380, 38872]
+assert all(not any(row["ProcessId"] == old["ProcessId"] or row.get("CommandLine") == old["CommandLine"]
+    for row in census["rows"]) for old in previous)
+diagnostic_path = ROOT / "diagnostic-observateur-r5/DIAGNOSTIC-OBSERVATEUR-R5.json"
+diagnostic = read(diagnostic_path)
+assert sha(diagnostic_path) == "a3286b152515c1af28ecd2e5a4ea26b4574c95c9a82c8af45dce654816665b7e"
+assert diagnostic["verified"] is True and diagnostic["admission_bytes_equal_effective_start_pin"] is True
+assert all(row["same_cim_equivalent_to_frozen_helper"] for row in diagnostic["source_only_comparisons"])
+closed_path = ROOT / "fermeture-r2-main-only-verifiee.json"
+closed = read(closed_path)
+assert closed["verified"] is True and closed["all_three_main_identities_absent"] is True
+assert closed["source_only_identities_preserved"] is True
+assert {action["job_id"] for action in closed["actions"]} == {"752139", "752140", "752141"}
+for route in diagnostic["old_route_bundle_still_contains_three_closed_R2_routes"]:
+    assert all(not row["present_in_current_recorded_census"] for row in route["pair_current"])
+absence = {"schema": "hpc-forest-passive-reader-recorded-natural-exit-absence-v1", "verified": True,
+    "verification_scope": "Previous passive r5 pair absent in actual parent recorded full CIM; fresh preflight still required",
+    "previous_observer_identities": previous, "previous_observer_natural_exit_confirmed": True,
+    "recorded_census_at": census["captured_at_utc"], "full_census": ref(census_path),
+    "previous_observer_received_identity": ref(paths[3]), "diagnostic": ref(diagnostic_path),
+    "previous_observer_or_worker_stopped_by_preparer": False,
+    "source_only_job_session_and_worker_pair_preserved": True,
+    "live_preflight_executed": False, "requires_fresh_parent_preflight_before_start": True}
+save("absence-observateur-r5-enregistree.json", absence)
+new_admission = copy.deepcopy(admission)
+new_admission.update(recorded_at_transition=datetime.now(UTC).isoformat(),
+    previous_observer_identities=previous, previous_observer_natural_exit_confirmed=True,
+    previous_observer_recorded_absence=ref(OUT / "absence-observateur-r5-enregistree.json"),
+    previous_admission_preserved_as_history=ref(paths[2]), completed_r2_owned_main_closure=ref(closed_path),
+    current_transition="SO-only passive reader; historical previous-reader notes retained as history only",
+    current_transition_supersedes_previous_observer_fields_only=True,
+    secondary_routes_intentionally_absent=True,
+    future_dynamic_lane_requires_new_observer_and_policy_before_start=True,
+    this_is_scientific_R5=False, native_worker_restarted_or_replayed=False,
+    proposed_reader_started=False)
+assert new_admission["relay_identities"] == admission["relay_identities"]
+new_admission.pop("previous_observer_owned_stop_receipt", None)
+save("admission-observateur-source-only.json", new_admission)
+python = BASE / "work/.venv/Scripts/python.exe"
+argv = [str(python), "-B", "-u", str(OUT / "observer-max4-r5.py"), "--admission", str(OUT / "admission-observateur-source-only.json")]
+command = {"schema": "hpc-forest-passive-source-only-transition-proposed-commands-v1", "verified": False,
+    "commands_are_proposed_only": True, "preflight_argv": argv, "run_argv": [*argv, "--run"],
+    "cwd": str(OUT), "only_remote_jobs_admissible": ["751592"],
+    "no_r2_routes_or_other_lane_route_argument": True,
+    "requires_only_existing_SO_native_session_in_fresh_census": True,
+    "run_requires_successful_real_parent_preflight_and_review": True,
+    "run_requires_hidden_owned_launch_and_actual_identity_receipt": True,
+    "no_observer_worker_CLI_model_job_start_or_RPC_by_preparer": True,
+    "future_dynamic_lane_requires_another_observer_and_policy_before_start": True}
+save("commandes-proposees-source-only.json", command)
+assert preserved_before == {str(path): sha(path) for path in paths}
+save("preservation-source-r5-et-validation.json", {"verified": True, "scope": "Static original observer/admission/validation bytes only",
+    "before": preserved_before, "after": {str(path): sha(path) for path in paths},
+    "copied_observer_byte_identical": True, "copied_validation_byte_identical": True,
+    "new_tests_or_qualifications_claimed": False, "new_observer_started": False})
+print(json.dumps({"code_sha256": sha(OUT / "observer-max4-r5.py"),
+    "admission_sha256": sha(OUT / "admission-observateur-source-only.json"),
+    "commands_sha256": sha(OUT / "commandes-proposees-source-only.json"),
+    "absence_sha256": sha(OUT / "absence-observateur-r5-enregistree.json"),
+    "preflight_or_run_executed": False}))

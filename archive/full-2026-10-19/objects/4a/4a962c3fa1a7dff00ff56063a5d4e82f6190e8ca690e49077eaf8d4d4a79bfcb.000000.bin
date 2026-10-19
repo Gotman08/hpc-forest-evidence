@@ -1,0 +1,320 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+#include <stdint.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define FORCE_TILE 32
+#define FORCE_PACKET 4
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static void body_force_scalar(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; ++j) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+typedef float ForcePacket __attribute__((vector_size(16)));
+
+static inline ForcePacket load_packet(const float *p) {
+  ForcePacket value;
+  memcpy(&value, p, sizeof(value));
+  return value;
+}
+
+static inline void store_packet(float *p, ForcePacket value) {
+  memcpy(p, &value, sizeof(value));
+}
+#endif
+
+#if defined(__GNUC__) && !defined(__clang__)
+#define COEFFICIENT_MATH __attribute__((optimize("no-math-errno")))
+#else
+#define COEFFICIENT_MATH
+#endif
+
+/* Source-major coefficients give contiguous loads for target packets. */
+static COEFFICIENT_MATH void fill_coefficients(
+    const float *restrict x, const float *restrict y,
+    const float *restrict z, int target_start, int target_n,
+    int source_start, int source_n, float *restrict coefficients) {
+  for (int j = 0; j < source_n; ++j) {
+    float sx = x[source_start + j];
+    float sy = y[source_start + j];
+    float sz = z[source_start + j];
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int i = 0; i < target_n; ++i) {
+      float dx = sx - x[target_start + i];
+      float dy = sy - y[target_start + i];
+      float dz = sz - z[target_start + i];
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      coefficients[j * FORCE_TILE + i] = inv_dist3;
+    }
+  }
+}
+
+static inline void accumulate_coefficients(
+    const float *restrict x, const float *restrict y,
+    const float *restrict z, float *restrict fx,
+    float *restrict fy, float *restrict fz,
+    int target_start, int target_n, int source_start, int source_n,
+    const float *restrict coefficients) {
+  int i = 0;
+#if defined(__GNUC__) || defined(__clang__)
+  for (; i + FORCE_PACKET <= target_n; i += FORCE_PACKET) {
+    int target = target_start + i;
+    ForcePacket tx = load_packet(x + target);
+    ForcePacket ty = load_packet(y + target);
+    ForcePacket tz = load_packet(z + target);
+    ForcePacket ax = load_packet(fx + target);
+    ForcePacket ay = load_packet(fy + target);
+    ForcePacket az = load_packet(fz + target);
+
+    /* Each lane visits sources in their original order. */
+    for (int j = 0; j < source_n; ++j) {
+      float sx = x[source_start + j];
+      float sy = y[source_start + j];
+      float sz = z[source_start + j];
+      ForcePacket sxv = { sx, sx, sx, sx };
+      ForcePacket syv = { sy, sy, sy, sy };
+      ForcePacket szv = { sz, sz, sz, sz };
+      ForcePacket coefficient = load_packet(
+          coefficients + j * FORCE_TILE + i);
+      ForcePacket dx = sxv - tx;
+      ForcePacket dy = syv - ty;
+      ForcePacket dz = szv - tz;
+      ax += dx * coefficient;
+      ay += dy * coefficient;
+      az += dz * coefficient;
+    }
+
+    store_packet(fx + target, ax);
+    store_packet(fy + target, ay);
+    store_packet(fz + target, az);
+  }
+#endif
+  for (; i < target_n; ++i) {
+    int target = target_start + i;
+    float ax = fx[target];
+    float ay = fy[target];
+    float az = fz[target];
+    for (int j = 0; j < source_n; ++j) {
+      float dx = x[source_start + j] - x[target];
+      float dy = y[source_start + j] - y[target];
+      float dz = z[source_start + j] - z[target];
+      float coefficient = coefficients[j * FORCE_TILE + i];
+      ax += dx * coefficient;
+      ay += dy * coefficient;
+      az += dz * coefficient;
+    }
+    fx[target] = ax;
+    fy[target] = ay;
+    fz[target] = az;
+  }
+}
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in
+ * the system using cache-local symmetric tiles.
+ */
+void body_force(Body *p, float dt, int n) {
+  if (n < 4 * FORCE_TILE) {
+    body_force_scalar(p, dt, n);
+    return;
+  }
+
+  /* Keep exceptional arithmetic on the original directional path. */
+  const float position_limit = FLT_MAX * 0.5f;
+  for (int i = 0; i < n; ++i) {
+    if (!(fabsf(p[i].x) <= position_limit) ||
+        !(fabsf(p[i].y) <= position_limit) ||
+        !(fabsf(p[i].z) <= position_limit)) {
+      body_force_scalar(p, dt, n);
+      return;
+    }
+  }
+
+  size_t stride = ((size_t)n + FORCE_TILE - 1) &
+                  ~((size_t)FORCE_TILE - 1);
+  if (stride > (SIZE_MAX - 63u) / (6u * sizeof(float))) {
+    body_force_scalar(p, dt, n);
+    return;
+  }
+  void *allocation = malloc(6u * stride * sizeof(float) + 63u);
+  if (allocation == NULL) {
+    body_force_scalar(p, dt, n);
+    return;
+  }
+
+  float *x = (float *)(((uintptr_t)allocation + 63u) & ~(uintptr_t)63u);
+  float *y = x + stride;
+  float *z = y + stride;
+  float *fx = z + stride;
+  float *fy = fx + stride;
+  float *fz = fy + stride;
+  int nblocks = 1 + (n - 1) / FORCE_TILE;
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+    float coefficients_ba[FORCE_TILE * FORCE_TILE];
+    float coefficients_ab[FORCE_TILE * FORCE_TILE];
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (int i = 0; i < n; ++i) {
+      x[i] = p[i].x;
+      y[i] = p[i].y;
+      z[i] = p[i].z;
+      fx[i] = 0.0f;
+      fy[i] = 0.0f;
+      fz[i] = 0.0f;
+    }
+
+    /*
+     * Pairs with the same block-index sum have disjoint targets.
+     * Increasing that sum visits each target's source blocks in order.
+     */
+    for (int wave = 0; wave < 2 * nblocks - 1; ++wave) {
+      int first = wave - (nblocks - 1);
+      if (first < 0) first = 0;
+      int last = wave / 2;
+      if (last >= nblocks) last = nblocks - 1;
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int a = first; a <= last; ++a) {
+        int b = wave - a;
+        int a_start = a * FORCE_TILE;
+        int b_start = b * FORCE_TILE;
+        int a_n = n - a_start;
+        int b_n = n - b_start;
+        if (a_n > FORCE_TILE) a_n = FORCE_TILE;
+        if (b_n > FORCE_TILE) b_n = FORCE_TILE;
+
+        fill_coefficients(x, y, z, a_start, a_n,
+                          b_start, b_n, coefficients_ba);
+        accumulate_coefficients(x, y, z, fx, fy, fz,
+                                a_start, a_n, b_start, b_n,
+                                coefficients_ba);
+
+        if (a != b) {
+          for (int i = 0; i < a_n; ++i) {
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+            for (int j = 0; j < b_n; ++j) {
+              coefficients_ab[i * FORCE_TILE + j] =
+                  coefficients_ba[j * FORCE_TILE + i];
+            }
+          }
+          accumulate_coefficients(x, y, z, fx, fy, fz,
+                                  b_start, b_n, a_start, a_n,
+                                  coefficients_ab);
+        }
+      }
+    }
+
+#ifdef _OPENMP
+#pragma omp for schedule(static) nowait
+#endif
+    for (int i = 0; i < n; ++i) {
+      p[i].vx += dt*fx[i];
+      p[i].vy += dt*fy[i];
+      p[i].vz += dt*fz[i];
+    }
+  }
+
+  free(allocation);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

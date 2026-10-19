@@ -1,0 +1,69 @@
+"""Bind a real received R2d qualification locally; no submission or generation."""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('r2d_static_commands_for_qualification', HERE / 'rendre-trois-dossiers.py')
+r = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r)
+m = r.m
+
+
+def bind(qualification_ref, reception_ref, output_name):
+    r.verify_static_source()
+    qualification = m.read(m.artifact(qualification_ref))
+    reception = m.read(m.artifact(reception_ref))
+    m.require(reception.get('verified') is True and reception.get('scope_id') == r.SCOPE
+        and reception.get('source_zip_sha256') == r.SOURCE and reception.get('plan_sha256') == r.PLAN
+        and reception.get('qualification_sha256') == qualification_ref['sha256']
+        and qualification.get('native_model_calls') == 0,
+        'Actual received independent R2d qualification required; old or missing Q never binds')
+    value = {'schema': 'hpc-forest-max-cap4-source-bindings-v1', 'verified': True, 'scope_id': r.SCOPE,
+        'source_zip': m.ref(r.SOURCE_ZIP), 'plan': m.ref(r.SEALED / 'native-max-plan.json'),
+        'runtime_manifest': m.ref(r.SEALED / 'runtime-manifest-r2max.json'), 'project_path': str(r.PROJECT),
+        'source_member_count': 108, 'remote_extraction': r.EXTRACTION, 'remote_qualification_root': r.QUAL_ROOT,
+        'qualification': qualification_ref, 'qualification_reception': reception_ref,
+        'source_review': m.ref(r.REVIEW_PATH), 'maximum_native_workers': 4, 'cells': m.CELLS}
+    m.require(__import__('re').fullmatch('[A-Za-z0-9][A-Za-z0-9_-]{0,63}', output_name), 'Fresh simple output name required')
+    output = HERE / output_name
+    output.mkdir(exist_ok=False)
+    candidate = m.save(output, 'source-bindings-CANDIDAT-A-VERIFIER.json', value)
+    try:
+        m.configure(candidate, 'gpt-6-astra')
+        module = m.native()
+        m.qualification(module, reception_ref, qualification_ref)
+    except Exception as exc:
+        m.save(output, 'REFUS-LIAISON-CONSERVE.json', {'verified': False, 'error_type': type(exc).__name__,
+            'error': str(exc), 'candidate': candidate, 'native_generation_admitted': False,
+            'candidate_must_not_be_used': True, 'native_calls': 0})
+        raise
+    result = m.save(output, 'source-bindings-reels-Q.json', value)
+    m.save(output, 'LIAISON-Q-REELLE-VERIFIEE.json', {'schema': 'hpc-forest-r2d-real-qualification-binding-v1',
+        'verified': True, 'verification_scope': 'Exact local received source/plan/qualification/archive/audit binding only',
+        'source_zip_sha256': r.SOURCE, 'plan_sha256': r.PLAN, 'bindings': result,
+        'qualification': qualification_ref, 'qualification_reception': reception_ref,
+        'native_generation_admitted': False, 'first_normal_call_proved': False,
+        'uploaded': False, 'worker_started': False, 'native_calls': 0})
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--qualification', type=Path, required=True)
+    parser.add_argument('--qualification-sha256', required=True)
+    parser.add_argument('--reception', type=Path, required=True)
+    parser.add_argument('--reception-sha256', required=True)
+    parser.add_argument('--output-name', required=True)
+    args = parser.parse_args()
+    result = bind({'path': str(args.qualification.resolve()), 'sha256': args.qualification_sha256},
+        {'path': str(args.reception.resolve()), 'sha256': args.reception_sha256}, args.output_name)
+    print(json.dumps({'bindings': result, 'native_calls': 0, 'jobs_submitted': 0}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

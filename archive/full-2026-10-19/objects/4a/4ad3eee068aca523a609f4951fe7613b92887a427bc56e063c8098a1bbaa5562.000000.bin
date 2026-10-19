@@ -1,0 +1,188 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#else
+static int omp_get_num_threads() { return 1; }
+static int omp_get_thread_num() { return 0; }
+#endif
+
+namespace {
+constexpr std::size_t block_bytes = 256u * 1024u;
+
+struct InputChunk {
+    std::unique_ptr<unsigned char[]> bytes;
+    std::unique_ptr<int[]> values;
+    std::size_t byte_capacity = 0;
+    std::size_t value_capacity = 0;
+    std::size_t length = 0;
+    std::size_t count = 0;
+
+    void reserve_bytes(std::size_t needed) {
+        if (needed <= byte_capacity) return;
+        const std::size_t capacity = std::max(needed, byte_capacity * 2u);
+        std::unique_ptr<unsigned char[]> replacement(new unsigned char[capacity]);
+        if (length != 0) {
+            std::memcpy(replacement.get(), bytes.get(), length);
+        }
+        bytes.swap(replacement);
+        byte_capacity = capacity;
+    }
+
+    void convert() {
+        const std::size_t needed = length / 2u + 1u;
+        if (needed > value_capacity) {
+            values.reset(new int[needed]);
+            value_capacity = needed;
+        }
+        const unsigned char* p = bytes.get();
+        const unsigned char* const end = p + length;
+        std::size_t used = 0;
+        for (;;) {
+            while (*p <= 32u) ++p;
+            if (p >= end) break;
+            bool negative = false;
+            if (*p == '-' || *p == '+') {
+                negative = (*p == '-');
+                ++p;
+            }
+            unsigned int value = 0;
+            while (*p >= '0' && *p <= '9') {
+                value = value * 10u + static_cast<unsigned int>(*p - '0');
+                ++p;
+            }
+            values[used++] = static_cast<int>(negative
+                ? -static_cast<long long>(value)
+                : static_cast<long long>(value));
+        }
+        count = used;
+    }
+};
+
+bool read_chunk(InputChunk& chunk, bool& finished) {
+    chunk.length = 0;
+    chunk.reserve_bytes(block_bytes + 64u);
+    chunk.length = std::fread(chunk.bytes.get(), 1, block_bytes, stdin);
+    if (chunk.length == 0) {
+        finished = true;
+        return false;
+    }
+    if (std::feof(stdin) || std::ferror(stdin)) finished = true;
+    if (!finished && chunk.bytes[chunk.length - 1] > 32u) {
+        for (;;) {
+            const int c = std::getc(stdin);
+            if (c == EOF) {
+                finished = true;
+                break;
+            }
+            chunk.reserve_bytes(chunk.length + 2u);
+            chunk.bytes[chunk.length++] = static_cast<unsigned char>(c);
+            if (c <= 32) break;
+        }
+    }
+    chunk.reserve_bytes(chunk.length + 1u);
+    chunk.bytes[chunk.length] = 127;
+    return true;
+}
+}
+
+int main() {
+    int n, s;
+    if (std::scanf("%d%d", &n, &s) != 2) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t total = static_cast<std::size_t>(n) * n;
+    const int positions = n - s + 1;
+    std::unique_ptr<int[]> matrix(new int[total]);
+    bool complete = false;
+    long long answer = std::numeric_limits<long long>::lowest();
+
+    #pragma omp parallel if(total >= 262144u) reduction(max:answer)
+    {
+        #pragma omp single
+        {
+            const int workers = omp_get_num_threads();
+            std::vector<InputChunk> chunks(static_cast<std::size_t>(workers) * 2u);
+            std::size_t placed = 0;
+            bool finished = false;
+            while (placed < total && !finished) {
+                int active = 0;
+                for (int slot = 0; slot < static_cast<int>(chunks.size()); ++slot) {
+                    if (!read_chunk(chunks[slot], finished)) break;
+                    ++active;
+                    #pragma omp task firstprivate(slot) shared(chunks) if(workers > 1)
+                    {
+                        chunks[slot].convert();
+                    }
+                    if (finished) break;
+                }
+                #pragma omp taskwait
+                for (int slot = 0; slot < active && placed < total; ++slot) {
+                    const std::size_t take = std::min(chunks[slot].count, total - placed);
+                    if (take != 0) {
+                        std::memcpy(matrix.get() + placed, chunks[slot].values.get(),
+                                    take * sizeof(int));
+                        placed += take;
+                    }
+                }
+            }
+            complete = (placed == total);
+        }
+
+        if (complete) {
+            const int tid = omp_get_thread_num();
+            const int workers = omp_get_num_threads();
+            const int first = positions * tid / workers;
+            const int last = positions * (tid + 1) / workers;
+            if (first < last) {
+                std::vector<long long> columns(n, 0);
+                for (int row = first; row < first + s; ++row) {
+                    const int* const source = matrix.get() + static_cast<std::size_t>(row) * n;
+                    #pragma omp simd
+                    for (int col = 0; col < n; ++col) {
+                        columns[col] += source[col];
+                    }
+                }
+
+                long long local_best = std::numeric_limits<long long>::lowest();
+                for (int top = first; top < last; ++top) {
+                    if (top != first) {
+                        const int* const entering = matrix.get()
+                            + static_cast<std::size_t>(top + s - 1) * n;
+                        const int* const leaving = matrix.get()
+                            + static_cast<std::size_t>(top - 1) * n;
+                        #pragma omp simd
+                        for (int col = 0; col < n; ++col) {
+                            columns[col] += static_cast<long long>(entering[col])
+                                          - static_cast<long long>(leaving[col]);
+                        }
+                    }
+                    long long sum = 0;
+                    #pragma omp simd reduction(+:sum)
+                    for (int col = 0; col < s; ++col) sum += columns[col];
+                    long long row_best = sum;
+                    for (int col = s; col < n; ++col) {
+                        sum += columns[col] - columns[col - s];
+                        if (sum > row_best) row_best = sum;
+                    }
+                    if (row_best > local_best) local_best = row_best;
+                }
+                answer = local_best;
+            }
+        }
+    }
+
+    if (!complete) return 0;
+    std::printf("%lld\n", answer);
+    return 0;
+}

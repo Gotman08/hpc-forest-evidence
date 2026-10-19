@@ -1,0 +1,58 @@
+"""Verify the existing cache and the byte-identical retransmission after recovery."""
+import hashlib
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+WORKER = ROOT / "runs/coverage-gpt-6-astra-xhigh/worker"
+NONCE = "87f3e943666c4442804ca5dac9b1ac56"
+EXPECTED = "760ed6307424a849af0b06e6f97d35da7f1ac987c293427d104c6f07fa75059d"
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def main():
+    before = read(HERE / "inventaire-local-avant.json")
+    changed = [name for name, digest in before.items() if sha(WORKER / name) != digest]
+    assert set(changed) <= {"worker-ready.json", NONCE + "/download-receipt.json"}, changed
+    original = HERE / "avant/cache" / NONCE / "response.json"
+    local = WORKER / NONCE / "response.json"
+    remote = HERE / "reponse-retransmise-recue.json"
+    assert sha(original) == sha(local) == sha(remote) == EXPECTED
+    assert read(HERE / "reponse-ready-recue.json") == {"sha256": EXPECTED, "bytes": local.stat().st_size}
+    assert read(WORKER / NONCE / "delivered.json")["response_sha256"] == EXPECTED
+    events = [json.loads(line) for line in (WORKER / "resume-events.jsonl").read_text(encoding="utf-8").splitlines()]
+    retransmission = [event for event in events if event.get("event") == "request_delivered" and event.get("nonce") == NONCE]
+    assert len(retransmission) == 1 and retransmission[0]["had_response"] and retransmission[0]["was_claimed"]
+    assert read(HERE / "identites-verifiees.json")["observer"]["ProcessId"] == 33948
+    state = read(ROOT / "coordinator-state.json")
+    assert state["current_key"] == "coverage-gpt-6-astra-xhigh" and not state.get("error")
+    assert state["stage"] == "running_current_group_observation_recovered"
+    assert (HERE / "observer.stderr.log").stat().st_size == (HERE / "relais.stderr.log").stat().st_size == 0
+    info = {"verified": True, "verified_utc": datetime.now(UTC).isoformat(), "job_id": "750205", "session_id": "2bd8b683b45b41c8b48ec38708f46bab",
+        "same_job_session_channel_cache": True, "remote_submission_replayed": False, "started_generation_replayed": False,
+        "original_cache_files": len(before), "original_cache_files_unchanged": len(before) - len(changed), "changed_original_files": changed,
+        "previously_delivered_responses_verified_and_skipped": 58, "cached_response_retransmitted": NONCE,
+        "cached_response_sha256_original_local_remote": EXPECTED, "retransmission_event": retransmission[0],
+        "helper_unchanged": True, "helper_neutral_tests_passed": 11, "observer_neutral_tests_passed": 15, "ruff_passed": True,
+        "source_zip_sha256": read(HERE / "inspection-avant.json")["source_zip_sha256"], "frozen_source_files_verified": 90,
+        "relay_pids": [52576, 46556], "observer_pids": [21984, 33948], "source_only_coordinator_pids": [27336, 11168], "source_only_relay_pids": [25896, 41388],
+        "source_only_four_identities_preserved": True, "native_workers": 2, "no_process_stopped_for_recovery": True,
+        "strict_reception_and_reconciliation_before_owned_stop": True, "expected_terminal_stage": "awaiting_audited_reception_after_strict_dispatch",
+        "new_final_result_received": False, "article_updated": False, "low_level_cause_or_mcp_update_causality_established": False,
+        "proof_files": {name: sha(HERE / name) for name in ["inspection-avant.json", "inventaire-local-avant.json", "statuts-apres-reprise.json", "cim-apres-reprise.json", "identite-relais-verifiee.json", "reponse-retransmise-recue.json", "reponse-ready-recue.json", "tests-reprise.xml", "observer-courant.py", "test_observation.py"]}}
+    (HERE / "verification-reprise.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({key: info[key] for key in ["verified", "original_cache_files", "original_cache_files_unchanged", "changed_original_files", "cached_response_sha256_original_local_remote", "native_workers"]}))
+
+
+if __name__ == "__main__":
+    main()

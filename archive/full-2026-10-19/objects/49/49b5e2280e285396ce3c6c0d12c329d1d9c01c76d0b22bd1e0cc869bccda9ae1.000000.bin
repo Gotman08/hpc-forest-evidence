@@ -1,0 +1,42 @@
+set -euo pipefail
+archive=/scratch_p/nimarano/hpc-forest-harness-smallmodels-20261015-r2.tar.gz
+root=/scratch_p/nimarano/hpc-forest-harness-smallmodels-20261015-r2
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+test ! -e "$root"
+printf '%s  %s\n' '07b6e14d8e128dfc14a988c43b8699c79daddb6bd03defd7d1f85507c3ed9f72' "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" -C "$root"
+"$py" - "$root" <<'PY'
+import hashlib,json,shutil,stat,sys,zipfile
+from pathlib import Path
+root=Path(sys.argv[1])
+manifest=json.loads((root/'payload-manifest.json').read_text())
+for name,expected in manifest['files'].items():
+    assert hashlib.sha256((root/name).read_bytes()).hexdigest()==expected, name
+project=root/'project'
+with zipfile.ZipFile(root/'project.zip') as z:
+    for info in z.infolist():
+        name=info.filename.removeprefix('HPC-Forest/')
+        target=project/name
+        assert info.filename.startswith('HPC-Forest/') and target.resolve().is_relative_to(project.resolve())
+        assert not stat.S_ISLNK(info.external_attr >> 16)
+        if info.is_dir():
+            target.mkdir(parents=True,exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(z.read(info))
+for name,expected in json.loads((project/'FILES.sha256.json').read_text()).items():
+    assert hashlib.sha256((project/name).read_bytes()).hexdigest()==expected,name
+official=root/'sources-officielles'
+official.mkdir()
+for name,expected in manifest['official_files'].items():
+    original=Path('/scratch_p/nimarano/hpc-forest-marathon22-20261015-r1/sources-officielles')/name
+    shutil.copyfile(original,official/name)
+    assert hashlib.sha256((official/name).read_bytes()).hexdigest()==expected,name
+print('Source and official inputs verified',flush=True)
+PY
+export PYTHONPATH="$root/project/src:$root/project/examples/marathon22"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export OPENBLAS_NUM_THREADS=1
+exec "$py" -u "$root/smoke_harness.py" --root "$root" --ollama /scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/tools/ollama-0.40.4/bin/ollama

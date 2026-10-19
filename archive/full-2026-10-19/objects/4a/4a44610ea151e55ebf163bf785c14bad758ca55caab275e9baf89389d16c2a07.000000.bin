@@ -1,0 +1,95 @@
+"""Measured program populations, same-island selection, and advisory lexical diversity."""
+from __future__ import annotations
+
+import json
+import math
+import random
+import re
+import statistics
+
+from .contracts import EvolutionError, Measurement, encoded, fingerprint, identifier, relative_file
+
+
+def code_features(code: dict[str, str]) -> set[str]:
+    if not isinstance(code, dict) or not code or any(not isinstance(v, str) for v in code.values()):
+        raise EvolutionError("Expected complete source files")
+    if len(code) > 128 or len(encoded(code)) > 2_000_000:
+        raise EvolutionError("Source proposal exceeds the file or byte limit")
+    for name in code:
+        relative_file(name)
+    tokens = re.findall(r"[A-Za-z_]\w*|\d+(?:\.\d+)?|[^\s]", "\n".join(code[k] for k in sorted(code)))
+    return {" ".join(tokens[i:i + 3]) for i in range(max(1, len(tokens) - 2))}
+
+
+def similarity(left: dict, right: dict) -> float:
+    a, b = code_features(left), code_features(right)
+    return len(a & b) / max(1, len(a | b))
+
+
+class Population:
+    def __init__(self, journal, scope: str):
+        self.journal, self.scope = journal, identifier(scope)
+
+    def members(self, island: str | None = None, *, valid_only=True):
+        result = []
+        for row in self.journal.db.execute("SELECT * FROM programs WHERE scope=? ORDER BY id", (self.scope,)):
+            item = dict(row)
+            item["code"] = json.loads(item["code"])
+            item["measurement"] = json.loads(item["measurement"])
+            if (island is None or item["island"] == island) and (
+                    not valid_only or item["measurement"]["status"] == "valid"):
+                result.append(item)
+        return result
+
+    def novelty(self, code: dict, island: str):
+        code_features(code)
+        fingerprint_code = fingerprint(code)
+        peers = self.members(island, valid_only=False)
+        exact = next((p["id"] for p in peers if p["code_sha"] == fingerprint_code), None)
+        nearest = max(((similarity(code, p["code"]), p["id"]) for p in peers), default=(0.0, None))
+        return {"exact_alias": exact, "lexical_similarity": nearest[0], "nearest": nearest[1],
+                "semantic_equivalence_proved": False}
+
+    def add(self, program_id: str, code: dict, island: str, parent: str | None,
+            measurement: Measurement, *, alias_of: str | None = None):
+        identifier(program_id)
+        identifier(island)
+        code_features(code)
+        if parent is not None and not any(p["id"] == parent for p in self.members(island, valid_only=False)):
+            raise EvolutionError("Parent is not from the same island and measurement scope")
+        values = (program_id, encoded(code).decode(), fingerprint(code), island, parent,
+                  encoded(measurement.record()).decode(), self.scope, 0, alias_of)
+        old = self.journal.db.execute("SELECT * FROM programs WHERE id=?", (program_id,)).fetchone()
+        if old:
+            if tuple(old)[:7] != values[:7] or old["alias_of"] != alias_of:
+                raise EvolutionError("Program identity already has different evidence")
+            return False
+        if alias_of is not None:
+            originals = self.members(island, valid_only=False)
+            if not any(p["id"] == alias_of and p["code_sha"] == values[2] for p in originals):
+                raise EvolutionError("Alias must identify byte-identical code in the same scope")
+            if measurement.status != "duplicate":
+                raise EvolutionError("An alias cannot claim an independent measurement")
+        elif measurement.status == "duplicate":
+            raise EvolutionError("A duplicate requires an explicit source alias")
+        self.journal.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.journal.db.execute("INSERT INTO programs VALUES(?,?,?,?,?,?,?,?,?)", values)
+            if parent:
+                self.journal.db.execute("UPDATE programs SET offspring=offspring+1 WHERE id=?", (parent,))
+            self.journal.db.execute("COMMIT")
+        except BaseException:
+            self.journal.db.execute("ROLLBACK")
+            raise
+        return True
+
+    def parent(self, island: str, seed: int):
+        peers = self.members(island)
+        if not peers:
+            return None
+        scores = [p["measurement"]["quality"] for p in peers]
+        middle = statistics.median(scores)
+        scale = max(statistics.median(abs(v - middle) for v in scores), 1e-6)
+        weights = [1 / (1 + math.exp(-max(-60, min(60, 4 * (s - middle) / scale))))
+                   / (1 + p["offspring"]) for p, s in zip(peers, scores, strict=True)]
+        return random.Random(seed).choices(peers, weights=weights, k=1)[0]

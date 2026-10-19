@@ -1,0 +1,1250 @@
+"""Read-only, independent arithmetic audit for the professional manuscript.
+
+Never executes, imports or edits experimental code or candidates. SQLite is
+opened immutable/read-only. All exports are analysis data, never model input.
+"""
+
+import csv
+import hashlib
+import json
+import math
+import sqlite3
+import statistics as st
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+from source_only_sol_accounting import closed_sol_accounting
+from terra_accounting import closed_terra_accounting
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parent
+OUT = STUDY.parent
+WORKSPACE = OUT.parent
+EVIDENCE = HERE / "donnees"
+EVIDENCE.mkdir(exist_ok=True)
+SOURCES = {}
+CHECKS = Counter()
+TERRA_DESCRIPTORS = [
+    {"key": "terra_xhigh", "cohort": "terra_xhigh_fourteen_subjects", "job_id": "750909",
+     "session_id": "bb34f01e2e114cf4a59ae51b02823166", "effort": "xhigh",
+     "receipt_folder": STUDY / "receptions/coverage-terra-xhigh-750909",
+     "worker": STUDY / "runs/coverage-gpt-5.6-terra-xhigh/worker",
+     "campaign": "grille-r1/coverage-gpt-5.6-terra-xhigh", "cost_file": "couts-terra-xhigh.json"},
+    {"key": "source_only_terra", "cohort": "source_only_terra_max_fifteen_subjects", "job_id": "750831",
+     "session_id": "15219a6fd62b4dcb91b395dcd4ae03d5", "effort": "max",
+     "receipt_folder": OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-terra-max-750831",
+     "worker": OUT / "HPC-Forest-Harnais-Comparaison-r1/runs/source-only-gpt-5.6-terra-max/worker",
+     "campaign": "comparaison-source-only/terra-max-750831", "cost_file": "couts-source-only-terra.json"},
+]
+
+
+def sha(p):
+    return hashlib.file_digest(p.open("rb"), "sha256").hexdigest()
+
+
+def record(p):
+    p = Path(p).resolve()
+    SOURCES[str(p)] = {"sha256": sha(p), "bytes": p.stat().st_size}
+    return p
+
+
+def read(p):
+    return json.loads(record(p).read_text(encoding="utf-8-sig"))
+
+
+def close(a, b, label):
+    assert math.isclose(a, b, rel_tol=2e-10, abs_tol=2e-12), (label, a, b)
+    CHECKS[label] += 1
+
+
+def save(name, data):
+    (EVIDENCE / name).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def table(name, rows):
+    if not rows:
+        return
+    with (EVIDENCE / name).open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def registry(campaign_root):
+    root = Path(campaign_root)
+    candidates = (
+        [root / "registry.sqlite3"]
+        if (root / "registry.sqlite3").exists()
+        else list(root.glob("preuves/**/registry.sqlite3"))
+    )
+    assert len(candidates) == 1, (root, candidates)
+    db = record(candidates[0])
+    before = sha(db)
+    con = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
+    meta = {k: json.loads(v) for k, v in con.execute("select key,value from metadata")}
+    best = meta.get("best_confirmed")
+    assert best is not None, str(db)
+    evaluations = [
+        {"id": i, "epoch": ep, "phase": ph, **json.loads(v)}
+        for i, ep, ph, v in con.execute(
+            "select experiment_id,epoch,phase,payload from evaluations order by id"
+        )
+    ]
+    confirmations = [
+        e
+        for e in evaluations
+        if e["phase"] == "confirmation" and e["epoch"] == best["epoch"]
+    ]
+    valid = [
+        e for e in confirmations if e.get("correct") and e.get("status") == "valid"
+    ]
+    baseline = next(e for e in valid if e["id"] == f"baseline-e{best['epoch']}")
+    chosen = next(e for e in valid if e["id"] == best["experiment_id"])
+    for e in evaluations:
+        if e.get("correct") and e.get("times"):
+            close(st.mean(e["times"]), e["mean_seconds"], "original_evaluation_means")
+    for e in confirmations:
+        if e.get("correct") and e.get("status") == "valid":
+            assert len(e["times"]) == 5, (str(db), e["id"], len(e["times"]))
+            CHECKS["five_confirmation_samples"] += 1
+        elif e.get("status") == "incorrect":
+            assert (
+                not e.get("times") and not e.get("mean_seconds") and e.get("score") == 0
+            ), e
+            CHECKS["protected_confirmation_rejections"] += 1
+    close(best["mean_seconds"], st.mean(chosen["times"]), "chosen_confirmation_means")
+    close(
+        best["reference_seconds"],
+        st.mean(baseline["times"]),
+        "reference_confirmation_means",
+    )
+    gain = 1 - st.mean(chosen["times"]) / st.mean(baseline["times"])
+    close(gain, best["improvement_fraction"], "confirmed_gain_fractions")
+    # A valid selected candidate must satisfy the confirmed 3% margin; keeping
+    # the reference is valid even if another admissible finalist is marginally faster.
+    if not best.get("is_baseline"):
+        assert gain >= 0.03 - 1e-12
+        assert chosen["mean_seconds"] <= min(e["mean_seconds"] for e in valid) + 1e-12
+    CHECKS["admissible_winner"] += 1
+    trials = []
+    for i, role, state, mission, result in con.execute(
+        "select id,role,state,mission,result from trials order by created"
+    ):
+        trials.append(
+            {
+                "id": i,
+                "role": role,
+                "state": state,
+                "mission": json.loads(mission),
+                "result": json.loads(result) if result else None,
+            }
+        )
+    tree_roots = [
+        {"id": i, "role": role, "checkpoint_sha256": h, "treequest_version": version}
+        for i, role, h, version in con.execute(
+            "select id,role,sha256,version from trees order by id"
+        )
+    ]
+    by_id = {t["id"]: t for t in trials}
+    for t in trials:
+        m = t["mission"]
+        parent = m.get("parent_id")
+        if parent:
+            assert parent in by_id
+            previous = by_id[parent]
+            assert previous["mission"]["tree_id"] == m["tree_id"]
+            assert previous["mission"]["depth"] + 1 == m["depth"]
+            assert (previous["result"] or {}).get("commit") == m["base_commit"]
+            CHECKS["true_parent_program_links"] += 1
+        sources = m.get("sources", [])
+        source_commits = m.get("source_commits", [])
+        assert len(sources) == len(source_commits)
+        for source, commit in zip(sources, source_commits, strict=True):
+            assert source in by_id and source != t["id"]
+            assert by_id[source]["result"]["correct"]
+            assert by_id[source]["result"]["commit"] == commit
+            CHECKS["true_integration_source_links"] += 1
+    contract_path = db.parent / "trusted/contract.json"
+    if not contract_path.exists():
+        contract_path = db.parent / "repo/contract.json"
+    contract = read(contract_path) if contract_path.exists() else None
+    con.close()
+    assert sha(db) == before, str(db)
+    return {
+        "campaign_root": str(db.parent),
+        "registry_sha256": before,
+        "best_confirmed": best,
+        "reference_samples": baseline["times"],
+        "chosen_samples": chosen["times"],
+        "reference_stdev": st.stdev(baseline["times"]),
+        "chosen_stdev": st.stdev(chosen["times"]),
+        "gain_fraction": gain,
+        "speedup": best["reference_seconds"] / best["mean_seconds"],
+        "confirmations": confirmations,
+        "trials": trials,
+        "tree_roots": tree_roots,
+        "contract": contract,
+        "config": meta.get("config"),
+        "identity": meta.get("identity"),
+        "mother_plans": {k: v for k, v in meta.items() if k.startswith("mother_plan:")},
+    }
+
+
+def terra_accounting(cohort, admissions):
+    """Attribute the closed receipt by subject/role without reclassifying unknowns."""
+    folder = STUDY / "receptions/coverage-terra-max-748782"
+    receipt_path = record(folder / "reception-verifiee.json")
+    reviewed = next(c for c in admissions["reviewed_new_cohorts"] if c["cohort"] == "terra_max_fourteen_subjects")
+    assert sha(receipt_path) == reviewed["independent_reception_sha256"]
+    receipt = read(receipt_path)
+    assert receipt["verified"] and receipt["job_id"] == "748782" and receipt["subjects_received"] == 14
+    for key in ("audit", "reconciliation"):
+        assert sha(record(receipt[key]["path"])) == receipt[key]["sha256"]
+    reconciliation = read(folder / "reconciliation-livraisons.json")
+    assert reconciliation["all_published_requests_accounted_for"]
+    assert not reconciliation["total_exact_consumption_available"]
+    roots = {r["subject"]: Path(r["campaign_root"]) for r in cohort["rows"]}
+    trial_roles = {}
+    for subject, root in roots.items():
+        db = record(root / "registry.sqlite3")
+        con = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
+        trial_roles[subject] = dict(con.execute("select id,role from trials"))
+        con.close()
+    totals = {s: {"native_calls": 0, "known_exact_tokens": 0, "unmetered_calls": 0,
+                  "expired_unanswered_requests": 0} for s in roots}
+    calls, seen = [], set()
+    for item in reconciliation["records"]:
+        key = (item["session_id"], item["nonce"])
+        assert key not in seen
+        seen.add(key)
+        references = [Path(p) for p in item["request_references"]]
+        assert references and all(".." not in p.parts and not p.is_absolute() for p in references)
+        subject = references[0].parts[0]
+        assert subject in roots and all(p.parts[0] == subject for p in references)
+        requests = [read(roots[subject].parent / p) for p in references]
+        request = requests[0]
+        assert all(r == request for r in requests)
+        assert (request["session_id"], request["nonce"]) == key
+        assert request["model"] == "gpt-5.6-terra" and request["reasoning_effort"] == "max"
+        if request.get("meta_role"):
+            assert request["meta_role"] in ("mother-preparation", "mother-synthesis")
+            role = "mère"
+        else:
+            trial = request["mission_id"].rsplit("-h", 1)[0]
+            tree_role = trial_roles[subject][trial]
+            assert tree_role in ("A", "B", "C", "G")
+            role = "intégration" if tree_role == "G" else "enfant"
+        native = bool(item["native_invocation_observed"])
+        unknown = native and not item["usage_measured"]
+        exact = item["known_exact_tokens"]
+        assert isinstance(exact, int) and exact >= 0
+        assert item["usage_measured"] or exact == 0
+        total = totals[subject]
+        total["native_calls"] += int(native)
+        total["known_exact_tokens"] += exact
+        total["unmetered_calls"] += int(unknown)
+        total["expired_unanswered_requests"] += int(not item["delivery_verified"])
+        calls.append({"session_id": key[0], "nonce": key[1], "subject": subject,
+                      "campaign": "grille-r1/coverage-gpt-5.6-terra-max", "kind": role,
+                      "native_invocation_observed": native, "usage_measured": item["usage_measured"],
+                      "exact_total": exact if item["usage_measured"] else None,
+                      "state": "exact" if item["usage_measured"] else "unmetered" if native else "expired_unanswered",
+                      "request_sha256": item["request_sha256"], "status": item["status"]})
+    for field, expected in (("native_calls", 58), ("known_exact_tokens", 980971),
+                            ("unmetered_calls", 24), ("expired_unanswered_requests", 1)):
+        assert sum(t[field] for t in totals.values()) == expected, field
+    assert len(calls) == reconciliation["published_requests"] == 63
+    save("couts-terra.json", {"job_id": "748782", "receipt_sha256": sha(receipt_path),
+                             "reconciliation_sha256": sha(folder / "reconciliation-livraisons.json"),
+                             "per_subject": totals, "native_calls": calls,
+                             "total_exact_consumption_available": False})
+    return totals
+
+
+def sol_accounting(cohort, admissions):
+    """Attribute the closed receipt by subject/role without reclassifying unknowns."""
+    folder = STUDY / "receptions/coverage-sol-max-749415"
+    receipt_path = record(folder / "reception-verifiee.json")
+    reviewed = next(c for c in admissions["reviewed_new_cohorts"] if c["cohort"] == "sol_max_fourteen_subjects")
+    assert sha(receipt_path) == reviewed["independent_reception_sha256"]
+    receipt = read(receipt_path)
+    assert receipt["verified"] and receipt["job_id"] == "749415" and receipt["subjects_received"] == 14
+    for key in ("audit", "reconciliation"):
+        assert sha(record(receipt[key]["path"])) == receipt[key]["sha256"]
+    reconciliation = read(folder / "reconciliation-livraisons.json")
+    assert reconciliation["all_published_requests_accounted_for"]
+    assert not reconciliation["total_exact_consumption_available"]
+    roots = {r["subject"]: Path(r["campaign_root"]) for r in cohort["rows"]}
+    trial_roles = {}
+    for subject, root in roots.items():
+        db = record(root / "registry.sqlite3")
+        con = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
+        trial_roles[subject] = dict(con.execute("select id,role from trials"))
+        con.close()
+    totals = {s: {"native_calls": 0, "known_exact_tokens": 0, "unmetered_calls": 0,
+                  "expired_unanswered_requests": 0} for s in roots}
+    calls, seen = [], set()
+    for item in reconciliation["records"]:
+        key = (item["session_id"], item["nonce"])
+        assert key not in seen
+        seen.add(key)
+        references = [Path(p) for p in item["request_references"]]
+        assert references and all(".." not in p.parts and not p.is_absolute() for p in references)
+        subject = references[0].parts[0]
+        assert subject in roots and all(p.parts[0] == subject for p in references)
+        requests = [read(roots[subject].parent / p) for p in references]
+        request = requests[0]
+        assert all(r == request for r in requests)
+        assert (request["session_id"], request["nonce"]) == key
+        assert request["model"] == "gpt-6.1-sol" and request["reasoning_effort"] == "max"
+        if request.get("meta_role"):
+            assert request["meta_role"] in ("mother-preparation", "mother-synthesis")
+            role = "mère"
+        else:
+            trial = request["mission_id"].rsplit("-h", 1)[0]
+            tree_role = trial_roles[subject][trial]
+            assert tree_role in ("A", "B", "C", "G")
+            role = "intégration" if tree_role == "G" else "enfant"
+        native = bool(item["native_invocation_observed"])
+        unknown = native and not item["usage_measured"]
+        exact = item["known_exact_tokens"]
+        assert isinstance(exact, int) and exact >= 0
+        assert item["usage_measured"] or exact == 0
+        total = totals[subject]
+        total["native_calls"] += int(native)
+        total["known_exact_tokens"] += exact
+        total["unmetered_calls"] += int(unknown)
+        total["expired_unanswered_requests"] += int(not item["delivery_verified"])
+        calls.append({"session_id": key[0], "nonce": key[1], "subject": subject,
+                      "campaign": "grille-r1/coverage-gpt-6.1-sol-max", "kind": role,
+                      "native_invocation_observed": native, "usage_measured": item["usage_measured"],
+                      "exact_total": exact if item["usage_measured"] else None,
+                      "state": "exact" if item["usage_measured"] else "unmetered" if native else "expired_unanswered",
+                      "request_sha256": item["request_sha256"], "status": item["status"]})
+    for field, expected in (("native_calls", 110), ("known_exact_tokens", 2502330),
+                            ("unmetered_calls", 8), ("expired_unanswered_requests", 0)):
+        assert sum(t[field] for t in totals.values()) == expected, field
+    assert len(calls) == reconciliation["published_requests"] == 113
+    save("couts-sol.json", {"job_id": "749415", "receipt_sha256": sha(receipt_path),
+                             "reconciliation_sha256": sha(folder / "reconciliation-livraisons.json"),
+                             "per_subject": totals, "native_calls": calls,
+                             "total_exact_consumption_available": False})
+    return totals
+
+
+def luna_xhigh_accounting(cohort, admissions):
+    """Attribute the closed receipt by subject/role without reclassifying unknowns."""
+    folder = STUDY / "receptions/coverage-luna-xhigh-749940"
+    receipt_path = record(folder / "reception-verifiee.json")
+    reviewed = next(c for c in admissions["reviewed_new_cohorts"] if c["cohort"] == "luna_xhigh_fourteen_subjects")
+    assert sha(receipt_path) == reviewed["independent_reception_sha256"]
+    receipt = read(receipt_path)
+    assert receipt["verified"] and receipt["job_id"] == "749940" and receipt["subjects_received"] == 14
+    for key in ("audit", "reconciliation"):
+        assert sha(record(receipt[key]["path"])) == receipt[key]["sha256"]
+    reconciliation = read(folder / "reconciliation-livraisons.json")
+    assert reconciliation["all_published_requests_accounted_for"]
+    assert reconciliation["total_exact_consumption_available"]
+    roots = {r["subject"]: Path(r["campaign_root"]) for r in cohort["rows"]}
+    trial_roles = {}
+    for subject, root in roots.items():
+        db = record(root / "registry.sqlite3")
+        con = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
+        trial_roles[subject] = dict(con.execute("select id,role from trials"))
+        con.close()
+    totals = {s: {"native_calls": 0, "known_exact_tokens": 0, "unmetered_calls": 0,
+                  "expired_unanswered_requests": 0} for s in roots}
+    calls, seen = [], set()
+    for item in reconciliation["records"]:
+        key = (item["session_id"], item["nonce"])
+        assert key not in seen
+        seen.add(key)
+        references = [Path(p) for p in item["request_references"]]
+        assert references and all(".." not in p.parts and not p.is_absolute() for p in references)
+        subject = references[0].parts[0]
+        assert subject in roots and all(p.parts[0] == subject for p in references)
+        requests = [read(roots[subject].parent / p) for p in references]
+        request = requests[0]
+        assert all(r == request for r in requests)
+        assert (request["session_id"], request["nonce"]) == key
+        assert request["model"] == "gpt-6-luna" and request["reasoning_effort"] == "xhigh"
+        if request.get("meta_role"):
+            assert request["meta_role"] in ("mother-preparation", "mother-synthesis")
+            role = "mère"
+        else:
+            trial = request["mission_id"].rsplit("-h", 1)[0]
+            tree_role = trial_roles[subject][trial]
+            assert tree_role in ("A", "B", "C", "G")
+            role = "intégration" if tree_role == "G" else "enfant"
+        native = bool(item["native_invocation_observed"])
+        unknown = native and not item["usage_measured"]
+        exact = item["known_exact_tokens"]
+        assert isinstance(exact, int) and exact >= 0
+        assert item["usage_measured"] or exact == 0
+        total = totals[subject]
+        total["native_calls"] += int(native)
+        total["known_exact_tokens"] += exact
+        total["unmetered_calls"] += int(unknown)
+        total["expired_unanswered_requests"] += int(not item["delivery_verified"])
+        calls.append({"session_id": key[0], "nonce": key[1], "subject": subject,
+                      "campaign": "grille-r1/coverage-gpt-6-luna-xhigh", "kind": role,
+                      "native_invocation_observed": native, "usage_measured": item["usage_measured"],
+                      "exact_total": exact if item["usage_measured"] else None,
+                      "state": "exact" if item["usage_measured"] else "unmetered" if native else "expired_unanswered",
+                      "request_sha256": item["request_sha256"], "status": item["status"]})
+    for field, expected in (("native_calls", 158), ("known_exact_tokens", 3434224),
+                            ("unmetered_calls", 0), ("expired_unanswered_requests", 0)):
+        assert sum(t[field] for t in totals.values()) == expected, field
+    assert len(calls) == reconciliation["published_requests"] == 158
+    save("couts-luna-xhigh.json", {"job_id": "749940", "receipt_sha256": sha(receipt_path),
+                             "reconciliation_sha256": sha(folder / "reconciliation-livraisons.json"),
+                             "per_subject": totals, "native_calls": calls,
+                             "total_exact_consumption_available": True})
+    return totals
+
+
+def astra_xhigh_accounting(cohort, admissions):
+    """Attribute the closed receipt by subject/role without reclassifying unknowns."""
+    folder = STUDY / "receptions/coverage-astra-xhigh-750205"
+    receipt_path = record(folder / "reception-verifiee.json")
+    reviewed = next(c for c in admissions["reviewed_new_cohorts"] if c["cohort"] == "astra_xhigh_fourteen_subjects")
+    assert sha(receipt_path) == reviewed["independent_reception_sha256"]
+    receipt = read(receipt_path)
+    assert receipt["verified"] and receipt["job_id"] == "750205" and receipt["subjects_received"] == 14
+    for key in ("audit", "reconciliation"):
+        assert sha(record(receipt[key]["path"])) == receipt[key]["sha256"]
+    reconciliation = read(folder / "reconciliation-livraisons.json")
+    assert reconciliation["all_published_requests_accounted_for"]
+    assert not reconciliation["total_exact_consumption_available"]
+    roots = {r["subject"]: Path(r["campaign_root"]) for r in cohort["rows"]}
+    trial_roles = {}
+    for subject, root in roots.items():
+        db = record(root / "registry.sqlite3")
+        con = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
+        trial_roles[subject] = dict(con.execute("select id,role from trials"))
+        con.close()
+    totals = {s: {"native_calls": 0, "known_exact_tokens": 0, "unmetered_calls": 0,
+                  "expired_unanswered_requests": 0, "expired_before_invocation": 0} for s in roots}
+    calls, seen = [], set()
+    for item in reconciliation["records"]:
+        key = (item["session_id"], item["nonce"])
+        assert key not in seen
+        seen.add(key)
+        references = [Path(p) for p in item["request_references"]]
+        assert references and all(".." not in p.parts and not p.is_absolute() for p in references)
+        subject = references[0].parts[0]
+        assert subject in roots and all(p.parts[0] == subject for p in references)
+        requests = [read(roots[subject].parent / p) for p in references]
+        request = requests[0]
+        assert all(r == request for r in requests)
+        assert (request["session_id"], request["nonce"]) == key
+        assert request["model"] == "gpt-6-astra" and request["reasoning_effort"] == "xhigh"
+        if request.get("meta_role"):
+            assert request["meta_role"] in ("mother-preparation", "mother-synthesis")
+            role = "mère"
+        else:
+            trial = request["mission_id"].rsplit("-h", 1)[0]
+            tree_role = trial_roles[subject][trial]
+            assert tree_role in ("A", "B", "C", "G")
+            role = "intégration" if tree_role == "G" else "enfant"
+        native = bool(item["native_invocation_observed"])
+        unknown = native and not item["usage_measured"]
+        exact = item["known_exact_tokens"]
+        assert isinstance(exact, int) and exact >= 0
+        assert item["usage_measured"] or exact == 0
+        total = totals[subject]
+        total["expired_before_invocation"] += int(item.get("not_called_before_expiry", False))
+        total["native_calls"] += int(native)
+        total["known_exact_tokens"] += exact
+        total["unmetered_calls"] += int(unknown)
+        total["expired_unanswered_requests"] += int(not item["delivery_verified"])
+        calls.append({"session_id": key[0], "nonce": key[1], "subject": subject,
+                      "campaign": "grille-r1/coverage-gpt-6-astra-xhigh", "kind": role,
+                      "native_invocation_observed": native, "usage_measured": item["usage_measured"],
+                      "exact_total": exact if item["usage_measured"] else None,
+                      "state": "exact" if item["usage_measured"] else "unmetered" if native else "expired_unanswered",
+                      "request_sha256": item["request_sha256"], "status": item["status"]})
+    for field, expected in (("native_calls", 115), ("known_exact_tokens", 2091845),
+                            ("unmetered_calls", 12), ("expired_unanswered_requests", 0)):
+        assert sum(t[field] for t in totals.values()) == expected, field
+    assert sum(t["expired_before_invocation"] for t in totals.values()) == 3
+    assert len(calls) == reconciliation["published_requests"] == 118
+    save("couts-astra-xhigh.json", {"job_id": "750205", "receipt_sha256": sha(receipt_path),
+                             "reconciliation_sha256": sha(folder / "reconciliation-livraisons.json"),
+                             "per_subject": totals, "native_calls": calls,
+                             "total_exact_consumption_available": False})
+    return totals
+
+
+def source_only_accounting(cohort, admissions):
+    """Recompute closed source-only usage from bound requests and native journals."""
+    folder = OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-luna-max-749843"
+    receipt_path = record(folder / "reception-verifiee.json")
+    reviewed = next(c for c in admissions["reviewed_new_cohorts"]
+                    if c["cohort"] == "source_only_luna_max_fifteen_subjects")
+    assert sha(receipt_path) == reviewed["independent_reception_sha256"]
+    receipt = read(receipt_path)
+    assert receipt["verified"] and receipt["subjects_received_and_audited"] == 15
+    for key in ("coordinator_audit", "independent_audit", "owned_stop"):
+        assert sha(record(receipt[key]["path"])) == receipt[key]["sha256"]
+    audit = read(receipt["independent_audit"]["path"])
+    assert sha(record(receipt["independent_audit"]["path"])) == receipt["independent_audit"]["sha256"]
+    reconciliation = audit["local_delivery_reconciliation"]
+    assert reconciliation["all_published_requests_delivered"] and reconciliation["total_exact_consumption_available"]
+    owners, roles = {}, {}
+    roots = {r["subject"]: Path(r["campaign_root"]) for r in cohort["rows"]}
+    for subject, root in roots.items():
+        con = sqlite3.connect(record(root / "registry.sqlite3").as_uri() + "?mode=ro&immutable=1", uri=True)
+        roles[subject] = dict(con.execute("select id,role from trials"))
+        con.close()
+        for path in [*(root / "logs").glob("*/codex-request.json"),
+                     *(root / "logs").glob("mother-*/request.json")]:
+            request = read(path)
+            assert request["nonce"] not in owners
+            owners[request["nonce"]] = subject, request
+    totals = {subject: {"native_calls": 0, "known_exact_tokens": 0, "unmetered_calls": 0} for subject in roots}
+    calls, seen = [], set()
+    for item in reconciliation["records"]:
+        key = item["session_id"], item["nonce"]
+        assert key not in seen
+        seen.add(key)
+        subject, request = owners[item["nonce"]]
+        flat = roots[subject].parent / "mailbox/requests" / (item["nonce"] + ".request.json")
+        assert read(flat) == request and sha(flat) == item["request_sha256"]
+        assert request["session_id"] == receipt["session_id"] == item["session_id"]
+        assert request["model"] == "gpt-6-luna" and request["reasoning_effort"] == "max"
+        journal = record(OUT / "HPC-Forest-Harnais-Comparaison-r1/runs/source-only-gpt-6-luna-max/worker"
+                         / item["nonce"] / "codex.jsonl")
+        events = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()
+                  if line.lstrip().startswith("{")]
+        assert all(event.get("item", {}).get("type") in {None, "agent_message", "reasoning", "error"}
+                   for event in events if event.get("type") in {"item.started", "item.completed", "item.updated"})
+        usages = [event["usage"] for event in events if event.get("type") == "turn.completed"]
+        assert usages and all(type(u[k]) is int and u[k] >= 0 for u in usages
+                              for k in ("input_tokens", "output_tokens"))
+        exact = sum(u["input_tokens"] + u["output_tokens"] for u in usages)
+        assert item["native_invocation_observed"] and item["usage_measured"] and exact == item["known_exact_tokens"]
+        role = "mère" if request.get("meta_role") else "intégration" if roles[subject][request["mission_id"]] == "G" else "enfant"
+        totals[subject]["native_calls"] += 1
+        totals[subject]["known_exact_tokens"] += exact
+        calls.append({"session_id": key[0], "nonce": key[1], "subject": subject,
+                      "campaign": "comparaison-source-only/luna-max-749843", "kind": role,
+                      "native_invocation_observed": True, "usage_measured": True,
+                      "exact_total": exact, "state": "exact", "request_sha256": item["request_sha256"]})
+    assert len(calls) == 150 and sum(c["exact_total"] for c in calls) == 3564823
+    save("couts-source-only.json", {"job_id": "749843", "receipt_sha256": sha(receipt_path),
+                                   "per_subject": totals, "native_calls": calls,
+                                   "total_exact_consumption_available": True})
+    return totals
+
+
+def source_only_astra_accounting(cohort, admissions):
+    """Recompute closed source-only usage from bound requests and native journals."""
+    folder = OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-astra-max-750122"
+    receipt_path = record(folder / "reception-verifiee.json")
+    reviewed = next(c for c in admissions["reviewed_new_cohorts"]
+                    if c["cohort"] == "source_only_astra_max_fifteen_subjects")
+    assert sha(receipt_path) == reviewed["independent_reception_sha256"]
+    receipt = read(receipt_path)
+    assert receipt["verified"] and receipt["subjects_received_and_audited"] == 15
+    for key in ("coordinator_audit", "independent_audit", "owned_stop"):
+        assert sha(record(receipt[key]["path"])) == receipt[key]["sha256"]
+    audit = read(receipt["independent_audit"]["path"])
+    assert sha(record(receipt["independent_audit"]["path"])) == receipt["independent_audit"]["sha256"]
+    reconciliation = audit["local_delivery_reconciliation"]
+    assert reconciliation["all_published_requests_delivered"] and not reconciliation["total_exact_consumption_available"]
+    owners, roles = {}, {}
+    roots = {r["subject"]: Path(r["campaign_root"]) for r in cohort["rows"]}
+    for subject, root in roots.items():
+        con = sqlite3.connect(record(root / "registry.sqlite3").as_uri() + "?mode=ro&immutable=1", uri=True)
+        roles[subject] = dict(con.execute("select id,role from trials"))
+        con.close()
+        for path in [*(root / "logs").glob("*/codex-request.json"),
+                     *(root / "logs").glob("mother-*/request.json")]:
+            request = read(path)
+            assert request["nonce"] not in owners
+            owners[request["nonce"]] = subject, request
+    totals = {subject: {"native_calls": 0, "known_exact_tokens": 0, "unmetered_calls": 0, "expired_before_invocation": 0} for subject in roots}
+    calls, seen = [], set()
+    for item in reconciliation["records"]:
+        key = item["session_id"], item["nonce"]
+        assert key not in seen
+        seen.add(key)
+        subject, request = owners[item["nonce"]]
+        flat = roots[subject].parent / "mailbox/requests" / (item["nonce"] + ".request.json")
+        assert read(flat) == request and sha(flat) == item["request_sha256"]
+        assert request["session_id"] == receipt["session_id"] == item["session_id"]
+        assert request["model"] == "gpt-6-astra" and request["reasoning_effort"] == "max"
+        native = item["native_invocation_observed"]
+        journal_path = OUT / "HPC-Forest-Harnais-Comparaison-r1/runs/source-only-gpt-6-astra-max/worker" / item["nonce"] / "codex.jsonl"
+        if native:
+            journal = record(journal_path)
+            events = []
+            for line in journal.read_text(encoding="utf8", errors="replace").splitlines():
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    continue
+            assert all(event.get("item", {}).get("type") in {None, "agent_message", "reasoning", "error"}
+                       for event in events if event.get("type") in {"item.started", "item.completed", "item.updated"})
+            usages = [event["usage"] for event in events if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict)]
+            assert all(type(u[k]) is int and u[k] >= 0 for u in usages for k in ("input_tokens", "output_tokens"))
+            measured = bool(usages)
+            exact = sum(u["input_tokens"] + u["output_tokens"] for u in usages)
+            assert measured == item["usage_measured"] and exact == item["known_exact_tokens"]
+        else:
+            assert item["not_called_before_expiry"] and item["usage_measured"] and item["known_exact_tokens"] == 0
+            assert not journal_path.exists() and not journal_path.with_name("invocation.json").exists()
+            measured, exact = True, 0
+            totals[subject]["expired_before_invocation"] += 1
+        totals[subject]["unmetered_calls"] += int(native and not measured)
+        role = "mère" if request.get("meta_role") else "intégration" if roles[subject][request["mission_id"].rsplit("-h", 1)[0]] == "G" else "enfant"
+        totals[subject]["native_calls"] += int(native)
+        totals[subject]["known_exact_tokens"] += exact
+        calls.append({"session_id": key[0], "nonce": key[1], "subject": subject,
+                      "campaign": "comparaison-source-only/astra-max-750122", "kind": role,
+                      "native_invocation_observed": native, "usage_measured": measured,
+                      "exact_total": exact if measured else None, "state": "exact" if native and measured else "unmetered" if native else "expired_before_invocation", "request_sha256": item["request_sha256"]})
+    assert len(calls) == 101 and sum(c["exact_total"] or 0 for c in calls) == 1856292
+    assert sum(v["native_calls"] for v in totals.values()) == 98
+    assert sum(v["unmetered_calls"] for v in totals.values()) == 13
+    assert sum(v["expired_before_invocation"] for v in totals.values()) == 3
+    save("couts-source-only-astra.json", {"job_id": "750122", "receipt_sha256": sha(receipt_path),
+                                   "per_subject": totals, "native_calls": calls,
+                                   "total_exact_consumption_available": False})
+    return totals
+
+
+def gpt96_accounting(cohort, admissions):
+    """Reconcile the closed native receipt; inactive reservations are not usage."""
+    folder = OUT / "Marathon22-GPT61Sol-MAX/reference96-r2"
+    receipt_path = record(folder / "reception-finale-748383/reception-verifiee.json")
+    reviewed = next(c for c in admissions["reviewed_new_cohorts"] if c["cohort"] == "gpt96_three_subjects")
+    assert sha(receipt_path) == reviewed["independent_reception_sha256"]
+    receipt = read(receipt_path)
+    assert receipt["received_and_audited"] and receipt["all_179_requests_delivered_and_reconciled"]
+    for key in ("native_audit", "supplemental_audit", "worker_stopped_after_audit_and_reconciliation", "lane_release"):
+        assert sha(record(receipt[key]["path"])) == receipt[key]["sha256"]
+    link = folder / "reception-finale-748383/livraisons-reconciliees.json"
+    assert sha(record(link)) == reviewed["reconciliation_sha256"]
+    reconciliation = read(link)
+    assert reconciliation["all_published_requests_delivered"]
+    roots = {r["subject"]: Path(r["campaign_root"]) for r in cohort["rows"]}
+    requests = {}
+    for subject, root in roots.items():
+        db = record(root / "registry.sqlite3")
+        con = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
+        for trial, role in con.execute("select id,role from trials"):
+            path = root / "logs" / trial / "codex-request.json"
+            if not path.exists():
+                continue
+            request = read(path)
+            requests[(request["session_id"], request["nonce"])] = (subject, role, request)
+        con.close()
+    totals = {s: {"native_calls": 0, "known_exact_tokens": 0, "unmetered_calls": 0,
+                  "expired_without_native_invocation": 0} for s in roots}
+    calls, seen = [], set()
+    for item in reconciliation["records"]:
+        key = (item["session_id"], item["nonce"])
+        assert key not in seen
+        seen.add(key)
+        subject, role, request = requests[key]
+        local = record(folder / "worker" / item["nonce"] / "downloaded-request.json")
+        assert sha(local) == item["request_sha256"]
+        assert read(local) == request
+        assert request["model"] == "gpt-6.1-sol" and request["reasoning_effort"] == "max"
+        assert role in ("A", "B", "C", "G") and not request.get("meta_role")
+        native = bool(item["native_invocation_observed"])
+        exact = item["known_exact_tokens"]
+        assert isinstance(exact, int) and exact >= 0
+        assert item["usage_measured"] or exact == 0
+        expired = bool(item["not_called_before_expiry"])
+        assert not expired or (not native and exact == 0)
+        total = totals[subject]
+        total["native_calls"] += int(native)
+        total["known_exact_tokens"] += exact
+        total["unmetered_calls"] += int(native and not item["usage_measured"])
+        total["expired_without_native_invocation"] += int(expired)
+        calls.append({"session_id": key[0], "nonce": key[1], "subject": subject,
+                      "campaign": "reference96-r2", "kind": "intégration" if role == "G" else "enfant",
+                      "native_invocation_observed": native, "usage_measured": item["usage_measured"],
+                      "exact_total": exact if item["usage_measured"] or expired else None,
+                      "state": "expired_no_native" if expired else "exact" if item["usage_measured"] else "unmetered",
+                      "request_sha256": item["request_sha256"]})
+    for field, expected in (("native_calls", 177), ("known_exact_tokens", 5126918),
+                            ("unmetered_calls", 17), ("expired_without_native_invocation", 2)):
+        assert sum(t[field] for t in totals.values()) == expected, field
+    assert len(calls) == 179
+    save("couts-gpt96.json", {"job_id": "748383", "receipt_sha256": sha(receipt_path),
+                             "reconciliation_sha256": sha(link), "per_subject": totals,
+                             "native_calls": calls, "total_exact_consumption_available": False})
+    return totals
+
+
+def main():
+    start = datetime.now(UTC).isoformat()
+    admissions = read(HERE / "admissions.json")
+    cohorts = {
+        "count": read(STUDY / "resultats-vingt-couples-count.json"),
+        "luna": read(STUDY / "resultats-couverture-luna-max.json"),
+        "astra": read(STUDY / "resultats-couverture-astra-max.json"),
+        "terra": read(STUDY / "resultats-couverture-terra-max.json"),
+        "sol": read(STUDY / "resultats-couverture-sol-max.json"),
+        "luna_xhigh": read(STUDY / "resultats-couverture-luna-xhigh.json"),
+        "astra_xhigh": read(STUDY / "resultats-couverture-astra-xhigh.json"),
+        "terra_xhigh": read(STUDY / "resultats-couverture-terra-xhigh.json"),
+        "source_only_terra": read(STUDY / "resultats-source-only-terra-max.json"),
+        "source_only_sol": read(STUDY / "resultats-source-only-sol-max.json"),
+        "source_only_astra": read(STUDY / "resultats-source-only-astra-max.json"),
+        "source_only": read(STUDY / "resultats-source-only-luna-max.json"),
+        "gpt96": read(STUDY / "resultats-reference96.json"),
+        "comparison": read(
+            OUT / "Marathon22-GPT61Sol-MAX/harnais-r2/resultats-comparaison-recus.json"
+        ),
+        "deepseek": read(
+            OUT / "Marathon22-DeepSeek-v11/resultats-verifies-complets.json"
+        ),
+    }
+    terra_costs = terra_accounting(cohorts["terra"], admissions)
+    for row in cohorts["terra"]["rows"]:
+        row.update(terra_costs[row["subject"]])
+    cohorts["terra"].update(native_calls=58, known_exact_tokens=980971, unmetered_calls=24)
+    sol_costs = sol_accounting(cohorts["sol"], admissions)
+    for row in cohorts["sol"]["rows"]:
+        assert all(row[k] == sol_costs[row["subject"]][k] for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+    luna_xhigh_costs = luna_xhigh_accounting(cohorts["luna_xhigh"], admissions)
+    for row in cohorts["luna_xhigh"]["rows"]:
+        assert all(row[k] == luna_xhigh_costs[row["subject"]][k] for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+    gpt96_costs = gpt96_accounting(cohorts["gpt96"], admissions)
+    for row in cohorts["gpt96"]["rows"]:
+        assert all(row[k] == gpt96_costs[row["subject"]][k] for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+    source_only_costs = source_only_accounting(cohorts["source_only"], admissions)
+    for row in cohorts["source_only"]["rows"]:
+        assert all(row[k] == source_only_costs[row["subject"]][k]
+                   for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+    for group, reader in [("astra_xhigh", astra_xhigh_accounting), ("source_only_astra", source_only_astra_accounting)]:
+        accounting = reader(cohorts[group], admissions)
+        for row in cohorts[group]["rows"]:
+            assert all(row[k] == accounting[row["subject"]][k] for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+    for descriptor in TERRA_DESCRIPTORS:
+        group = descriptor["key"]
+        accounting = closed_terra_accounting(cohorts[group], admissions, descriptor,
+                                             read=read, record=record, save=save, sha=sha)
+        for row in cohorts[group]["rows"]:
+            assert all(row[k] == accounting[row["subject"]][k]
+                       for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+            row.update(accounting[row["subject"]])
+    sol_source_costs = closed_sol_accounting(cohorts["source_only_sol"], admissions,
+        read=read, record=record, save=save, sha=sha)
+    for row in cohorts["source_only_sol"]["rows"]:
+        assert all(row[k] == sol_source_costs[row["subject"]][k]
+                   for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+        row.update(sol_source_costs[row["subject"]])
+    old = read(
+        STUDY
+        / "versions/20261016-avant-refonte-professionnelle/donnees-consolidees.json"
+    )
+    history_path = record(STUDY / "historique-campagnes.jsonl")
+    history = [
+        json.loads(l)
+        for l in history_path.read_text(encoding="utf-8").splitlines()
+        if l.strip()
+    ]
+    save("historique-preserve.json", {"rows": history, "legacy_consolidation": old})
+    roots = {}
+    reports = []
+    for group in ("count", "luna", "astra", "terra", "sol", "comparison", "gpt96", "source_only", "luna_xhigh", "astra_xhigh", "source_only_astra", "terra_xhigh", "source_only_terra", "source_only_sol"):
+        for row in cohorts[group]["rows"]:
+            root = row["campaign_root"]
+            audited = roots.setdefault(root, registry(root))
+            settings = audited["config"]["codex"]
+            assert settings["model"] == row.get("model", "gpt-6.1-sol")
+            assert settings["reasoning_effort"] == row.get("effort", "max")
+            CHECKS["native_model_effort_configuration"] += 1
+            if group == "count":
+                audit_path = record(row["audit_path"])
+                assert sha(audit_path) == row["audit_sha256"]
+                reception = read(audit_path)
+                assert reception["coverage_and_final_confirmations_verified"]
+                assert reception["read_only_file_verification_before_and_after"]
+                CHECKS["positive_original_reception_receipts"] += 1
+            b = row.get("confirmation", row.get("best_confirmed"))
+            close(
+                b["improvement_fraction"],
+                audited["gain_fraction"],
+                "published_gain_matches_registry",
+            )
+            subject = row.get("subject") or (
+                "2023-count" if group == "count" else "2022-" + row["problem"]
+            )
+            reports.append(
+                {
+                    "cohort": group,
+                    "subject": subject,
+                    "model": row.get("model", "gpt-6.1-sol"),
+                    "effort": row.get("effort", "max"),
+                    "arm": row.get("arm", ""),
+                    "job_id": row["job_id"]
+                    if "job_id" in row
+                    else cohorts[group]["job_id"],
+                    "campaign_root": audited["campaign_root"],
+                    "reference_seconds": b["reference_seconds"],
+                    "chosen_seconds": b["mean_seconds"],
+                    "gain_percent": 100 * audited["gain_fraction"],
+                    "speedup": audited["speedup"],
+                    "reference_sd": audited["reference_stdev"],
+                    "chosen_sd": audited["chosen_stdev"],
+                    "baseline_retained": b["is_baseline"],
+                    "nodes": row.get("topology", {}).get("scored_nodes"),
+                    "known_exact_tokens": row.get(
+                        "known_exact_tokens",
+                        row.get(
+                            "exact_tokens", row.get("archived_exact_native_tokens")
+                        ),
+                    ),
+                    "native_calls": row.get(
+                        "native_calls", row.get("archived_native_invocations")
+                    ),
+                    "unmetered_calls": row.get(
+                        "unmetered_calls",
+                        row.get("archived_unmetered_native_invocations", 0),
+                    ),
+                }
+            )
+    for job in cohorts["deepseek"]["verified_jobs"]:
+        for row in job["problems"]:
+            root = str(Path(job["root"]) / row["problem"])
+            audited = roots.setdefault(root, registry(root))
+            b = row["best_confirmed"]
+            close(
+                b["improvement_fraction"],
+                audited["gain_fraction"],
+                "published_gain_matches_registry",
+            )
+            reports.append(
+                {
+                    "cohort": "deepseek",
+                    "subject": "2022-" + row["problem"],
+                    "model": job["model"],
+                    "effort": "local",
+                    "arm": "",
+                    "job_id": job["job_id"],
+                    "campaign_root": root,
+                    "reference_seconds": b["reference_seconds"],
+                    "chosen_seconds": b["mean_seconds"],
+                    "gain_percent": 100 * audited["gain_fraction"],
+                    "speedup": audited["speedup"],
+                    "reference_sd": audited["reference_stdev"],
+                    "chosen_sd": audited["chosen_stdev"],
+                    "baseline_retained": b["is_baseline"],
+                    "nodes": row["scored_nodes"],
+                    "known_exact_tokens": row["exact_tokens"],
+                    "native_calls": None,
+                    "unmetered_calls": 0,
+                }
+            )
+    for group in ("count", "luna", "astra", "terra", "sol", "comparison", "gpt96", "source_only", "luna_xhigh", "astra_xhigh", "source_only_astra", "terra_xhigh", "source_only_terra", "source_only_sol"):
+        rows = [r for r in reports if r["cohort"] == group]
+        exact = sum(r["known_exact_tokens"] for r in rows)
+        close(
+            exact,
+            cohorts[group].get(
+                "known_exact_tokens", cohorts[group].get("exact_native_tokens")
+            ),
+            "cohort_exact_token_sums",
+        )
+        close(
+            sum(r["native_calls"] for r in rows),
+            cohorts[group]["native_calls"],
+            "cohort_native_call_sums",
+        )
+    all_points, raw_samples, batches, campaign_rows, curves = [], [], [], [], []
+    unique_roots, identities, subjects, inputs, unique_combinations = (
+        set(),
+        set(),
+        set(),
+        set(),
+        set(),
+    )
+    for admitted_audit in sorted(admissions["received_file_paths"]["cpu"],
+                                 key=lambda value: int(Path(value).parent.name.split("-")[-1])):
+        folder = Path(admitted_audit).parent
+        batch_no = int(folder.name.split("-")[-1])
+        plan = read(folder / "payload/plan.json")
+        result = read(folder / "preuves/results/results.json")
+        receipt = read(folder / "audit.json")
+        assert (
+            result["complete"]
+            and receipt["evidence_integrity_verified"]
+            and receipt["statistics_recomputed"]
+        )
+        assert (
+            result["model_calls"]
+            == result["source_edits"]
+            == result["compilations"]
+            == 0
+        )
+        assert result["plan_sha256"] == sha(folder / "payload/plan.json")
+        assert result["repetitions"] == 5 and result["warmups"] == 1
+        resources = result["resources"]
+        assert (
+            resources["physical_cpu_count"] == 16
+            and len({(x["package"], x["core"]) for x in resources["topology"]}) == 16
+        )
+        cases = {c["key"]: c for c in plan["cases"]}
+        binaries = {b["key"]: b for b in plan["binaries"]}
+        oracle_hashes = {o["case_key"]: o["stdout_sha256"] for o in result["oracles"]}
+        for c in cases.values():
+            assert sha(record(folder / "payload" / c["input"])) == c["input_sha256"]
+        for b in binaries.values():
+            assert sha(record(folder / "payload" / b["binary"])) == b["sha256"]
+        for oracle in result["oracles"]:
+            assert oracle["accepted"] and oracle["returncode"] == 0
+            archived_expected = cases[oracle["case_key"]]["expected_stdout_sha256"]
+            if archived_expected is not None:
+                assert oracle["stdout_sha256"] == archived_expected
+                CHECKS["cpu_oracles_with_archived_expected"] += 1
+            else:
+                assert (
+                    cases[oracle["case_key"]]["phase"]
+                    == "additional_previous_scaling_input"
+                )
+                CHECKS["additional_inputs_canonical_reference_oracles"] += 1
+            CHECKS["exact_cpu_oracles"] += 1
+        points = {}
+        for p in result["points"]:
+            assert (
+                p["full_valid_measurement"] and p["correct"] and len(p["samples"]) == 5
+            )
+            k = (p["program_key"], p["case_key"], p["cores"])
+            assert k not in points
+            points[k] = p
+            samples = p["samples"]
+            close(
+                st.mean(x["seconds"] for x in samples),
+                p["mean_seconds"],
+                "cpu_point_means",
+            )
+            close(
+                st.stdev(x["seconds"] for x in samples),
+                p["stdev_seconds"],
+                "cpu_point_standard_deviations",
+            )
+            close(
+                st.median(x["seconds"] for x in samples),
+                p["median_seconds"],
+                "cpu_point_medians",
+            )
+            for idx, x in enumerate([p["warmup"], *samples]):
+                assert x["returncode"] == 0 and x["matches_oracle"]
+                assert x["stdout_sha256"] == oracle_hashes[p["case_key"]]
+                assert x["cores_accessible"] == len(x["cpu_affinity"]) == p["cores"]
+                assert set(x["cpu_affinity"]).issubset(resources["affinity"])
+                close(
+                    x["cpu_seconds"] / x["seconds"],
+                    x["average_used_cores"],
+                    "cpu_to_wall_ratios",
+                )
+                if idx:
+                    raw_samples.append(
+                        {
+                            "batch": batch_no,
+                            "job_id": result["job_id"],
+                            "case_key": p["case_key"],
+                            "program_key": p["program_key"],
+                            "cores": p["cores"],
+                            "repeat": idx - 1,
+                            "wall_seconds": x["seconds"],
+                            "cpu_seconds": x["cpu_seconds"],
+                            "mean_used_cores": x["average_used_cores"],
+                            "stdout_sha256": x["stdout_sha256"],
+                        }
+                    )
+            close(
+                st.mean(x["average_used_cores"] for x in samples),
+                p["mean_average_used_cores"],
+                "mean_cpu_to_wall_ratios",
+            )
+            unique_combinations.add(
+                (binaries[p["program_key"]]["sha256"], p["input_sha256"], p["cores"])
+            )
+            inputs.add((p["subject"], p["input_sha256"]))
+            all_points.append({"batch": batch_no, "job_id": result["job_id"], **p})
+        for order in result["round_orders"]:
+            expected = {
+                (p["program_key"], p["cores"])
+                for p in result["points"]
+                if p["case_key"] == order["case_key"]
+            }
+            assert (
+                len(order["order"]) == len(expected)
+                and {tuple(x) for x in order["order"]} == expected
+            )
+            CHECKS["complete_interleaved_round_orders"] += 1
+        for c in plan["campaigns"]:
+            root = c["campaign_root"]
+            audit_path = record(c["audit_path"])
+            assert sha(audit_path) == c["audit_sha256"]
+            CHECKS["cpu_admission_audit_fingerprints"] += 1
+            assert root not in unique_roots, ("campaign replay", root)
+            unique_roots.add(root)
+            identities.add(c["model"])
+            subjects.add(c["subject"])
+            if root not in roots and not any(
+                r["campaign_root"] == root for r in roots.values()
+            ):
+                roots[root] = registry(root)
+            for case_key, case in cases.items():
+                if case["subject"] != c["subject"]:
+                    continue
+                for cores in (1, 2, 4, 8, 16):
+                    chosen = points[(c["keys"]["chosen"], case_key, cores)]
+                    ref = points[(c["keys"]["original_reference"], case_key, cores)]
+                    first = points[(c["keys"]["chosen"], case_key, 1)]
+                    campaign_rows.append(
+                        {
+                            "batch": batch_no,
+                            "job_id": result["job_id"],
+                            "campaign_root": root,
+                            "model": c["model"],
+                            "effort": c.get("effort", "local"),
+                            "arm": c.get("arm", ""),
+                            "subject": c["subject"],
+                            "case_name": case["name"],
+                            "phase": case["phase"],
+                            "input_sha256": case["input_sha256"],
+                            "size": chosen["size"],
+                            "cores": cores,
+                            "chosen_program_key": c["keys"]["chosen"],
+                            "reference_program_key": c["keys"]["original_reference"],
+                            "chosen_seconds": chosen["mean_seconds"],
+                            "chosen_sd": chosen["stdev_seconds"],
+                            "reference_seconds": ref["mean_seconds"],
+                            "reference_sd": ref["stdev_seconds"],
+                            "seconds_saved": ref["mean_seconds"]
+                            - chosen["mean_seconds"],
+                            "gain_fraction": 1
+                            - chosen["mean_seconds"] / ref["mean_seconds"],
+                            "speedup_vs_reference": ref["mean_seconds"]
+                            / chosen["mean_seconds"],
+                            "scaling_speedup": first["mean_seconds"]
+                            / chosen["mean_seconds"],
+                            "scaling_efficiency": first["mean_seconds"]
+                            / chosen["mean_seconds"]
+                            / cores,
+                            "mean_used_cores": chosen["mean_average_used_cores"],
+                            "baseline_retained": c["chosen_is_unchanged_baseline"],
+                        }
+                    )
+            curves.append({"batch": batch_no, **c})
+        batches.append(
+            {
+                "batch": batch_no,
+                "job_id": result["job_id"],
+                "campaigns": len(plan["campaigns"]),
+                "points": len(points),
+                "samples": len(points) * 5,
+                "files_previously_verified": receipt["files_verified_before_and_after"],
+                "archive_sha256": receipt["archive_sha256"],
+                "plan_sha256": sha(folder / "payload/plan.json"),
+                "audit_sha256": sha(folder / "audit.json"),
+                "resources": resources,
+            }
+        )
+    expected = admissions["expected_cpu_totals"]
+    actual = {
+        "campaigns": len(unique_roots),
+        "models": len(identities),
+        "subjects": len(subjects),
+        "inputs": len(inputs),
+        "points": len(all_points),
+        "samples": len(raw_samples),
+        "unique_combinations": len(unique_combinations),
+        "repeated_controls": len(all_points) - len(unique_combinations),
+    }
+    assert actual == expected, (actual, expected)
+    ledger = read(OUT / "HPC-Forest-Mere-Dynamique-r3/tokens-par-modele.json")
+    calls = ledger["native_calls"]
+    assert len({(r["session_id"], r["nonce"]) for r in calls}) == len(calls)
+    for r in calls:
+        if r["state"] == "exact":
+            close(
+                r["input_tokens"] + r["output_tokens"],
+                r["exact_total"],
+                "native_input_output_sum",
+            )
+    ledger_summary = {
+        k: ledger[k]
+        for k in (
+            "observed_utc",
+            "native_unique_calls",
+            "native_exact_total",
+            "native_unmetered_calls",
+            "native_pending_calls",
+            "native_campaigns",
+            "concurrent_files_not_yet_readable",
+        )
+    }
+    state = read(STUDY / "coordinator-state.json")
+    matrix = read(STUDY / "MATRICE.json")
+    for file in [
+        "arbres-couverture-luna-max.json",
+        "arbres-couverture-astra-max.json",
+        "comparabilite-couvertures-luna-astra-max.json",
+        "comparabilite-max-xhigh-high-medium-low.json",
+        "CONTRAT-DE-DETAILS-RAPPORT.md",
+    ]:
+        record(STUDY / file)
+    supporting = [
+        STUDY / "catalogue-sources.json",
+        WORKSPACE / "ID.md",
+        OUT / "HPC-Forest-Conformite-Quicksort-r1/validation-locale-preliminaire.json",
+        OUT / "HPC-Forest-Conformite-Quicksort-r1/transport-arm64-r1/audit-transport-arm64.json",
+        OUT / "HPC-Forest-Conformite-Coeurs-r3/validation-contrats-recus.json",
+        STUDY / "receptions/coverage-astra-max-748355/reception-verifiee.json",
+        STUDY / "runs/coverage-gpt-6-astra-max/audit.json",
+        STUDY / "receptions/coverage-terra-max-748782/reception-verifiee.json",
+        STUDY / "receptions/coverage-terra-max-748782/audit-initial.json",
+        STUDY / "comparabilite-couvertures-luna-astra-terra-max.json",
+        STUDY / "comparabilite-couvertures-luna-astra-terra-sol-max.json",
+        STUDY / "receptions/coverage-sol-max-749415/reception-verifiee.json",
+        STUDY / "receptions/coverage-sol-max-749415/audit-complementaire.json",
+        HERE / "admission-sol-verifiee.json",
+        STUDY / "comparabilite-couverture-luna-xhigh-max.json",
+        STUDY / "receptions/coverage-luna-xhigh-749940/reception-verifiee.json",
+        STUDY / "receptions/coverage-luna-xhigh-749940/audit-complementaire.json",
+        HERE / "admission-luna-xhigh-verifiee.json",
+        HERE / "admission-astra-double-verifiee.json",
+        HERE / "admission-terra-double-verifiee.json",
+        HERE / "terra_accounting.py",
+        STUDY / "comparabilite-couverture-terra-xhigh-max.json",
+        STUDY / "comparabilite-source-only-terra-max-r1.json",
+        STUDY / "receptions/coverage-terra-xhigh-750909/reception-verifiee.json",
+        STUDY / "receptions/coverage-terra-xhigh-750909/audit-complementaire.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-terra-max-750831/reception-verifiee.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-terra-max-750831/audit-complementaire.json",
+        STUDY / "comparabilite-couverture-astra-xhigh-max.json",
+        STUDY / "comparabilite-source-only-astra-max-r1.json",
+        STUDY / "receptions/coverage-astra-xhigh-750205/reception-verifiee.json",
+        STUDY / "receptions/coverage-astra-xhigh-750205/audit-complementaire.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-astra-max-750122/reception-verifiee.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-astra-max-750122/audit-independant.json",
+        OUT / "HPC-Forest-R5-Preconditions-r1/observation-apres-redemarrage-20261017T1402.json",
+        OUT / "Marathon22-GPT61Sol-MAX/reference96-r2/reception-finale-748383/reception-verifiee.json",
+        OUT / "Marathon22-GPT61Sol-MAX/reference96-r2/reception-finale-748383/audit-complet.json",
+        OUT / "Marathon22-GPT61Sol-MAX/reference96-r2/reception-finale-748383/audit-complementaire-r2.json",
+        OUT / "Marathon22-GPT61Sol-MAX/reference96-r2/reception-finale-748383/voie-liberee.json",
+        HERE / "admission-reference96-verifiee.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/DEMANDE.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/plan-comparaison.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/codex-natif-r7/validation-locale.json",
+        OUT
+        / "Marathon22-GPT61Sol-MAX/harnais-r2/receptions/audit-comparaison-747885.json",
+        OUT / "Marathon22-DeepSeek-v11/receptions/audits-747504/audit-complet.json",
+        OUT / "Marathon22-DeepSeek-v11/receptions/audits-747505-r2/audit-complet.json",
+    ]
+    supporting.extend([
+        HERE / "source_only_sol_accounting.py",
+        STUDY / "comparabilite-source-only-sol-max-r1.json",
+        STUDY / "resultats-source-only-sol-max.json",
+        STUDY / "details-missions-source-only-sol-max.json",
+        STUDY / "arbres-source-only-sol-max.json",
+        STUDY / "negatifs-source-only-sol-max.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-sol-max-751592/reception-verifiee.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-sol-max-751592/audit-independant/AUDIT-INDEPENDANT.json",
+    ])
+    for p in supporting:
+        record(p)
+        save(
+            "source-" + p.parent.name + "-" + p.name,
+            read(p) if p.suffix == ".json" else {"text": p.read_text(encoding="utf-8")},
+        )
+    for rel in [
+        "work/marathon-archive-mother-r1/project/src/hpc_forest/search.py",
+        "work/marathon-archive-mother-r1/project/src/hpc_forest/mother.py",
+        "work/marathon-archive-mother-r1/project/src/hpc_forest/evaluator.py",
+        "outputs/HPC-Forest-Etude-2020-2024-r1/runs/coverage-gpt-6-luna-max/preuves/results-748259/2022-knn/worktrees/e499a157e6f74ad7/src/knn.c",
+        "outputs/HPC-Forest-Etude-2020-2024-r1/runs/coverage-gpt-6-luna-max/preuves/results-748259/2022-nbody/worktrees/dc7f6acd76164315/src/nbody.c",
+    ]:
+        record(WORKSPACE / rel)
+    for key in ("count", "luna", "astra", "terra", "sol", "comparison", "gpt96", "luna_xhigh", "astra_xhigh", "source_only_astra", "terra_xhigh", "source_only_terra", "source_only_sol"):
+        save(key + ".json", cohorts[key])
+    save("deepseek.json", cohorts["deepseek"])
+    unique_registries = {r["campaign_root"]: r for r in roots.values()}
+    assert len(unique_registries) == admissions["expected_registry_count"]
+    assert len(reports) == admissions["expected_principal_results"]
+    save("registres-recalcules.json", list(unique_registries.values()))
+    save("confirmations-recalculees.json", reports)
+    save("cpu-points.json", all_points)
+    save("cpu-campagnes.json", curves)
+    save("cpu-lots.json", batches)
+    save("couts-natifs.json", ledger)
+    save(
+        "etat-campagnes.json",
+        {
+            "observed_utc": start,
+            "r1": state,
+            "matrix": matrix,
+            "gpt96": read(
+                OUT / "Marathon22-GPT61Sol-MAX/reference96-r2/current-job.json"
+            ),
+            "r4_native_pilot_validated": False,
+        },
+    )
+    table("confirmations.csv", reports)
+    table("cpu-mesures-brutes.csv", raw_samples)
+    table("cpu-comparaisons.csv", campaign_rows)
+    frozen_hashes = {
+        str(p.relative_to(EVIDENCE)): sha(p)
+        for p in EVIDENCE.iterdir()
+        if p.is_file() and p.name not in {"index-campagnes.json", "ID-snapshot.md"}
+    }
+    changed = [p for p, v in SOURCES.items() if sha(Path(p)) != v["sha256"]]
+    # Live states may advance; all scientific input data and immutable registries must remain unchanged.
+    allowed_live = {
+        str((STUDY / x).resolve()) for x in ("coordinator-state.json", "MATRICE.json")
+    }
+    assert not (set(changed) - allowed_live), changed
+    receipt = {
+        "schema": "hpc-forest-professional-article-arithmetic-audit-v1",
+        "started_utc": start,
+        "completed_utc": datetime.now(UTC).isoformat(),
+        "verified": True,
+        "operator_report_is_never_model_input": True,
+        "program_executions": 0,
+        "candidate_edits": 0,
+        "model_calls": 0,
+        "registry_count": len(unique_registries),
+        "scientific_input_files_unchanged": True,
+        "live_state_files_advanced": changed,
+        "checks": dict(CHECKS),
+        "cpu_totals": actual,
+        "research_confirmation_rows": len(reports),
+        "native_accounting": ledger_summary,
+        "sources": SOURCES,
+        "frozen_data_files": frozen_hashes,
+    }
+    (HERE / "audit-calculs.json").write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                k: receipt[k]
+                for k in (
+                    "verified",
+                    "registry_count",
+                    "checks",
+                    "cpu_totals",
+                    "research_confirmation_rows",
+                )
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

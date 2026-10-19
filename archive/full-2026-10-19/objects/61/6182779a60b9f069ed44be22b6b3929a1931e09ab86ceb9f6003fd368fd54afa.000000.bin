@@ -1,0 +1,252 @@
+#include <bits/stdc++.h>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define NPBONACCI_HAVE_NEON 1
+#endif
+
+using namespace std;
+
+using u32 = uint32_t;
+using u64 = uint64_t;
+using u128 = unsigned __int128;
+
+constexpr int MAX_N = 1024;
+constexpr int STRIDE = 1028;
+constexpr u64 MOD = 1000000007ULL;
+constexpr u64 TWO64_MOD =
+    ((std::numeric_limits<u64>::max() % MOD) + 1ULL) % MOD;
+
+alignas(64) static u32 transposed_rhs[MAX_N][STRIDE];
+
+static inline u32 reduce_dot_sum(u128 value) {
+    const u64 low = static_cast<u64>(value);
+    const u64 high = static_cast<u64>(value >> 64);
+    const u64 folded = (low % MOD + high * TWO64_MOD) % MOD;
+    return static_cast<u32>(folded);
+}
+
+#if defined(NPBONACCI_HAVE_NEON)
+static inline uint64x2_t pairwise_products(const u32* lhs, const u32* rhs) {
+    const uint32x4_t left = vld1q_u32(lhs);
+    const uint32x4_t right = vld1q_u32(rhs);
+    const uint64x2_t low = vmull_u32(vget_low_u32(left), vget_low_u32(right));
+    const uint64x2_t high = vmull_u32(vget_high_u32(left), vget_high_u32(right));
+    return vaddq_u64(low, high);
+}
+#endif
+
+static inline u32 dot_mod(const u32* __restrict__ lhs,
+                          const u32* __restrict__ rhs,
+                          int count) {
+    if (count <= 18) {
+        u64 lane0 = 0;
+        u64 lane1 = 0;
+        u64 lane2 = 0;
+        u64 lane3 = 0;
+        int k = 0;
+
+        for (; k + 3 < count; k += 4) {
+            lane0 += static_cast<u64>(lhs[k]) * rhs[k];
+            lane1 += static_cast<u64>(lhs[k + 1]) * rhs[k + 1];
+            lane2 += static_cast<u64>(lhs[k + 2]) * rhs[k + 2];
+            lane3 += static_cast<u64>(lhs[k + 3]) * rhs[k + 3];
+        }
+
+        u64 total = lane0 + lane1 + lane2 + lane3;
+        for (; k < count; ++k) {
+            total += static_cast<u64>(lhs[k]) * rhs[k];
+        }
+        return static_cast<u32>(total % MOD);
+    }
+
+    u128 sum0 = 0;
+    u128 sum1 = 0;
+    int k = 0;
+
+#if defined(NPBONACCI_HAVE_NEON)
+    for (; k + 31 < count; k += 32) {
+        uint64x2_t acc0 = vdupq_n_u64(0);
+        uint64x2_t acc1 = vdupq_n_u64(0);
+        uint64x2_t acc2 = vdupq_n_u64(0);
+        uint64x2_t acc3 = vdupq_n_u64(0);
+
+#pragma GCC unroll 2
+        for (int part = 0; part < 2; ++part) {
+            const int offset = k + (part << 2);
+            acc0 = vaddq_u64(acc0, pairwise_products(lhs + offset, rhs + offset));
+            acc1 = vaddq_u64(acc1, pairwise_products(lhs + offset + 8, rhs + offset + 8));
+            acc2 = vaddq_u64(acc2, pairwise_products(lhs + offset + 16, rhs + offset + 16));
+            acc3 = vaddq_u64(acc3, pairwise_products(lhs + offset + 24, rhs + offset + 24));
+        }
+
+        const uint64x2_t joined =
+            vaddq_u64(vaddq_u64(acc0, acc1), vaddq_u64(acc2, acc3));
+        sum0 += static_cast<u128>(vgetq_lane_u64(joined, 0));
+        sum1 += static_cast<u128>(vgetq_lane_u64(joined, 1));
+    }
+
+    if (k + 15 < count) {
+        uint64x2_t acc0 = vdupq_n_u64(0);
+        uint64x2_t acc1 = vdupq_n_u64(0);
+
+#pragma GCC unroll 2
+        for (int part = 0; part < 2; ++part) {
+            const int offset = k + (part << 2);
+            acc0 = vaddq_u64(acc0, pairwise_products(lhs + offset, rhs + offset));
+            acc1 = vaddq_u64(acc1, pairwise_products(lhs + offset + 8, rhs + offset + 8));
+        }
+
+        const uint64x2_t joined = vaddq_u64(acc0, acc1);
+        sum0 += static_cast<u128>(vgetq_lane_u64(joined, 0));
+        sum1 += static_cast<u128>(vgetq_lane_u64(joined, 1));
+        k += 16;
+    }
+#endif
+
+    u128 lane0 = 0;
+    u128 lane1 = 0;
+    u128 lane2 = 0;
+    u128 lane3 = 0;
+    for (; k + 3 < count; k += 4) {
+        lane0 += static_cast<u128>(lhs[k]) * rhs[k];
+        lane1 += static_cast<u128>(lhs[k + 1]) * rhs[k + 1];
+        lane2 += static_cast<u128>(lhs[k + 2]) * rhs[k + 2];
+        lane3 += static_cast<u128>(lhs[k + 3]) * rhs[k + 3];
+    }
+
+    sum0 += lane0 + lane2;
+    sum1 += lane1 + lane3;
+    for (; k < count; ++k) {
+        sum0 += static_cast<u128>(lhs[k]) * rhs[k];
+    }
+
+    return reduce_dot_sum(sum0 + sum1);
+}
+
+class Matrix {
+public:
+    int n;
+    alignas(64) u32 first[MAX_N][STRIDE];
+    alignas(64) u32 second[MAX_N][STRIDE];
+    u32 (*mat)[STRIDE];
+    u32 (*aux)[STRIDE];
+
+    Matrix() : n(0), mat(first), aux(second) {}
+
+    void set_size(int size) {
+        n = size;
+    }
+
+    void clear() {
+        for (int i = 0; i < n; ++i) {
+            fill_n(mat[i], n, 0U);
+        }
+    }
+
+    void identity() {
+        clear();
+        for (int i = 0; i < n; ++i) {
+            mat[i][i] = 1U;
+        }
+    }
+
+    void multiply(const Matrix& rhs) {
+        constexpr int BLOCK = 32;
+        for (int ii = 0; ii < n; ii += BLOCK) {
+            const int i_end = min(ii + BLOCK, n);
+            for (int jj = 0; jj < n; jj += BLOCK) {
+                const int j_end = min(jj + BLOCK, n);
+                for (int i = ii; i < i_end; ++i) {
+                    const u32* source = rhs.mat[i];
+                    for (int j = jj; j < j_end; ++j) {
+                        transposed_rhs[j][i] = source[j];
+                    }
+                }
+            }
+        }
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n >= 96)
+#endif
+        for (int i = 0; i < n; ++i) {
+            const u32* lhs = mat[i];
+            u32* output = aux[i];
+            for (int j = 0; j < n; ++j) {
+                output[j] = dot_mod(lhs, transposed_rhs[j], n);
+            }
+        }
+
+        swap(mat, aux);
+    }
+
+    void power(u64 exponent, Matrix& result) {
+        Matrix* current = this;
+        while (exponent != 0) {
+            if (exponent & 1ULL) {
+                result.multiply(*current);
+            }
+            exponent >>= 1;
+            if (exponent != 0) {
+                current->multiply(*current);
+            }
+        }
+    }
+};
+
+static Matrix transition;
+static Matrix initial;
+static Matrix result;
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n;
+    u64 height;
+    if (!(cin >> n >> height)) {
+        return 0;
+    }
+
+    transition.set_size(n);
+    initial.set_size(n);
+    result.set_size(n);
+
+    vector<u32> base_terms(n);
+    vector<u32> weights(n);
+    for (int i = 0; i < n; ++i) {
+        u64 value;
+        cin >> value;
+        base_terms[i] = static_cast<u32>(value % MOD);
+    }
+    for (int i = 0; i < n; ++i) {
+        u64 value;
+        cin >> value;
+        weights[i] = static_cast<u32>(value % MOD);
+    }
+
+    if (height <= static_cast<u64>(n)) {
+        cout << base_terms[static_cast<size_t>(height - 1)] << '\n';
+        return 0;
+    }
+
+    transition.clear();
+    initial.clear();
+    result.identity();
+
+    for (int j = 0; j < n; ++j) {
+        transition.mat[0][j] = weights[j];
+    }
+    initial.mat[0][0] = base_terms[n - 1];
+
+    for (int i = 1; i < n; ++i) {
+        transition.mat[i][i - 1] = 1U;
+        initial.mat[i][0] = base_terms[n - i - 1];
+    }
+
+    transition.power(height - static_cast<u64>(n), result);
+    result.multiply(initial);
+
+    cout << result.mat[0][0] << '\n';
+    return 0;
+}

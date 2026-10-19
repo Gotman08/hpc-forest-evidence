@@ -1,0 +1,222 @@
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <limits>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+struct adjacency_matrix {
+    int vertices;
+    vector<unsigned char> entries;
+
+    explicit adjacency_matrix(int n)
+        : vertices(n), entries(static_cast<size_t>(n) * static_cast<size_t>(n), 0) {}
+
+    const unsigned char *row(int vertex) const {
+        return entries.data() + static_cast<size_t>(vertex) * static_cast<size_t>(vertices);
+    }
+};
+
+adjacency_matrix readGraph() {
+    int vertices, edges;
+    cin >> vertices;
+    adjacency_matrix graph(vertices);
+    cin >> edges;
+    for (int i = 0; i < edges; ++i) {
+        int source, destination;
+        cin >> source >> destination;
+        graph.entries[static_cast<size_t>(source) * vertices + destination] = 1;
+        graph.entries[static_cast<size_t>(destination) * vertices + source] = 1;
+    }
+    return graph;
+}
+
+class PermutationWriter {
+    static const size_t capacity = 65536;
+    char buffer[capacity];
+    size_t used;
+
+    void flush() {
+        if (used != 0) {
+            cout.write(buffer, static_cast<streamsize>(used));
+            used = 0;
+        }
+    }
+
+    void append(char value) {
+        if (used == capacity)
+            flush();
+        buffer[used++] = value;
+    }
+
+public:
+    PermutationWriter() : used(0) {}
+
+    ~PermutationWriter() {
+        flush();
+    }
+
+    void print(const vector<int> &equivalence) {
+        for (int vertex : equivalence) {
+            unsigned int value = static_cast<unsigned int>(vertex);
+            char digits[numeric_limits<unsigned int>::digits10 + 1];
+            size_t count = 0;
+            do {
+                digits[count++] = static_cast<char>('0' + value % 10);
+                value /= 10;
+            } while (value != 0);
+            while (count != 0)
+                append(digits[--count]);
+            append(' ');
+        }
+        append('\n');
+    }
+};
+
+vector<int> vertexSignatures(const adjacency_matrix &graph) {
+    vector<int> signatures(graph.vertices);
+    for (int i = 0; i < graph.vertices; ++i) {
+        const unsigned char *row = graph.row(i);
+        int population = 0;
+        for (int j = 0; j < graph.vertices; ++j)
+            population += row[j];
+        signatures[i] = 2 * population + row[i];
+    }
+    return signatures;
+}
+
+struct ConstraintRow {
+    int vertex;
+    int begin;
+    int end;
+    unsigned char expected;
+};
+
+struct VerificationPlan {
+    vector<ConstraintRow> rows;
+    vector<int> columns;
+
+    explicit VerificationPlan(const adjacency_matrix &graph) {
+        const int n = graph.vertices;
+        rows.reserve(static_cast<size_t>(n));
+        columns.reserve(graph.entries.size() / 4);
+        for (int i = 0; i < n; ++i) {
+            const unsigned char *source = graph.row(i);
+            int ones = 0;
+            for (int j = i + 1; j < n; ++j)
+                ones += source[j];
+            const int remaining = n - i - 1;
+            const unsigned char expected = ones <= remaining - ones ? 1 : 0;
+            const int begin = static_cast<int>(columns.size());
+            for (int j = i + 1; j < n; ++j) {
+                if (source[j] == expected)
+                    columns.push_back(j);
+            }
+            const int end = static_cast<int>(columns.size());
+            if (begin != end)
+                rows.push_back(ConstraintRow{i, begin, end, expected});
+        }
+    }
+
+    bool verify(const adjacency_matrix &target, const vector<int> &equivalence) const {
+        // All assignments must already match loop status and row population.
+        // Earlier rows establish the entries preceding each row's suffix.
+        // Equal remaining populations make the suffix's majority entries
+        // implicit once every stored minority entry has matched.
+        const unsigned char *base = target.entries.data();
+        const size_t stride = static_cast<size_t>(target.vertices);
+        const int *mapping = equivalence.data();
+        const int *positions = columns.data();
+        for (const ConstraintRow &row : rows) {
+            const unsigned char *target_row =
+                base + static_cast<size_t>(mapping[row.vertex]) * stride;
+            for (int k = row.begin; k < row.end; ++k) {
+                if (target_row[mapping[positions[k]]] != row.expected)
+                    return false;
+            }
+        }
+        return true;
+    }
+};
+
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2) {
+    if (g1.vertices != g2.vertices)
+        return false;
+
+    const int n = g1.vertices;
+    vector<int> equivalence(n);
+    for (int i = 0; i < n; ++i)
+        equivalence[i] = i;
+
+    PermutationWriter output;
+    if (g1.entries == g2.entries) {
+        output.print(equivalence);
+        return true;
+    }
+
+    const vector<int> signatures1 = vertexSignatures(g1);
+    const vector<int> signatures2 = vertexSignatures(g2);
+    vector<int> sorted1 = signatures1;
+    vector<int> sorted2 = signatures2;
+    sort(sorted1.begin(), sorted1.end());
+    sort(sorted2.begin(), sorted2.end());
+    if (sorted1 != sorted2)
+        return false;
+
+    const size_t stride = static_cast<size_t>(n);
+    vector<unsigned char> incompatible(stride * stride);
+    int incompatible_count = 0;
+    for (int i = 0; i < n; ++i) {
+        unsigned char *row = incompatible.data() + static_cast<size_t>(i) * stride;
+        for (int j = 0; j < n; ++j)
+            row[j] = signatures1[i] != signatures2[j];
+        incompatible_count += row[i];
+    }
+
+    const VerificationPlan plan(g1);
+    vector<int> exchange_counter(n, 0);
+    int exchange_index = 1;
+    bool isomorphism_found = false;
+
+    // Preserve the reference's complete Heap sequence after identity fails.
+    while (exchange_index < n) {
+        int &counter = exchange_counter[exchange_index];
+        if (counter < exchange_index) {
+            const int a = (exchange_index & 1) ? counter : 0;
+            const int b = exchange_index;
+            const int old_a = equivalence[a];
+            const int old_b = equivalence[b];
+            const unsigned char *row_a =
+                incompatible.data() + static_cast<size_t>(a) * stride;
+            const unsigned char *row_b =
+                incompatible.data() + static_cast<size_t>(b) * stride;
+            incompatible_count += row_a[old_b] + row_b[old_a]
+                                - row_a[old_a] - row_b[old_b];
+            swap(equivalence[a], equivalence[b]);
+
+            if (incompatible_count == 0 && plan.verify(g2, equivalence)) {
+                output.print(equivalence);
+                isomorphism_found = true;
+            }
+            ++counter;
+            exchange_index = 1;
+        } else {
+            counter = 0;
+            ++exchange_index;
+        }
+    }
+    return isomorphism_found;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    adjacency_matrix g1 = readGraph();
+    adjacency_matrix g2 = readGraph();
+    if (!testIsomorphism(g1, g2))
+        cout << "The graphs are not isomorphic\n";
+    return 0;
+}

@@ -1,0 +1,122 @@
+"""Read only pinned code as data/AST and existing XML; no production import."""
+import ast
+import hashlib
+import json
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
+OWN = Path(__file__).resolve().parent
+HERE = OWN.parent
+OLD = ROOT / "outputs/HPC-Forest-Primes-Natif-Relance-r2e/reception-premier-batch-r1"
+PINS = {"reception_bornee.py": "d17472603acfd4cbff81f998924ec0c31b5628018aef8edec038b5d39a7d5a30",
+        "controler-reception-bornee.py": "444b131dea673cef9af471aa9217da65ad86240b75c362a2b27b7cf1bfeed17f",
+        "collecter-frontiere.py": "c5728e60ea500c577e31a50d266ec6135440a4f3827d096e645688c106df0f43",
+        "preparer-contexte.py": "0211207d6770289609ce7138122965bdd2654d1c32a0a7d0ffe53cee86e2703b",
+        "audit_prive.py": "0d7d141a6bff7ca294e9e8d4d16b53acd2e903e38f59099c838fb2f47a609c97"}
+SEEN = {}
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, expected=None):
+    path = Path(path)
+    assert path.is_file() and not path.is_symlink()
+    raw = path.read_bytes()
+    actual = sha(raw)
+    assert expected is None or actual == expected, (str(path), actual)
+    SEEN[path] = actual
+    return raw
+
+
+def load(path, expected=None):
+    return json.loads(read(path, expected))
+
+
+def functions(raw):
+    return {n.name: ast.dump(n, include_attributes=False) for n in ast.parse(raw).body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def literals(raw, wanted):
+    return {n.targets[0].id: ast.literal_eval(n.value) for n in ast.parse(raw).body
+            if isinstance(n, ast.Assign) and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name) and n.targets[0].id in wanted}
+
+
+def main():
+    baseline_path = OLD / "revue-lecteur/REVUE-LECTEUR-PREMIER-BATCH-SCELLEE.json"
+    baseline_sha = "89ce6515ef0a0c7f03fa8db858fe7d64fd2bf64a020ac5048883ef9a93d20d53"
+    baseline = load(baseline_path, baseline_sha)
+    assert baseline["verified"] is True and baseline["blocking_findings"] == []
+    delta = load(HERE / "DIFF-FERME.json")
+    read(HERE / "deriver-lecteur-froid.py")
+    assert delta["files"] == PINS
+    original, current = {}, {}
+    for name, expected in PINS.items():
+        original[name] = read(OLD / name, baseline["reviewed_files"][name])
+        current[name] = read(HERE / name, expected)
+        assert delta["source_old_files_preserved"][name] == baseline["reviewed_files"][name]
+        transformed = original[name].decode("utf-8")
+        for before, after in {**delta["replacements"], **delta["dynamic_hash_updates"]}.items():
+            transformed = transformed.replace(before, after)
+        assert transformed.encode("utf-8") == current[name], ("Unexpected delta", name)
+    assert current["audit_prive.py"] == original["audit_prive.py"]
+    for name in ("reception_bornee.py", "audit_prive.py", "collecter-frontiere.py", "preparer-contexte.py"):
+        assert functions(current[name]) == functions(original[name])
+    old_control, new_control = functions(original["controler-reception-bornee.py"]), functions(current["controler-reception-bornee.py"])
+    assert set(old_control) == set(new_control)
+    assert [name for name in new_control if old_control[name] != new_control[name]] == ["audit"]
+    for name in ("verify_frozen_authorizations", "check_frozen_identity", "admissible_directory_path", "wire_schema"):
+        assert old_control[name] == new_control[name]
+    for name in PINS:
+        schemas = lambda raw: {n.value for n in ast.walk(ast.parse(raw)) if isinstance(n, ast.Constant)
+                              and isinstance(n.value, str) and n.value.startswith("hpc-forest-r2e-")}
+        assert schemas(original[name]) == schemas(current[name])
+    identity = literals(current["reception_bornee.py"], {"SCOPE", "SOURCE", "PLAN", "CELLS"})
+    assert identity["SCOPE"] == "hpc-forest-primes-native-max-r2f"
+    source_review = load(ROOT / "outputs/HPC-Forest-Primes-Natif-Relance-r2f/revue-independante-source-parser/REVUE-SOURCE-PLAN-PAQUET-R2F-COMPAT-SCELLEE.json", "d0735f9903a185f3678e6584146497a456e3b6f130a629015f0e1dbd4d8a797b")
+    assert identity["SOURCE"] == source_review["source_zip_sha256"] and identity["PLAN"] == source_review["plan_sha256"] and identity["CELLS"] == source_review["cells"]
+    controls = literals(current["controler-reception-bornee.py"], {"HELPER_SHA", "FACTORY_SHA", "PUBLICATION_SHA", "PRIVATE_SHA"})
+    assert controls["HELPER_SHA"] == PINS["reception_bornee.py"] and controls["PRIVATE_SHA"] == PINS["audit_prive.py"]
+    factory = ROOT / "outputs/HPC-Forest-Primes-Natif-Lancement-r2f/revision-r1"
+    read(factory / "preparer-cellule-max.py", controls["FACTORY_SHA"])
+    read(factory / "publication-locale.py", controls["PUBLICATION_SHA"])
+    assert literals(current["preparer-contexte.py"], {"COLLECTOR_SHA"})["COLLECTOR_SHA"] == PINS["collecter-frontiere.py"]
+    read(HERE / "test_delta_lecteur_r2f.py")
+    xml = ET.fromstring(read(HERE / "tests-delta.xml"))
+    cases = list(xml.iter("testcase"))
+    assert len(cases) == 11 and len({(c.get("classname"), c.get("name")) for c in cases}) == 11
+    assert all(not any(c.find(tag) is not None for tag in ("failure", "error", "skipped")) for c in cases)
+    assert all(sha(path.read_bytes()) == expected for path, expected in SEEN.items())
+    report = {"schema": "hpc-forest-r2f-first-batch-cold-reader-independent-code-review-v1", "verified": True, "blocking_findings": [],
+              "verdict": "GO_EXACT_FIVE_CODE_COMPONENTS_ONLY", "reviewed_at_utc": datetime.now(timezone.utc).isoformat(),
+              "reviewed_files": PINS, "scope_id": identity["SCOPE"], "source_zip_sha256": identity["SOURCE"], "plan_sha256": identity["PLAN"], "cells": identity["CELLS"], "source_member_count_required": 109,
+              "baseline_reader_review": {"path": str(baseline_path), "sha256": baseline_sha},
+              "closed_delta_exact": True, "scientific_helper_collector_context_functions_AST_identical": True, "private_auditor_byte_identical": True,
+              "frozen_authorization_identity_path_wire_guards_AST_identical": True,
+              "only_controller_audit_function_changes": ["required source member count 108 to 109", "diagnostic reader revision R2f"],
+              "wire_schemas_R2e_preserved": True, "factory_helper_private_and_collector_SHA_checked_before_their_import": True,
+              "canonical_transfer_boundary_preserved": "Only the exact received /gpfs/scratch/nimarano/SCOPE-SESSION/results-JOB paths proposed by context; no alias rewriting or MCP path-refusal bypass.",
+              "checkpoint_private_digest_and_source_gate_release_proposals_preserved": True,
+              "actual_application_requires_frozen_installation_OAuth_transfers_raw_private_records_checkpoint_and_root_publication": True,
+              "new_qualification_and_real_reception_still_required_before_native_admission": True,
+              "existing_delta_XML_only": {"distinct_passed": 11, "reviewer_replayed": 0}, "old_24_cases_replayed": False,
+              "actual_first_batch_private_argv_or_evaluation_received": False, "native_research_admitted": False, "remote_release_published": False,
+              "reader_factory_sourceworker_cache_CLI_process_census_socket_job_MCP_auth_or_transport_executed": False,
+              "production_files_edited": False, "input_inventory_before_after_equal": True,
+              "manifest_and_instructions_reviewed": False,
+              "scope_limitation": "This receipt seals only the five code pins and closed derivative plus existing 11-case XML evidence. Packaging manifest and instructions are still being finalized by their owner; no future real receipt, transfer, first-batch audit or release is fabricated."}
+    target = OWN / "REVUE-CODE-LECTEUR-R2F-SCELLEE.json"
+    with target.open("x", encoding="utf-8", newline="\n") as handle:
+        json.dump(report, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+    assert all(sha(path.read_bytes()) == expected for path, expected in SEEN.items())
+    print(json.dumps({"verified": True, "blocking_findings": [], "report": str(target), "sha256": sha(target.read_bytes()), "code_components": 5, "existing_XML_cases": 11, "tests_replayed": 0}))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,133 @@
+"""Verify CLI facts and exact declared Windows/POSIX mirrors from actual received bytes."""
+from __future__ import annotations
+
+import re
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+from audit_context import artifact, json_file, need, sha
+
+
+def local_path(value):
+    need(isinstance(value, str) and re.fullmatch(r"[A-Za-z]:", PureWindowsPath(value).drive)
+         and PureWindowsPath(value).is_absolute() and ".." not in PureWindowsPath(value).parts,
+         "exact local Windows drive path required; no UNC, relative or traversal alias")
+    return Path(value)
+
+
+def remote_leaf(value, root):
+    need(isinstance(value, str) and "\\" not in value and ":" not in value
+         and not any(ord(char) < 32 for char in value), "malformed remote admission alias")
+    path = PurePosixPath(value)
+    need(path.is_absolute() and str(path) == value and path.parent == PurePosixPath(root)
+         and path.name not in {".", "..", ""}, "alias leaves the exact selected admission root")
+    return path.name
+
+
+def verify_cli_namespaces(expectation, cell, parsed, authorizations):
+    refs = expectation.get("admission_namespace_aliases")
+    need(isinstance(refs, dict) and set(refs) == {"upload_manifest", "publication", "download_receipt"},
+         "three actual immutable namespace-matrix references required")
+    protected = []
+
+    def proof(ref):
+        candidate = local_path(ref.get("path") if isinstance(ref, dict) else None)
+        need(candidate.is_file() and not candidate.is_symlink() and candidate.stat().st_size <= 128 * 1024**2,
+             "missing, linked or oversized local namespace proof")
+        path = artifact(ref)
+        protected.append((str(path.resolve()), ref["sha256"]))
+        return path
+
+    upload = json_file(proof(refs["upload_manifest"]))
+    publication = json_file(proof(refs["publication"]))
+    downloaded = json_file(proof(refs["download_receipt"]))
+    downloaded = downloaded.get("structuredContent", downloaded)
+    root = "/scratch_p/nimarano/" + cell["scope_id"] + "-admission-" + cell["session_id"]
+    need(upload.get("schema") == "hpc-forest-max-cell-explicit-upload-proposal-v1"
+         and upload.get("job_id") == cell["job_id"], "publication alias matrix belongs to a different job")
+    need(publication.get("schema") == "hpc-forest-max-cell-minimal-directory-publication-v1"
+         and all(publication.get(key) == cell[key] for key in
+                 ("scope_id", "model", "effort", "session_id", "job_id", "source_zip_sha256", "plan_sha256"))
+         and publication.get("remote_root") == root, "publication identity/root differs from the immutable selected cell")
+    need(downloaded.get("ok") is True and downloaded.get("downloaded") == root
+         and downloaded.get("transport") == "scp", "actual directory readback for this exact admission root required")
+    readback = local_path(downloaded.get("to"))
+    need(readback.is_dir() and not readback.is_symlink(), "actual local readback directory missing or linked")
+    declared = publication.get("inventory")
+    need(isinstance(declared, dict) and 1 <= len(declared) <= 64, "bounded exact publication inventory required")
+    expected = dict(declared)
+    extras = {"allocation-ready.json": publication["allocation_marker"], "authorization-ready.json": publication["ready"]["local"]}
+    actual_names = set()
+    for path in readback.iterdir():
+        need(path.is_file() and not path.is_symlink(), "unrecognized readback directory/link")
+        actual_names.add(path.name)
+    need(set(declared) <= actual_names <= set(declared) | set(extras), "readback has missing or unrecognized publication files")
+    for name in actual_names - set(declared):
+        source = proof(extras[name])
+        expected[name] = {"sha256": extras[name]["sha256"], "bytes": source.stat().st_size}
+    total = 0
+    for name, info in expected.items():
+        need(remote_leaf(root + "/" + name, root) == name and isinstance(info, dict)
+             and set(info) == {"sha256", "bytes"} and re.fullmatch(r"[0-9a-f]{64}", info.get("sha256", ""))
+             and type(info.get("bytes")) is int and 0 <= info["bytes"] <= 128 * 1024**2,
+             "unsafe or oversized publication inventory member")
+        path = readback / name
+        need(path.stat().st_size == info["bytes"], "received publication size differs before bounded read")
+        raw = path.read_bytes()
+        total += len(raw)
+        need(len(raw) == info["bytes"] and sha(raw) == info["sha256"] and total <= 256 * 1024**2,
+             "received original publication member SHA/size differs")
+        protected.append((str(path.resolve()), info["sha256"]))
+    aliases = {}
+    dependencies = upload.get("dependencies")
+    need(isinstance(dependencies, list) and 1 <= len(dependencies) <= 64, "bounded declared local/remote dependency aliases required")
+    for entry in dependencies:
+        need(isinstance(entry, dict) and set(entry) == {"remote_path", "local"}, "exact local/remote dependency alias required")
+        name = remote_leaf(entry["remote_path"], root)
+        local = proof(entry["local"])
+        need(entry["remote_path"] not in aliases and name in declared
+             and entry["local"]["sha256"] == declared[name]["sha256"], "duplicate or mismatched publication alias")
+        aliases[entry["remote_path"]] = {"local": local, "sha256": declared[name]["sha256"], "received": readback / name}
+    controller, worker = parsed["controller"]["cli_identity"], parsed["worker"]["cli_identity"]
+    need({key: value for key, value in controller.items() if key != "evidence_refs"}
+         == {key: value for key, value in worker.items() if key != "evidence_refs"},
+         "controller/worker effective CLI facts or immutable metadata differ")
+    # Actual actors are immutable: the ARM controller uses POSIX admissions;
+    # the local Windows worker uses its original Windows admissions.
+    original_controller = authorizations["controller"]["artifacts"]["cli_identity"]
+    remote_leaf(original_controller["path"], root)
+    cli_alias = aliases.get(original_controller["path"])
+    need(cli_alias is not None and original_controller["sha256"] == cli_alias["sha256"]
+         and json_file(cli_alias["received"]) == controller,
+         "controller CLI identity is not the actual received POSIX mirror")
+    original_worker = authorizations["worker"]["artifacts"]["cli_identity"]
+    need(json_file(proof(original_worker)) == worker,
+         "worker CLI identity differs from its exact original Windows bytes")
+    left, right = worker.get("evidence_refs"), controller.get("evidence_refs")
+    need(isinstance(left, list) and isinstance(right, list) and 1 <= len(left) == len(right) <= 16,
+         "exact nonempty paired CLI evidence references required")
+    seen = set()
+    for local_ref, remote_ref in zip(left, right, strict=True):
+        need(isinstance(remote_ref, dict) and set(remote_ref) == {"path", "sha256"}
+             and isinstance(remote_ref["path"], str), "exact POSIX CLI evidence ref required")
+        alias = aliases.get(remote_ref["path"])
+        local = proof(local_ref)
+        need(alias is not None and remote_ref["path"] not in seen
+             and PureWindowsPath(local_ref["path"]) == PureWindowsPath(str(alias["local"]))
+             and local_ref["sha256"] == remote_ref["sha256"] == alias["sha256"],
+             "CLI evidence refs are not exact separately verified Windows/POSIX aliases")
+        seen.add(remote_ref["path"])
+        evidence = json_file(local)
+        need(evidence == json_file(alias["received"])
+             and evidence.get("schema") == "hpc-forest-max-cell-cli-files-rehash-v1"
+             and evidence.get("verified") is True and evidence.get("authentication_exported") is False
+             and evidence.get("cli_executed") is False
+             and all(evidence.get(key) == worker.get(key) for key in
+                     ("version", "executable_path", "executable_sha256", "files")),
+             "actual received CLI evidence facts differ from the immutable identity")
+    return tuple(sorted(set(protected))), {"effective_cli_facts_identical": True,
+        "controller_namespace": "romeo-posix", "worker_namespace": "windows-local",
+        "first_start_admission_actor": "controller",
+        "paired_windows_posix_evidence_refs_verified": len(left), "declared_dependency_aliases_verified": len(aliases),
+        "received_publication_members_verified": len(expected), "directory_tool_hash_verification_assumed": False,
+        "actual_received_member_sha256_recomputed": True, "remote_paths_followed_locally": False,
+        "external_cli_executable_bytes_independently_verified": False}

@@ -1,0 +1,394 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10
+#define DT 0.01f
+#define SOFTENING 1e-9f
+#define PAIR_TILE 32
+#define PAIR_CACHE_BYTES (64u * 1024u * 1024u)
+#define PAIR_CACHE_ALIGNMENT 128u
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+typedef struct { float x, y, z; } Position;
+
+typedef struct {
+  Position *positions;
+  float *coefficients;
+  void *coefficient_allocation;
+  size_t coefficient_stride;
+} ForceWorkspace;
+
+static inline float inverse_cube(float dx, float dy, float dz) {
+  float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+  float inv_dist = 1 / sqrt(sqrd_dist);
+  return inv_dist * inv_dist * inv_dist;
+}
+
+/* Allocation-free reference fallback. */
+static void body_force_unpacked(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+    for (int j = 0; j < n; ++j) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float scale = inverse_cube(dx, dy, dz);
+      fx += dx * scale;
+      fy += dy * scale;
+      fz += dz * scale;
+    }
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline __attribute__((always_inline))
+float32x4_t reference_inv_dist4(float32x4_t distance) {
+  const float64x2_t one = vdupq_n_f64(1.0);
+  float64x2_t low = vcvt_f64_f32(vget_low_f32(distance));
+  float64x2_t high = vcvt_f64_f32(vget_high_f32(distance));
+  low = vdivq_f64(one, vsqrtq_f64(low));
+  high = vdivq_f64(one, vsqrtq_f64(high));
+  return vcombine_f32(vcvt_f32_f64(low), vcvt_f32_f64(high));
+}
+
+static inline __attribute__((always_inline))
+float32x4_t inverse_cube4(float32x4_t dx, float32x4_t dy,
+                         float32x4_t dz) {
+  const float32x4_t softening = vdupq_n_f32(SOFTENING);
+  float32x4_t distance = dx*dx + dy*dy + dz*dz + softening;
+  float32x4_t inv = reference_inv_dist4(distance);
+  return inv * inv * inv;
+}
+#endif
+
+static inline void mirror_coefficient(const Position *src, float *coefficients,
+                                      size_t stride, int i, int j,
+                                      float scale) {
+  if (i != j) {
+    if (isnan(scale)) {
+      scale = inverse_cube(src[i].x - src[j].x,
+                           src[i].y - src[j].y,
+                           src[i].z - src[j].z);
+    }
+    coefficients[(size_t)j * stride + (size_t)i] = scale;
+  }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline __attribute__((always_inline))
+void fill_four_coefficients(const Position *src, float *coefficients,
+                            size_t stride, int i, int j) {
+  const float32x4_t xj = {src[j].x, src[j+1].x, src[j+2].x, src[j+3].x};
+  const float32x4_t yj = {src[j].y, src[j+1].y, src[j+2].y, src[j+3].y};
+  const float32x4_t zj = {src[j].z, src[j+1].z, src[j+2].z, src[j+3].z};
+  float32x4_t scale = inverse_cube4(xj - vdupq_n_f32(src[i].x),
+                                   yj - vdupq_n_f32(src[i].y),
+                                   zj - vdupq_n_f32(src[i].z));
+  vst1q_f32(coefficients + (size_t)i * stride + (size_t)j, scale);
+  mirror_coefficient(src, coefficients, stride, i, j,
+                     vgetq_lane_f32(scale, 0));
+  mirror_coefficient(src, coefficients, stride, i, j+1,
+                     vgetq_lane_f32(scale, 1));
+  mirror_coefficient(src, coefficients, stride, i, j+2,
+                     vgetq_lane_f32(scale, 2));
+  mirror_coefficient(src, coefficients, stride, i, j+3,
+                     vgetq_lane_f32(scale, 3));
+}
+#endif
+
+/* One work item owns an upper-triangular tile and its transpose. */
+static inline void fill_coefficient_tile(const Position *src,
+                                         float *coefficients, size_t stride,
+                                         int n, int nblocks, size_t tile) {
+  int lo = 0;
+  int hi = nblocks;
+  while (lo + 1 < hi) {
+    int mid = lo + (hi - lo) / 2;
+    size_t base = (size_t)mid *
+                  (2u * (size_t)nblocks - (size_t)mid + 1u) / 2u;
+    if (base <= tile)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  size_t base = (size_t)lo *
+                (2u * (size_t)nblocks - (size_t)lo + 1u) / 2u;
+  int block_i = lo;
+  int block_j = lo + (int)(tile - base);
+  int i_begin = block_i * PAIR_TILE;
+  int j_begin = block_j * PAIR_TILE;
+  int i_end = i_begin + PAIR_TILE;
+  int j_end = j_begin + PAIR_TILE;
+  if (i_end > n) i_end = n;
+  if (j_end > n) j_end = n;
+
+  for (int i = i_begin; i < i_end; ++i) {
+    int j = block_i == block_j ? i : j_begin;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    for (; j_end - j >= 12; j += 12) {
+      fill_four_coefficients(src, coefficients, stride, i, j);
+      fill_four_coefficients(src, coefficients, stride, i, j+4);
+      fill_four_coefficients(src, coefficients, stride, i, j+8);
+    }
+    for (; j_end - j >= 4; j += 4) {
+      fill_four_coefficients(src, coefficients, stride, i, j);
+    }
+#endif
+    for (; j < j_end; ++j) {
+      float dx = src[j].x - src[i].x;
+      float dy = src[j].y - src[i].y;
+      float dz = src[j].z - src[i].z;
+      float scale = inverse_cube(dx, dy, dz);
+      coefficients[(size_t)i * stride + (size_t)j] = scale;
+      mirror_coefficient(src, coefficients, stride, i, j, scale);
+    }
+  }
+}
+
+static inline void force_one(const Position *src, Body *p,
+                              const float *coefficients, size_t stride,
+                              float dt, int n, int i) {
+  const float *row = coefficients ? coefficients + (size_t)i * stride : NULL;
+  float xi = src[i].x;
+  float yi = src[i].y;
+  float zi = src[i].z;
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+  for (int j = 0; j < n; ++j) {
+    float dx = src[j].x - xi;
+    float dy = src[j].y - yi;
+    float dz = src[j].z - zi;
+    float scale = row ? row[j] : inverse_cube(dx, dy, dz);
+    fx += dx * scale;
+    fy += dy * scale;
+    fz += dz * scale;
+  }
+  p[i].vx += dt*fx;
+  p[i].vy += dt*fy;
+  p[i].vz += dt*fz;
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline __attribute__((always_inline))
+float32x4_t load_coefficient4(const float *r0, const float *r1,
+                              const float *r2, const float *r3, int j) {
+  return (float32x4_t){r0[j], r1[j], r2[j], r3[j]};
+}
+
+static inline void force_four(const Position *src, Body *p,
+                               const float *coefficients, size_t stride,
+                               float dt, int n, int i) {
+  const float32x4_t x = {src[i].x, src[i+1].x, src[i+2].x, src[i+3].x};
+  const float32x4_t y = {src[i].y, src[i+1].y, src[i+2].y, src[i+3].y};
+  const float32x4_t z = {src[i].z, src[i+1].z, src[i+2].z, src[i+3].z};
+  const float *r0 = coefficients ? coefficients + (size_t)i * stride : NULL;
+  const float *r1 = r0 ? r0 + stride : NULL;
+  const float *r2 = r1 ? r1 + stride : NULL;
+  const float *r3 = r2 ? r2 + stride : NULL;
+  float32x4_t fx = vdupq_n_f32(0.0f);
+  float32x4_t fy = vdupq_n_f32(0.0f);
+  float32x4_t fz = vdupq_n_f32(0.0f);
+  const int source_end = n - n % 3;
+  int j = 0;
+
+  /* Each SIMD lane accumulates one target in ascending source order. */
+  for (; j < source_end; j += 3) {
+    float32x4_t dx0 = vdupq_n_f32(src[j].x) - x;
+    float32x4_t dy0 = vdupq_n_f32(src[j].y) - y;
+    float32x4_t dz0 = vdupq_n_f32(src[j].z) - z;
+    float32x4_t dx1 = vdupq_n_f32(src[j+1].x) - x;
+    float32x4_t dy1 = vdupq_n_f32(src[j+1].y) - y;
+    float32x4_t dz1 = vdupq_n_f32(src[j+1].z) - z;
+    float32x4_t dx2 = vdupq_n_f32(src[j+2].x) - x;
+    float32x4_t dy2 = vdupq_n_f32(src[j+2].y) - y;
+    float32x4_t dz2 = vdupq_n_f32(src[j+2].z) - z;
+    float32x4_t scale0, scale1, scale2;
+    if (r0 != NULL) {
+      scale0 = load_coefficient4(r0, r1, r2, r3, j);
+      scale1 = load_coefficient4(r0, r1, r2, r3, j+1);
+      scale2 = load_coefficient4(r0, r1, r2, r3, j+2);
+    } else {
+      scale0 = inverse_cube4(dx0, dy0, dz0);
+      scale1 = inverse_cube4(dx1, dy1, dz1);
+      scale2 = inverse_cube4(dx2, dy2, dz2);
+    }
+    fx += dx0 * scale0;
+    fy += dy0 * scale0;
+    fz += dz0 * scale0;
+    fx += dx1 * scale1;
+    fy += dy1 * scale1;
+    fz += dz1 * scale1;
+    fx += dx2 * scale2;
+    fy += dy2 * scale2;
+    fz += dz2 * scale2;
+  }
+  for (; j < n; ++j) {
+    float32x4_t dx = vdupq_n_f32(src[j].x) - x;
+    float32x4_t dy = vdupq_n_f32(src[j].y) - y;
+    float32x4_t dz = vdupq_n_f32(src[j].z) - z;
+    float32x4_t scale;
+    if (r0 != NULL)
+      scale = load_coefficient4(r0, r1, r2, r3, j);
+    else
+      scale = inverse_cube4(dx, dy, dz);
+    fx += dx * scale;
+    fy += dy * scale;
+    fz += dz * scale;
+  }
+  p[i].vx += dt*vgetq_lane_f32(fx, 0);
+  p[i].vy += dt*vgetq_lane_f32(fy, 0);
+  p[i].vz += dt*vgetq_lane_f32(fz, 0);
+  p[i+1].vx += dt*vgetq_lane_f32(fx, 1);
+  p[i+1].vy += dt*vgetq_lane_f32(fy, 1);
+  p[i+1].vz += dt*vgetq_lane_f32(fz, 1);
+  p[i+2].vx += dt*vgetq_lane_f32(fx, 2);
+  p[i+2].vy += dt*vgetq_lane_f32(fy, 2);
+  p[i+2].vz += dt*vgetq_lane_f32(fz, 2);
+  p[i+3].vx += dt*vgetq_lane_f32(fx, 3);
+  p[i+3].vy += dt*vgetq_lane_f32(fy, 3);
+  p[i+3].vz += dt*vgetq_lane_f32(fz, 3);
+}
+#endif
+
+static ForceWorkspace create_workspace(int n) {
+  ForceWorkspace work = {NULL, NULL, NULL, 0};
+  if (n <= 0 || (size_t)n > (size_t)-1 / sizeof(Position)) return work;
+  size_t count = (size_t)n;
+  work.positions = (Position *)malloc(count * sizeof(Position));
+  if (work.positions == NULL) return work;
+
+  work.coefficient_stride =
+      ((count + (size_t)PAIR_TILE - 1u) / (size_t)PAIR_TILE) *
+      (size_t)PAIR_TILE;
+  if (work.coefficient_stride <=
+      ((size_t)PAIR_CACHE_BYTES / sizeof(float)) / count) {
+    size_t bytes = count * work.coefficient_stride * sizeof(float);
+    work.coefficient_allocation =
+        malloc(bytes + (size_t)PAIR_CACHE_ALIGNMENT - 1u);
+    if (work.coefficient_allocation != NULL) {
+      uintptr_t address = (uintptr_t)work.coefficient_allocation;
+      address = (address + (uintptr_t)PAIR_CACHE_ALIGNMENT - 1u) &
+                ~((uintptr_t)PAIR_CACHE_ALIGNMENT - 1u);
+      work.coefficients = (float *)address;
+    }
+  }
+  return work;
+}
+
+static void destroy_workspace(ForceWorkspace *work) {
+  free(work->coefficient_allocation);
+  free(work->positions);
+}
+
+static void body_force_workspace(Body *p, float dt, int n,
+                                  ForceWorkspace *work) {
+  Position *positions = work->positions;
+  if (positions == NULL) {
+    body_force_unpacked(p, dt, n);
+    return;
+  }
+  for (int i = 0; i < n; ++i) {
+    positions[i].x = p[i].x;
+    positions[i].y = p[i].y;
+    positions[i].z = p[i].z;
+  }
+
+  float *coefficients = work->coefficients;
+  size_t stride = work->coefficient_stride;
+  if (coefficients != NULL) {
+    int nblocks = n / PAIR_TILE + (n % PAIR_TILE != 0);
+    size_t ntiles = (size_t)nblocks * ((size_t)nblocks + 1u) / 2u;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(n >= 256)
+#endif
+    for (size_t tile = 0; tile < ntiles; ++tile) {
+      fill_coefficient_tile(positions, coefficients, stride, n, nblocks, tile);
+    }
+  }
+
+  const int nblocks = n / 4;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(n >= 256)
+#endif
+  for (int block = 0; block < nblocks; ++block) {
+    int i = block * 4;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    force_four(positions, p, coefficients, stride, dt, n, i);
+#else
+    for (int lane = 0; lane < 4; ++lane) {
+      force_one(positions, p, coefficients, stride, dt, n, i + lane);
+    }
+#endif
+  }
+  for (int i = nblocks * 4; i < n; ++i) {
+    force_one(positions, p, coefficients, stride, dt, n, i);
+  }
+}
+
+void body_force(Body *p, float dt, int n) {
+  if (n <= 0) return;
+  ForceWorkspace work = create_workspace(n);
+  body_force_workspace(p, dt, n, &work);
+  destroy_workspace(&work);
+}
+
+static void simulate(Body *p, float dt, int n) {
+  if (n <= 0) return;
+  ForceWorkspace work = create_workspace(n);
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force_workspace(p, dt, n, &work);
+    for (int i = 0; i < n; ++i) {
+      p[i].x += p[i].vx * dt;
+      p[i].y += p[i].vy * dt;
+      p[i].z += p[i].vz * dt;
+    }
+  }
+  destroy_workspace(&work);
+}
+
+/* Read a binary dataset with initialized bodies. */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+  return bodies;
+}
+
+/* Write simulation results into a binary dataset. */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+  simulate(bodies, DT, nbodies);
+  write_dataset(nbodies, bodies);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

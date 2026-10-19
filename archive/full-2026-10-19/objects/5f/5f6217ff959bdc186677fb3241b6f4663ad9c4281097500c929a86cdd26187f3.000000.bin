@@ -1,0 +1,193 @@
+#include <iostream>
+#include <vector>
+#include <utility>
+#include <cstddef>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+struct adjacency_matrix {
+    size_t vertices;
+    size_t stride;
+    vector<unsigned char> entries;
+
+    explicit adjacency_matrix(int count)
+        : vertices(static_cast<size_t>(count)),
+          stride(((vertices + 15) / 16) * 16),
+          entries(vertices * stride, 0) {}
+
+    size_t size() const {
+        return vertices;
+    }
+
+    unsigned char *operator[](size_t row) {
+        return entries.data() + row * stride;
+    }
+
+    const unsigned char *operator[](size_t row) const {
+        return entries.data() + row * stride;
+    }
+};
+
+adjacency_matrix readGraph();
+bool testIsomorphism(adjacency_matrix &g1, adjacency_matrix &g2);
+
+int main(){
+    adjacency_matrix g1 = readGraph();
+    adjacency_matrix g2 = readGraph();
+
+    if(!testIsomorphism(g1, g2))
+        cout << "The graphs are not isomorphic" << endl;
+
+    return 0;
+}
+
+adjacency_matrix readGraph(){
+    int vertices, edges, source, destination;
+
+    cin >> vertices;
+    adjacency_matrix read(vertices);
+
+    cin >> edges;
+    for (int i = 0; i < edges; i++) {
+        cin >> source >> destination;
+        read[destination][source] = read[source][destination] = 1;
+    }
+
+    return read;
+}
+
+bool verifyPermutation(const adjacency_matrix &g1,
+                       const adjacency_matrix &g2,
+                       const vector<int> &equivalence,
+                       size_t &mismatch_row,
+                       size_t &mismatch_column){
+    for (size_t i = g1.size(); i > 0; --i) {
+        const size_t row = i - 1;
+        const unsigned char *row1 = g1[row];
+        const unsigned char *row2 = g2[equivalence[row]];
+        for (size_t j = i; j > 0; --j) {
+            const size_t column = j - 1;
+            if (row1[column] != row2[equivalence[column]]) {
+                mismatch_row = row;
+                mismatch_column = column;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+bool verifyPermutation(const adjacency_matrix &g1,
+                       const adjacency_matrix &g2,
+                       const vector<unsigned char> &equivalence,
+                       size_t &mismatch_row,
+                       size_t &mismatch_column){
+    static const unsigned char column_labels[16] = {
+        1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 11, 12, 13, 14, 15, 16
+    };
+    const uint8x16_t labels = vld1q_u8(column_labels);
+    const uint8x16_t indices = vld1q_u8(equivalence.data());
+    for (size_t i = g1.size(); i > 0; --i) {
+        const size_t row = i - 1;
+        const uint8x16_t expected = vld1q_u8(g1[row]);
+        const uint8x16_t source = vld1q_u8(g2[equivalence[row]]);
+        const uint8x16_t actual = vqtbl1q_u8(source, indices);
+        const uint8x16_t mismatch_labels =
+            vbicq_u8(labels, vceqq_u8(expected, actual));
+        const unsigned int last_mismatch = vmaxvq_u8(mismatch_labels);
+        if (last_mismatch != 0) {
+            mismatch_row = row;
+            mismatch_column = static_cast<size_t>(last_mismatch - 1);
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+template <typename Index>
+inline void printPermutation(const vector<Index> &equivalence, size_t vertices){
+    for (size_t i = 0; i < vertices; ++i)
+        cout << static_cast<int>(equivalence[i]) << " ";
+    cout << endl;
+}
+
+template <typename Index>
+bool enumeratePermutations(const adjacency_matrix &g1,
+                           const adjacency_matrix &g2){
+    const size_t vertices = g1.size();
+    // TBL returns zero for the inactive lanes, matching the zero row padding.
+    vector<Index> equivalence(vertices < 16 ? 16 : vertices,
+                              static_cast<Index>(255));
+    vector<size_t> exchange_counter(vertices, 0);
+    size_t exchange_index = 1;
+    bool isomorphism_found = false;
+    size_t mismatch_row = 0;
+    size_t mismatch_column = 0;
+
+    for (size_t i = 0; i < vertices; ++i)
+        equivalence[i] = static_cast<Index>(i);
+
+    if (verifyPermutation(g1, g2, equivalence,
+                          mismatch_row, mismatch_column)) {
+        printPermutation(equivalence, vertices);
+        return true;
+    }
+    bool witness_valid = true;
+
+    /* Preserve Heap's permutation sequence and print every nonidentity match. */
+    while (exchange_index < vertices) {
+        if (exchange_counter[exchange_index] < exchange_index) {
+            const size_t partner = exchange_index % 2 == 0
+                ? 0 : exchange_counter[exchange_index];
+            swap(equivalence[partner], equivalence[exchange_index]);
+
+            // A mismatched pair remains mismatched if neither image changes.
+            const bool witness_touched =
+                mismatch_row == partner ||
+                mismatch_row == exchange_index ||
+                mismatch_column == partner ||
+                mismatch_column == exchange_index;
+
+            if (!witness_valid || witness_touched) {
+                witness_valid =
+                    g1[mismatch_row][mismatch_column] !=
+                    g2[equivalence[mismatch_row]][equivalence[mismatch_column]];
+                if (!witness_valid) {
+                    witness_valid = !verifyPermutation(
+                        g1, g2, equivalence, mismatch_row, mismatch_column);
+                    if (!witness_valid) {
+                        printPermutation(equivalence, vertices);
+                        isomorphism_found = true;
+                    }
+                }
+            }
+
+            ++exchange_counter[exchange_index];
+            exchange_index = 1;
+        } else {
+            exchange_counter[exchange_index] = 0;
+            ++exchange_index;
+        }
+    }
+    return isomorphism_found;
+}
+
+bool testIsomorphism(adjacency_matrix &g1, adjacency_matrix &g2){
+    if (g1.size() != g2.size()) return false;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    // One NEON table covers up to 16 vertices. Symmetry makes full-row
+    // comparisons equivalent to checking the original lower triangle.
+    if (g1.size() <= 16)
+        return enumeratePermutations<unsigned char>(g1, g2);
+#endif
+
+    return enumeratePermutations<int>(g1, g2);
+}

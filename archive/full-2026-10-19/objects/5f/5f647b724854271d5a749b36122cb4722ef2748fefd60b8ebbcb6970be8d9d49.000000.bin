@@ -1,0 +1,466 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define SOURCE_BLOCK 128
+#define PAIR_TILE 32
+#define PAIR_CACHE_BYTES (64u * 1024u * 1024u)
+#define PAIR_CACHE_ALIGNMENT 128u
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("no-math-errno")
+#endif
+
+/* Original single-step interface, also used on allocation failure. */
+void body_force(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; j++) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+static inline float inverse_cube(float dx, float dy, float dz) {
+  float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+  float inv_dist = 1 / sqrt(sqrd_dist);
+  return inv_dist * inv_dist * inv_dist;
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+/* Match the reference's double sqrt/division and subsequent float rounding. */
+static inline __attribute__((always_inline))
+float32x4_t reference_inv_dist4(float32x4_t distance) {
+  const float64x2_t one = vdupq_n_f64(1.0);
+  float64x2_t low = vcvt_f64_f32(vget_low_f32(distance));
+  float64x2_t high = vcvt_f64_f32(vget_high_f32(distance));
+  low = vdivq_f64(one, vsqrtq_f64(low));
+  high = vdivq_f64(one, vsqrtq_f64(high));
+  return vcombine_f32(vcvt_f32_f64(low), vcvt_f32_f64(high));
+}
+
+static inline __attribute__((always_inline))
+float32x4_t inverse_cube4(float32x4_t distance) {
+  float32x4_t inv_dist = reference_inv_dist4(distance);
+  return inv_dist * inv_dist * inv_dist;
+}
+
+static inline __attribute__((always_inline))
+float32x4_t squared_distance4(const float *x, const float *y,
+                             const float *z, int j,
+                             float32x4_t xi, float32x4_t yi,
+                             float32x4_t zi) {
+  float32x4_t dx = vld1q_f32(x + j) - xi;
+  float32x4_t dy = vld1q_f32(y + j) - yi;
+  float32x4_t dz = vld1q_f32(z + j) - zi;
+  return dx*dx + dy*dy + dz*dz + vdupq_n_f32(SOFTENING);
+}
+#endif
+
+/* Each work item owns one upper-triangular tile and its transpose. */
+static inline void fill_coefficient_tile(const float *x, const float *y,
+                                         const float *z, float *coefficients,
+                                         size_t coefficient_stride,
+                                         int n, int nblocks, size_t tile) {
+  int lo = 0;
+  int hi = nblocks;
+  while (lo + 1 < hi) {
+    int mid = lo + (hi - lo) / 2;
+    size_t base = (size_t)mid *
+                  (2u * (size_t)nblocks - (size_t)mid + 1u) / 2u;
+    if (base <= tile)
+      lo = mid;
+    else
+      hi = mid;
+  }
+
+  size_t base = (size_t)lo *
+                (2u * (size_t)nblocks - (size_t)lo + 1u) / 2u;
+  int block_i = lo;
+  int block_j = lo + (int)(tile - base);
+  int i_begin = block_i * PAIR_TILE;
+  int j_begin = block_j * PAIR_TILE;
+  int i_end = n - i_begin < PAIR_TILE ? n : i_begin + PAIR_TILE;
+  int j_end = n - j_begin < PAIR_TILE ? n : j_begin + PAIR_TILE;
+
+  for (int i = i_begin; i < i_end; ++i) {
+    const float xi = x[i];
+    const float yi = y[i];
+    const float zi = z[i];
+    float *row = coefficients + (size_t)i * coefficient_stride;
+    int first_j = block_i == block_j ? i : j_begin;
+    int j = first_j;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const float32x4_t xi4 = vdupq_n_f32(xi);
+    const float32x4_t yi4 = vdupq_n_f32(yi);
+    const float32x4_t zi4 = vdupq_n_f32(zi);
+
+    /* Three independent source vectors expose sqrt/division overlap. */
+    for (; j_end - j >= 12; j += 12) {
+      float32x4_t d0 = squared_distance4(x, y, z, j, xi4, yi4, zi4);
+      float32x4_t d1 = squared_distance4(x, y, z, j + 4, xi4, yi4, zi4);
+      float32x4_t d2 = squared_distance4(x, y, z, j + 8, xi4, yi4, zi4);
+      float32x4_t c0 = inverse_cube4(d0);
+      float32x4_t c1 = inverse_cube4(d1);
+      float32x4_t c2 = inverse_cube4(d2);
+      vst1q_f32(row + j, c0);
+      vst1q_f32(row + j + 4, c1);
+      vst1q_f32(row + j + 8, c2);
+    }
+    for (; j_end - j >= 4; j += 4) {
+      float32x4_t distance = squared_distance4(x, y, z, j, xi4, yi4, zi4);
+      vst1q_f32(row + j, inverse_cube4(distance));
+    }
+#endif
+
+    for (; j < j_end; ++j) {
+      row[j] = inverse_cube(x[j] - xi, y[j] - yi, z[j] - zi);
+    }
+
+    for (j = first_j; j < j_end; ++j) {
+      if (i != j) {
+        float reverse = row[j];
+        if (isnan(reverse)) {
+          reverse = inverse_cube(xi - x[j], yi - y[j], zi - z[j]);
+        }
+        coefficients[(size_t)j * coefficient_stride + (size_t)i] = reverse;
+      }
+    }
+  }
+}
+
+static inline void advance_pair(const Body *src, Body *dst,
+                                const float *x, const float *y, const float *z,
+                                const float *coefficients,
+                                size_t coefficient_stride,
+                                float dt, int n, int pair) {
+  const int i0 = 2 * pair;
+  const int i1 = i0 + 1 < n ? i0 + 1 : i0;
+  const float xi0 = x[i0];
+  const float yi0 = y[i0];
+  const float zi0 = z[i0];
+  const float xi1 = x[i1];
+  const float yi1 = y[i1];
+  const float zi1 = z[i1];
+  float fx0 = 0.0f;
+  float fy0 = 0.0f;
+  float fz0 = 0.0f;
+  float fx1 = 0.0f;
+  float fy1 = 0.0f;
+  float fz1 = 0.0f;
+
+  if (coefficients != NULL) {
+    const float *row0 = coefficients + (size_t)i0 * coefficient_stride;
+    const float *row1 = coefficients + (size_t)i1 * coefficient_stride;
+    for (int jb = 0; jb < n; ) {
+      int count = n - jb;
+      if (count > SOURCE_BLOCK) count = SOURCE_BLOCK;
+      for (int k = 0; k < count; ++k) {
+        const int j = jb + k;
+        const float xj = x[j];
+        const float yj = y[j];
+        const float zj = z[j];
+        float dx0 = xj - xi0;
+        float dy0 = yj - yi0;
+        float dz0 = zj - zi0;
+        float dx1 = xj - xi1;
+        float dy1 = yj - yi1;
+        float dz1 = zj - zi1;
+        float inv_dist30 = row0[j];
+        float inv_dist31 = row1[j];
+        fx0 += dx0 * inv_dist30;
+        fy0 += dy0 * inv_dist30;
+        fz0 += dz0 * inv_dist30;
+        fx1 += dx1 * inv_dist31;
+        fy1 += dy1 * inv_dist31;
+        fz1 += dz1 * inv_dist31;
+      }
+      jb += count;
+    }
+  } else {
+    float dx0[SOURCE_BLOCK];
+    float dy0[SOURCE_BLOCK];
+    float dz0[SOURCE_BLOCK];
+    float inv_dist30[SOURCE_BLOCK];
+    float dx1[SOURCE_BLOCK];
+    float dy1[SOURCE_BLOCK];
+    float dz1[SOURCE_BLOCK];
+    float inv_dist31[SOURCE_BLOCK];
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const float32x4_t xi04 = vdupq_n_f32(xi0);
+    const float32x4_t yi04 = vdupq_n_f32(yi0);
+    const float32x4_t zi04 = vdupq_n_f32(zi0);
+    const float32x4_t xi14 = vdupq_n_f32(xi1);
+    const float32x4_t yi14 = vdupq_n_f32(yi1);
+    const float32x4_t zi14 = vdupq_n_f32(zi1);
+    const float32x4_t softening = vdupq_n_f32(SOFTENING);
+#endif
+
+    for (int jb = 0; jb < n; ) {
+      int count = n - jb;
+      if (count > SOURCE_BLOCK) count = SOURCE_BLOCK;
+      int k = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+      for (; count - k >= 4; k += 4) {
+        float32x4_t xj = vld1q_f32(x + jb + k);
+        float32x4_t yj = vld1q_f32(y + jb + k);
+        float32x4_t zj = vld1q_f32(z + jb + k);
+        float32x4_t ddx0 = xj - xi04;
+        float32x4_t ddy0 = yj - yi04;
+        float32x4_t ddz0 = zj - zi04;
+        float32x4_t ddx1 = xj - xi14;
+        float32x4_t ddy1 = yj - yi14;
+        float32x4_t ddz1 = zj - zi14;
+        float32x4_t d0 = ddx0*ddx0 + ddy0*ddy0 + ddz0*ddz0 + softening;
+        float32x4_t d1 = ddx1*ddx1 + ddy1*ddy1 + ddz1*ddz1 + softening;
+        float32x4_t c0 = inverse_cube4(d0);
+        float32x4_t c1 = inverse_cube4(d1);
+        vst1q_f32(dx0 + k, ddx0);
+        vst1q_f32(dy0 + k, ddy0);
+        vst1q_f32(dz0 + k, ddz0);
+        vst1q_f32(inv_dist30 + k, c0);
+        vst1q_f32(dx1 + k, ddx1);
+        vst1q_f32(dy1 + k, ddy1);
+        vst1q_f32(dz1 + k, ddz1);
+        vst1q_f32(inv_dist31 + k, c1);
+      }
+#endif
+#ifdef _OPENMP
+#pragma omp simd
+#elif defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+      for (int t = k; t < count; ++t) {
+        const float xj = x[jb + t];
+        const float yj = y[jb + t];
+        const float zj = z[jb + t];
+        float ddx0 = xj - xi0;
+        float ddy0 = yj - yi0;
+        float ddz0 = zj - zi0;
+        float ddx1 = xj - xi1;
+        float ddy1 = yj - yi1;
+        float ddz1 = zj - zi1;
+        dx0[t] = ddx0;
+        dy0[t] = ddy0;
+        dz0[t] = ddz0;
+        inv_dist30[t] = inverse_cube(ddx0, ddy0, ddz0);
+        dx1[t] = ddx1;
+        dy1[t] = ddy1;
+        dz1[t] = ddz1;
+        inv_dist31[t] = inverse_cube(ddx1, ddy1, ddz1);
+      }
+
+      /* Keep each target's additions in ascending source order. */
+      for (int t = 0; t < count; ++t) {
+        fx0 += dx0[t] * inv_dist30[t];
+        fy0 += dy0[t] * inv_dist30[t];
+        fz0 += dz0[t] * inv_dist30[t];
+        fx1 += dx1[t] * inv_dist31[t];
+        fy1 += dy1[t] * inv_dist31[t];
+        fz1 += dz1[t] * inv_dist31[t];
+      }
+      jb += count;
+    }
+  }
+
+  float vx0 = src[i0].vx + dt*fx0;
+  float vy0 = src[i0].vy + dt*fy0;
+  float vz0 = src[i0].vz + dt*fz0;
+  dst[i0].vx = vx0;
+  dst[i0].vy = vy0;
+  dst[i0].vz = vz0;
+  dst[i0].x = xi0 + vx0*dt;
+  dst[i0].y = yi0 + vy0*dt;
+  dst[i0].z = zi0 + vz0*dt;
+  if (i1 != i0) {
+    float vx1 = src[i1].vx + dt*fx1;
+    float vy1 = src[i1].vy + dt*fy1;
+    float vz1 = src[i1].vz + dt*fz1;
+    dst[i1].vx = vx1;
+    dst[i1].vy = vy1;
+    dst[i1].vz = vz1;
+    dst[i1].x = xi1 + vx1*dt;
+    dst[i1].y = yi1 + vy1*dt;
+    dst[i1].z = zi1 + vz1*dt;
+  }
+}
+
+static void simulate(Body *p, float dt, int n) {
+  if (n <= 0) return;
+
+  const size_t count = (size_t)n;
+  const size_t position_stride = (count + 15u) & ~(size_t)15u;
+  Body *next = (Body *)malloc(count * sizeof(Body));
+  void *position_allocation =
+      malloc(3u * position_stride * sizeof(float) + 63u);
+  if (next == NULL || position_allocation == NULL) {
+    free(next);
+    free(position_allocation);
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      body_force(p, dt, n);
+      for (int i = 0; i < n; ++i) {
+        p[i].x += p[i].vx * dt;
+        p[i].y += p[i].vy * dt;
+        p[i].z += p[i].vz * dt;
+      }
+    }
+    return;
+  }
+
+  float *x = (float *)(((uintptr_t)position_allocation + 63u) &
+                       ~(uintptr_t)63u);
+  float *y = x + position_stride;
+  float *z = y + position_stride;
+  const size_t coefficient_stride =
+      ((count + (size_t)PAIR_TILE - 1u) / (size_t)PAIR_TILE) *
+      (size_t)PAIR_TILE;
+  float *coefficients = NULL;
+  void *coefficient_allocation = NULL;
+  if (coefficient_stride <=
+      ((size_t)PAIR_CACHE_BYTES / sizeof(float)) / count) {
+    size_t bytes = count * coefficient_stride * sizeof(float);
+    coefficient_allocation =
+        malloc(bytes + (size_t)PAIR_CACHE_ALIGNMENT - 1u);
+    if (coefficient_allocation != NULL) {
+      uintptr_t address = (uintptr_t)coefficient_allocation;
+      uintptr_t aligned =
+          (address + (uintptr_t)PAIR_CACHE_ALIGNMENT - 1u) &
+          ~((uintptr_t)PAIR_CACHE_ALIGNMENT - 1u);
+      coefficients = (float *)aligned;
+    }
+  }
+
+  const int nblocks = n / PAIR_TILE + (n % PAIR_TILE != 0);
+  const size_t tile_count =
+      (size_t)nblocks * ((size_t)nblocks + 1u) / 2u;
+  const int target_pairs = n / 2 + n % 2;
+  Body *src = p;
+  Body *dst = next;
+
+#ifdef _OPENMP
+#pragma omp parallel if(n >= 256)
+#endif
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < n; ++i) {
+        x[i] = src[i].x;
+        y[i] = src[i].y;
+        z[i] = src[i].z;
+      }
+
+      if (coefficients != NULL) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (size_t tile = 0; tile < tile_count; ++tile) {
+          fill_coefficient_tile(x, y, z, coefficients, coefficient_stride,
+                                n, nblocks, tile);
+        }
+      }
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int pair = 0; pair < target_pairs; ++pair) {
+        advance_pair(src, dst, x, y, z, coefficients, coefficient_stride,
+                     dt, n, pair);
+      }
+
+#ifdef _OPENMP
+#pragma omp single
+#endif
+      {
+        Body *tmp = src;
+        src = dst;
+        dst = tmp;
+      }
+    }
+  }
+
+  if (src != p) memcpy(p, src, count * sizeof(Body));
+  free(coefficient_allocation);
+  free(position_allocation);
+  free(next);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+  simulate(bodies, DT, nbodies);
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

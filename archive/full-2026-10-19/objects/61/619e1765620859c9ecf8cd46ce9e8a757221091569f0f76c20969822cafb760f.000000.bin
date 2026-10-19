@@ -1,0 +1,263 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+
+static void bubble_sort(double *values, int length) {
+    int i, j;
+    double temporary;
+
+    for (i = length - 1; i > 0; i--) {
+        for (j = 0; j < i; j++) {
+            if (values[j] > values[j + 1]) {
+                temporary = values[j];
+                values[j] = values[j + 1];
+                values[j + 1] = temporary;
+            }
+        }
+    }
+}
+
+static void merge_sort(double *values, double *scratch, size_t length) {
+    size_t width;
+    double *source = values;
+    double *destination = scratch;
+
+    for (width = 1; width < length;) {
+        size_t left = 0;
+
+        while (left < length) {
+            size_t remaining = length - left;
+            size_t middle = left + (remaining < width ? remaining : width);
+            size_t right;
+            size_t i, j, output;
+
+            remaining = length - middle;
+            right = middle + (remaining < width ? remaining : width);
+            i = left;
+            j = middle;
+            output = left;
+
+            while (i < middle && j < right) {
+                if (source[i] <= source[j])
+                    destination[output++] = source[i++];
+                else
+                    destination[output++] = source[j++];
+            }
+            while (i < middle)
+                destination[output++] = source[i++];
+            while (j < right)
+                destination[output++] = source[j++];
+
+            left = right;
+        }
+
+        {
+            double *temporary = source;
+            source = destination;
+            destination = temporary;
+        }
+
+        if (width > length / 2)
+            break;
+        width *= 2;
+    }
+
+    if (source != values)
+        memcpy(values, source, length * sizeof(*values));
+}
+
+static void ordena_colunas(double *matriz, int lin, int col,
+                           double *scratch) {
+    size_t rows = (size_t)lin;
+    size_t columns = (size_t)col;
+    size_t i, j;
+
+    for (i = 0; i < columns; i++) {
+        double *column = matriz + i * rows;
+        int has_nan = 0;
+
+        for (j = 0; j < rows; j++) {
+            if (isnan(column[j])) {
+                has_nan = 1;
+                break;
+            }
+        }
+
+        if (has_nan || scratch == NULL)
+            bubble_sort(column, lin);
+        else
+            merge_sort(column, scratch, rows);
+    }
+}
+
+static void calcula_medias(double *matriz, double *media, double *media_har,
+                           int lin, int col) {
+    size_t rows = (size_t)lin;
+    size_t columns = (size_t)col;
+    size_t i, j;
+
+    for (i = 0; i < columns; i++) {
+        size_t base = i * rows;
+        double soma = 0.0;
+        double soma_harmonica = 0.0;
+
+        for (j = 0; j < rows; j++) {
+            double value = matriz[base + j];
+            soma += value;
+            soma_harmonica += 1 / value;
+        }
+        media[i] = soma / lin;
+        media_har[i] = lin / soma_harmonica;
+    }
+}
+
+static double moda_coluna_com_nan(const double *column, size_t length) {
+    size_t i, j;
+    float best_count = 0.0f;
+    float mode = 0.0f;
+
+    for (i = 0; i < length; i++) {
+        double count = 0.0;
+        for (j = i + 1; j < length; j++) {
+            if (column[i] == column[j]) {
+                count++;
+                if (count > best_count) {
+                    best_count = (float)count;
+                    mode = (float)column[i];
+                }
+            }
+        }
+    }
+
+    return best_count == 0.0f ? -1.0 : (double)mode;
+}
+
+static void calcula_metricas_ordenadas(double *matriz, double *media,
+                                       double *mediana, double *moda,
+                                       double *variancia, double *dp,
+                                       double *cv, int lin, int col) {
+    size_t rows = (size_t)lin;
+    size_t columns = (size_t)col;
+    size_t i, j;
+
+    for (i = 0; i < columns; i++) {
+        size_t base = i * rows;
+        double *column = matriz + base;
+        double sum_squares = 0.0;
+        double run_value = column[0];
+        size_t run_length = 1;
+        float best_count = 0.0f;
+        float mode = 0.0f;
+        int has_nan = 0;
+
+        if (rows % 2 == 0) {
+            mediana[i] = (column[rows / 2 - 1] + column[rows / 2]) * 0.5;
+        } else {
+            mediana[i] = column[rows / 2];
+        }
+
+        for (j = 0; j < rows; j++) {
+            double value = column[j];
+            sum_squares += pow((value - media[i]), 2);
+            if (isnan(value))
+                has_nan = 1;
+
+            if (j == 0) {
+                run_value = value;
+                run_length = 1;
+            } else if (value == run_value) {
+                run_length++;
+            } else {
+                size_t candidate_count = run_length - 1;
+                if ((double)candidate_count > (double)best_count) {
+                    best_count = (float)candidate_count;
+                    mode = (float)run_value;
+                }
+                run_value = value;
+                run_length = 1;
+            }
+        }
+
+        if (has_nan) {
+            moda[i] = moda_coluna_com_nan(column, rows);
+        } else {
+            size_t candidate_count = run_length - 1;
+            if ((double)candidate_count > (double)best_count) {
+                best_count = (float)candidate_count;
+                mode = (float)run_value;
+            }
+            moda[i] = best_count == 0.0f ? -1.0 : (double)mode;
+        }
+
+        variancia[i] = sum_squares / (lin - 1);
+        dp[i] = sqrt(variancia[i]);
+        cv[i] = dp[i] / media[i];
+    }
+}
+
+int main(int argc, char **argv) {
+    int lin, col, i, j;
+    double *matriz, *scratch, *mediana, *media, *media_har;
+    double *moda, *variancia, *dp, *cv;
+    size_t rows, columns;
+
+    fscanf(stdin, "%d ", &lin);
+    fscanf(stdin, "%d\n", &col);
+    rows = (size_t)lin;
+    columns = (size_t)col;
+
+    matriz = (double *)malloc(rows * columns * sizeof(*matriz));
+    scratch = (double *)malloc(rows * sizeof(*scratch));
+    media = (double *)malloc(columns * sizeof(*media));
+    media_har = (double *)malloc(columns * sizeof(*media_har));
+    mediana = (double *)malloc(columns * sizeof(*mediana));
+    moda = (double *)malloc(columns * sizeof(*moda));
+    variancia = (double *)malloc(columns * sizeof(*variancia));
+    cv = (double *)malloc(columns * sizeof(*cv));
+    dp = (double *)malloc(columns * sizeof(*dp));
+
+    for (i = 0; i < lin; i++) {
+        for (j = 0; j < col; j++) {
+            fscanf(stdin, "%lf ", &matriz[(size_t)j * rows + (size_t)i]);
+        }
+    }
+
+    calcula_medias(matriz, media, media_har, lin, col);
+    ordena_colunas(matriz, lin, col, scratch);
+    calcula_metricas_ordenadas(matriz, media, mediana, moda, variancia,
+                               dp, cv, lin, col);
+
+    for (i = 0; i < col; i++)
+        printf("%.1lf ", media[i]);
+    printf("\n");
+    for (i = 0; i < col; i++)
+        printf("%.1lf ", media_har[i]);
+    printf("\n");
+    for (i = 0; i < col; i++)
+        printf("%.1lf ", mediana[i]);
+    printf("\n");
+    for (i = 0; i < col; i++)
+        printf("%.1lf ", moda[i]);
+    printf("\n");
+    for (i = 0; i < col; i++)
+        printf("%.1lf ", variancia[i]);
+    printf("\n");
+    for (i = 0; i < col; i++)
+        printf("%.1lf ", dp[i]);
+    printf("\n");
+    for (i = 0; i < col; i++)
+        printf("%.1lf ", cv[i]);
+    printf("\n");
+
+    free(matriz);
+    free(scratch);
+    free(media);
+    free(media_har);
+    free(mediana);
+    free(moda);
+    free(variancia);
+    free(dp);
+    free(cv);
+    return 0;
+}

@@ -1,0 +1,286 @@
+#include "knn.h"
+#include <float.h>
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+static char winning_label(const size_t * votes) {
+    char best = (char)-1;
+    size_t best_count = 0;
+
+    for (unsigned int value = 0; value <= UCHAR_MAX; value++) {
+        char label = (char)(unsigned char)value;
+        if (votes[value] > best_count ||
+            (best_count != 0 && votes[value] == best_count && label < best)) {
+            best = label;
+            best_count = votes[value];
+        }
+    }
+
+    return best;
+}
+
+static char insertion_knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *)malloc((size_t)k * sizeof(*labels));
+    float * distances = (float *)malloc((size_t)k * sizeof(*distances));
+
+    if (labels == NULL || distances == NULL) {
+        free(labels);
+        free(distances);
+        on_error();
+        return (char)-1;
+    }
+
+    for (int i = 0; i < k; i++) {
+        labels[i] = (char)-1;
+        distances[i] = -1.0f;
+    }
+
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (int x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1.0f) {
+                    for (int y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    size_t votes[UCHAR_MAX + 1] = {0};
+    for (int i = 0; i < k; i++) {
+        votes[(unsigned char)labels[i]]++;
+    }
+
+    char result = winning_label(votes);
+    free(distances);
+    free(labels);
+    return result;
+}
+
+static uint32_t select_distance_key_small(const uint32_t * keys, size_t count,
+                                          size_t rank, size_t * lower_count) {
+    uint32_t prefix = 0;
+    uint32_t mask = 0;
+    size_t skipped = 0;
+
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        size_t buckets[256] = {0};
+        for (size_t i = 0; i < count; i++) {
+            uint32_t key = keys[i];
+            if ((key & mask) == prefix) {
+                buckets[(key >> shift) & UINT32_C(255)]++;
+            }
+        }
+
+        unsigned int bucket = 0;
+        while (bucket < 255 && rank >= buckets[bucket]) {
+            rank -= buckets[bucket];
+            skipped += buckets[bucket];
+            bucket++;
+        }
+
+        prefix |= (uint32_t)bucket << shift;
+        mask |= UINT32_C(255) << shift;
+    }
+
+    *lower_count = skipped;
+    return prefix;
+}
+
+static uint32_t select_distance_key(const uint32_t * keys, size_t count,
+                                    size_t rank, size_t * lower_count) {
+    if (count < 4096) {
+        return select_distance_key_small(keys, count, rank, lower_count);
+    }
+
+    /* Nonnegative distance keys have 31 significant bits: 11 + 11 + 9. */
+    size_t buckets[2048] = {0};
+    for (size_t i = 0; i < count; i++) {
+        buckets[keys[i] >> 20]++;
+    }
+
+    size_t skipped = 0;
+    unsigned int high = 0;
+    while (high < 2047 && rank >= buckets[high]) {
+        rank -= buckets[high];
+        skipped += buckets[high];
+        high++;
+    }
+
+    size_t active_count = buckets[high];
+    uint32_t prefix = (uint32_t)high << 20;
+    if (active_count == 1) {
+        for (size_t i = 0; i < count; i++) {
+            if ((keys[i] >> 20) == high) {
+                *lower_count = skipped;
+                return keys[i];
+            }
+        }
+    }
+
+    /* Keep the original stream ordered for the final boundary-tie vote. */
+    uint32_t * compact = NULL;
+    if (active_count <= count / 4) {
+        compact = (uint32_t *)malloc(active_count * sizeof(*compact));
+    }
+
+    memset(buckets, 0, sizeof(buckets));
+    size_t output = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint32_t key = keys[i];
+        if ((key >> 20) == high) {
+            buckets[(key >> 9) & UINT32_C(2047)]++;
+            if (compact != NULL) {
+                compact[output++] = key;
+            }
+        }
+    }
+
+    unsigned int middle = 0;
+    while (middle < 2047 && rank >= buckets[middle]) {
+        rank -= buckets[middle];
+        skipped += buckets[middle];
+        middle++;
+    }
+    prefix |= (uint32_t)middle << 9;
+
+    const uint32_t * active = compact != NULL ? compact : keys;
+    size_t scan_count = compact != NULL ? active_count : count;
+    uint32_t selected_prefix = prefix >> 9;
+
+    if (buckets[middle] == 1) {
+        for (size_t i = 0; i < scan_count; i++) {
+            uint32_t key = active[i];
+            if ((key >> 9) == selected_prefix) {
+                *lower_count = skipped;
+                free(compact);
+                return key;
+            }
+        }
+    }
+
+    memset(buckets, 0, 512 * sizeof(*buckets));
+    for (size_t i = 0; i < scan_count; i++) {
+        uint32_t key = active[i];
+        if ((key >> 9) == selected_prefix) {
+            buckets[key & UINT32_C(511)]++;
+        }
+    }
+
+    unsigned int low = 0;
+    while (low < 511 && rank >= buckets[low]) {
+        rank -= buckets[low];
+        skipped += buckets[low];
+        low++;
+    }
+
+    free(compact);
+    *lower_count = skipped;
+    return prefix | (uint32_t)low;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    if (k <= 0) {
+        return (char)-1;
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t)groups[i].length;
+            if (length > SIZE_MAX - total) {
+                return insertion_knn(n_groups, groups, k, to_evaluate);
+            }
+            total += length;
+        }
+    }
+
+    size_t votes[UCHAR_MAX + 1] = {0};
+    if (total <= (size_t)k) {
+        for (int i = 0; i < n_groups; i++) {
+            if (groups[i].length > 0) {
+                votes[(unsigned char)groups[i].label] += (size_t)groups[i].length;
+            }
+        }
+        votes[(unsigned char)(char)-1] += (size_t)k - total;
+        return winning_label(votes);
+    }
+
+    if (sizeof(float) != sizeof(uint32_t) || FLT_RADIX != 2 ||
+        FLT_MANT_DIG != 24 || FLT_MAX_EXP != 128 ||
+        total > SIZE_MAX / sizeof(uint32_t)) {
+        return insertion_knn(n_groups, groups, k, to_evaluate);
+    }
+
+    uint32_t * keys = (uint32_t *)malloc(total * sizeof(*keys));
+    if (keys == NULL) {
+        return insertion_knn(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t index = 0;
+    unsigned int has_nan = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            uint32_t key;
+            memcpy(&key, &d, sizeof(key));
+            key &= UINT32_C(0x7fffffff);
+            keys[index++] = key;
+            has_nan |= key > UINT32_C(0x7f800000);
+        }
+    }
+
+    if (has_nan) {
+        free(keys);
+        return insertion_knn(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t lower_count;
+    uint32_t threshold = select_distance_key(keys, total, (size_t)k - 1,
+                                             &lower_count);
+    size_t equal_remaining = (size_t)k - lower_count;
+
+    /* Retain traversal order so equal-distance boundary ties match insertion. */
+    index = 0;
+    for (int i = 0; i < n_groups; i++) {
+        size_t chosen = 0;
+        for (int j = 0; j < groups[i].length; j++) {
+            uint32_t key = keys[index++];
+            if (key < threshold) {
+                chosen++;
+            } else if (key == threshold && equal_remaining != 0) {
+                chosen++;
+                equal_remaining--;
+            }
+        }
+        votes[(unsigned char)groups[i].label] += chosen;
+    }
+
+    free(keys);
+    return winning_label(votes);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

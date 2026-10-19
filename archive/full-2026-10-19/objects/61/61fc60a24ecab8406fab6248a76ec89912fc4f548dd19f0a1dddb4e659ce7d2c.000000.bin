@@ -1,0 +1,150 @@
+"""Isolate the explicitly requested pilot; never edit a subject or existing campaign."""
+import hashlib
+import json
+import shutil
+import time
+import uuid
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+root = Path(__file__).resolve().parent.parent
+work = root / 'work/marathon-gpt61sol-max/pilot-r1'
+project = work / 'project'
+out = root / 'outputs/Marathon22-GPT61Sol-MAX/pilote-r1'
+project.mkdir(parents=True, exist_ok=False)
+out.mkdir(parents=True, exist_ok=False)
+archive = root / 'outputs/Marathon22-GPT61Sol-MAX/HPC-Forest-GPT61Sol-MAX-v1.zip'
+assert hashlib.sha256(archive.read_bytes()).hexdigest() == 'ca012a473f60da49e0abc6fbcaeaca2a7be839fc6e5b528a5523740c9d9d7803'
+with zipfile.ZipFile(archive) as z:
+    for name in z.namelist():
+        target = project / Path(name).relative_to('HPC-Forest')
+        assert target.resolve().is_relative_to(project.resolve())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(z.read(name))
+baseline = json.loads((project / 'FILES.sha256.json').read_text())
+assert all(hashlib.sha256((project / name).read_bytes()).hexdigest() == expected for name, expected in baseline.items())
+session = uuid.uuid4().hex
+auth = {
+    'schema': 'hpc-forest-explicit-parallel-pilot-v1',
+    'status': 'parallel_pilot_explicitly_authorized',
+    'scope_id': 'gpt61sol-max-pilot-20261015-r1',
+    'next_model': 'gpt-6.1-sol', 'reasoning_effort': 'max',
+    'session_id': session, 'expires_at': time.time() + 8 * 3600,
+    'authorized_at_utc': datetime.now(timezone.utc).isoformat(),
+    'authorization_source': 'Direct human message in this chat, overriding the previous wait order for this pilot only',
+    'user_message': "Bon en vrai, vu que ça va prendre autant de temps, lance déjà ChatGPT sur mon PC pour voir déjà le comportement de GPT 6.1 Sol Max sur mon PC, si le comportement déjà il est très gratifiant.",
+    'problem': 'knn', 'cycles': 2, 'trials_per_role_per_cycle': 3,
+    'integration_opportunities_per_cycle': 3, 'planned_slots': 24,
+    'wall_seconds': 7200, 'token_budget': 1500000,
+    'deepseek_jobs_still_running_allowed': ['747504', '747505'],
+    'deepseek_completion_claimed': False, 'old_candidates_imported': False,
+    'manual_algorithm_hints': False, 'manual_candidate_repairs': False,
+    'evaluation': 'ROMEO ARM64 CPU allocation; local authenticated Windows Codex client',
+}
+receipt = out / 'autorisation-pilote.json'
+receipt.write_text(json.dumps(auth, ensure_ascii=False, indent=2) + '\n', encoding='utf8')
+
+p = project / 'src/hpc_forest/codex_process.py'
+s = p.read_text(encoding='utf8')
+needle = '    gate = bounded_json(receipt, 65536)\n'
+replacement = needle + '''    if gate.get("status") == "parallel_pilot_explicitly_authorized":
+        if (gate.get("schema") != "hpc-forest-explicit-parallel-pilot-v1"
+                or gate.get("scope_id") != "gpt61sol-max-pilot-20261015-r1"
+                or required_jobs != {gate.get("scope_id")}
+                or gate.get("next_model") != MODEL or gate.get("reasoning_effort") != EFFORT
+                or gate.get("deepseek_completion_claimed") is not False
+                or not isinstance(gate.get("user_message"), str)
+                or not gate["user_message"].strip()
+                or gate.get("expires_at", 0) <= time.time()):
+            raise InfrastructureError("The explicit parallel pilot authorization is invalid or expired")
+        return gate
+'''
+assert s.count(needle) == 1
+s = s.replace(needle, replacement)
+needle = '    check_dependencies(dependency_receipt, required_jobs)\n'
+replacement = '''    gate = check_dependencies(dependency_receipt, required_jobs)
+    if (gate.get("status") == "parallel_pilot_explicitly_authorized"
+            and request.get("session_id") != gate.get("session_id")):
+        raise InfrastructureError("Pilot generation belongs to another authorized session")
+'''
+assert s.count(needle) == 1
+p.write_text(s.replace(needle, replacement), encoding='utf8')
+
+p = project / 'examples/marathon22/romeo_codex.py'
+s = p.read_text(encoding='utf8')
+needle = '    parser.add_argument("--worker-wait-seconds", type=int, default=180)\n'
+replacement = needle + '''    parser.add_argument("--cycles", type=int, default=4)
+    parser.add_argument("--trials-per-role", type=int, default=6)
+    parser.add_argument("--integrations-per-cycle", type=int, default=6)
+    parser.add_argument("--wall-seconds", type=int, default=21600)
+    parser.add_argument("--tokens", type=int, default=4000000)
+'''
+assert s.count(needle) == 1
+s = s.replace(needle, replacement)
+s = s.replace('    reference.SCHEDULE.update(cycles=4, trials_per_role_per_cycle=6, integrations_per_cycle=6)',
+'''    if min(args.cycles, args.trials_per_role, args.integrations_per_cycle,
+           args.wall_seconds, args.tokens) <= 0:
+        parser.error("Campaign limits must be positive")
+    reference.SCHEDULE.update(cycles=args.cycles, trials_per_role_per_cycle=args.trials_per_role,
+                              integrations_per_cycle=args.integrations_per_cycle)''')
+s = s.replace('    reference.LIMITS.update(wall_seconds=21600, tokens=4000000, generation_seconds=600)',
+              '    reference.LIMITS.update(wall_seconds=args.wall_seconds, tokens=args.tokens, generation_seconds=600)')
+p.write_text(s, encoding='utf8')
+
+p = project / 'tests/test_codex_pilot_authorization.py'
+p.write_text('''import json
+import time
+
+import pytest
+
+from hpc_forest.codex_process import check_dependencies
+from hpc_forest.core import InfrastructureError
+
+
+def test_parallel_pilot_does_not_require_or_claim_deepseek_receipt(tmp_path):
+    gate = {"schema": "hpc-forest-explicit-parallel-pilot-v1",
+            "status": "parallel_pilot_explicitly_authorized",
+            "scope_id": "gpt61sol-max-pilot-20261015-r1",
+            "next_model": "gpt-6.1-sol", "reasoning_effort": "max",
+            "deepseek_completion_claimed": False,
+            "expires_at": time.time() + 60, "user_message": "Launch a pilot now"}
+    receipt = tmp_path / "authorization.json"
+    receipt.write_text(json.dumps(gate))
+    assert check_dependencies(receipt, {gate["scope_id"]}) == gate
+    with pytest.raises(InfrastructureError):
+        check_dependencies(receipt, {"747504", "747505"})
+    gate["expires_at"] = time.time() - 1
+    receipt.write_text(json.dumps(gate))
+    with pytest.raises(InfrastructureError):
+        check_dependencies(receipt, {gate["scope_id"]})
+''', encoding='utf8')
+
+smoke = work / 'interface_smoke.py'
+smoke.write_text('''import json
+import time
+import uuid
+from pathlib import Path
+
+from hpc_forest.codex_mailbox import EFFORT, MODEL, PROTOCOL, json_bytes, sha256
+from hpc_forest.codex_process import run_codex
+
+workspace = Path(__file__).resolve().parents[3]
+output = workspace / "outputs/Marathon22-GPT61Sol-MAX/pilote-r1"
+receipt = output / "autorisation-pilote.json"
+gate = json.loads(receipt.read_text(encoding="utf8"))
+request = {"protocol": PROTOCOL, "kind": "source-proposal", "nonce": uuid.uuid4().hex,
+           "session_id": gate["session_id"], "model": MODEL, "reasoning_effort": EFFORT,
+           "expires_at": time.time() + 180,
+           "messages": [{"role": "system", "content": "Return the requested JSON object. No tools."},
+                        {"role": "user", "content": "Return an object with ok set to true."}],
+           "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}},
+                      "required": ["ok"], "additionalProperties": False}}
+result = run_codex(request, sha256(json_bytes(request)), output / "interface-smoke-1",
+                   receipt, {gate["scope_id"]})
+print(json.dumps(result, ensure_ascii=False))
+raise SystemExit(0 if result.get("data") == {"ok": True} and not result.get("error") else 1)
+''', encoding='utf8')
+
+print(json.dumps({'project': str(project), 'output': str(out), 'authorization': str(receipt),
+                  'session_id': session, 'model_calls_started': False}, ensure_ascii=False))

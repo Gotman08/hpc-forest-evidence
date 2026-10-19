@@ -1,0 +1,154 @@
+"""Local metadata-only policy preparation; no discovery, CLI, transport or inference."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[3]
+REL = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2f"
+PROJECT = BASE / "work/hpc-forest-primes-natif-relance-r2f/project"
+METADATA = REL / "operations-parent/SKILLS-CHEMINS-CANDIDATS.json"
+META_SHA = "34164b26e1c86da6e30d9d72a2b2587aa5c4d061fb9b4f116b9dac335a83e47a"
+PLAN = REL / "qualification-zero-modele-r1/paquet-source-lie-r1/native-max-plan.json"
+PLAN_SHA = "8d91ebe83ab550ad50acc330f830e1bc86bcc67f66b88054538df6b394558450"
+ZIP = REL / "correction-cli/candidats/revision-r1/HPC-Forest-Primes-Natif-MAX-r2f.zip"
+ZIP_SHA = "47f97afabcd6d10c5e95a1dc3aae0a34b0841183919785a6bd62d58aa1e90d75"
+LOADER = PROJECT / "src/hpc_forest/codex_process.py"
+LOADER_SHA = "a354b23f00b3ad26059cdc0e994d5af20f7238523c86d172884322e3cae6ef9d"
+CLI_SHA = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+SCOPE = "hpc-forest-primes-native-max-r2f"
+CELLS = {
+    "gpt-6-astra": "5aeceff56b26452290325ed4274d71bd",
+    "gpt-5.6-terra": "e7c86715f4d34e9f9efcdcc4ce2a81c8",
+    "gpt-6.1-sol": "1294453607b34c68ba05872072640120",
+}
+FIELDS = {"scope_id", "model", "effort", "session_id", "job_id", "remote_root",
+          "source_zip_sha256", "plan_sha256"}
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def ordinary(path: Path) -> None:
+    if (not path.is_absolute() or ".." in path.parts or not path.is_file()
+            or any(p.is_symlink() or getattr(p, "is_junction", lambda: False)()
+                   for p in (path, *path.parents))):
+        raise ValueError("Exact ordinary absolute metadata file required")
+
+
+def read_pinned(path: Path, checksum: str, limit: int = 262144) -> bytes:
+    ordinary(path)
+    data = path.read_bytes()
+    if len(data) > limit or digest(data) != checksum:
+        raise ValueError("Metadata/source pin or byte limit differs")
+    return data
+
+
+def write_exclusive(path: Path, value: dict) -> dict:
+    data = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if path.parent != HERE or path.exists() or path.is_symlink():
+        raise ValueError("Only a new exact policy artifact in this directory is allowed")
+    with path.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return {"path": str(path), "sha256": digest(data), "bytes": len(data)}
+
+
+def inputs() -> list[str]:
+    metadata = json.loads(read_pinned(METADATA, META_SHA))
+    plan = json.loads(read_pinned(PLAN, PLAN_SHA))
+    read_pinned(ZIP, ZIP_SHA, 8 * 1024 * 1024)
+    read_pinned(LOADER, LOADER_SHA)
+    paths = metadata.get("candidate_directories")
+    if (metadata.get("candidate_count") != 236 or not isinstance(paths, list)
+            or len(paths) != 236 or len(set(paths)) != 236
+            or metadata.get("instruction_or_SKILL_body_read") is not False
+            or metadata.get("is_actual_CLI_discovery_receipt") is not False
+            or plan.get("scope_id") != SCOPE or plan.get("cells") != CELLS
+            or plan.get("source_zip_sha256") != ZIP_SHA):
+        raise ValueError("Exact local filesystem metadata and new plan required")
+    if any(not isinstance(p, str) or not re.match(r"^[A-Za-z]:[/\\]", p)
+           or ".." in p.replace("\\", "/").split("/")
+           or any(c in p for c in ("\0", "\r", "\n")) for p in paths):
+        raise ValueError("Only the already received ordinary path strings are allowed")
+    return paths
+
+
+def binding_for(model: str, job_id: str | None) -> dict:
+    session = CELLS[model]
+    return {"scope_id": SCOPE, "model": model, "effort": "max", "session_id": session,
+            "job_id": job_id, "remote_root": "/scratch_p/nimarano/" + SCOPE + "-" + session,
+            "source_zip_sha256": ZIP_SHA, "plan_sha256": PLAN_SHA}
+
+
+def policy_for(binding: dict, paths: list[str]) -> dict:
+    return {"schema": "hpc-forest-r2e-local-cli-policy-v1", **binding,
+            "cli_executable_sha256": CLI_SHA, "skill_candidate_directories": paths,
+            "filesystem_metadata_sha256": META_SHA,
+            "is_actual_CLI_discovery_receipt": False, "instruction_or_SKILL_body_read": False}
+
+
+def validate_with_pinned_loader(path: Path, checksum: str, binding: dict) -> None:
+    # Compile this one pure function only, never import or execute the source module.
+    tree = ast.parse(read_pinned(LOADER, LOADER_SHA).decode("utf-8"))
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_task_cli_policy")
+    namespace = {"Path": Path, "re": re, "InfrastructureError": ValueError,
+                 "sha256": digest,
+                 "bounded_json": lambda p, limit: json.loads(p.read_bytes())
+                 if p.stat().st_size <= limit else (_ for _ in ()).throw(ValueError("Too large"))}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(LOADER), "exec"), namespace)  # noqa: S102 -- exact SHA-bound pure loader only
+    namespace["load_task_cli_policy"](path, checksum, binding, CLI_SHA)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binding", type=Path)
+    parser.add_argument("--binding-sha256")
+    args = parser.parse_args()
+    paths = inputs()
+    if (args.binding is None) != (args.binding_sha256 is None):
+        raise ValueError("Actual eight-field cell binding and SHA are required together")
+    if args.binding is None:
+        refs = []
+        for model, session in CELLS.items():
+            value = {"schema": "hpc-forest-r2e-local-cli-policy-template-NON-ADMIS-v1",
+                     "worker_acceptable": False, "native_research_admitted": False,
+                     "missing_actual_binding_fields": ["job_id"],
+                     "policy_payload_not_yet_acceptable": policy_for(binding_for(model, None), paths)}
+            refs.append(write_exclusive(HERE / ("GABARIT-NON-ADMIS-" + session + ".json"), value))
+        receipt = {"schema": "hpc-forest-r2e-local-cli-policy-templates-receipt-v1",
+                   "templates": refs, "candidate_count": len(paths),
+                   "filesystem_metadata": {"path": str(METADATA), "sha256": META_SHA},
+                   "plan_sha256": PLAN_SHA, "source_zip_sha256": ZIP_SHA,
+                   "native_research_admitted": False, "jobs_created": 0,
+                   "actual_cli_discovery_or_grammar_verified": False,
+                   "skill_bodies_read": False, "raw_skill_paths_exported_to_ARM": False}
+        ref = write_exclusive(HERE / "GABARITS-LOCAUX-NON-ADMIS.json", receipt)
+        print(json.dumps({"templates": len(refs), "receipt": ref, "native_research_admitted": False}))
+        return
+    if not re.fullmatch(r"[0-9a-f]{64}", args.binding_sha256):
+        raise ValueError("Exact binding SHA required")
+    binding = json.loads(read_pinned(args.binding, args.binding_sha256))
+    if (not isinstance(binding, dict) or set(binding) != FIELDS or binding.get("model") not in CELLS
+            or not isinstance(binding.get("job_id"), str)
+            or not re.fullmatch(r"[1-9][0-9]*", binding["job_id"])
+            or binding != binding_for(binding["model"], binding["job_id"])):
+        raise ValueError("Exact actual eight-field new R2e cell binding required")
+    path = HERE / ("cli-policy-" + binding["session_id"] + ".json")
+    ref = write_exclusive(path, policy_for(binding, paths))
+    validate_with_pinned_loader(path, ref["sha256"], binding)
+    print(json.dumps({"policy": ref, "caller_binding_sha256": args.binding_sha256,
+                      "mechanical_loader_verified": True, "job_existence_verified_here": False,
+                      "native_research_admitted": False}))
+
+
+if __name__ == "__main__":
+    main()

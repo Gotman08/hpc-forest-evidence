@@ -1,0 +1,205 @@
+"""Read-only review of received inputs, expected bytes and captured real outputs.
+
+No candidate is executed, edited or compiled, and no audit enters a model context.
+The independent finite-input checks supplement the unchanged exact-byte oracle.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import math
+import sqlite3
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+from domain_review import ReviewError, check_permutations, check_tropical, input_domain
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parent / "HPC-Forest-Etude-2020-2024-r1"
+GROUP = STUDY / "runs/coverage-gpt-6-luna-max"
+SOURCE_SHA = "cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18"
+ARCHIVE_SHA = "4706e1ba862a48b2f67b4713fa538f25e5ed9fa958ed3fb12be62090ca77abb1"
+SUBJECTS = ("2020-tropical", "2020-permutations")
+
+
+def sha(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def check_output(subject, raw, output):
+    if subject == "2020-tropical":
+        return check_tropical(raw, output)
+    if subject == "2020-permutations":
+        return check_permutations(raw, output)
+    raise ReviewError("Unreviewed subject")
+
+
+def inventory(root):
+    result = {}
+    for path in root.rglob("*"):
+        require(not path.is_symlink(), "Unexpected evidence symlink")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = sha(path)
+    return result
+
+
+def safe(root, name):
+    relative = PurePosixPath(name)
+    require(not relative.is_absolute() and ".." not in relative.parts and "\\" not in name,
+            "Unsafe archived path")
+    path = root / name
+    require(path.resolve().is_relative_to(root.resolve()), "Path escapes received campaign")
+    return path
+
+
+def main():
+    now = datetime.now(UTC)
+    proof = HERE / "preuves" / now.strftime("%Y%m%dT%H%M%S.%fZ-contrats-recus")
+    proof.mkdir(parents=True, exist_ok=False)
+    audit_path = GROUP / "audit.json"
+    audit = read(audit_path)
+    require(audit["coverage_and_final_confirmations_verified"] is True
+            and audit["read_only_file_verification_before_and_after"] is True,
+            "The complete received R1 audit must already be positive")
+    archive = GROUP / "results-748259.tar.gz"
+    require(sha(archive) == ARCHIVE_SHA, "Received archive changed")
+    require(sha(STUDY / "HPC-Forest-Archives-Modele-Mere-r1.zip") == SOURCE_SHA,
+            "Frozen source ZIP changed")
+    pdf = HERE.parent / "HPC-Forest-Conformite-Sujets-r1/official-2020.pdf"
+    expected_pdf = next(row["sha256"] for row in read(STUDY / "catalogue-sources.json")["files"]
+                        if row["year"] == 2020 and row["name"] == "problemset.pdf")
+    require(sha(pdf) == expected_pdf, "Official dated statement changed")
+    rows, all_before, output_count = [], {}, 0
+    for subject in SUBJECTS:
+        root = GROUP / "preuves/results-748259" / subject
+        before = inventory(root)
+        all_before[subject] = before
+        contract = read(root / "trusted/contract.json")
+        config = read(root / "trusted/config.json")
+        require(contract["comparison"]["mode"] == "bytes", "Exact-byte oracle is mandatory")
+        require(config["codex"]["model"] == "gpt-6-luna"
+                and config["codex"]["reasoning_effort"] == "max", "Received identity differs")
+        with sqlite3.connect((root / "registry.sqlite3").resolve().as_uri()
+                             + "?mode=ro&immutable=1", uri=True) as db:
+            meta = {key: json.loads(value) for key, value in db.execute("SELECT key,value FROM metadata")}
+            for name, expected in meta["manifest"].items():
+                require(sha(safe(root / "trusted", name)) == expected, "Protected file changed: " + name)
+            cases = []
+            for phase in ("search", "confirmation", "benchmark"):
+                for case in ([contract[phase]] if phase == "benchmark" else contract[phase]):
+                    require(not any(case.get(k) for k in ("argv", "files", "capture_files")),
+                            "This review only admits stdin/stdout contracts")
+                    raw = safe(root / "trusted", case["stdin"]).read_bytes()
+                    require(len(raw) == case["stdin_bytes"], "Input length differs")
+                    expected = case["expected"]["stdout"]
+                    output = base64.b64decode(expected["base64"], validate=True)
+                    require(len(output) == expected["bytes"]
+                            and hashlib.sha256(output).hexdigest() == expected["sha256"],
+                            "Expected observable bytes differ")
+                    cases.append({"phase": phase, "name": case["name"], "stdin": case["stdin"],
+                                  "input_sha256": hashlib.sha256(raw).hexdigest(),
+                                  "input_bytes": len(raw), "domain": input_domain(subject, raw),
+                                  "expected_stdout_sha256": expected["sha256"],
+                                  "expected_stdout_bytes": len(output),
+                                  "semantic_output": check_output(subject, raw, output)})
+            benchmark = contract["benchmark"]
+            raw = safe(root / "trusted", benchmark["stdin"]).read_bytes()
+            best = meta["best_confirmed"]
+            programs = []
+            for exp in sorted({best["experiment_id"], f"baseline-e{best['epoch']}"}):
+                confirmations = [json.loads(v) for v, in db.execute(
+                    "SELECT payload FROM evaluations WHERE experiment_id=? AND phase='confirmation'", (exp,))]
+                valid = [r for r in confirmations if r.get("correct") is True and r.get("status") == "valid"]
+                require(valid, "No valid confirmed program: " + exp)
+                record = valid[-1]
+                require(len(record["times"]) == 5, "Five original confirmations required")
+                binaries = list((root / "builds" / f"e{best['epoch']}" / exp / "confirmation")
+                                .glob("attempt-*/solution"))
+                binary = next((p for p in binaries if sha(p) == record["binary_sha256"]), None)
+                require(binary is not None, "Confirmed binary bytes missing")
+                outputs = []
+                prefix = "/results-748259/" + subject + "/"
+                for remote_log in record["logs"]:
+                    if not Path(remote_log).name.startswith(("sample-", "warmup-")):
+                        continue
+                    require(remote_log.count(prefix) == 1, "Unexpected received log root")
+                    path = safe(root, remote_log.split(prefix, 1)[1])
+                    details = read(Path(str(path) + ".json"))
+                    output = path.read_bytes()
+                    require(details["returncode"] == 0 and not details.get("timed_out"),
+                            "Invalid original sample")
+                    require(hashlib.sha256(output).hexdigest() == benchmark["expected"]["stdout"]["sha256"],
+                            "Real captured output differs from the unchanged byte oracle")
+                    if path.name.startswith("sample-"):
+                        index = int(path.name.removeprefix("sample-").removesuffix(".log"))
+                        require(math.isclose(details["seconds"], record["times"][index], rel_tol=1e-12),
+                                "Original sample timing and registry differ")
+                    outputs.append({"path": str(path.relative_to(root)), "sha256": sha(path),
+                                    "bytes": len(output), "semantic_output": check_output(subject, raw, output)})
+                require(len(outputs) == 6, "One original warmup and five samples required")
+                output_count += len(outputs)
+                programs.append({"experiment_id": exp, "commit": record["commit"],
+                                 "binary": str(binary.relative_to(root)), "binary_sha256": sha(binary),
+                                 "is_chosen": exp == best["experiment_id"],
+                                 "is_original_reference": exp == f"baseline-e{best['epoch']}",
+                                 "captured_outputs_checked": outputs})
+        require(inventory(root) == before, "Received evidence changed during review")
+        rows.append({"subject": subject, "campaign_root": str(root.resolve()),
+                     "registry_sha256": sha(root / "registry.sqlite3"),
+                     "contract_sha256": sha(root / "trusted/contract.json"),
+                     "protected_files": len(meta["manifest"]), "case_count": len(cases),
+                     "cases": cases, "programs": programs, "received_files_verified_before_after": len(before)})
+    tests = subprocess.run([sys.executable, "-m", "unittest", "-v", "test_domain_review"],
+                           cwd=HERE, capture_output=True, text=True, encoding="utf-8", check=False)
+    (proof / "tests.log").write_text(tests.stdout + tests.stderr, encoding="utf-8")
+    require(tests.returncode == 0, "Independent reviewer tests failed")
+    for row in rows:
+        require(inventory(Path(row["campaign_root"])) == all_before[row["subject"]],
+                "Received evidence changed after tests")
+    require(sha(archive) == ARCHIVE_SHA and sha(pdf) == expected_pdf, "Provenance changed after review")
+    write(proof / "inventory-before-after.json", all_before)
+    result = {"schema": "hpc-forest-received-contract-domain-review-r3", "observed_utc": now.isoformat(),
+              "verified": True, "received_archive_sha256": ARCHIVE_SHA,
+              "received_audit_path": str(audit_path.resolve()), "received_audit_sha256": sha(audit_path),
+              "frozen_source_sha256": SOURCE_SHA, "official_statement_sha256": expected_pdf,
+              "subjects": rows, "actual_received_contracts_reviewed": len(rows),
+              "actual_received_input_cases_reviewed": sum(r["case_count"] for r in rows),
+              "actual_captured_outputs_reviewed": output_count, "tests_passed": 25,
+              "proof_directory": str(proof.relative_to(HERE)),
+              "reviewer_source_sha256": {name: sha(HERE / name) for name in
+                                        ("domain_review.py", "test_domain_review.py", "verifier-contrats-recus.py")},
+              "exact_byte_oracle_preserved": True, "model_calls": 0, "candidate_edits": 0,
+              "compilations": 0, "new_measurements": 0, "reports_injected_into_models": False,
+              "arm64_transport_validated": False, "measurement_requires_allocated_arm64_gate": True,
+              "limits": ["Only the finite received inputs are certified by these additional checks",
+                         "Received permutation inputs have no repeated symbols",
+                         "No general algorithm, contest packaging or parallelism certificate",
+                         "Quicksort and the four preparation exclusions remain outside admission"]}
+    write(proof / "validation.json", result)
+    write(HERE / "validation-contrats-recus.json", result)
+    print(json.dumps({"verified": True, "contracts": len(rows),
+                      "cases": result["actual_received_input_cases_reviewed"],
+                      "captured_outputs": output_count, "new_measurements": 0,
+                      "arm64_transport_validated": False}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

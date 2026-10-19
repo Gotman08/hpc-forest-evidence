@@ -1,0 +1,238 @@
+#include "knn.h"
+#include <ctype.h>
+#include <string.h>
+
+static void fail(void) {
+    fprintf(stderr, "Invalid input file.\n");
+    exit(1);
+}
+
+static const char *input_ptr;
+
+static void skip_ws(void) {
+    while (*input_ptr == ' ' || *input_ptr == '\n' ||
+           *input_ptr == '\r' || *input_ptr == '\t')
+        input_ptr++;
+}
+
+static void expect(const char *s) {
+    skip_ws();
+    while (*s) {
+        if (*input_ptr != *s)
+            fail();
+        input_ptr++;
+        s++;
+    }
+}
+
+static int parse_int(void) {
+    skip_ws();
+    int sign = 1;
+    if (*input_ptr == '-') {
+        sign = -1;
+        input_ptr++;
+    }
+    long v = 0;
+    while (*input_ptr >= '0' && *input_ptr <= '9') {
+        v = v * 10 + (*input_ptr - '0');
+        input_ptr++;
+    }
+    return (int)(sign * v);
+}
+
+static float parse_float(void) {
+    skip_ws();
+    char *end;
+    float v = strtof(input_ptr, &end);
+    if (end == input_ptr)
+        fail();
+    input_ptr = end;
+    return v;
+}
+
+static char *read_all_input(void) {
+    size_t cap = 1 << 20;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf)
+        fail();
+
+    for (;;) {
+        if (len == cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) {
+                free(buf);
+                fail();
+            }
+            buf = nb;
+        }
+        size_t n = fread(buf + len, 1, cap - len, stdin);
+        len += n;
+        if (n == 0)
+            break;
+    }
+
+    char *nb = (char *)realloc(buf, len + 1);
+    if (!nb) {
+        free(buf);
+        fail();
+    }
+    buf = nb;
+    buf[len] = '\0';
+    return buf;
+}
+
+static void grow_arrays(long need, float **xs, float **ys,
+                        char **labels, long *cap) {
+    if (need <= *cap)
+        return;
+    long nc = (*cap == 0) ? (1 << 16) : *cap;
+    while (nc < need)
+        nc *= 2;
+
+    float *nx = (float *)realloc(*xs, (size_t)nc * sizeof(float));
+    if (!nx) fail();
+    *xs = nx;
+
+    float *ny = (float *)realloc(*ys, (size_t)nc * sizeof(float));
+    if (!ny) fail();
+    *ys = ny;
+
+    char *nl = (char *)realloc(*labels, (size_t)nc * sizeof(char));
+    if (!nl) fail();
+    *labels = nl;
+
+    *cap = nc;
+}
+
+static int compare_for_sort(const void *a, const void *b) {
+    return *(const char *)a - *(const char *)b;
+}
+
+char knn(const float *xs, const float *ys, const char *labels,
+         long n_points, int k, Point q) {
+    if (k <= 0 || n_points <= 0)
+        return '\0';
+
+    float *dist = (float *)malloc((size_t)k * sizeof(float));
+    char *lab = (char *)malloc((size_t)k * sizeof(char));
+    if (!dist || !lab) {
+        free(dist);
+        free(lab);
+        fail();
+    }
+
+    for (int i = 0; i < k; ++i) {
+        dist[i] = -1.0f;
+        lab[i] = (char)-1;
+    }
+
+    const float qx = q.x;
+    const float qy = q.y;
+
+    for (long idx = 0; idx < n_points; ++idx) {
+        float dx = xs[idx] - qx;
+        float dy = ys[idx] - qy;
+        float d = dx * dx + dy * dy;
+
+        if (dist[k - 1] != -1.0f && d >= dist[k - 1])
+            continue;
+
+        int pos = 0;
+        while (pos < k) {
+            if (d < dist[pos] || dist[pos] == -1.0f)
+                break;
+            ++pos;
+        }
+        if (pos == k)
+            continue;
+
+        for (int y = k - 1; y > pos; --y) {
+            dist[y] = dist[y - 1];
+            lab[y] = lab[y - 1];
+        }
+        dist[pos] = d;
+        lab[pos] = labels[idx];
+    }
+
+    qsort(lab, (size_t)k, sizeof(char), compare_for_sort);
+
+    char best_label = lab[0];
+    int best_count = 1;
+    int cur_count = 1;
+
+    for (int i = 1; i < k; ++i) {
+        if (lab[i] == lab[i - 1]) {
+            ++cur_count;
+        } else {
+            if (cur_count > best_count) {
+                best_count = cur_count;
+                best_label = lab[i - 1];
+            }
+            cur_count = 1;
+        }
+    }
+    if (cur_count > best_count)
+        best_label = lab[k - 1];
+
+    free(dist);
+    free(lab);
+    return best_label;
+}
+
+int main(void) {
+    char *input = read_all_input();
+    input_ptr = input;
+
+    expect("n_groups=");
+    int n_groups = parse_int();
+
+    long cap = 0;
+    long total = 0;
+    float *xs = NULL;
+    float *ys = NULL;
+    char *labels = NULL;
+
+    for (int g = 0; g < n_groups; ++g) {
+        expect("label=");
+        char label = *input_ptr++;
+        expect("length=");
+        int length = parse_int();
+
+        if (total + length > cap)
+            grow_arrays(total + length, &xs, &ys, &labels, &cap);
+
+        for (int j = 0; j < length; ++j) {
+            expect("(");
+            float x = parse_float();
+            expect(",");
+            float y = parse_float();
+            expect(")");
+
+            xs[total] = x;
+            ys[total] = y;
+            labels[total] = label;
+            ++total;
+        }
+    }
+
+    expect("k=");
+    int k = parse_int();
+
+    Point q;
+    expect("(");
+    q.x = parse_float();
+    expect(",");
+    q.y = parse_float();
+    expect(")");
+
+    char ans = knn(xs, ys, labels, total, k, q);
+    printf("%c", ans);
+
+    free(input);
+    free(xs);
+    free(ys);
+    free(labels);
+    return 0;
+}

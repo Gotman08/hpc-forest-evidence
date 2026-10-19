@@ -1,0 +1,197 @@
+#include <algorithm>
+#include <iostream>
+#include <omp.h>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+static constexpr int MOD = 1000000007;
+
+static int modPow(int base, int exponent) {
+    long long result = 1;
+    long long value = base;
+    while (exponent != 0) {
+        if (exponent & 1) result = result * value % MOD;
+        value = value * value % MOD;
+        exponent >>= 1;
+    }
+    return static_cast<int>(result);
+}
+
+static int unobstructedPaths(int n) {
+    vector<int> fact(2 * n), inverseFact(2 * n);
+    fact[0] = 1;
+    for (int i = 1; i < 2 * n; ++i)
+        fact[i] = static_cast<long long>(fact[i - 1]) * i % MOD;
+    inverseFact.back() = modPow(fact.back(), MOD - 2);
+    for (int i = 2 * n - 1; i > 0; --i)
+        inverseFact[i - 1] = static_cast<long long>(inverseFact[i]) * i % MOD;
+    return static_cast<long long>(fact[2 * n - 2]) * inverseFact[n - 1] % MOD * inverseFact[n - 1] % MOD;
+}
+
+static int sparsePaths(int n, vector<pair<int, int>> points) {
+    sort(points.begin(), points.end());
+    points.erase(unique(points.begin(), points.end()), points.end());
+
+    const pair<int, int> start{0, 0};
+    const pair<int, int> finish{n - 1, n - 1};
+    if (binary_search(points.begin(), points.end(), start) ||
+        binary_search(points.begin(), points.end(), finish))
+        return 0;
+    if (points.empty()) return unobstructedPaths(n);
+
+    vector<int> fact(2 * n), inverseFact(2 * n);
+    fact[0] = 1;
+    for (int i = 1; i < 2 * n; ++i)
+        fact[i] = static_cast<long long>(fact[i - 1]) * i % MOD;
+    inverseFact.back() = modPow(fact.back(), MOD - 2);
+    for (int i = 2 * n - 1; i > 0; --i)
+        inverseFact[i - 1] = static_cast<long long>(inverseFact[i]) * i % MOD;
+
+    const auto paths = [&](int dy, int dx) -> int {
+        if (dy < 0 || dx < 0) return 0;
+        return static_cast<long long>(fact[dy + dx]) * inverseFact[dy] % MOD * inverseFact[dx] % MOD;
+    };
+
+    points.push_back(finish);
+    vector<int> ways(points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        long long value = paths(points[i].first, points[i].second);
+        for (size_t j = 0; j < i; ++j) {
+            if (points[j].second <= points[i].second) {
+                value -= static_cast<long long>(ways[j]) *
+                         paths(points[i].first - points[j].first,
+                               points[i].second - points[j].second) % MOD;
+                if (value < 0) value += MOD;
+            }
+        }
+        ways[i] = static_cast<int>(value);
+    }
+    return ways.back();
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n, m;
+    cin >> n >> m;
+
+    constexpr int denseLimit = 16000;
+    if (n > denseLimit) {
+        vector<pair<int, int>> points;
+        points.reserve(m);
+        for (int i = 0; i < m; ++i) {
+            int y, x;
+            cin >> y >> x;
+            points.emplace_back(y, x);
+        }
+        cout << sparsePaths(n, move(points)) << '\n';
+        return 0;
+    }
+
+    const size_t width = static_cast<size_t>(n);
+    vector<bool> blocked(width * width, false);
+    for (int i = 0; i < m; ++i) {
+        int y, x;
+        cin >> y >> x;
+        blocked[static_cast<size_t>(y) * width + x] = true;
+    }
+
+    if (m == 0) {
+        cout << unobstructedPaths(n) << '\n';
+        return 0;
+    }
+    if (blocked[0] || blocked[width * width - 1]) {
+        cout << 0 << '\n';
+        return 0;
+    }
+
+    vector<int> previous(n), current(n);
+    previous[0] = 1;
+    for (int x = 1; x < n; ++x)
+        previous[x] = blocked[x] ? 0 : previous[x - 1];
+
+    int threads = min(n, omp_get_max_threads());
+    if (n < 256 * threads) threads = 1;
+
+    if (threads == 1) {
+        for (int y = 1; y < n; ++y) {
+            int left = 0;
+            const size_t row = static_cast<size_t>(y) * width;
+            for (int x = 0; x < n; ++x) {
+                if (blocked[row + x]) {
+                    current[x] = 0;
+                } else {
+                    int value = previous[x] + left;
+                    if (value >= MOD) value -= MOD;
+                    current[x] = value;
+                    left = value;
+                }
+            }
+            previous.swap(current);
+        }
+    } else {
+        vector<int> tails(threads), entries(threads);
+        vector<unsigned char> resets(threads);
+        int *previousRow = previous.data();
+        int *currentRow = current.data();
+
+#pragma omp parallel num_threads(threads) shared(previousRow, currentRow, tails, entries, resets, blocked)
+        {
+            const int tid = omp_get_thread_num();
+            const int first = n * tid / threads;
+            const int last = n * (tid + 1) / threads;
+            for (int y = 1; y < n; ++y) {
+                const size_t row = static_cast<size_t>(y) * width;
+                int partial = 0;
+                unsigned char hasReset = 0;
+                for (int x = first; x < last; ++x) {
+                    if (blocked[row + x]) {
+                        currentRow[x] = 0;
+                        partial = 0;
+                        hasReset = 1;
+                    } else {
+                        partial += previousRow[x];
+                        if (partial >= MOD) partial -= MOD;
+                        currentRow[x] = partial;
+                    }
+                }
+                tails[tid] = partial;
+                resets[tid] = hasReset;
+
+#pragma omp barrier
+#pragma omp single
+                {
+                    int carry = 0;
+                    for (int t = 0; t < threads; ++t) {
+                        entries[t] = carry;
+                        if (resets[t]) {
+                            carry = tails[t];
+                        } else {
+                            carry += tails[t];
+                            if (carry >= MOD) carry -= MOD;
+                        }
+                    }
+                }
+
+                const int carry = entries[tid];
+                if (carry != 0) {
+                    for (int x = first; x < last && !blocked[row + x]; ++x) {
+                        int value = currentRow[x] + carry;
+                        if (value >= MOD) value -= MOD;
+                        currentRow[x] = value;
+                    }
+                }
+
+#pragma omp barrier
+#pragma omp single
+                { swap(previousRow, currentRow); }
+            }
+        }
+    }
+
+    cout << previous[n - 1] << '\n';
+    return 0;
+}

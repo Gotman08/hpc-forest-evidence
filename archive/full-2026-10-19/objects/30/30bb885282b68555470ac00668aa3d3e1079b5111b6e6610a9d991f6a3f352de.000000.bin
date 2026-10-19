@@ -1,0 +1,215 @@
+"""Read a closed R2 registry and Git objects; never import the running controller."""
+from __future__ import annotations
+
+import json
+import math
+import re
+import zipfile
+
+from audit_common import (
+    CAMPAIGN,
+    JOB,
+    MODEL,
+    OFFICIAL_SHA,
+    SESSION,
+    digest,
+    finite_contract,
+    inventory,
+    need,
+    open_closed_database,
+    read_json,
+    rebased,
+    relative,
+    sha,
+    slot_costs,
+)
+from audit_evaluations import evaluation_evidence
+from audit_source_binding_r2 import (
+    frozen_protocol_evidence,
+    proposal_evidence,
+    worktree_evidence,
+)
+from git_loose_readonly import LooseGit
+
+
+def normal_sources(files):
+    return {name: value.replace("\r\n", "\n").replace("\r", "\n") for name, value in files.items()}
+
+
+def feedback_evidence(attempt):
+    statuses = {"pending", "valid", "development_valid", "build_failed", "incorrect", "runtime_failed", "duplicate", "rejected", "infrastructure_failed", "budget_exhausted", "failed", "completed"}
+    codes = {"compilation_failed", "execution_failed", "execution_timeout", "output_size_or_missing", "output_mismatch", "check_passed", "unavailable_diagnostic", "infrastructure_error"}
+    outcome = attempt.get("development_outcome", {})
+    need(isinstance(outcome, dict) and set(outcome) <= {"status", "correct"}
+         and (not outcome or outcome.get("status") in statuses)
+         and ("correct" not in outcome or type(outcome["correct"]) is bool), "Development feedback contains untyped/raw data")
+    for diagnostic in attempt.get("measured_diagnostics", []):
+        need(isinstance(diagnostic, dict) and set(diagnostic) <= {"status", "code", "case", "returncode"}
+             and diagnostic.get("status") in {"failed", "completed"} and diagnostic.get("code") in codes,
+             "Raw or arbitrary measured diagnostics entered model feedback")
+        need("case" not in diagnostic or isinstance(diagnostic["case"], str) and re.fullmatch(r"(?:search|confirmation|benchmark)-case-[1-8]", diagnostic["case"]), "Private diagnostic case was not generic")
+        need("returncode" not in diagnostic or type(diagnostic["returncode"]) is int and -255 <= diagnostic["returncode"] <= 255, "Untyped diagnostic returncode")
+
+
+def harness_evidence(campaign, mission, outcome, git, root, calls):
+    path = campaign / "logs" / mission["id"] / "node-harness.json"
+    journal = read_json(path)
+    need(journal.get("mission_id") == mission["id"] and journal.get("parent_id") == mission["parent_id"]
+         and journal.get("holdout_access") is False and journal.get("outer_tree_reward_assigned") is False,
+         "Harness identity/private-phase contract differs")
+    attempts = journal.get("attempts", [])
+    need(len(attempts) <= 3 and journal.get("state") == "finished", "Unclosed/oversized harness episode")
+    sources = git.sources_at(mission["base_commit"])
+    for number, attempt in enumerate(attempts, 1):
+        generation = f"{mission['id']}-h{number:02d}"
+        need(attempt.get("attempt") == number and attempt.get("generation_id") == generation
+             and generation in calls["mission_ids"] and attempt.get("source_digest_before_call") == digest(normal_sources(sources)),
+             "Unreconciled harness invocation or source parent")
+        generated = campaign / "logs" / generation / "agent-result.json"
+        if generated.exists():
+            data = proposal_evidence(generation, generated, calls)
+            for edit in data.get("files", []):
+                name = relative(edit["path"])
+                need(name.startswith("src/") and isinstance(edit["content"], str), "Model edit leaves source scope")
+                sources[name] = edit["content"]
+            snapshot = read_json(path.parent / f"harness-source-{number:02d}.json")
+            need(snapshot == normal_sources(sources) and digest(snapshot) == attempt.get("source_digest"),
+                 "Archived model edits differ from harness source")
+        else:
+            need(attempt.get("generation_error") or attempt.get("state") == "generation_failed",
+                 "Unexplained missing model source proposal")
+        feedback_evidence(attempt)
+    if outcome.get("commit"):
+        commit = outcome["commit"]
+        need(git.commit(commit)["parents"] == [mission["base_commit"]], "Candidate Git parent differs from search mission")
+        need(git.sources_at(commit) == sources, "Committed source differs from model-authored edits")
+        base_files, files = git.files_at(mission["base_commit"]), git.files_at(commit)
+        need({k: v for k, v in files.items() if not k.startswith("src/")} ==
+             {k: v for k, v in base_files.items() if not k.startswith("src/")}, "Candidate changed protected repository files")
+        worktree = rebased(mission["worktree"], root)
+        actual = {"src/" + name: entry for name, entry in inventory(worktree / "src").items()}
+        need(actual == {name: {"sha256": sha(raw), "bytes": len(raw)} for name, raw in files.items() if name.startswith("src/")},
+             "Archived candidate worktree differs from its Git commit")
+    return [attempt["generation_id"] for attempt in attempts]
+
+
+def submission_evidence(path, best, winner, git):
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        need(len(names) == len(set(names)) and archive.testzip() is None, "Duplicate/corrupt submission ZIP")
+        regular = {name for name in names if not name.endswith("/")}
+        files = git.files_at(best["commit"])
+        need(regular == set(files) | {"HPC_FOREST_MANIFEST.json"}, "Submission inventory differs from selected Git tree")
+        for name, raw in files.items():
+            need(archive.read(name) == raw, "Submission source bytes differ from selected commit")
+        manifest = json.loads(archive.read("HPC_FOREST_MANIFEST.json"))
+        need(all(manifest.get(key) == value for key, value in best.items())
+             and manifest.get("confirmation") == winner, "Submission manifest differs from exact confirmation")
+
+
+def campaign_evidence(root, certified, source_zip, calls):
+    campaign = root / ("results-" + JOB) / CAMPAIGN
+    db = open_closed_database(campaign / "registry.sqlite3")
+    try:
+        meta = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT key,value FROM metadata")}
+        config, identity = meta["config"], meta["identity"]
+        need(config == read_json(campaign / "trusted/config.json"), "Registry/protected configurations differ")
+        need(config.get("backend") == "codex" and config.get("method") == "H" and config.get("seed") == 23,
+             "Wrong native backend/method/seed")
+        codex, budget, protocol = config["codex"], config["budget"], config["protocol"]
+        need(codex.get("model") == MODEL and codex.get("reasoning_effort") == "max" and codex.get("session_id") == SESSION,
+             "Registry child identity differs")
+        need(budget.get("max_workers") == 1 and budget.get("max_depth") == 6 and budget.get("tokens") == 1500000
+             and budget.get("wall_seconds") == 1800 and protocol.get("repetitions") == 3
+             and protocol.get("confirmation_repetitions") == 5 and config.get("minimum_gain") == .03,
+             "Native bounds/protocol changed")
+        manifest = {name: value["sha256"] for name, value in inventory(campaign / "trusted").items()}
+        need(meta["manifest"] == manifest and meta["protocol_id"] == digest({"protocol": protocol, "manifest": manifest, "target": identity}),
+             "Protected controller protocol digest changed")
+        with zipfile.ZipFile(source_zip) as source:
+            prefix = "HPC-Forest/src/hpc_forest/"
+            impl = {name[len(prefix):]: sha(source.read(name)) for name in source.namelist() if name.startswith(prefix) and name.endswith(".py")}
+            need(impl and digest(impl) == identity.get("controller_implementation"), "Runtime controller differs from admitted source ZIP")
+            need((campaign / "trusted/contract_tool.py").read_bytes() == source.read(prefix + "contracts.py"), "Protected checker differs from admitted source")
+        contract = finite_contract(campaign / "trusted", certified)
+        scripts = frozen_protocol_evidence(campaign / "trusted", contract, protocol, source_zip)
+        epochs = [dict(row) for row in db.execute("SELECT * FROM epochs")]
+        need(len(epochs) == 1 and epochs[0]["id"] == 1 and epochs[0]["protocol_id"] == meta["protocol_id"], "Only one fresh epoch is admitted")
+        epoch, git = epochs[0], LooseGit(campaign / "repo")
+        need(sha(git.files_at(epoch["base_commit"])["src/model-view/primetest.c"]) == OFFICIAL_SHA, "Official baseline bytes differ")
+        trees = [dict(row) for row in db.execute("SELECT * FROM trees")]
+        need(trees and all(r["version"] == "0.3.2" and sha(r["checkpoint"]) == r["sha256"] for r in trees), "Invalid TreeQuest checkpoint hash/version")
+        # Check hashes only. Unpickling untrusted restored evidence is forbidden.
+        previous, statuses, generation_ids = {}, {}, []
+        trials = [dict(r) for r in db.execute("SELECT * FROM trials ORDER BY created,id")]
+        need(len(trials) <= 8, "Program mission limit exceeded")
+        for row in trials:
+            mission, outcome = json.loads(row["mission"]), json.loads(row["result"])
+            need(row["state"] != "pending" and mission["id"] == row["id"] and mission["epoch"] == 1
+                 and mission["role"] in {"A", "B", "C", "G"} and mission["delegation_parent"] == "R/" + mission["role"],
+                 "Pending or wrong trial lineage")
+            parent = mission["parent_id"]
+            need(parent is None or parent in previous, "Search parent absent or not earlier in this cohort")
+            expected_base = epoch["base_commit"] if parent is None else (previous[parent][1].get("commit") or previous[parent][0]["base_commit"])
+            need(mission["base_commit"] == expected_base and mission["depth"] == (1 if parent is None else previous[parent][0]["depth"] + 1)
+                 and 1 <= mission["depth"] <= 6, "Search depth/base commit differs")
+            need(len(mission["sources"]) == len(mission["source_commits"]) == len(set(mission["sources"])), "Duplicate/misaligned source provenance")
+            for source_id, commit in zip(mission["sources"], mission["source_commits"], strict=True):
+                need(source_id in previous and previous[source_id][1].get("correct") is True
+                     and previous[source_id][1].get("commit") == commit, "Imported/nonvalid integration source")
+            generation_ids.extend(harness_evidence(campaign, mission, outcome, git, root, calls))
+            evaluation_evidence(outcome, "search", root, 3, expected_worktree=mission["worktree"], expected_commit=outcome.get("commit"), git=git)
+            previous[row["id"]] = mission, outcome
+            statuses[outcome["status"]] = statuses.get(outcome["status"], 0) + 1
+        need(set(generation_ids) == {r["mission_id"] for r in calls["nonce_records"] if not r["mother"]}, "Child cache requests do not match the complete trial cohort")
+        interactions = [dict(row) for row in db.execute("SELECT * FROM interactions")]
+        need({r["experiment_id"] for r in interactions} == {name for name, (m, _) in previous.items() if m["role"] == "G"}, "Integration interactions incomplete")
+        for row in interactions:
+            mission, outcome = previous[row["experiment_id"]]
+            need(json.loads(row["sources"]) == mission["sources"] and json.loads(row["payload"]) == outcome, "Integration provenance/result differs")
+        evaluations = [dict(row) for row in db.execute("SELECT * FROM evaluations")]
+        search = {r["experiment_id"]: json.loads(r["payload"]) for r in evaluations if r["phase"] == "search"}
+        need(set(search) == {"baseline-e1"} | {name for name, (_, o) in previous.items() if o["status"] != "duplicate"}, "Search evaluations incomplete or extra")
+        baseline = search["baseline-e1"]
+        baseline_log = rebased(baseline["logs"][0], root)
+        baseline_worktree = read_json(baseline_log.with_name(baseline_log.name + ".json"))["argv"][3]
+        evaluation_evidence(baseline, "search", root, 3, expected_worktree=baseline_worktree, expected_commit=epoch["base_commit"], git=git)
+        for name, (_, outcome) in previous.items():
+            need(outcome["status"] == "duplicate" or search.get(name) == outcome, "Trial/evaluation payload differs")
+        confirmations = {r["experiment_id"]: json.loads(r["payload"]) for r in evaluations if r["phase"] == "confirmation"}
+        plan = meta["confirmation_plan:1"]
+        need(1 <= len(plan) <= 3 and {r["id"] for r in plan} == set(confirmations) and len(plan) == len(confirmations), "Full confirmation cohort missing")
+        for item in plan:
+            expected_commit = epoch["base_commit"] if item["id"] == "baseline-e1" else previous[item["id"]][1]["commit"]
+            outcome = confirmations[item["id"]]
+            need(item["commit"] == expected_commit == outcome["commit"], "Confirmation commit differs from exact candidate")
+            worktree_evidence(root, item["worktree"], expected_commit, git)
+            evaluation_evidence(outcome, "confirmation", root, 5, expected_worktree=item["worktree"], expected_commit=expected_commit, git=git)
+        reference = confirmations["baseline-e1"]
+        valid = {key: value for key, value in confirmations.items() if value.get("correct") is True}
+        need(reference.get("correct") is True and valid, "No valid same-allocation reference confirmation")
+        fastest = min(valid, key=lambda key: valid[key]["mean_seconds"])
+        gain = 1 - valid[fastest]["mean_seconds"] / reference["mean_seconds"]
+        if gain < .03:
+            fastest, gain = "baseline-e1", 0.0
+        best, winner = meta["best_confirmed"], valid[fastest]
+        need(best["experiment_id"] == fastest and best["commit"] == winner["commit"] and best["evaluation_digest"] == digest(winner)
+             and best["protocol_id"] == meta["protocol_id"] and best["is_baseline"] == (fastest == "baseline-e1")
+             and math.isclose(best["mean_seconds"], winner["mean_seconds"], rel_tol=1e-12)
+             and math.isclose(best["reference_seconds"], reference["mean_seconds"], rel_tol=1e-12)
+             and math.isclose(best["improvement_fraction"], gain, rel_tol=1e-12, abs_tol=1e-15), "Selected winner/3-percent policy differs")
+        submission_evidence(campaign / "submission.zip", best, winner, git)
+        costs = slot_costs([dict(r) for r in db.execute("SELECT * FROM slots")])
+        need(costs["exact_known_tokens"] == calls["exact_known_tokens"] and costs["reserved_tokens"] == 0
+             and costs["unknown_usage_slots"] == costs["upper_bound_slots"] == 0, "Ledger/cache token accounting is not fully reconciled")
+        for phase in ("preparation", "synthesis"):
+            mother = meta.get("mother_plan:" + phase)
+            if mother and mother.get("response"):
+                response = mother["response"]
+                need(response.get("model") == MODEL and response.get("reasoning_effort") == "max" and response.get("session_id") == SESSION,
+                     "Mother identity differs from child identity")
+        return {"received_native_checker_protocol_verified": True, "lineage_and_five_confirmations_verified": True,
+                "frozen_protocol_scripts": scripts, "trials": len(trials), "negative_and_positive_status_counts": statuses, "confirmations": len(confirmations),
+                "selected_reported_by_frozen_checker": best, "ledger": costs, "tree_checkpoints_unpickled": False}
+    finally:
+        db.close()

@@ -1,0 +1,339 @@
+"""Read received qualification bytes only; never launch C, CLI, model, Git or ROMEO."""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import sys
+import tarfile
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parent
+BASE = ROOT.parents[2]
+SOURCE_SHA = "ade344bfec4322e8aaecc99cfbf7bd502e6d39b55c62180e8f552a3d6391e680"
+PLAN_SHA = "bac579fdb44850c636a6522c014175f95d4ce867bab502d86dd15c1bff31032e"
+BUNDLE_SHA = "b64b297c0d1550c7b906f601c924fe36a7fe3bf71a9b111c8678450f0082697a"
+ARCHIVE_SHA = "4f8db76788d3cb3a46636cd71370462bd8d54ac6e2570d64234482c30d991df1"
+PREPARATION_SHA = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+OFFICIAL_C_SHA = "70e15be0d677eb40d700c3c09c20dc4d2db50332fbf9a2a4d30fb37bd3014f6d"
+SCOPE = "hpc-forest-primes-native-max-r2c"
+REMOTE_ROOT = "/scratch_p/nimarano/hpc-forest-primes-native-contract-qualification-20261018-r2c-b64b297c0d15"
+MAX_BYTES = 64 * 1024 * 1024
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def file_sha(path):
+    return sha(path.read_bytes())
+
+
+def save_new(name, value):
+    with (ROOT / name).open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+
+
+def canonical(name):
+    require(isinstance(name, str) and name and "\\" not in name and "\0" not in name,
+            "Unsafe archive member")
+    parts = PurePosixPath(name)
+    require(not parts.is_absolute() and ".." not in parts.parts and str(parts) == name
+            and name != "." and all(":" not in part for part in parts.parts), "Member escape")
+    return parts
+
+
+def tar_members(raw, prefix, limit=1000):
+    require(len(raw) <= MAX_BYTES, "Compressed archive exceeds bound")
+    material, folded, size = {}, set(), 0
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+        for member in archive:
+            path = canonical(member.name)
+            require(member.isfile() and path.parts[0] == prefix and len(path.parts) > 1,
+                    "Nonregular member or incorrect archive root")
+            name = path.relative_to(prefix).as_posix()
+            canonical(name)
+            size += member.size
+            require(name not in material and name.casefold() not in folded and len(material) < limit
+                    and 0 <= member.size <= 8 * 1024 * 1024 and size <= MAX_BYTES,
+                    "Duplicate, case collision or oversized archive")
+            stream = archive.extractfile(member)
+            require(stream is not None, "Absent regular member stream")
+            content = stream.read(member.size + 1)
+            require(len(content) == member.size, "Short or changed archive member")
+            material[name] = content
+            folded.add(name.casefold())
+    return material
+
+
+def inventory(path):
+    result = {}
+    for member in sorted(path.rglob("*")):
+        require(not member.is_symlink(), "Linked restored member")
+        if member.is_file():
+            require(member.resolve(strict=True).is_relative_to(path.resolve(strict=True)), "Restored escape")
+            result[member.relative_to(path).as_posix()] = file_sha(member)
+    return result
+
+
+def structured(name):
+    result = json.loads((ROOT / name).read_text(encoding="utf8"))
+    return result["structuredContent"]
+
+
+def main():
+    submitted = json.loads((ROOT.parent / "soumission-observee-parent.json").read_text(encoding="utf8"))["structuredContent"]
+    require(submitted.get("ok") is True and submitted.get("submission_observed") is True
+            and submitted.get("job_id") == "752128"
+            and submitted.get("plan_id") == "958c0c6c8c8d4f3d925d2e5c796f3734"
+            and submitted.get("plan_sha256") == "b1443802ae583f3df1067cf14b7aa97ad355aac71eeaf0fcd20af8ff9da328d0",
+            "Actual unique parent submission does not bind this job and prepared plan")
+    wrapper_review_path = ROOT.parent / "REVUE-INDEPENDANTE-ENVELOPPE.json"
+    require(file_sha(wrapper_review_path) == "13f04797c52de7cbbb61cc2c85b02391ea35303e9ea8f1dcb0b68e97328d2d73",
+            "Actual separate envelope review changed")
+    wrapper_review = json.loads(wrapper_review_path.read_text(encoding="utf8"))
+    require(wrapper_review.get("verified") is True and wrapper_review.get("blocking_findings") == []
+            and wrapper_review.get("native_research_admitted") is False
+            and all(file_sha(ROOT.parent / name) == expected for name, expected in wrapper_review["artifacts"].items()),
+            "Reviewed envelope artifact bytes changed")
+    archive = ROOT / "envelope-results-752128.tar.gz"
+    archive_raw = archive.read_bytes()
+    sidecar = json.loads((ROOT / "envelope-archive.json").read_text(encoding="utf8"))
+    transfer = structured("archive-transfert.json")
+    status = structured("statut-initial.json")
+    efficiency = structured("efficacite-initiale.json")
+    require(sha(archive_raw) == ARCHIVE_SHA == sidecar["sha256"] == transfer["remote_sha256"]
+            == transfer["empreinte_locale"] == transfer["empreinte_distante"]
+            and transfer["verifie"] is True and sidecar["bytes"] == len(archive_raw) == 794274,
+            "Announced, remote and independently local archive SHA/size differ")
+    require(sidecar["path"] == REMOTE_ROOT + "/envelope-results-752128.tar.gz"
+            and sidecar["passed"] is True and sidecar["native_model_calls"] == 0
+            and sidecar["native_research_admitted"] is False, "Sidecar binding differs")
+    require(status["job_id"] == "752128" and status["state"] == "COMPLETED"
+            and status["exit_code"] == "0:0" and status["observation"]["current_state_observed"] is True,
+            "Fresh successful terminal observation absent")
+    require(efficiency["job_id"] == "752128" and efficiency["state"] == "COMPLETED"
+            and efficiency["exit_code"] == "0:0" and efficiency["alloc_cpus"] == 4
+            and efficiency["alloc_gpus"] == 0 and efficiency["req_mem_mb"] == 16384,
+            "Terminal allocation efficiency differs")
+    material = tar_members(archive_raw, "qualification-envelope")
+    require(len(material) == 503, "Unexpected envelope inventory")
+    restoration = ROOT / "restauration-neuve"
+    require(not restoration.exists() and not restoration.is_symlink(), "Fresh restoration required")
+    restoration.mkdir()
+    for name, raw in material.items():
+        path = restoration.joinpath(*canonical(name).parts)
+        require(path.resolve().is_relative_to(restoration), "Restoration target escaped")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(raw)
+    restored_before = inventory(restoration)
+    require(restored_before == {name: sha(raw) for name, raw in material.items()}, "Fresh restored bytes differ")
+    save_new("inventaire-avant-audit.json", restored_before)
+
+    envelope = json.loads(material["envelope-receipt.json"])
+    bindings = json.loads((ROOT.parent / "bindings-proposees.json").read_text(encoding="utf8"))
+    require(envelope["bindings"] == bindings and envelope["scope_id"] == SCOPE
+            and envelope["passed"] is True and envelope["qualification_returncode"] == 0
+            and envelope["qualification_launched_count"] == 1 and envelope["input_files_unchanged"] is True
+            and envelope["native_model_calls"] == 0 and envelope["native_research_admitted"] is False
+            and envelope["performance_claimed"] is False, "Envelope admission or one-launch evidence differs")
+    allocation = envelope["allocation"]
+    expected_allocation = {"job_id": "752128", "architecture": "aarch64", "nodes": 1, "tasks": 1,
+                           "cpus_per_task": 4, "memory_mib": 16384, "gpus": 0,
+                           "affinity_cpu_ids": [0, 1, 2, 3], "affinity_cpu_count": 4}
+    require(allocation == expected_allocation, "Actual ARM64 allocation/affinity differs")
+    launched = json.loads(material["qualification-launch-intent.json"])
+    require(launched["launch_count"] == 1 and launched["native_model_calls"] == 0
+            and launched["no_retry"] is True, "Unique real qualification launch absent")
+    expected_argv = ["/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python", "-I", "-B",
+        REMOTE_ROOT + "/extraction/HPC-Forest/examples/marathon22/qualify_r2max_contract.py",
+        "--package", REMOTE_ROOT + "/extraction/certified-preparation", "--output", REMOTE_ROOT + "/Q",
+        "--source-zip", REMOTE_ROOT + "/extraction/HPC-Forest-Primes-Natif-MAX-r2c.zip",
+        "--plan", REMOTE_ROOT + "/extraction/native-max-plan.json"]
+    require(launched.get("argv") == expected_argv, "Actual official-only qualification argv changed")
+    require(material["qualification-launch.stderr"] == b"" and (ROOT / "slurm-752128.err").read_bytes() == b"",
+            "Unexpected real qualification stderr; preserve for review")
+    require(json.loads(material["allocation-before-work.json"])["allocation"] == allocation,
+            "Allocation-before-work differs")
+
+    extraction = {name.removeprefix("extraction/"): raw for name, raw in material.items()
+                  if name.startswith("extraction/")}
+    declared_before = json.loads(material["input-inventory-before.json"])
+    require(declared_before == json.loads(material["input-inventory-after.json"])["files"]
+            == {name: sha(raw) for name, raw in extraction.items()}, "Input before/after bytes differ")
+    source_raw = extraction["HPC-Forest-Primes-Natif-MAX-r2c.zip"]
+    require(sha(source_raw) == SOURCE_SHA and sha(extraction["native-max-plan.json"]) == PLAN_SHA
+            and bindings["payload_sha256"] == BUNDLE_SHA, "Source/plan/bundle differs")
+    plan = json.loads(extraction["native-max-plan.json"])
+    require(plan.get("scope_id") == SCOPE and plan.get("efforts") == ["max"]
+            and plan.get("maximum_native_workers_total") == 4
+            and plan.get("maximum_cells_per_authorization") == 1
+            and plan.get("automatic_extension") is False
+            and plan.get("cells") == {"gpt-6-astra": "979ef61f50d041639c1cd46e1942a3f3",
+                "gpt-5.6-terra": "a35692d6da3f46278fe3840f5c56984e",
+                "gpt-6.1-sol": "0fbe579c95f74ec7b90ebe702877434b"},
+            "Received closed MAX/cap4/one-cell plan differs")
+    runtime = json.loads(extraction["runtime-manifest-r2max.json"])
+    require(len(runtime) == 103 and sha(extraction["runtime-manifest-r2max.json"])
+            == "20802c1855c983954c2af5d21d336cc14e7b8964a1ab5d40aec38c6ba1c37c5d",
+            "Runtime manifest differs")
+    sources = {}
+    with zipfile.ZipFile(io.BytesIO(source_raw)) as source_zip:
+        for member in source_zip.infolist():
+            path = canonical(member.filename)
+            require(not member.is_dir() and path.parts[0] == "HPC-Forest"
+                    and member.filename not in sources and member.file_size <= 8 * 1024 * 1024,
+                    "Unsafe or repeated source ZIP member")
+            sources[member.filename.removeprefix("HPC-Forest/")] = source_zip.read(member)
+    require(len(sources) == 103 and {name: sha(raw) for name, raw in sources.items()} == runtime
+            and all(extraction["HPC-Forest/" + name] == raw for name, raw in sources.items()),
+            "Exact 103 sources not restored")
+    project = BASE / "work/hpc-forest-primes-native-max-r2c/project"
+    local_source_before = {name: file_sha(project / name) for name in runtime}
+    require(local_source_before == runtime, "Read-only native auditor source differs from the sealed source")
+    save_new("sources-locales-avant-audit.json", local_source_before)
+
+    qraw = material["Q/qualification.json"]
+    qualification = json.loads(qraw)
+    require(qraw == material["qualification-original.json"]
+            and sha(qraw) == envelope["qualification_sha256"]
+            == "298fee9af787299dd22783c2f8a6c590d672424b53e4359008558979c822f28a", "Original raw Q receipt changed")
+    require(qualification["scope_id"] == SCOPE and qualification["verified"] is True
+            and qualification["source_zip_sha256"] == SOURCE_SHA and qualification["plan_sha256"] == PLAN_SHA
+            and qualification["preparation_manifest_sha256"] == PREPARATION_SHA
+            and qualification["allocation"] == allocation and qualification["native_model_calls"] == 0
+            and qualification["native_research_admitted"] is False, "Q source/plan/allocation binding differs")
+    require(qualification["prepared_root"] == envelope["prepared_root_original"]
+            and qualification["prepared_root"].startswith("/gpfs/scratch/nimarano/")
+            and qualification["prepared_root"].endswith("/Q/prepared"), "Original remote prepared root not retained")
+    inner_sidecar = json.loads(material["Q-archive.json"])
+    inner_raw = material["Q.tar.gz"]
+    require(sha(material["Q-archive.json"]) == envelope["qualification_archive_sidecar_sha256"]
+            and sha(inner_raw) == inner_sidecar["sha256"] == envelope["qualification_archive_sha256"]
+            == "c16e528606590b879d281158d8aa1136efed17d2c609c34024a7853c79cf1242",
+            "Inner archive exact SHA differs")
+    inner = tar_members(inner_raw, "qualification")
+    expected_inner = {"qualification.json": sha(qraw),
+                      **{"prepared/" + name: value for name, value in qualification["prepared_files"].items()},
+                      **{"official-evaluator-trace/" + name: value
+                         for name, value in qualification["official_evaluator_trace_files"].items()}}
+    require({name: sha(raw) for name, raw in inner.items()} == expected_inner
+            and all(material["Q/" + name] == raw for name, raw in inner.items()),
+            "Original inner/outer archive member bytes differ")
+    for label in ("qualification_archive_identity", "prepared_root_identity"):
+        identity = envelope[label]
+        require(identity["same_complete_resolved_path"] is True and identity["verified"] is True
+                and identity["resolved_path"].startswith("/gpfs/scratch/nimarano/"),
+                "Allocated full resolved identity evidence absent")
+
+    # Import only the 103 hash-verified local Python sources. Every callable below is a pure reader.
+    require(not any(name == "hpc_forest" or name.startswith("hpc_forest.") for name in sys.modules),
+            "Unexpected preloaded auditor modules")
+    sys.path.insert(0, str(project / "src"))
+    from hpc_forest.native_r2max import (
+        verify_qualification,
+        verify_qualification_members,
+        verify_reception,
+        verify_trace_members,
+    )
+    from hpc_forest.primes_contract import verify_preparation
+
+    package = restoration / "extraction/certified-preparation"
+    certified_data = verify_preparation(package)
+    verify_qualification(qualification, SOURCE_SHA, prepared=False)
+    read_prepared = lambda name: inner["prepared/" + name]
+    verify_qualification_members(qualification, read_prepared, certified_data)
+    links = verify_trace_members(qualification, lambda name: inner["official-evaluator-trace/" + name],
+                                 read_prepared_member=read_prepared)
+    require(links.get("original_archive_links_verified") is True
+            and links.get("cluster_paths_followed_locally") is False
+            and links.get("evaluator_executions") == 14 and links.get("case_executions") == 13,
+            "Native original archive trace graph verification incomplete")
+    official = inner["prepared/source/src/model-view/primetest.c"]
+    require(sha(official) == OFFICIAL_C_SHA, "Official C changed")
+    restored_after = inventory(restoration)
+    source_after = {name: file_sha(project / name) for name in runtime}
+    require(restored_after == restored_before and source_after == local_source_before,
+            "Audit modified restored or sealed source bytes")
+    save_new("inventaire-apres-audit.json", restored_after)
+    save_new("sources-locales-apres-audit.json", source_after)
+    with (ROOT / "qualification.json").open("xb") as stream:
+        stream.write(qraw)
+    with (ROOT / "qualification.tar.gz").open("xb") as stream:
+        stream.write(inner_raw)
+    report = {"schema": "hpc-forest-primes-r2max-allocated-contract-reception-audit-v1",
+              "scope_id": SCOPE, "verified": True,
+              "verification_scope": "Received mechanical qualification, official C and original Evaluator trace only",
+              "job_id": "752128", "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+              "slurm_plan_id": submitted["plan_id"], "slurm_plan_sha256": submitted["plan_sha256"],
+              "wrapper_review_sha256": file_sha(wrapper_review_path),
+              "closed_three_max_plan_verified": True, "maximum_native_workers_total": 4,
+              "maximum_cells_per_authorization": 1,
+              "preparation_manifest_sha256": PREPARATION_SHA, "qualification_sha256": sha(qraw),
+              "archive_sha256": sha(inner_raw), "envelope_archive_sha256": ARCHIVE_SHA,
+              "all_members_regular_unique": True, "restored_files_byte_identical": True,
+              "restored_files_unchanged_after_readonly_audit": True, "restored_file_count": len(material),
+              "qualification_member_count": len(inner), "prepared_file_count": len(qualification["prepared_files"]),
+              "official_trace_file_count": len(qualification["official_evaluator_trace_files"]),
+              "source_files_verified": 103, "input_files_unchanged": True,
+              "actual_compiler_command_verified": True,
+              "actual_compiler_executable_declared": qualification["compiler_command"]["argv"][0],
+              "compiler_flags": qualification["compiler_flags"],
+              "external_executable_bytes_independently_verified": False,
+              "reference_source_sha256": OFFICIAL_C_SHA,
+              "reference_binary_sha256": qualification["reference_binary_sha256"],
+              "certified_twelve_case_contract_verified": True, "distinct_certified_cases": 12,
+              "certified_rows_including_benchmark_alias": 13, "actual_allocation": allocation,
+              "original_archive_trace_verification": links, "native_model_calls": 0,
+              "new_model_candidates": 0, "native_first_start_proved": False,
+              "native_research_admitted": False, "performance_research_result": False,
+              "hardware_or_process_isolation_proved": False,
+              "remote_prepared_root_original": qualification["prepared_root"],
+              "remote_paths_followed_locally": False, "negative_preserved_no_retry": True,
+              "local_c_compiler_cli_model_or_git_executed": False,
+              "utc": datetime.now(UTC).isoformat()}
+    save_new("audit-natif.json", report)
+    reception = {"schema": "hpc-forest-primes-r2max-allocated-contract-reception-v1", "scope_id": SCOPE,
+                 "verified": True, "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+                 "preparation_manifest_sha256": PREPARATION_SHA, "qualification_sha256": sha(qraw),
+                 "archive": {"path": str(ROOT / "qualification.tar.gz"), "sha256": sha(inner_raw)},
+                 "audit": {"path": str(ROOT / "audit-natif.json"), "sha256": file_sha(ROOT / "audit-natif.json")},
+                 "evidence_refs": [{"path": str(ROOT / "envelope-results-752128.tar.gz"), "sha256": ARCHIVE_SHA}]}
+    save_new("reception-contrat.json", reception)
+    verify_reception(reception, ROOT / "qualification.json", package)
+    require(inventory(restoration) == restored_before
+            and {name: file_sha(project / name) for name in runtime} == local_source_before,
+            "Native reception reader changed source/restoration")
+    save_new("verification-relecture-native.json", {
+        "verified": True, "audit_sha256": file_sha(ROOT / "audit-natif.json"),
+        "reception_sha256": file_sha(ROOT / "reception-contrat.json"),
+        "native_verify_reception_passed": True, "raw_qualification_bytes_unchanged": True,
+        "all_503_restored_files_unchanged": True, "all_103_local_sources_unchanged": True,
+        "native_model_calls": 0, "native_first_start_proved": False,
+        "native_research_admitted": False, "utc": datetime.now(UTC).isoformat()})
+    print(json.dumps({"verified": True, "job_id": "752128", "restored_files": len(material),
+                      "inner_archive_members": len(inner), "source_files": 103, "trace": links,
+                      "audit_sha256": file_sha(ROOT / "audit-natif.json"),
+                      "reception_sha256": file_sha(ROOT / "reception-contrat.json"),
+                      "qualification_sha256": sha(qraw), "native_model_calls": 0}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, KeyError, TypeError, RuntimeError, ImportError, tarfile.TarError,
+            zipfile.BadZipFile) as exc:
+        error = {"verified": False, "error_type": type(exc).__name__, "error": str(exc),
+                 "negative_preserved_no_retry": True, "native_model_calls": 0,
+                 "utc": datetime.now(UTC).isoformat()}
+        save_new("audit-refus-initial.json", error)
+        raise

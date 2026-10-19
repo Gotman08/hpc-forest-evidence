@@ -1,0 +1,121 @@
+"""Cold private argv/policy/projection checks; no CLI, transport or model effects."""
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+from subprocess import list2cmdline
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def expected_argv(client, executable, model, policy, directory):
+    directory = Path(directory)
+    argv = [executable, 'exec', '--ignore-user-config', '--strict-config', '--ephemeral',
+        '--skip-git-repo-check', '--sandbox', 'read-only', '--json', '--color', 'never',
+        '--model', model, '--output-schema', str(directory/'output-schema.json'),
+        '--output-last-message', str(directory/'agent-result.json'), '-C', str(directory)]
+    overrides = {'model_reasoning_effort':'max','model_instructions_file':str(directory/'instructions.txt'),
+        'model_context_window':65536,'project_doc_max_bytes':0,'skills.max_context_tokens':1,
+        'skills.config':[{'path':p,'enabled':False} for p in policy['skill_candidate_directories']],
+        'skills.include_instructions':False,'skills.bundled.enabled':False,
+        'approval_policy':'never','forced_login_method':'chatgpt','web_search':'disabled',
+        **{'features.'+name:enabled for name,enabled in client.TASK_CLI_FEATURES.items()}}
+    for key,value in overrides.items():
+        argv.extend(['--config',key+'='+client.toml_override_value(value)])
+    argv.append('-')
+    require(len(list2cmdline(argv).encode('utf-16-le'))//2+1 <= 32767,'Exact private argv exceeds Windows bound')
+    return argv
+
+
+def audit_private(audit, refs, expected, snapshot, context, cell, worker):
+    """Called only after complete source/ZIP/manifest verification in _contracts.
+
+    refs14 are local raw records. Context points to the exact local policy,
+    diagnostics, and two separately downloaded public projections under hashes.
+    The two local generated projection sidecars must also match those downloads.
+    """
+    require(isinstance(context,dict) and set(context)=={'schema','policy','diagnostics','projections'}
+        and context.get('schema')=='hpc-forest-r4b-source110-private-context-v1'
+        and set(context['projections'])=={'invocation','process'},'Closed private context required')
+    snapshot=Path(snapshot).resolve(strict=True)
+    original=Path(expected['source_cache'])
+    policy_path=Path(context['policy']['path'])
+    prep=Path(__file__).resolve().parents[3]
+    require(policy_path.is_absolute() and policy_path.name=='cli-policy-'+expected['session_id']+'.json'
+        and policy_path.resolve().is_relative_to(prep) and not policy_path.resolve().is_relative_to(original.resolve()),
+        'Named received policy must stay in private receiving workspace before read')
+    policy_path=audit._hash_ref(context['policy'],'received private task policy')
+    cli=audit._decode(audit._read_ref(cell['artifacts']['cli_identity'],'original CLI identity'),'original CLI identity')
+    binding={key:cell[key] for key in ('scope_id','model','effort','session_id','job_id','remote_root')}
+    binding.update(source_zip_sha256=expected['source_zip_sha256'],plan_sha256=expected['plan_sha256'])
+    require(context['policy']['sha256']==cli.get('task_cli_policy_sha256')==worker.get('task_cli_policy_sha256')
+        and worker.get('local_skill_paths_exported') is False,'CLI/ready/policy digest differs')
+    client=importlib.import_module('hpc_forest.codex_process')
+    project=prep.parents[1]/'work/hpc-forest-mere-dynamique-r4b-lane-r3/project'
+    require(Path(client.__file__).resolve()==project/'src/hpc_forest/codex_process.py',
+        'Source110 private validator namespace differs')
+    policy=client.load_task_cli_policy(policy_path,context['policy']['sha256'],binding,audit.CLI_SHA)
+    require(type(worker.get('task_cli_policy_candidate_count')) is int
+        and worker['task_cli_policy_candidate_count']==len(policy['skill_candidate_directories']),
+        'Ready candidate count differs from exact local policy')
+    request=audit._decode(audit._read_ref(refs['request_native'],'native request'),'native request')
+    nonce=request['nonce']
+    directory=original/nonce
+    wanted=expected_argv(client,worker['codex_executable'],expected['model'],policy,directory)
+    projection_hashes={}
+    for kind,filename,raw_ref in (('invocation','invocation.json',refs['invocation']),
+                                 ('process','codex.jsonl.json',refs['execution_sidecar'])):
+        raw_path=audit._hash_ref(raw_ref,'private raw '+kind)
+        require(raw_path==snapshot/nonce/filename,'Raw metadata outside exact named cold nonce')
+        raw_record=audit._decode(raw_path.read_bytes(),'private raw '+kind)
+        require(raw_record.get('argv')==wanted,'Private argv differs from source110 exact constructor/policy')
+        entry=context['projections'][kind]
+        require(isinstance(entry,dict) and set(entry)=={'received','transfer'},'Projection plus actual transfer required')
+        for reference in entry.values():
+            candidate=Path(reference['path'])
+            require(candidate.is_absolute() and candidate.resolve().is_relative_to(prep)
+                and not candidate.resolve().is_relative_to(original.resolve()),'Projection proof outside receiving workspace before read')
+        projected=audit._decode(audit._read_ref(entry['received'],'downloaded '+kind+' projection'),'downloaded projection')
+        transfer=audit._decode(audit._read_ref(entry['transfer'],'projection transfer'),'projection transfer')
+        destination=audit._hash_ref(entry['received'],'downloaded projection')
+        remote=cell['remote_root']+'/results-'+expected['job_id']+'/mailbox/logs/'+nonce+'.'+filename
+        require(transfer.get('ok') is True and transfer.get('verifie') is True and transfer.get('transport')=='scp'
+            and transfer.get('downloaded') in {remote,remote.replace('/scratch_p/','/gpfs/scratch/',1)}
+            and transfer.get('to')==str(destination) and type(transfer.get('bytes')) is int
+            and transfer['bytes']==destination.stat().st_size
+            and all(transfer.get(key)==entry['received']['sha256'] for key in ('remote_sha256','empreinte_locale','empreinte_distante')),
+            'Exact downloaded projection transfer source/namespace/SHA required')
+        previous=client.CLI_POLICY
+        client.CLI_POLICY=policy
+        try:
+            reproduced=client.cli_metadata_projection(raw_path,context['policy']['sha256'],kind)
+        finally:
+            client.CLI_POLICY=previous
+        require(reproduced==projected,'Actual raw/local policy does not reproduce downloaded public projection')
+        local=snapshot/nonce/(filename+'.arm-projection.json')
+        require(audit._sha(local.read_bytes())==entry['received']['sha256'],'Frozen local/received projection bytes differ')
+        record,public=client.check_cli_metadata_projection(projected,kind,cli,expected['model'])
+        require(record=={k:v for k,v in raw_record.items() if k!='argv'},'Projection changed nonprivate process metadata')
+        projection_hashes[kind]=entry['received']['sha256']
+        require(public==[x for x in projected['argv_public']],'Public argv validation changed')
+    diagnostics_path=audit._hash_ref(context['diagnostics'],'cold diagnostics')
+    require(diagnostics_path==snapshot/nonce/'cli-diagnostics.json','Exact named cold diagnostics required')
+    log=audit._hash_ref(refs['jsonl'],'cold raw CLI log')
+    diagnostics=client.diagnostics_from_events(log)
+    require(diagnostics.get('clean') is True and audit._decode(diagnostics_path.read_bytes(),'diagnostics')==diagnostics,
+        'Unfiltered CLI diagnostic/unknown/tool output refuses NORMAL')
+    previous_model,previous_effort=client.MODEL,client.EFFORT
+    client.MODEL,client.EFFORT=expected['model'],'max'
+    try:
+        usage,tools=client.usage_from_events(log)
+    finally:
+        client.MODEL,client.EFFORT=previous_model,previous_effort
+    usage.update(cli_diagnostics_sha256=context['diagnostics']['sha256'],cli_diagnostic_count=len(diagnostics['findings']))
+    require(not tools and usage.get('token_accounting')=='exact' and usage.get('usage_parse_ambiguity') is False,
+        'Tool event/ambiguous usage refuses NORMAL')
+    return {'usage':usage,'task_cli_policy_sha256':context['policy']['sha256'],
+        'projection_sha256':projection_hashes,'private_argv_and_received_projections_reconciled':True,
+        'raw_skill_paths_exported':False,'runtime_global_admission_verified':False}

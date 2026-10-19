@@ -1,0 +1,147 @@
+"""Static/interface seal only. No candidate import, test rerun, cache or native action."""
+import ast
+import hashlib
+import json
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+READER = HERE.parent
+BASE = HERE.parents[3]
+REL = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2e"
+FACTORY = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2e/revision-r1"
+observed = {}
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+def read(path, expected=None):
+    assert path.is_file() and not path.is_symlink()
+    raw = path.read_bytes()
+    checksum = digest(raw)
+    assert expected is None or checksum == expected, str(path)
+    observed[path] = checksum
+    return raw
+
+def load(path, expected=None):
+    return json.loads(read(path, expected))
+
+def referenced(value):
+    path = Path(value["path"])
+    assert path.is_absolute() and path.resolve().is_relative_to(BASE)
+    return read(path, value["sha256"])
+
+def function(tree, name):
+    return next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+
+def assigned(function_node, name):
+    return next(node.value for node in function_node.body if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
+
+delivery_sha = "094e73dfd19ef0e126eeef8f92dbf29ff2148a94f983daa1c5d06fc2b9790113"
+manifest_sha = "cce9a7cb35d0c134e2bb8ef6eb8d8b0e7b8265a19e51b39ae016d504f99ea611"
+delivery = load(READER / "LIVRAISON-LECTEUR-PREMIER-BATCH.json", delivery_sha)
+manifest = load(READER / "MANIFESTE-LECTEUR.json", manifest_sha)
+assert delivery["prepared_only"] is True and delivery["verified"] is False and delivery["independent_review_required"] is True
+assert delivery["manifest"]["sha256"] == manifest_sha and len(manifest["reviewed_files"]) == 8
+material = {name: read(READER / name, checksum) for name, checksum in manifest["reviewed_files"].items()}
+assert manifest["reviewed_files"]["audit_prive.py"] == "0d7d141a6bff7ca294e9e8d4d16b53acd2e903e38f59099c838fb2f47a609c97"
+assert manifest["reviewed_files"]["controler-reception-bornee.py"] == "7d704cfa7dc2abbb360a137eb82ce86ed9d13b88c20a09eed4cfb10fd15219bf"
+assert manifest["reviewed_files"]["reception_bornee.py"] == "8d815c99c36d9cbf968cfb50c030dfcbbd0a5c679c292138c490d52d006e163f"
+assert manifest["reviewed_files"]["collecter-frontiere.py"] == "ec4393d0df89af78f4ca19b05b21d320f618f3063066ad35c603ad80fb653d94"
+assert manifest["reviewed_files"]["preparer-contexte.py"] == "6eed9e45f3c59caad03039b62d02f272fe80d895d6c4de2610b2691d1c09f723"
+trees = {name: ast.parse(raw.decode("utf-8")) for name, raw in material.items() if name.endswith(".py")}
+old_path = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2d/premier-demarrage-attempt2-r2/reception_bornee.py"
+old_tree = ast.parse(read(old_path).decode("utf-8"))
+guard_names = ("private_evaluation", "call_boundary", "validate_header", "parse_jsonl", "admissible_call_path")
+for name in guard_names:
+    assert ast.dump(function(old_tree, name), include_attributes=False) == ast.dump(function(trees["reception_bornee.py"], name), include_attributes=False)
+controller_constants = {node.targets[0].id: ast.literal_eval(node.value)
+    for node in trees["controler-reception-bornee.py"].body
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+    and node.targets[0].id in ("HELPER_SHA", "PRIVATE_SHA", "FACTORY_SHA", "PUBLICATION_SHA")}
+assert controller_constants["HELPER_SHA"] == manifest["reviewed_files"]["reception_bornee.py"]
+assert controller_constants["PRIVATE_SHA"] == manifest["reviewed_files"]["audit_prive.py"]
+read(FACTORY / "preparer-cellule-max.py", controller_constants["FACTORY_SHA"])
+read(FACTORY / "publication-locale.py", controller_constants["PUBLICATION_SHA"])
+context_pin = next(ast.literal_eval(node.value) for node in trees["preparer-contexte.py"].body
+    if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "COLLECTOR_SHA" for target in node.targets))
+assert context_pin == manifest["reviewed_files"]["collecter-frontiere.py"]
+project = BASE / "work/hpc-forest-primes-natif-relance-r2e/project"
+sealed = REL / "qualification-zero-modele-r1/paquet-source-lie-r1"
+runtime = load(sealed / "runtime-manifest-r2max.json", "a4a9418edb8ea86aeb720259eca1a7ac246952d280648115be4c93cd0364800b")
+assert len(runtime) == 108
+for name, checksum in runtime.items():
+    read(project / name, checksum)
+runner = ast.parse(read(project / "examples/marathon22/primes_native_max.py", "6053c464f1231f2c5db34651c8b79a87ec2593210c657cc77b1a1ae58a1f55c1").decode("utf-8"))
+# Compare the proposal's literal fields with the exact source gate's literal schema fields.
+proposal_function = function(trees["audit_prive.py"], "release_proposals")
+source_gate = function(runner, "validate_first_batch_release")
+def dict_keys(node):
+    assert isinstance(node, ast.Dict)
+    return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+def set_keys(node):
+    assert isinstance(node, ast.Set)
+    return {item.value for item in node.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)}
+assert dict_keys(assigned(proposal_function, "projection")) == set_keys(assigned(source_gate, "audit_fields"))
+assert dict_keys(assigned(proposal_function, "release")) == set_keys(assigned(source_gate, "fields"))
+assert "base = '/gpfs/scratch/nimarano/'" in material["preparer-contexte.py"].decode("utf-8")
+assert "canonical_path_requires_actual_MCP_admission" in material["preparer-contexte.py"].decode("utf-8")
+assert "no_path_refusal_bypass" in material["preparer-contexte.py"].decode("utf-8")
+latest, xml_summary = {}, []
+for reference in delivery["neutral_evidence"]:
+    raw = referenced(reference)
+    root = ET.fromstring(raw)
+    cases = root.findall(".//testcase")
+    bad = 0
+    for case in cases:
+        passed = not any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+        latest[(case.get("classname", ""), case.get("name", ""))] = passed
+        bad += not passed
+    xml_summary.append({"path": reference["path"], "sha256": reference["sha256"], "cases": len(cases), "nonpassing": bad})
+assert len(latest) == 24 and all(latest.values())
+assert [(row["cases"], row["nonpassing"]) for row in xml_summary] == [(21, 0), (24, 1), (1, 0)]
+referenced(delivery["first_local_refusals"])
+factory_review = load(REL / "reception-premier-batch-r1/revue-externe-lancement/REVUE-FACTORY-R2E-SCELLEE.json",
+    "7248a355c783dbafea9bb3174dcfc1d32bd7c42ae7901f47bc9cd8f1ab1575ed")
+assert factory_review["verified"] is True and factory_review["blocking_findings"] == []
+assert all(digest(path.read_bytes()) == checksum for path, checksum in observed.items())
+report = {
+    "schema": "hpc-forest-r2e-first-batch-cold-reader-independent-code-review-v1",
+    "verified": True, "blocking_findings": [], "verdict": "GO_EXACT_COLD_READER_PREPARATION_ONLY",
+    "scope_id": "hpc-forest-primes-native-max-r2e", "reviewer": "/root/cli_task_scope_options/revue_q_zero_r2e",
+    "delivery_sha256": delivery_sha, "manifest_sha256": manifest_sha, "reviewed_files": manifest["reviewed_files"],
+    "source_zip_sha256": manifest["source_zip_sha256"], "plan_sha256": manifest["plan_sha256"],
+    "source_members_currently_rehashed": 108, "mechanical_Q_dependency": "753285",
+    "scientific_guard_functions_AST_verbatim_equal_to_preserved_reader": list(guard_names),
+    "new_interfaces_reviewed": [
+        "Actual launch/auth/ready/policy refs build a closed frozen installation context; no future receipt fabricated.",
+        "Only explicitly reconciled nonce files are snapshotted; no cache enumeration, lock or database read.",
+        "Private argv is compared with the pure source108 rendering and exact local policy; both projections, named diagnostics and strict usage are checked.",
+        "Deep-copied raw private refs feed the unchanged strict call boundary, followed by the unchanged private evaluation guard.",
+        "Actual checkpoint transfer, first receipt, evaluation and call hashes bind a digest-only projection and exact source-gate release proposal.",
+        "Projection serialization uses exact LF bytes, then root-only digest upload/readback and release-last; no budget recredit."
+    ],
+    "source_gate_literal_release_and_audit_fields_match_proposals": True,
+    "canonical_transfer_boundary": {
+        "proposed_paths": "/gpfs/scratch/nimarano/SCOPE-SESSION/results-JOB for first/paused/results directory",
+        "original_received_paths_rewritten": False,
+        "scratch_alias_transfers_not_substituted_for_canonical_original_references": True,
+        "MCP_path_admission_required_and_refusal_bypass_forbidden": True
+    },
+    "existing_neutral_XML_evidence_only": {"unique_cases_with_later_passing_result": 24, "records": xml_summary,
+        "fixture_LF_refusal_and_single_case_correction_retained": True, "tests_rerun_by_this_review": False},
+    "actual_first_batch_or_private_argv_or_evaluation_received_by_this_review": False,
+    "scientific_performance_or_final_cohort_admission": False,
+    "native_research_admitted": False, "remote_release_published": False,
+    "candidate_import_or_execution_cache_collection_CLI_process_socket_job_or_transport_by_review": False,
+    "production_code_edited_by_review": False,
+    "actual_application_requires_frozen_installation_OAuth_transfers_raw_private_records_checkpoint_and_root_publication": True,
+    "factory_parent_role_preflight_boundary_retained": True,
+    "input_files_still_match_at_seal": True,
+    "input_file_sha256": {str(path): checksum for path, checksum in sorted(observed.items())}
+}
+out = HERE / "REVUE-LECTEUR-PREMIER-BATCH-SCELLEE.json"
+with out.open("x", encoding="utf-8", newline="\n") as stream:
+    stream.write(json.dumps(report, indent=2, ensure_ascii=True) + "\n")
+print(json.dumps({"verdict": report["verdict"], "report_sha256": digest(out.read_bytes()), "existing_XML_unique_passed": len(latest)}))

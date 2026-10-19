@@ -1,0 +1,186 @@
+"""Finished-nonce byte comparisons only; never reads locks or native databases."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RX = HERE.parent
+COMPARE = RX.parent.parent
+RUN = COMPARE / 'runs/source-only-gpt-6.1-sol-max'
+WORKER = RUN / 'worker'
+RESTORED = RX / 'restauration-neuve/results-751592'
+SESSION = '665743a02b824021a697b6a4884a667c'
+FIELDS = ('ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate')
+ALLOWED = {'agent-result.json', 'codex.jsonl', 'codex.jsonl.json', 'delivered.json', 'download-receipt.json',
+           'downloaded-request.json', 'generation-claimed.json', 'instructions.txt', 'invocation.json',
+           'output-schema.json', 'request.json', 'response-ready.json', 'response.json'}
+MAPPED = {'downloaded-request.json': ('requests', '.request.json'), 'response.json': ('responses', '.response.json'),
+          'response-ready.json': ('responses', '.ready.json'), 'invocation.json': ('logs', '.invocation.json'),
+          'codex.jsonl': ('logs', '.codex.jsonl')}
+
+
+def need(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def sha(path):
+    need(path.is_file() and not path.is_symlink(), 'Ordinary evidence file required')
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {'path': str(path.resolve(strict=True)), 'sha256': sha(path)}
+
+
+def read(path):
+    return json.loads(path.read_text(encoding='utf-8-sig'))
+
+
+def save(path, value):
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    return ref(path)
+
+
+def full(row):
+    need(all(k in row for k in FIELDS), 'Five fields required')
+    return {k: row[k] for k in FIELDS}
+
+
+def gate(census_ref):
+    path = Path(census_ref['path']);need(sha(path) == census_ref['sha256'], 'Fresh census SHA mismatch')
+    census = read(path)
+    age = time.time() - datetime.fromisoformat(census['captured_at_utc'].replace('Z', '+00:00')).timestamp()
+    need(0 <= age <= 120 and census['complete_census'] is True and census['strict_utf8_decoding'] is True,
+         'Current full UTF8 census must be non-future and <=120seconds before cache access')
+    rows = census['rows'];by = {r['ProcessId']: r for r in rows};need(len(rows) == len(by) == census['rows_count'], 'Complete unique census required')
+    closure_path = COMPARE / 'reprises/r3-corrige-r4-parallele-20261018/fermeture-r2-main-only-verifiee.json'
+    need(sha(closure_path) == 'f9d64a0e87ad68248429681cb3efe01a9e56289fba615eeb55291089665aee3d', 'Pinned historical SO ownership proof changed')
+    closure = read(closure_path);baseline_ref = closure['final_full_cim'];baseline_path = Path(baseline_ref['path'])
+    need(sha(baseline_path) == baseline_ref['sha256'], 'Historical owned descendants proof changed')
+    baseline = read(baseline_path);old_rows = baseline['rows'] if isinstance(baseline, dict) and 'rows' in baseline else baseline
+    old = {r['ProcessId']: r for r in old_rows}
+    expected = {37900, 37848, 38444, 8568, 42212, 58728, 14648}
+    need(all(pid in old and pid in by and full(by[pid]) == full(old[pid]) for pid in expected), 'Owned relay/descendant full identity changed')
+    launch_path = RUN / 'worker-launch-started.json';launch = read(launch_path)
+    need(launch['session_id'] == SESSION and all(by[pid]['CommandLine'] == subprocess.list2cmdline(launch['argv']) for pid in (37900, 37848)),
+         'SO worker full command differs from actual launch')
+    descendants = {37900, 37848}
+    while True:
+        expanded = descendants | {r['ProcessId'] for r in rows if r['ParentProcessId'] in descendants}
+        if expanded == descendants:
+            break
+        descendants = expanded
+    need(descendants == expected, 'New/unknown descendant or active native CLI; no cache read allowed')
+    for pid in expected - {37900}:
+        row = by[pid];parent = by[row['ParentProcessId']]
+        need(datetime.fromisoformat(row['CreationDate'].replace('Z', '+00:00')) > datetime.fromisoformat(parent['CreationDate'].replace('Z', '+00:00')),
+             'Child creation must follow its exact present parent')
+    profiles = {pid: Path(by[pid]['ExecutablePath']).name.casefold() for pid in expected}
+    need(profiles[38444] == profiles[58728] == 'conhost.exe' and profiles[8568] == profiles[42212] == 'python.exe'
+         and profiles[14648] == 'ssh.exe' and all('-m romeo_mcp' in by[pid]['CommandLine'] for pid in (8568, 42212)),
+         'Historical descendants must remain MCP/SSH/conhost transport profiles, not new generation')
+    # No foreign census rows are copied/exported. This is not a stop authorization.
+    return {'schema': 'hpc-forest-source-only-live-read-identity-gate-v1', 'verified': True,
+        'census': census_ref, 'baseline_census': baseline_ref, 'launch': ref(launch_path), 'closure': ref(closure_path),
+        'observed_at_utc': datetime.now(timezone.utc).isoformat(), 'census_age_seconds_at_first_cache_read': age,
+        'session_id': SESSION, 'worker_identities': [full(by[pid]) for pid in (37900, 37848)],
+        'historical_transport_descendants': [full(by[pid]) for pid in sorted(expected - {37900, 37848})],
+        'unknown_descendants': [], 'active_CLI_descendants': [], 'foreign_census_exported': False, 'stop_authorized': False}
+
+
+def names(folder):
+    return sorted(p.name for p in folder.iterdir())
+
+
+def capture(census_ref, output):
+    need(output.parent == HERE and not output.exists(), 'Fresh owned capture folder required')
+    # Archive/B stabilization must precede the live boundary, and all original refs are rehashed.
+    need(sha(RX / 'verification-index-stable-apres-baseline.json') == 'cc8171e0c46a46b7f2a312c802950dfb61dba0f987123a4063977fa8a32dc811', 'Stable B completion proof missing/changed')
+    index_path = RX / 'inventaire-requetes-archive.json'
+    need(sha(index_path) == '4a93d9bfce28807ffa8faf4c63cd876805b8b2b06aba3dfc4a17c0187cb62e44', 'Stable B request inventory missing/changed')
+    index = read(index_path)['requests']
+    need(sha(RX / 'audit-initial.json') == '185df0597b79f1994d0583764ef66f7ac127fbdea887b041d1a831e9d46fb482', 'Stable B baseline audit changed')
+    proof = gate(census_ref)
+    output.mkdir();save(output / 'identites-avant-lecture.json', proof)
+    need(WORKER.is_dir() and not WORKER.is_symlink(), 'Exact worker directory required')
+    initial_names = names(WORKER)
+    dirs = [p for p in WORKER.iterdir() if p.is_dir()]
+    need(all(not p.is_symlink() and re.fullmatch('[0-9a-f]{32}', p.name) for p in dirs), 'Unexpected directory/alias must not be silently excluded')
+    orphan_dirs = sorted(p.name for p in dirs if p.name not in index)
+    files, nonterminal, conflicts = {}, [], []
+    for folder in sorted(dirs):
+        nonce = folder.name;entries = sorted(folder.iterdir());entry_names = [p.name for p in entries]
+        need(all(p.is_file() and not p.is_symlink() and p.name in ALLOWED for p in entries), 'Unknown per-nonce file, subdirectory or alias')
+        if not all((folder / name).is_file() for name in ('delivered.json', 'response.json', 'response-ready.json')):
+            nonterminal.append({'nonce': nonce, 'filename_metadata_only': entry_names, 'payloads_not_read': True})
+            continue
+        # Read terminal delivery metadata first, then only the immutable finished payload set.
+        delivered, ready = read(folder / 'delivered.json'), read(folder / 'response-ready.json')
+        response_sha = sha(folder / 'response.json')
+        need(ready == {'sha256': response_sha, 'bytes': (folder / 'response.json').stat().st_size}
+             and delivered['response_sha256'] == response_sha, 'Finished delivery binding inconsistent')
+        for path in entries:
+            key = nonce + '/' + path.name
+            before = sha(path);raw = path.read_bytes();need(hashlib.sha256(raw).hexdigest() == before, 'Live finished payload changed during read')
+            archive_path = None
+            if path.name in MAPPED:
+                sub, suffix = MAPPED[path.name];candidate = RESTORED / 'mailbox' / sub / (nonce + suffix)
+                if candidate.is_file():
+                    archive_path = candidate
+            item = {'live_path': str(path), 'sha256': before, 'bytes': len(raw), 'finished_nonce_only': True}
+            if archive_path is not None and sha(archive_path) == before:
+                item.update(preserved=ref(archive_path), disposition='byte-identical-existing-archive')
+            else:
+                if archive_path is not None:
+                    if path.name != 'codex.jsonl' or not raw.startswith(archive_path.read_bytes()):
+                        conflicts.append({'nonce': nonce, 'file': path.name, 'archive': ref(archive_path), 'live_sha256': before})
+                    item['archived_prefix_or_conflict'] = ref(archive_path)
+                target = output / 'pieces-supplementaires' / nonce / path.name;target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open('xb') as stream:
+                    stream.write(raw)
+                item.update(preserved=ref(target), disposition='strict-supplement-finished-nonce')
+            need(sha(path) == before, 'Finished payload changed after strict preservation')
+            files[key] = item
+    top = {}
+    for name in ('OWNER.json', 'worker-ready.json', 'resume-process-identity.json'):
+        path = WORKER / name
+        need(path.is_file() and not path.is_symlink(), 'Bounded worker identity metadata missing')
+        digest = sha(path);raw = path.read_bytes();dest = output / name;dest.write_bytes(raw)
+        need(sha(dest) == sha(path) == digest, 'Worker identity metadata changed')
+        top[name] = {'live_path': str(path), 'preserved': ref(dest), 'sha256': digest}
+    after = {key: sha(Path(item['live_path'])) for key, item in files.items()}
+    need(all(after[key] == item['sha256'] for key, item in files.items()) and names(WORKER) == initial_names,
+         'Bounded live payloads or nonce directory set changed during comparison')
+    result = {'schema': 'hpc-forest-source-only-finished-nonce-preservation-v1', 'verified': not conflicts,
+        'verification_scope': 'finished nonce payload bytes only; excludes live locks, DBs and active operational stream',
+        'session_id': SESSION, 'job_id': '751592', 'worker_source': str(WORKER), 'restored_archive_source': str(RESTORED),
+        'source_only_still_alive': True, 'identity_gate': ref(output / 'identites-avant-lecture.json'),
+        'archive_request_inventory': ref(index_path), 'baseline_audit': ref(RX / 'audit-initial.json'),
+        'files': files, 'top_identity_metadata': top, 'nonce_directory_count': len(dirs),
+        'orphan_nonce_directories': orphan_dirs, 'nonterminal_nonce_directories': nonterminal,
+        'conflicts': conflicts, 'before_after_SHA_identical': True, 'nonce_names_before_after_identical': True,
+        'worker_lock_opened_or_copied': False, 'database_or_database_locks_opened_or_copied': False,
+        'complete_live_cache_snapshot': False, 'resume_events_stream_opened_or_copied': False,
+        'top_filename_metadata_only': initial_names, 'native_calls_started_by_auditor': 0, 'stop_authorized': False}
+    return save(output / 'PRESERVATION-PAR-NONCE.json', result)
+
+
+def main():
+    parser = argparse.ArgumentParser();parser.add_argument('--census', type=Path, required=True)
+    parser.add_argument('--census-sha256', required=True);parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    result = capture({'path': str(args.census.resolve()), 'sha256': args.census_sha256}, args.output.resolve())
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == '__main__':
+    main()

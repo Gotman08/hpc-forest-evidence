@@ -1,0 +1,295 @@
+#include "knn.h"
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+typedef struct {
+    size_t order;
+    float distance;
+    char label;
+} KnnCandidate;
+
+typedef struct {
+    KnnCandidate *heap;
+    size_t count;
+    int fallback;
+} KnnLocal;
+
+static int knn_distance_is_nan(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000);
+}
+
+static int knn_worse(KnnCandidate a, KnnCandidate b) {
+    return a.distance > b.distance ||
+           (a.distance == b.distance && a.order > b.order);
+}
+
+static void knn_heap_sift_down(KnnCandidate *heap, size_t count, size_t root) {
+    KnnCandidate value = heap[root];
+    while (root < count / 2) {
+        size_t child = root * 2 + 1;
+        if (child + 1 < count && knn_worse(heap[child + 1], heap[child])) {
+            ++child;
+        }
+        if (!knn_worse(heap[child], value)) {
+            break;
+        }
+        heap[root] = heap[child];
+        root = child;
+    }
+    heap[root] = value;
+}
+
+static void knn_heap_build(KnnCandidate *heap, size_t count) {
+    for (size_t i = count / 2; i > 0; --i) {
+        knn_heap_sift_down(heap, count, i - 1);
+    }
+}
+
+static void knn_heap_offer(KnnCandidate *heap, size_t *count,
+                           size_t capacity, KnnCandidate candidate) {
+    if (*count < capacity) {
+        heap[*count] = candidate;
+        ++(*count);
+        if (*count == capacity) {
+            knn_heap_build(heap, capacity);
+        }
+    } else if (knn_worse(heap[0], candidate)) {
+        heap[0] = candidate;
+        knn_heap_sift_down(heap, capacity, 0);
+    }
+}
+
+static char knn_vote(const size_t *counts) {
+    char best = (char)CHAR_MIN;
+    size_t best_count = 0;
+    for (int label = CHAR_MIN; label <= CHAR_MAX; ++label) {
+        size_t count = counts[(unsigned char)(char)label];
+        if (count > best_count) {
+            best = (char)label;
+            best_count = count;
+        }
+    }
+    return best;
+}
+
+static void knn_free_locals(KnnLocal *locals, int count) {
+    for (int i = 0; i < count; ++i) {
+        free(locals[i].heap);
+    }
+    free(locals);
+}
+
+static char knn_serial_reference(int n_groups, Group *groups,
+                                 int k, Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * k);
+    float *distances = (float *)malloc(sizeof(float) * k);
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0 || n_groups < 0) {
+        return knn_serial_reference(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t *offsets = (size_t *)malloc(((size_t)n_groups + 1) * sizeof(*offsets));
+    if (offsets == NULL) {
+        return knn_serial_reference(n_groups, groups, k, to_evaluate);
+    }
+    offsets[0] = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        if (groups[i].length < 0) {
+            free(offsets);
+            return knn_serial_reference(n_groups, groups, k, to_evaluate);
+        }
+        offsets[i + 1] = offsets[i] + (size_t)groups[i].length;
+    }
+
+    size_t total = offsets[n_groups];
+    if (total == 0) {
+        free(offsets);
+        return (char)-1;
+    }
+    size_t retained = total < (size_t)k ? total : (size_t)k;
+
+    int workers = 1;
+#ifdef _OPENMP
+    if (!omp_in_parallel()) {
+        workers = omp_get_max_threads();
+    }
+#endif
+    if (workers < 1) {
+        workers = 1;
+    }
+    size_t useful_workers = total / 4096;
+    if (useful_workers == 0) {
+        useful_workers = 1;
+    }
+    if ((size_t)workers > useful_workers) {
+        workers = (int)useful_workers;
+    }
+
+    KnnLocal *locals = (KnnLocal *)calloc((size_t)workers, sizeof(*locals));
+    if (locals == NULL) {
+        free(offsets);
+        return knn_serial_reference(n_groups, groups, k, to_evaluate);
+    }
+    size_t quotient = total / (size_t)workers;
+    size_t remainder = total % (size_t)workers;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(workers) if(workers > 1)
+#endif
+    for (int block = 0; block < workers; ++block) {
+        size_t rank = (size_t)block;
+        size_t begin = quotient * rank + (rank < remainder ? rank : remainder);
+        size_t end = begin + quotient + (rank < remainder ? 1 : 0);
+        size_t capacity = end - begin;
+        if (capacity > retained) {
+            capacity = retained;
+        }
+
+        KnnLocal local = {NULL, 0, 0};
+        local.heap = (KnnCandidate *)malloc(capacity * sizeof(*local.heap));
+        if (local.heap == NULL) {
+            local.fallback = 1;
+        } else {
+            int low = 0;
+            int high = n_groups;
+            while (low < high) {
+                int mid = low + (high - low) / 2;
+                if (offsets[mid + 1] <= begin) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+
+            int group_index = low;
+            size_t position = begin;
+            while (position < end && !local.fallback) {
+                const Group *group = &groups[group_index];
+                size_t group_end = offsets[group_index + 1];
+                if (group_end > end) {
+                    group_end = end;
+                }
+                for (; position < group_end; ++position) {
+                    size_t index = position - offsets[group_index];
+                    float d = euclidean_distance_no_sqrt(to_evaluate, group->points[index]);
+                    if (knn_distance_is_nan(d)) {
+                        local.fallback = 1;
+                        break;
+                    }
+                    KnnCandidate candidate = {position, d, group->label};
+                    knn_heap_offer(local.heap, &local.count, capacity, candidate);
+                }
+                ++group_index;
+            }
+        }
+        locals[block] = local;
+    }
+
+    free(offsets);
+    for (int block = 0; block < workers; ++block) {
+        if (locals[block].fallback) {
+            knn_free_locals(locals, workers);
+            return knn_serial_reference(n_groups, groups, k, to_evaluate);
+        }
+    }
+
+    KnnCandidate *merged = locals[0].heap;
+    size_t selected_count = locals[0].count;
+    if (selected_count < retained) {
+        KnnCandidate *grown = (KnnCandidate *)realloc(merged, retained * sizeof(*merged));
+        if (grown == NULL) {
+            knn_free_locals(locals, workers);
+            return knn_serial_reference(n_groups, groups, k, to_evaluate);
+        }
+        merged = grown;
+        locals[0].heap = merged;
+    }
+
+    for (int block = 1; block < workers; ++block) {
+        for (size_t i = 0; i < locals[block].count; ++i) {
+            knn_heap_offer(merged, &selected_count, retained, locals[block].heap[i]);
+        }
+    }
+
+    size_t counts[UCHAR_MAX + 1] = {0};
+    for (size_t i = 0; i < selected_count; ++i) {
+        ++counts[(unsigned char)merged[i].label];
+    }
+    counts[UCHAR_MAX] += (size_t)k - selected_count;
+    char answer = knn_vote(counts);
+    knn_free_locals(locals, workers);
+    return answer;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

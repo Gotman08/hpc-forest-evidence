@@ -1,0 +1,46 @@
+"""Preserve three owned worker caches opaquely before any possible owned stop.
+No model, process action, live lock read, database interpretation or source edit."""
+from pathlib import Path
+from datetime import datetime,timezone
+import hashlib,json,os
+BASE=Path(__file__).resolve().parents[3];HERE=Path(__file__).resolve().parent/'preservation-caches-avant-arret'
+LAUNCH=BASE/'outputs/HPC-Forest-Primes-Natif-Lancement-r2d'
+CELLS=[('astra','752650','26d58fc2d88f423d9b5fd241ade3d185'),('terra','752651','fee3bd8ba5fc4e6eafa1167ef279f9fa'),('sol','752652','182500fef7c546af87f14498de353581')]
+def sha(b):return hashlib.sha256(b).hexdigest()
+def ref(p):return {'path':str(p.resolve()),'sha256':sha(p.read_bytes())}
+def save(p,v):
+ with p.open('x',encoding='utf-8',newline='\n') as f:f.write(json.dumps(v,ensure_ascii=False,indent=2)+'\n')
+def inventory(root,copy_root=None):
+ result={};excluded=[]
+ for directory,dirs,files in os.walk(root,followlinks=False):
+  for name in dirs:
+   p=Path(directory)/name
+   assert not p.is_symlink() and not p.is_junction(),('Linked directory',p)
+  for name in files:
+   p=Path(directory)/name;rel=p.relative_to(root).as_posix()
+   assert not p.is_symlink() and not p.is_junction() and p.is_file() and p.resolve().is_relative_to(root.resolve()),('Non-owned regular file',p)
+   if name.casefold()=='worker.lock':
+    excluded.append(rel);continue
+   before=p.stat();data=p.read_bytes();after=p.stat()
+   assert (before.st_size,before.st_mtime_ns)==(after.st_size,after.st_mtime_ns),('Changing owned file',rel)
+   result[rel]={'bytes':len(data),'sha256':sha(data)}
+   if copy_root is not None:
+    target=copy_root/Path(rel);target.parent.mkdir(parents=True,exist_ok=True)
+    with target.open('xb') as f:f.write(data)
+    assert sha(target.read_bytes())==result[rel]['sha256']
+ return result,excluded
+HERE.mkdir(exist_ok=False)
+out=[]
+for slug,job,session in CELLS:
+ src=LAUNCH/('worker-'+session);assert src.is_dir() and not src.is_symlink()
+ binding=json.loads((src/'CELL-BINDING.json').read_text('utf-8-sig'))
+ assert binding['job_id']==job and binding['session_id']==session and binding['scope_id']=='hpc-forest-primes-native-max-r2d' and binding['source_zip_sha256']=='13ccaf7c74d13db246d1127a25c511bc03d7989ba9097eb6ad7b4f681c0a0a46'
+ d=HERE/slug;d.mkdir();copy=d/'copie-opaque';copy.mkdir()
+ before,excluded=inventory(src,copy);after,excluded_after=inventory(src);copied,_=inventory(copy)
+ assert before==after==copied and excluded==excluded_after
+ save(d/'inventaire-avant.json',before);save(d/'inventaire-apres.json',after)
+ out.append({'model_slug':slug,'job_id':job,'session_id':session,'source_cache':str(src),'opaque_copy':str(copy),'regular_files_preserved':len(before),'bytes':sum(x['bytes'] for x in before.values()),'before_after_copy_equal':True,'excluded_live_lock_paths':excluded,'live_lock_content_read':False,'database_or_candidate_interpreted':False,'full_cache_preservation_complete_including_lock':False,'evidence_refs':[ref(d/'inventaire-avant.json'),ref(d/'inventaire-apres.json')]})
+v={'schema':'hpc-forest-r2d-three-worker-cache-preservation-before-stop-v1','verified':False,'captured_at_utc':datetime.now(timezone.utc).isoformat(),'opaque_regular_cache_files_preserved_except_live_lock':True,'source_cache_unchanged':True,'workers':out,'processes_stopped':0,'live_lock_pending_after_stop':True,'not_an_authorization_to_stop':True}
+save(HERE/'PRESERVATION-CACHES-AVANT-ARRET.json',v)
+print(json.dumps({'receipt':ref(HERE/'PRESERVATION-CACHES-AVANT-ARRET.json'),'workers':[{'job':r['job_id'],'files':r['regular_files_preserved'],'bytes':r['bytes'],'excluded':r['excluded_live_lock_paths']} for r in out]}))
+

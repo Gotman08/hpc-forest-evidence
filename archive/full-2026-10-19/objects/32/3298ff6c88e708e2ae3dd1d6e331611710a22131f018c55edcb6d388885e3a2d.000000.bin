@@ -1,0 +1,217 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef struct {
+    float x;
+    float y;
+} Point;
+
+typedef struct {
+    char label;
+    int length;
+    Point * points;
+} Group;
+
+void on_error() {
+    printf("Invalid input file.\n");
+    exit(1);
+}
+
+typedef struct {
+    char *data;
+    size_t position;
+    size_t length;
+    size_t capacity;
+    int at_eof;
+} KnnInputWindow;
+
+static KnnInputWindow knn_input;
+
+static void knn_input_refill(void) {
+    if (knn_input.at_eof) {
+        return;
+    }
+
+    if (knn_input.data == NULL) {
+        knn_input.capacity = 65536;
+        knn_input.data = (char *)malloc(knn_input.capacity + 1);
+        if (knn_input.data == NULL) {
+            on_error();
+        }
+    }
+
+    size_t remaining = knn_input.length - knn_input.position;
+    if (remaining != 0 && knn_input.position != 0) {
+        memmove(knn_input.data, knn_input.data + knn_input.position,
+                remaining);
+    }
+    knn_input.position = 0;
+    knn_input.length = remaining;
+
+    if (knn_input.length == knn_input.capacity) {
+        if (knn_input.capacity > (SIZE_MAX - 1) / 2) {
+            on_error();
+        }
+        size_t capacity = knn_input.capacity * 2;
+        char *data = (char *)realloc(knn_input.data, capacity + 1);
+        if (data == NULL) {
+            on_error();
+        }
+        knn_input.data = data;
+        knn_input.capacity = capacity;
+    }
+
+    size_t count = fread(knn_input.data + knn_input.length, 1,
+                         knn_input.capacity - knn_input.length, stdin);
+    knn_input.length += count;
+    knn_input.data[knn_input.length] = 0;
+    if (ferror(stdin)) {
+        on_error();
+    }
+    if (feof(stdin) || count == 0) {
+        knn_input.at_eof = 1;
+    }
+}
+
+static int knn_input_peek(void) {
+    if (knn_input.position == knn_input.length) {
+        knn_input_refill();
+        if (knn_input.position == knn_input.length) {
+            return EOF;
+        }
+    }
+    return (unsigned char)knn_input.data[knn_input.position];
+}
+
+static int knn_input_take(void) {
+    int value = knn_input_peek();
+    if (value != EOF) {
+        ++knn_input.position;
+    }
+    return value;
+}
+
+static void knn_input_skip_space(void) {
+    int value;
+    while ((value = knn_input_peek()) != EOF &&
+           isspace((unsigned char)value)) {
+        ++knn_input.position;
+    }
+}
+
+static void knn_input_expect(const char *literal) {
+    knn_input_skip_space();
+    while (*literal != 0) {
+        if (knn_input_take() != (unsigned char)*literal) {
+            on_error();
+        }
+        ++literal;
+    }
+}
+
+static int knn_input_number_character(unsigned char value) {
+    return (value >= '0' && value <= '9') ||
+           (value >= 'a' && value <= 'z') ||
+           (value >= 'A' && value <= 'Z') ||
+           value == '+' || value == '-' || value == '.' ||
+           value == '_' || value == '(' || value == ')';
+}
+
+/* Keep complete numeric lexemes resident before calling strtof/strtol. */
+static void knn_input_prepare_number(void) {
+    knn_input_skip_space();
+    size_t scanned = 0;
+    for (;;) {
+        while (scanned < knn_input.length - knn_input.position) {
+            unsigned char value = (unsigned char)
+                knn_input.data[knn_input.position + scanned];
+            if (!knn_input_number_character(value)) {
+                return;
+            }
+            ++scanned;
+        }
+        if (knn_input.at_eof) {
+            return;
+        }
+        knn_input_refill();
+    }
+}
+
+static int knn_input_integer(void) {
+    knn_input_prepare_number();
+    char *begin = knn_input.data + knn_input.position;
+    char *end;
+    long value = strtol(begin, &end, 10);
+    if (end == begin || value < INT_MIN || value > INT_MAX) {
+        on_error();
+    }
+    knn_input.position = (size_t)(end - knn_input.data);
+    return (int)value;
+}
+
+static float knn_input_float(void) {
+    knn_input_prepare_number();
+    char *begin = knn_input.data + knn_input.position;
+    char *end;
+    float value = strtof(begin, &end);
+    if (end == begin) {
+        on_error();
+    }
+    knn_input.position = (size_t)(end - knn_input.data);
+    return value;
+}
+
+int parse_number_of_groups() {
+    knn_input_expect("n_groups=");
+    return knn_input_integer();
+}
+
+Point parse_point() {
+    Point point;
+    knn_input_expect("(");
+    point.x = knn_input_float();
+    knn_input_expect(",");
+    point.y = knn_input_float();
+    if (knn_input_take() != ')') {
+        on_error();
+    }
+    return point;
+}
+
+Group parse_next_group() {
+    knn_input_expect("label=");
+    int label = knn_input_take();
+    if (label == EOF) {
+        on_error();
+    }
+    knn_input_expect("length=");
+    int length = knn_input_integer();
+
+    Group group;
+    group.label = (char)label;
+    group.length = length;
+    group.points = (Point *) malloc(sizeof(Point) * length);
+
+    for (int i = 0; i < length; i++) {
+        group.points[i] = parse_point();
+    }
+
+    return group;
+}
+
+int parse_k() {
+    knn_input_expect("k=");
+    return knn_input_integer();
+}
+
+float euclidean_distance_no_sqrt (Point a, Point b) {
+    return ((b.x - a.x) * ((b.x - a.x))) + ((b.y - a.y) * (b.y - a.y));
+}
+
+int compare_for_sort(const void *a, const void *b) {
+  return *(char*)a - *(char*)b;
+}

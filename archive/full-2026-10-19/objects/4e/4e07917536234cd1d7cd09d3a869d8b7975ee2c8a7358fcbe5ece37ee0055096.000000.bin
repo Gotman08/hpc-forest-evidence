@@ -1,0 +1,434 @@
+"""Read-only receipt for one explicitly referenced future R4b technical phase.
+
+This is not an admission builder, a cache/cohort census, or a performance audit.
+Nothing is executed and no receipt is written. Invalid evidence raises ReceiptError.
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib
+import importlib.util
+import json
+import math
+import re
+import sys
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+
+NORMALISATION_SHA = '46662bde26ff2fd68b7ce6bbe7217e492a98ab34cbb7aff08a53324755b74da7'
+_normal_path = Path(__file__).parent / 'normalisation_native.py'
+if hashlib.sha256(_normal_path.read_bytes()).hexdigest() != NORMALISATION_SHA:
+    raise RuntimeError('Changed isolated normalization module')
+_normal_spec = importlib.util.spec_from_file_location('isolated_normalisation_r3', _normal_path)
+normalisation = importlib.util.module_from_spec(_normal_spec)
+_normal_spec.loader.exec_module(normalisation)
+SUPPORTED_CONTRACT_SESSIONS = {'gpt-6.1-sol': {'roots': '80d47d8d3f8f4e35bc26ceb54d06e870', 'advice': 'b86d18fcf35d4031aa2ef0da49397c4e', 'harvest': '7c8bc0c5ae22467da05600fb735fc017'}, 'gpt-6-astra': {'roots': '29583a77237e4777aa09209331ec7ecd', 'advice': '7be16898433e49f4b481045079abbbe8', 'harvest': 'b6fc9cf3951d46d787f319b51905251b'}, 'gpt-5.6-terra': {'roots': '3ae8341d27784c1bbd830ac19e4b77bc', 'advice': '7516e40883c64ab8af8a38637d74de3f', 'harvest': '7d6f357d4e5741bb8349835f358563b2'}}
+WORKER_CACHE_PARENT = Path(__file__).resolve().parents[3] / 'lancement-modeles-max-r3'
+
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE_SHA = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN_SHA = "5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70"
+CLI_SHA = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+CLI_FILES = {
+    "codex.exe": CLI_SHA,
+    "codex-code-mode-host.exe": "3b6a9179a4da17fa5fc6948219cd61486dc3b534c683838076d8c61bd311c68e",
+    "codex-command-runner.exe": "ce80b56a2f37f808815fde33cceb97ac858ceecde296425ad3860f0f37fb4877",
+    "codex-windows-sandbox-setup.exe": "c4da812016cbfb92d9a62791f78460c59e9662faadb0a2720d3aa5d0535b80bd",
+}
+PROTOCOL = "hpc-forest-codex-mailbox-v1"
+PHASES = {"roots", "advice", "harvest"}
+REF_NAMES = {
+    "request_downloaded", "request_native", "claim", "invocation", "process",
+    "jsonl", "response", "ready", "delivered", "agent_result", "cli_identity",
+    "worker_ready", "cell_binding", "execution_sidecar",
+}
+EXPECTED_NAMES = {
+    "scope", "source_zip_sha256", "plan_sha256", "model", "effort", "phase",
+    "session_id", "job_id", "request_digest", "request_sha256", "source_cache",
+}
+REQUEST_NAMES = {
+    "protocol", "kind", "meta_role", "owner_key", "nonce", "session_id", "model",
+    "reasoning_effort", "mission_id", "integration_source_ids", "token_ceiling",
+    "expires_at", "schema", "messages",
+}
+
+
+class ReceiptError(ValueError):
+    """Missing, changed, unrelated, ambiguous, or non-normal technical evidence."""
+
+
+def _need(condition, message):
+    if not condition:
+        raise ReceiptError(message)
+
+
+def _sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _hex(value, length=64):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{" + str(length) + "}", value) is not None
+
+
+def _number(value, *, positive=False):
+    return type(value) in {int, float} and math.isfinite(value) and (value > 0 if positive else value >= 0)
+
+
+def _pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        _need(key not in value, "Duplicate JSON member")
+        value[key] = item
+    return value
+
+
+def _decode(raw, label):
+    try:
+        value = json.loads(raw.decode("utf8", errors="strict"), object_pairs_hook=_pairs,
+                           parse_constant=lambda _: (_ for _ in ()).throw(ReceiptError("Non-finite JSON")))
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise ReceiptError("Invalid JSON in " + label) from exc
+    _need(isinstance(value, dict), "JSON object required in " + label)
+    normalisation.canonical(value)
+    return value
+
+
+def _same(left, right):
+    """Preserve JSON numeric types; Python's True == 1 is not an exact binding."""
+    return json.dumps(left, sort_keys=True, ensure_ascii=False, allow_nan=False) == json.dumps(
+        right, sort_keys=True, ensure_ascii=False, allow_nan=False
+    )
+
+
+def _path_ref(ref, label):
+    _need(isinstance(ref, dict) and set(ref) == {"path", "sha256"}, "Closed reference required: " + label)
+    _need(isinstance(ref["path"], str) and _hex(ref["sha256"]), "Invalid reference: " + label)
+    path = Path(ref["path"])
+    _need(path.is_absolute() and ".." not in path.parts and path.is_file() and not path.is_symlink()
+          and not any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()) for p in (path, *path.parents)), "Unavailable regular file: " + label)
+    return path
+
+
+def _read_ref(ref, label, maximum=8 * 1024 * 1024):
+    path = _path_ref(ref, label)
+    with path.open("rb") as stream:
+        raw = stream.read(maximum + 1)
+    _need(len(raw) <= maximum and _sha(raw) == ref["sha256"], "Changed or oversized artifact: " + label)
+    return raw
+
+
+def _hash_ref(ref, label):
+    path = _path_ref(ref, label)
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for part in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(part)
+    _need(hasher.hexdigest() == ref["sha256"], "Changed artifact bytes: " + label)
+    return path.resolve(strict=True)
+
+
+def _contracts():
+    """Import only sealed helpers, with bytecode writes disabled even for API callers."""
+    base = Path(__file__).resolve().parents[5]
+    source = base / "work/hpc-forest-mere-dynamique-r4b-lane-r3/project"
+    pins = _decode((Path(__file__).parent / "pins-source-plan.json").read_bytes(), "pins")
+    _need(pins.get("scope_id") == SCOPE and pins.get("source_zip", {}).get("sha256") == SOURCE_SHA
+          and pins.get("plan", {}).get("sha256") == PLAN_SHA
+          and Path(pins.get("source_project", "")).resolve() == source.resolve(), "Pinned source/plan changed")
+    _need(pins.get("supported_contract_sessions") == SUPPORTED_CONTRACT_SESSIONS
+          and pins.get("worker_cache_parent") == str(WORKER_CACHE_PARENT), "External model/cache policy differs")
+    _hash_ref(pins["source_zip"], "sealed source ZIP")
+    _hash_ref(pins["plan"], "sealed source plan")
+    _need(pins["independent_source_review"]["sha256"] == "33b05b6825f1eb340073a63c13bdc1e11696db14b3e9b33ce48b3dcfcb0c326a"
+          and pins["source_manifest"]["sha256"] == "66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766",
+          "Actual reviewed derivative source/manifest is required")
+    _hash_ref(pins["independent_source_review"], "independent sealed source review")
+    manifest = _decode(_read_ref(pins["source_manifest"], "source manifest"), "source manifest")
+    _need(len(manifest) == 110, "Expected 110 sealed source files")
+    for relative, checksum in manifest.items():
+        _need(isinstance(relative, str) and not Path(relative).is_absolute() and ".." not in Path(relative).parts,
+              "Unsafe source manifest entry")
+        _hash_ref({"path": str(source / relative), "sha256": checksum}, "sealed source member")
+    with zipfile.ZipFile(_hash_ref(pins["source_zip"], "sealed source ZIP")) as archive:
+        members = [m for m in archive.infolist() if not m.is_dir()]
+        expected = {m.filename.removeprefix("HPC-Forest/"): hashlib.sha256(archive.read(m)).hexdigest() for m in members}
+        actual = {p.relative_to(source).as_posix(): _sha(p.read_bytes()) for p in source.rglob("*") if p.is_file()}
+        _need(expected == manifest == actual and len(members) == len(actual) == 110,
+              "Exact source110 ZIP inventory differs during cold receipt")
+    src = source / "src"
+    old_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(src))
+    try:
+        for name in ("hpc_forest", "hpc_forest.core", "hpc_forest.dynamic_mother", "hpc_forest.dynamic_admission"):
+            existing = sys.modules.get(name)
+            _need(existing is None or Path(existing.__file__).resolve().is_relative_to(src.resolve()),
+                  "Another hpc_forest source is already imported")
+        mother = importlib.import_module("hpc_forest.dynamic_mother")
+        admission = importlib.import_module("hpc_forest.dynamic_admission")
+        core = importlib.import_module("hpc_forest.core")
+    finally:
+        sys.path.pop(0)
+        sys.dont_write_bytecode = old_bytecode
+    _need(admission.SCOPE == SCOPE and admission.CLI_SHA256 == CLI_SHA and admission.CLI_FILES == CLI_FILES,
+          "Sealed CLI constants differ")
+    return pins, mother, core.digest
+
+
+def _parse_jsonl(raw):
+    """Every nonempty line must be JSON. No diagnostic allowlist exists."""
+    try:
+        lines=raw.decode("utf8",errors="strict").splitlines()
+    except UnicodeError as exc:
+        raise ReceiptError("Native JSONL is not strict UTF8") from exc
+    return [_decode(line.encode("utf8"),"native JSONL line "+str(number))
+            for number,line in enumerate(lines,1) if line.strip()],[],[]
+
+
+def _events(raw, data):
+    normalisation.refuse_stream_diagnostics(raw)
+    events, warnings, separators = _parse_jsonl(raw)
+    thread = turn = done = 0
+    usage = None
+    completed, pending, messages = set(), set(), []
+    for event in events:
+        kind = event.get("type")
+        _need(done == 0, "Event after the completed turn")
+        if kind == "thread.started":
+            _need(set(event) == {"type", "thread_id"} and thread == turn == 0
+                  and isinstance(event["thread_id"], str) and bool(event["thread_id"]), "Invalid/extra native thread")
+            thread += 1
+        elif kind == "turn.started":
+            _need(set(event) == {"type"} and thread == 1 and turn == 0, "Invalid/extra native turn")
+            turn += 1
+        elif kind in {"item.started", "item.updated", "item.completed"}:
+            _need(set(event) == {"type", "item"} and turn == 1, "Orphan native item")
+            item = event["item"]
+            _need(isinstance(item, dict) and set(item) == {"id", "type", "text"}
+                  and item.get("type") in {"reasoning", "agent_message"}
+                  and isinstance(item.get("id"), str) and bool(item["id"])
+                  and isinstance(item.get("text"), str), "Forbidden tool, error, or unknown native item")
+            identifier = item["id"]
+            _need(identifier not in completed, "Repeated completed native item")
+            if kind == "item.started":
+                _need(identifier not in pending, "Repeated native item start")
+                pending.add(identifier)
+            elif kind == "item.updated":
+                _need(identifier in pending, "Orphan native item update")
+            else:
+                pending.discard(identifier)
+                completed.add(identifier)
+                if item["type"] == "agent_message":
+                    messages.append(_decode(item["text"].encode("utf8"), "final agent message"))
+        elif kind == "turn.completed":
+            _need(set(event) == {"type", "usage"} and turn == 1 and not pending, "Malformed/incomplete native turn")
+            usage = event["usage"]
+            normalisation.usage_events([normalisation.canonical(event)])
+            done += 1
+        else:
+            raise ReceiptError("Unknown native event or failed turn")
+    _need(thread == turn == done == 1 and len(messages) == 1 and _same(messages[0], data),
+          "Missing/extra final message or final data differs")
+    return usage, warnings, separators
+
+
+def _argv(invocation, executable, model, *, private_verified=False):
+    _need(private_verified is True and invocation.get("model")==model
+          and invocation.get("reasoning_effort")=="max" and isinstance(invocation.get("argv"),list)
+          and invocation["argv"][0]==executable,
+          "Exact raw argv must first pass source110 private-policy/projection audit")
+
+
+def _verify_cli_bytes(proof, identity, executable):
+    """Production verifier; tests may explicitly stub this function, never the pins."""
+    _need(proof["executable_sha256"] == identity["executable_sha256"] == CLI_SHA, "Wrong copied executable SHA")
+    actual = Path(executable).resolve(strict=True)
+    _need(actual == Path(proof["executable_path"]).resolve(strict=True)
+          == Path(identity["executable_path"]).resolve(strict=True), "Actual CLI argument differs")
+    _need(set(proof["files"]) == set(identity["files"]) == set(CLI_FILES), "All four actual copied files required")
+    for name, sha in CLI_FILES.items():
+        ref = proof["files"][name]
+        _need(_same(ref, identity["files"][name]) and ref.get("sha256") == sha, "CLI companion reference differs")
+        _need(_hash_ref(ref, "copied CLI " + name) == actual.parent / name, "CLI companion path differs")
+    _need(actual.name == "codex.exe", "Unexpected copied executable name")
+
+
+def _cli(proof, cell, worker, expected):
+    _need(set(proof) == {"executable_path", "executable_sha256", "files", "verified_before_invocation"}
+          and proof.get("verified_before_invocation") is True and isinstance(proof.get("files"), dict),
+          "Actual pre-invocation CLI verification proof missing")
+    ref = cell.get("artifacts", {}).get("cli_identity")
+    identity = _decode(_read_ref(ref, "original CLI identity"), "original CLI identity")
+    fields = {"scope_id": expected["scope"], "source_zip_sha256": expected["source_zip_sha256"],
+              "plan_sha256": expected["plan_sha256"], "model": expected["model"], "effort": expected["effort"],
+              "session_id": expected["session_id"], "job_id": expected["job_id"], "remote_root": cell["remote_root"]}
+    _need(identity.get("schema") == "hpc-forest-dynamic-r4b-cli-identity-v1" and identity.get("verified") is True
+          and all(identity.get(k) == v for k, v in fields.items())
+          and identity.get("authentication") == "existing-local-ChatGPT" and identity.get("api_key_present") is False
+          and identity.get("tools_disabled") is True, "Unverified or unrelated original CLI identity")
+    _verify_cli_bytes(proof, identity, worker["codex_executable"])
+    return worker["codex_executable"], ref
+
+
+def audit_phase(refs: dict, expected: dict, *, snapshot_inventory: dict, snapshot: Path, private_cli: dict) -> dict:
+    """Verify one phase snapshot; return a scoped receipt in memory or raise ReceiptError.
+
+    ``refs`` has exactly REF_NAMES, each an absolute {path, sha256} reference.
+    ``expected`` has exactly EXPECTED_NAMES, including the pinned source_cache.
+    ``snapshot_inventory`` is caller-measured cold evidence, rechecked by receive(). No directory/cohort discovery occurs.
+    The source canonical digest and raw request-file SHA are deliberately separate.
+    """
+    try:
+        _need(isinstance(refs, dict) and set(refs) == REF_NAMES, "Exact single-phase reference set required")
+        _need(isinstance(expected, dict) and set(expected) == EXPECTED_NAMES, "Exact expected identity required")
+        _need(expected["scope"] == SCOPE and expected["source_zip_sha256"] == SOURCE_SHA
+              and expected["plan_sha256"] == PLAN_SHA and expected["model"] in SUPPORTED_CONTRACT_SESSIONS
+              and expected["effort"] == "max" and expected["phase"] in PHASES
+              and _hex(expected["session_id"], 32) and isinstance(expected["job_id"], str)
+              and re.fullmatch(r"[0-9]+", expected["job_id"]) is not None
+              and _hex(expected["request_digest"]) and _hex(expected["request_sha256"]), "Wrong pinned phase identity")
+        _pins, mother, digest = _contracts()
+        _need(SUPPORTED_CONTRACT_SESSIONS[expected["model"]].get(expected["phase"]) == expected["session_id"], "Wrong explicit model/phase session")
+        _need(expected["source_cache"] == str(WORKER_CACHE_PARENT / ("worker-" + expected["session_id"])), "Wrong exact factory source cache")
+        raw = {name: _read_ref(refs[name], name) for name in sorted(REF_NAMES)}
+        request_candidate = _decode(raw["request_native"], "worker serialized request")
+        request_normalization = normalisation.request_pair(raw["request_downloaded"], raw["request_native"],
+            downloaded_sha256=expected["request_sha256"], native_sha256=refs["request_native"]["sha256"],
+            canonical_sha256=expected["request_digest"], session_id=expected["session_id"], nonce=request_candidate["nonce"],
+            model=expected["model"], phase=expected["phase"])
+        _need(refs["request_downloaded"]["sha256"] == expected["request_sha256"], "Original downloaded request SHA differs")
+        objects = {name: _decode(value, name) for name, value in raw.items() if name != "jsonl"}
+        request = objects["request_native"]
+        _need(set(request) == REQUEST_NAMES and digest(request) == expected["request_digest"], "Closed request/canonical digest differs")
+        _need(request["protocol"] == PROTOCOL and request["kind"] == "source-proposal"
+              and request["meta_role"] == "mother-dynamic-" + expected["phase"]
+              and request["session_id"] == expected["session_id"] and request["model"] == expected["model"]
+              and request["reasoning_effort"] == "max" and _hex(request["nonce"], 32)
+              and all(isinstance(request[k], str) and bool(request[k].strip()) for k in ("owner_key", "mission_id"))
+              and request["integration_source_ids"] == [] and type(request["token_ceiling"]) is int
+              and request["token_ceiling"] == 196608 and _number(request["expires_at"], positive=True), "Unrelated native phase request")
+        schemas = {"roots": mother.PLAN_SCHEMA, "advice": mother.ADVICE_SCHEMA, "harvest": mother.HARVEST_SCHEMA}
+        messages = request["messages"]
+        _need(_same(request["schema"], schemas[expected["phase"]]) and isinstance(messages, list) and len(messages) == 2
+              and all(isinstance(m, dict) and set(m) == {"role", "content"} and isinstance(m["content"], str)
+                      and bool(m["content"].strip()) for m in messages)
+              and [m["role"] for m in messages] == ["system", "user"], "Wrong phase schema/messages")
+        cell, worker, proof = (objects[k] for k in ("cell_binding", "worker_ready", "cli_identity"))
+        root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + expected["session_id"]
+        cell_fields = {"scope_id": SCOPE, "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+                       **{k: expected[k] for k in ("model", "effort", "session_id", "job_id")},
+                       "purpose": "technical-contract", "technical_phase": expected["phase"],
+                       "allowed_request_sha256": expected["request_digest"], "remote_root": root,
+                       "canonical_remote_root": root.replace("/scratch_p/", "/gpfs/scratch/", 1)}
+        _need(cell.get("schema") == "hpc-forest-dynamic-r4b-max-authorization-v1" and cell.get("verified") is True
+              and all(cell.get(k) == v for k, v in cell_fields.items())
+              and all(cell.get(k) is False for k in ("operator_algorithm_advice", "old_candidates_imported", "automatic_extension")),
+              "Wrong/unverified technical CELL-BINDING")
+        # Reconcile the exact historical lane graph; expiry does not erase a
+        # received call, and initial=False grants no new-start right.
+        from hpc_forest.lane_contract import validate_lane_v2
+        lane_ref = cell.get("artifacts", {}).get("lane_freshness")
+        lane = _decode(_read_ref(lane_ref, "original lane-v2 graph"), "original lane-v2 graph")
+        lane_identity = {k: cell_fields[k] for k in ("scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "session_id", "job_id", "remote_root")}
+        validate_lane_v2(lane, lane_identity, lambda ref: _hash_ref(ref, "lane-v2 projection"), initial=False)
+        worker_names = {"protocol", "session_id", "model", "reasoning_effort", "mode", "pid", "started_at",
+                        "local_python", "model_weights_on_romeo", "codex_executable", "codex_cli_version",
+                        "authentication", "weight_digest_available", "owner", "scope_id", "effort", "job_id", "remote_root",
+                        "source_zip_sha256", "plan_sha256", "codex_executable_sha256", "task_cli_policy_sha256",
+                        "task_cli_policy_candidate_count", "local_skill_paths_exported"}
+        _need(set(worker) == worker_names and worker.get("protocol") == PROTOCOL
+              and worker.get("session_id") == expected["session_id"] and worker.get("model") == expected["model"]
+              and worker.get("reasoning_effort") == "max" and worker.get("mode") == "codex"
+              and type(worker.get("pid")) is int and worker["pid"] > 0 and _number(worker.get("started_at"), positive=True)
+              and worker.get("model_weights_on_romeo") is False and worker.get("weight_digest_available") is False
+              and worker.get("authentication") == "existing-local-ChatGPT"
+              and all(isinstance(worker.get(k), str) and bool(worker[k]) for k in ("codex_executable", "codex_cli_version", "local_python")),
+              "Wrong or non-native worker-ready")
+        executable, original_cli_ref = _cli(proof, cell, worker, expected)
+        _need(worker.get("owner")==worker.get("job_id")==expected["job_id"]
+              and worker.get("codex_executable_sha256")==CLI_SHA
+              and all(worker.get(key)==value for key,value in lane_identity.items()), "Ready source110 eight-field identity differs")
+        private_path=Path(__file__).parent/"private_cli110.py"
+        _need(_sha(private_path.read_bytes())=='3116515ff15e614cebdfc5960315befb83a94248b45d332c7cc9c668fb125486', "Private110 auditor changed before import")
+        private_spec=importlib.util.spec_from_file_location("r4b_private_cli110",private_path)
+        private_module=importlib.util.module_from_spec(private_spec)
+        private_spec.loader.exec_module(private_module)
+        private_result=private_module.audit_private(SimpleNamespace(_hash_ref=_hash_ref,_read_ref=_read_ref,_decode=_decode,_sha=_sha,CLI_SHA=CLI_SHA),
+            refs,expected,snapshot,private_cli,cell,worker)
+        claim, invocation, process = (objects[k] for k in ("claim", "invocation", "process"))
+        request_sha = expected["request_sha256"]
+        _need(set(claim) == {"request_sha256", "claimed_at"} and claim["request_sha256"] == request_sha
+              and _number(claim["claimed_at"], positive=True), "Wrong request claim")
+        _need(set(invocation) == {"argv", "model", "reasoning_effort", "request_sha256", "hosted_inference", "source_execution_allowed"}
+              and invocation.get("request_sha256") == request_sha and invocation.get("model") == expected["model"]
+              and invocation.get("reasoning_effort") == "max" and invocation.get("hosted_inference") is True
+              and invocation.get("source_execution_allowed") is False, "Wrong native invocation")
+        _argv(invocation, executable, expected["model"], private_verified=private_result["private_argv_and_received_projections_reconciled"])
+        _need(set(process) == {"returncode", "timed_out", "seconds", "log_sha256", "request_sha256", "never_model_input"}
+              and type(process.get("returncode")) is int and process["returncode"] == 0
+              and process.get("timed_out") is False and process.get("never_model_input") is True
+              and _number(process.get("seconds")) and process.get("request_sha256") == request_sha
+              and process.get("log_sha256") == refs["jsonl"]["sha256"], "Failed or unrelated native process")
+        original_nonce = str(Path(expected["source_cache"]) / request["nonce"])
+        sidecar = normalisation.known_sidecar(raw["execution_sidecar"], raw["invocation"], raw["process"],
+            before=snapshot_inventory, after=snapshot_inventory, nonce=request["nonce"],
+            sidecar_relative=request["nonce"] + "/codex.jsonl.json", jsonl_sha256=refs["jsonl"]["sha256"],
+            downloaded_sha256=request_sha, model=expected["model"], original_nonce_dir=original_nonce)
+        response, ready, delivered = (objects[k] for k in ("response", "ready", "delivered"))
+        response_fields = {"protocol": PROTOCOL, "nonce": request["nonce"], "session_id": expected["session_id"],
+                           "request_sha256": request_sha, "model": expected["model"], "reasoning_effort": "max"}
+        _need(set(response) == set(response_fields) | {"data", "usage", "error", "infrastructure_error"}
+              and all(response.get(k) == v for k, v in response_fields.items())
+              and response.get("error") is None and response.get("infrastructure_error") is False,
+              "Response is non-normal or bound to another request")
+        data = objects["agent_result"]
+        _need(_same(response["data"], data), "Agent-result and response data differ")
+        if expected["phase"] == "roots":
+            normalisation.require_nonempty_roots(data)
+            mother.validate_directions(data, 8, {"cpu", "c", "cxx", "openmp"})
+        elif expected["phase"] == "advice":
+            mother.validate_advice(data)
+        else:
+            mother.validate_harvest(data, {"fixture-a", "fixture-b"}, 2)
+        event_usage, warnings, separators = _events(raw["jsonl"], data)
+        tokens = event_usage["input_tokens"] + event_usage["output_tokens"]
+        usage = response["usage"]
+        expected_usage = {"tokens": tokens, "token_accounting": "exact", "events": [event_usage], "llm_calls": 1,
+                          "model_requested": expected["model"], "reasoning_effort_requested": "max",
+                          "cached_tokens_included_in_input": True, "tool_events": [], "codex_jsonl_sha256": refs["jsonl"]["sha256"],
+                          "usage_parse_ambiguity":False,"cli_diagnostics_sha256":private_cli["diagnostics"]["sha256"],"cli_diagnostic_count":0}
+        _need(_same(usage, expected_usage) and _same(usage, private_result["usage"]) and tokens <= request["token_ceiling"], "Unknown or inconsistent exact usage")
+        _need(set(ready) == {"sha256", "bytes"} and ready["sha256"] == refs["response"]["sha256"]
+              and type(ready["bytes"]) is int and ready["bytes"] == len(raw["response"]), "Response-ready bytes differ")
+        _need(set(delivered) == {"request_sha256", "response_sha256", "delivered_at", *lane_identity}
+              and delivered["request_sha256"] == request_sha and delivered["response_sha256"] == refs["response"]["sha256"]
+              and _number(delivered["delivered_at"], positive=True)
+              and delivered["delivered_at"] >= claim["claimed_at"]
+              and all(delivered.get(key)==value for key,value in lane_identity.items()), "Normal delivery receipt missing or unrelated")
+        for name in sorted(REF_NAMES):
+            _hash_ref(refs[name], name)
+        _hash_ref(original_cli_ref, "original CLI identity")
+        return {
+            "schema": "hpc-forest-dynamic-r4b-native-phase-receipt-v1", "verified": True,
+            "scope_id": SCOPE, **{k: expected[k] for k in ("source_zip_sha256", "plan_sha256", "phase", "session_id", "model", "effort", "job_id")},
+            "request_sha256": request_sha, "request_digest": expected["request_digest"],
+            "request_native_sha256": refs["request_native"]["sha256"],
+            "source_cache": expected["source_cache"], "request_normalization": request_normalization,
+            "execution_sidecar_linkage": sidecar, "reader_revision": "external-native-reader-r3",
+            "normal_native_delivery_verified": True, "closed_schema_verified": True, "usage_exact": True,
+            "tokens": tokens, "native_model_calls": 1, "request": dict(refs["request_native"]),
+            **{name: dict(ref) for name, ref in refs.items()},
+            "recognized_warnings": warnings, "recognized_warning_separator_lines": separators,
+            "private_cli_audit":{key:value for key,value in private_result.items() if key!="usage"},
+            "global_admission_verified": False, "native_research_admitted": False,
+            "native_campaign_admission_verified": False, "independent_performance_audit_verified": False,
+            "first_normal_candidate_delivery_and_evaluation_verified": False,
+            "all_started_calls_reconciled": False, "cohort_audit_verified": False,
+            "scope_limit": "One technical phase snapshot only; no directory census, campaign admission, candidate evaluation, or performance conclusion.",
+        }
+    except ReceiptError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError,
+            RuntimeError, ImportError, OverflowError) as exc:
+        raise ReceiptError("Incomplete or malformed phase evidence (" + type(exc).__name__ + ")") from exc

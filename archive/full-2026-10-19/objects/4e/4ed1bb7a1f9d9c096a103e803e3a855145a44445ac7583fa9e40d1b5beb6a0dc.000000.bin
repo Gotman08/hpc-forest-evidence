@@ -1,0 +1,163 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+void read_dataset(int *nbodies, float **px, float **py, float **pz,
+                  float **vx, float **vy, float **vz) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading nbodie value\n"); exit(EXIT_FAILURE); }
+  int n = *nbodies;
+  Body *tmp = (Body *)malloc(n * sizeof(Body));
+  b = fread(tmp, n * sizeof(Body), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading input values\n"); exit(EXIT_FAILURE); }
+  *px = (float*)malloc(n*sizeof(float));
+  *py = (float*)malloc(n*sizeof(float));
+  *pz = (float*)malloc(n*sizeof(float));
+  *vx = (float*)malloc(n*sizeof(float));
+  *vy = (float*)malloc(n*sizeof(float));
+  *vz = (float*)malloc(n*sizeof(float));
+  for (int i=0;i<n;i++){
+    (*px)[i] = tmp[i].x;
+    (*py)[i] = tmp[i].y;
+    (*pz)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+  free(tmp);
+}
+
+void write_dataset(const int nbodies, float *px, float *py, float *pz,
+                   float *vx, float *vy, float *vz) {
+  Body *out = (Body*)malloc(nbodies*sizeof(Body));
+  for (int i=0;i<nbodies;i++){
+    out[i].x = px[i];
+    out[i].y = py[i];
+    out[i].z = pz[i];
+    out[i].vx = vx[i];
+    out[i].vy = vy[i];
+    out[i].vz = vz[i];
+  }
+  int b = fwrite(out, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) { fprintf(stderr,"\nError writing to output\n"); exit(EXIT_FAILURE); }
+  free(out);
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  float *cur_px,*cur_py,*cur_pz,*cur_vx,*cur_vy,*cur_vz;
+  read_dataset(&nbodies,&cur_px,&cur_py,&cur_pz,&cur_vx,&cur_vy,&cur_vz);
+
+  // Allocate next-state buffers (double buffering)
+  float *nxt_px = (float*)malloc(nbodies*sizeof(float));
+  float *nxt_py = (float*)malloc(nbodies*sizeof(float));
+  float *nxt_pz = (float*)malloc(nbodies*sizeof(float));
+  float *nxt_vx = (float*)malloc(nbodies*sizeof(float));
+  float *nxt_vy = (float*)malloc(nbodies*sizeof(float));
+  float *nxt_vz = (float*)malloc(nbodies*sizeof(float));
+  if (!nxt_px || !nxt_py || !nxt_pz || !nxt_vx || !nxt_vy || !nxt_vz) {
+    perror("malloc"); exit(EXIT_FAILURE);
+  }
+
+  const int TILE = 64;
+
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    #pragma omp parallel
+    {
+      // Force computation and state update in one pass, writing to next buffers.
+      #pragma omp for schedule(dynamic,16)
+      for (int i0 = 0; i0 < nbodies; i0 += TILE) {
+        int i_end = i0 + TILE;
+        if (i_end > nbodies) i_end = nbodies;
+        int cnt = i_end - i0;
+
+        float fx[64] __attribute__((aligned(16)));
+        float fy[64] __attribute__((aligned(16)));
+        float fz[64] __attribute__((aligned(16)));
+        float xis[64] __attribute__((aligned(16)));
+        float yis[64] __attribute__((aligned(16)));
+        float zis[64] __attribute__((aligned(16)));
+
+        for (int t = 0; t < cnt; ++t) {
+          fx[t] = 0.0f;
+          fy[t] = 0.0f;
+          fz[t] = 0.0f;
+          int idx = i0 + t;
+          xis[t] = cur_px[idx];
+          yis[t] = cur_py[idx];
+          zis[t] = cur_pz[idx];
+        }
+
+#define ACCUM(jj) \
+    do { \
+      float pjx = cur_px[jj]; \
+      float pjy = cur_py[jj]; \
+      float pjz = cur_pz[jj]; \
+      _Pragma("omp simd aligned(fx,fy,fz,xis,yis,zis:16)") \
+      for (int t = 0; t < cnt; ++t) { \
+        float dx = pjx - xis[t]; \
+        float dy = pjy - yis[t]; \
+        float dz = pjz - zis[t]; \
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING; \
+        float inv_dist = 1.0f / sqrt(sqrd_dist); \
+        float inv_dist3 = inv_dist * inv_dist * inv_dist; \
+        fx[t] += dx * inv_dist3; \
+        fy[t] += dy * inv_dist3; \
+        fz[t] += dz * inv_dist3; \
+      } \
+    } while (0)
+
+        int j = 0;
+        for (; j + 3 < nbodies; j += 4) {
+          ACCUM(j);
+          ACCUM(j+1);
+          ACCUM(j+2);
+          ACCUM(j+3);
+        }
+        for (; j < nbodies; ++j) {
+          ACCUM(j);
+        }
+#undef ACCUM
+
+        // Update velocities and positions into next buffers.
+        for (int t = 0; t < cnt; ++t) {
+          int idx = i0 + t;
+          float nvx = cur_vx[idx] + DT * fx[t];
+          float nvy = cur_vy[idx] + DT * fy[t];
+          float nvz = cur_vz[idx] + DT * fz[t];
+          nxt_vx[idx] = nvx;
+          nxt_vy[idx] = nvy;
+          nxt_vz[idx] = nvz;
+          nxt_px[idx] = cur_px[idx] + nvx * DT;
+          nxt_py[idx] = cur_py[idx] + nvy * DT;
+          nxt_pz[idx] = cur_pz[idx] + nvz * DT;
+        }
+      }
+    } // implicit barrier at end of parallel region
+
+    // Swap current and next buffers for the next iteration.
+    float *tmp;
+    tmp = cur_px; cur_px = nxt_px; nxt_px = tmp;
+    tmp = cur_py; cur_py = nxt_py; nxt_py = tmp;
+    tmp = cur_pz; cur_pz = nxt_pz; nxt_pz = tmp;
+    tmp = cur_vx; cur_vx = nxt_vx; nxt_vx = tmp;
+    tmp = cur_vy; cur_vy = nxt_vy; nxt_vy = tmp;
+    tmp = cur_vz; cur_vz = nxt_vz; nxt_vz = tmp;
+  }
+
+  write_dataset(nbodies, cur_px, cur_py, cur_pz, cur_vx, cur_vy, cur_vz);
+
+  free(cur_px); free(cur_py); free(cur_pz);
+  free(cur_vx); free(cur_vy); free(cur_vz);
+  free(nxt_px); free(nxt_py); free(nxt_pz);
+  free(nxt_vx); free(nxt_vy); free(nxt_vz);
+
+  exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,132 @@
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <utility>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace {
+const int MOD = 1000000007;
+const int TILE_SIZE = 256;
+const std::size_t BOUNDARY_ALIGNMENT = 128;
+
+int* aligned_boundary(std::vector<int>& storage) {
+    const std::uintptr_t address =
+        reinterpret_cast<std::uintptr_t>(storage.data());
+    const std::size_t padding =
+        (BOUNDARY_ALIGNMENT - address % BOUNDARY_ALIGNMENT) %
+        BOUNDARY_ALIGNMENT;
+    return storage.data() + padding / sizeof(int);
+}
+
+void update_tile(int row_begin, int row_end, int col_begin, int col_end,
+                 const std::vector<int>& row_offsets,
+                 const std::vector<int>& blocked_columns,
+                 int* bottom, int* right) {
+    for (int row = row_begin; row < row_end; ++row) {
+        int left = right[row];
+        int col = col_begin;
+        const auto first = blocked_columns.begin() + row_offsets[row];
+        const auto last = blocked_columns.begin() + row_offsets[row + 1];
+        auto blocked = std::lower_bound(first, last, col_begin);
+
+        while (blocked != last && *blocked < col_end) {
+            const int stop = *blocked;
+            for (; col < stop; ++col) {
+                int value = bottom[col] + left;
+                if (value >= MOD) value -= MOD;
+                bottom[col] = value;
+                left = value;
+            }
+            bottom[stop] = 0;
+            left = 0;
+            col = stop + 1;
+            ++blocked;
+        }
+
+        for (; col < col_end; ++col) {
+            int value = bottom[col] + left;
+            if (value >= MOD) value -= MOD;
+            bottom[col] = value;
+            left = value;
+        }
+        right[row] = left;
+    }
+}
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n, m;
+    if (!(std::cin >> n >> m)) return 0;
+
+    std::vector<int> row_offsets(n + 1, 0);
+    std::vector<int> blocked_columns(m);
+    {
+        std::vector<std::pair<int, int> > coordinates(m);
+        for (int k = 0; k < m; ++k) {
+            int row, col;
+            std::cin >> row >> col;
+            coordinates[k] = std::make_pair(row, col);
+            ++row_offsets[row + 1];
+        }
+        for (int row = 0; row < n; ++row) {
+            row_offsets[row + 1] += row_offsets[row];
+        }
+        std::vector<int> next(row_offsets.begin(), row_offsets.end() - 1);
+        for (int k = 0; k < m; ++k) {
+            const int row = coordinates[k].first;
+            blocked_columns[next[row]++] = coordinates[k].second;
+        }
+    }
+    for (int row = 0; row < n; ++row) {
+        std::sort(blocked_columns.begin() + row_offsets[row],
+                  blocked_columns.begin() + row_offsets[row + 1]);
+    }
+
+    const std::size_t padding = BOUNDARY_ALIGNMENT / sizeof(int);
+    std::vector<int> bottom_storage(static_cast<std::size_t>(n) + padding, 0);
+    std::vector<int> right_storage(static_cast<std::size_t>(n) + padding, 0);
+    int* const bottom = aligned_boundary(bottom_storage);
+    int* const right = aligned_boundary(right_storage);
+
+    // A virtual incoming edge seeds the origin, unless it is blocked.
+    bottom[0] = 1;
+
+#ifdef _OPENMP
+    const int tile_count = (n + TILE_SIZE - 1) / TILE_SIZE;
+    const int workers = std::min(omp_get_max_threads(), tile_count);
+    if (n >= 2048 && workers > 1) {
+        // Each diagonal owns disjoint bottom and right boundary segments.
+        // The implicit worksharing barrier completes its dependencies.
+        #pragma omp parallel num_threads(workers)
+        {
+            for (int diagonal = 0; diagonal < 2 * tile_count - 1; ++diagonal) {
+                const int first_row = std::max(0, diagonal - tile_count + 1);
+                const int last_row = std::min(diagonal, tile_count - 1);
+                #pragma omp for schedule(static)
+                for (int tile_row = first_row; tile_row <= last_row; ++tile_row) {
+                    const int tile_col = diagonal - tile_row;
+                    const int row_begin = tile_row * TILE_SIZE;
+                    const int col_begin = tile_col * TILE_SIZE;
+                    update_tile(row_begin, std::min(n, row_begin + TILE_SIZE),
+                                col_begin, std::min(n, col_begin + TILE_SIZE),
+                                row_offsets, blocked_columns, bottom, right);
+                }
+            }
+        }
+    } else
+#endif
+    {
+        update_tile(0, n, 0, n, row_offsets, blocked_columns, bottom, right);
+    }
+
+    std::cout << bottom[n - 1] << '\n';
+    return 0;
+}

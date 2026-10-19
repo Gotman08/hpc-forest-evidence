@@ -1,0 +1,503 @@
+"""One R1 group only, with process-local preserved CLI; no receipt or stop path."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RECEIPT = HERE.parent
+ROOT = RECEIPT.parents[1]
+WORKSPACE = ROOT.parents[1]
+COMPARE = ROOT.parent / "HPC-Forest-Harnais-Comparaison-r1"
+PROJECT = WORKSPACE / "work/marathon-archive-mother-r1/project"
+INCIDENT = ROOT / "reprises/incident-double-liaison-20261017T2012"
+KEY = "coverage-gpt-6.1-sol-xhigh"
+SESSION = "445f72b190204fc08e02a578205b4ef4"
+MODEL = "gpt-6.1-sol"
+EFFORT = "xhigh"
+SOURCE = "cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18"
+PLAN_SHA = "bc70b339c29574c1c0a612794416acacbf8a8a9ec20c62ff063d51f72e2e577f"
+PIN_SHA = "9808e32b0fc05802b181c1552708be64f79e8f3e9110ace1ed3d29b603bcfa11"
+CLI_SHA = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+CLI_VERSION = "codex-cli 0.163.0-alpha.10.2"
+CLI = INCIDENT / "cli-0.163.0-alpha.10.2/codex.exe"
+OTHER_KEY = "source-only-gpt-5.6-terra-max"
+OTHER_SESSION = "15219a6fd62b4dcb91b395dcd4ae03d5"
+OTHER_JOB = "750831"
+SCOPE = "hpc-forest-archives-2020-2024-mother-r1"
+MAXIMUM = 39600
+AUDIT_RESERVE = 10800
+DEADLINE = datetime(2026, 10, 31, 23, tzinfo=UTC).timestamp()
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SHARED = "/scratch_p/nimarano/hpc-forest-native-matrix-20261015-r1-launchfix1"
+REMOTE_PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED"}
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def durable_json(path, value, exclusive=False):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = path if exclusive else path.with_suffix(path.suffix + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
+    fd = os.open(target, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    if not exclusive:
+        os.replace(target, path)
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def deadline_guard(now):
+    require(now + MAXIMUM + AUDIT_RESERVE < DEADLINE, "Maximum plus audit reserve reaches exclusive deadline")
+
+
+def choose_next(state):
+    require(state.get("source_zip_sha256") == SOURCE, "Frozen source pin differs")
+    require(state.get("stage") == "ready_for_next_group_after_audited_reception" and not state.get("error"),
+            "The same R1 queue is not ready after audited reception")
+    pending = [g for g in state["queue"] if g["state"] != "received_and_audited"]
+    require(bool(pending) and all(g["state"] == "not_started" for g in pending),
+            "An existing or uncertain submission requires reconciliation")
+    cell = pending[0]
+    require((cell["key"], cell["session_id"], cell["model"], cell["effort"], cell["phase"])
+            == (KEY, SESSION, MODEL, EFFORT, "coverage"), "Expected next group differs")
+    require(not any(k in cell for k in ("plan_id", "job_id", "worker_identity", "remote_root")),
+            "Next group already has remote or process evidence")
+    require(len(cell["subjects"]) == 18 and len(set(cell["subjects"])) == 18, "Expected subject list differs")
+    return cell
+
+
+def epoch(value):
+    if isinstance(value, str) and value.startswith("/Date("):
+        return int(value[6:-2])
+    return int(datetime.fromisoformat(value).timestamp() * 1000)
+
+
+def same_cim(a, b):
+    return all(a.get(k) == b.get(k) for k in
+               ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine")) and epoch(a["CreationDate"]) == epoch(b["CreationDate"])
+
+
+def census():
+    ps = "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{n='CreationDate';e={$_.CreationDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Depth 4 -Compress"
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
+                            text=True, capture_output=True, check=True, timeout=30, creationflags=NO_WINDOW)
+    rows = json.loads(result.stdout)
+    require(isinstance(rows, list) and bool(rows), "Full process census unavailable")
+    return rows
+
+
+def native_sessions(rows):
+    sessions = {}
+    for row in rows:
+        command = row.get("CommandLine") or ""
+        executable = (row.get("ExecutablePath") or "").lower()
+        if not executable.endswith(("python.exe", "pythonw.exe")):
+            continue
+        if not re.search(r"hpc_forest\.[a-z0-9_]*worker|reprendre-relais-r1\.py", command):
+            continue
+        match = re.search(r'--session-id["\x27]?\s+["\x27]?([0-9a-f]{32})(?:["\x27]|\s|$)', command)
+        require(match is not None, "Unknown research worker without exact session")
+        require(all(row.get(k) is not None for k in
+                    ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")),
+                "Incomplete research worker identity")
+        sessions.setdefault(match[1], []).append(row)
+    require(len(sessions) <= 2, "More than two native worker sessions")
+    for rows_for_session in sessions.values():
+        require(len(rows_for_session) <= 2, "More than the launcher/Python pair for one session")
+        if len(rows_for_session) == 2:
+            a, b = rows_for_session
+            require(a["CommandLine"] == b["CommandLine"] and
+                    (a["ParentProcessId"] == b["ProcessId"] or b["ParentProcessId"] == a["ProcessId"]),
+                    "Native worker pair has inconsistent identities")
+    return sessions
+
+
+def current_status(status, job, now, terminal=False):
+    observation = status.get("observation") or {}
+    require(status.get("ok") is True and str(status.get("job_id")) == str(job), "Status job or success differs")
+    require(observation.get("current_state_observed") is True, "A cached state is not a current observation")
+    observed = observation.get("observed_at")
+    require(isinstance(observed, (int, float)) and -5 <= now - observed <= 180, "Status observation is stale")
+    require(status.get("state") in TERMINAL if terminal else status.get("state") is not None, "Expected terminal state")
+    return status
+
+
+def receipt_guard():
+    received = read(RECEIPT / "reception-verifiee.json")
+    require(received.get("verified") is True and str(received.get("job_id")) == "750909"
+            and received.get("all_published_requests_reconciled") is True
+            and received.get("r1_lane_remains_reserved") is True, "Previous R1 receipt is not strict")
+    for key in ("audit", "supplemental_audit", "reconciliation", "absence"):
+        ref = received[key]
+        require(digest(ref["path"]) == ref["sha256"], "Previous R1 receipt dependency differs: " + key)
+    absence = read(received["absence"]["path"])
+    require(absence.get("after_audit") is True and absence.get("after_reconciliation") is True
+            and absence.get("all_owned_process_identities_absent") is True, "Previous R1 identities not absent")
+    return received, absence
+
+
+def cli_guard():
+    require(digest(COMPARE / "cli-figee.json") == PIN_SHA, "Historical CLI pin changed")
+    migration = read(INCIDENT / "migration-cli-autorisee.initial.json")
+    qualification = read(INCIDENT / "qualification-cli-isolee.json")
+    require(migration["human_authorization"]["answer"] == "chercher le et trouve le et si tu trouve pas demerde toi",
+            "Human fallback authorization differs")
+    require(qualification.get("ok") is True and qualification.get("non_inference_only") is True
+            and qualification.get("cli_sha256") == CLI_SHA and qualification.get("cli_version") == CLI_VERSION
+            and qualification.get("strict_flags_preserved") is True, "Isolated static CLI checks differ")
+    require(digest(CLI) == CLI_SHA and CLI.is_file() and not CLI.is_symlink(), "Preserved CLI differs")
+    for item in migration["files"]:
+        path = CLI.parent / item["path"]
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size == item["bytes"]
+                and digest(path) == item["sha256"], "Preserved CLI support binary differs")
+    scoped = read(HERE / "migration-cli-continuation-r1.json")
+    require(scoped.get("authorized") is True and scoped.get("scope") == "one-next-r1-group"
+            and scoped.get("key") == KEY and scoped.get("session_id") == SESSION
+            and scoped.get("cli_sha256") == CLI_SHA and scoped.get("old_pin_sha256") == PIN_SHA
+            and scoped.get("scientific_equivalence_claimed") is False, "Migration scope differs")
+    return scoped
+
+
+def source_guard():
+    require(digest(ROOT / "matrix-plan.json") == PLAN_SHA, "Original matrix plan differs")
+    reader = load_module("continuation_frozen_source", ROOT / "reprises/incident-liaison-20261016T1656/reprendre-relais-r1.py")
+    require(reader.frozen_source(ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip", PROJECT, SOURCE) == 90,
+            "Frozen R1 source differs")
+
+
+def transition_guard(state, current, rows):
+    require(current["state"] in {"not_started", "planned_not_submitted", "prepared", "submitting", "submitted", "worker_starting"}
+            and not state.get("error"), "Other lane transition is not controlled")
+    ref = state.get("continuation_transition") or {}
+    path = Path(ref.get("path", ""))
+    require(path.is_file() and digest(path) == ref.get("sha256"), "Other transition intent unavailable or changed")
+    intent = read(path)
+    require(intent.get("schema") == "hpc-forest-source-only-single-dispatch-intent-v1"
+            and intent.get("scope") == "one-source-only-group"
+            and intent.get("key") == current["key"] and intent.get("session_id") == current["session_id"]
+            and intent.get("source_sha256") == state.get("source_zip_sha256"),
+            "Other transition session or source differs")
+    dispatcher = Path(intent["dispatcher_path"])
+    require(COMPARE.resolve() in dispatcher.resolve().parents
+            and digest(dispatcher) == intent["dispatcher_sha256"], "Other dispatcher changed")
+    identity = intent["observer_identity"]
+    require((identity.get("ExecutablePath") or "").lower().endswith("python.exe")
+            and str(dispatcher) in (identity.get("CommandLine") or "")
+            and any(same_cim(identity, row) for row in rows), "Other transition observer identity changed")
+    previous = intent["previous_reception"]
+    require(digest(previous["path"]) == previous["sha256"]
+            and read(previous["path"]).get("verified") is True, "Other previous reception receipt changed")
+
+
+def other_lane_guard(rows, sessions, other_terminal_status, now, allow_transition=False):
+    state = read(COMPARE / "coordinator-state.json")
+    current = next(g for g in state["queue"] if g["key"] == state["current_key"])
+    require(current.get("arm") == "source-only", "Other reserved lane has another arm")
+    other = current["session_id"]
+    require(set(sessions) <= {SESSION, other}, "Unknown or third native worker session")
+    actual = sessions.get(other, [])
+    if actual:
+        launch_file = COMPARE / "runs" / current["key"] / "worker-lancement.json"
+        launch = read(launch_file)
+        expected = launch.get("identity", launch.get("worker_identity", current.get("worker_identity")))
+        require(expected is not None and any(same_cim(expected, row) for row in actual), "Other live relay identity changed")
+        return other
+    if current.get("state") == "received_and_audited":
+        require(not any(g.get("state") in {"prepared", "submitting", "worker_starting", "submitted", "working"}
+                        for g in state["queue"]), "Other lane has an uncertain pending submission")
+        return other
+    if allow_transition and current["key"] != OTHER_KEY:
+        transition_guard(state, current, rows)
+        return other
+    require(current["key"] == OTHER_KEY and other == OTHER_SESSION and str(current.get("job_id")) == OTHER_JOB,
+            "Absent other lane has a different unreconciled group")
+    require(other_terminal_status is not None, "Absent other lane needs its fresh terminal observation")
+    current_status(read(other_terminal_status), OTHER_JOB, now, terminal=True)
+    return other
+
+
+def process_guard(other_terminal_status=None, own_allowed=False, allow_other_transition=False):
+    now = time.time()
+    rows = census()
+    sessions = native_sessions(rows)
+    other_lane_guard(rows, sessions, other_terminal_status, now, own_allowed or allow_other_transition)
+    _, absence = receipt_guard()
+    for historical in absence["historical_identities"]:
+        require(not any(same_cim(historical, row) for row in rows), "Previous R1 full identity is still alive")
+    own = sessions.get(SESSION, [])
+    if not own_allowed:
+        require(not own, "This next group already has a relay")
+    else:
+        launch = read(ROOT / "runs" / KEY / "worker-lancement.json")
+        require(any(same_cim(launch["identity"], row) for row in own), "Current owned R1 launcher exited or changed")
+        ready_path = ROOT / "runs" / KEY / "worker/worker-ready.json"
+        if ready_path.exists():
+            ready = read(ready_path)
+            require((ready.get("session_id"), ready.get("model"), ready.get("reasoning_effort"),
+                     ready.get("codex_cli_version")) == (SESSION, MODEL, EFFORT, CLI_VERSION), "Worker ready identity differs")
+            require(Path(ready["codex_executable"]).resolve() == CLI.resolve(), "Worker resolved a different CLI")
+            require(any(row["ProcessId"] == ready["pid"] for row in own), "Real worker PID differs")
+        else:
+            require(now - launch["launched_at"] < 120, "Owned relay has not produced its ready marker")
+    return rows, sessions
+
+
+def child_environment(base=None):
+    result = dict(os.environ if base is None else base)
+    result["PATH"] = str(CLI.parent) + os.pathsep + result.get("PATH", "")
+    result["PYTHONPATH"] = str(PROJECT / "src")
+    result["PYTHONDONTWRITEBYTECODE"] = "1"
+    return result
+
+
+def preflight(other_terminal_status=None):
+    state = read(ROOT / "coordinator-state.json")
+    cell = choose_next(state)
+    deadline_guard(time.time())
+    require(not (ROOT / "STOP-AFTER-CURRENT").exists(), "Requested stop marker present")
+    require(not (ROOT / "runs" / KEY).exists(), "Existing group directory requires reconciliation")
+    source_guard()
+    receipt_guard()
+    cli_guard()
+    rows, sessions = process_guard(other_terminal_status)
+    return {"verified": True, "observed_at": time.time(), "key": KEY, "session_id": SESSION,
+            "model": MODEL, "effort": EFFORT, "subjects": cell["subjects"], "source_sha256": SOURCE,
+            "existing_native_sessions": sorted(sessions), "native_workers": len(sessions),
+            "census": rows, "maximum_seconds": MAXIMUM, "audit_reserve_seconds": AUDIT_RESERVE,
+            "new_groups_maximum": 1, "cli_executable": str(CLI), "cli_sha256": CLI_SHA,
+            "old_pin_sha256": PIN_SHA, "no_receipt_or_stop": True, "model_calls": 0}
+
+
+def job_request(cell):
+    remote = "/scratch_p/nimarano/hpc-forest-gpt61sol-max-archive-matrix-20261015-r1-" + KEY
+    argv = [REMOTE_PYTHON, "-u", SHARED + "/project/examples/marathon22/archive_matrix.py",
+            "--root", remote, "--shared", SHARED, "--model", MODEL, "--effort", EFFORT,
+            "--session-id", SESSION, "--subjects", *cell["subjects"]]
+    shell = ("set -euo pipefail\nexport PYTHONPATH=" + shlex.quote(SHARED + "/project/src:" + SHARED + "/qa-deps")
+             + "\nexport PYTHONDONTWRITEBYTECODE=1\nexport OPENBLAS_NUM_THREADS=1\nulimit -s unlimited\nexec " + shlex.join(argv))
+    return remote, {"name": "forest-matrix-" + KEY, "command": "bash -lc " + shlex.quote(shell),
+                    "arch": "armgpu", "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0,
+                    "time_limit": "11:00:00", "workdir": "/scratch_p/nimarano",
+                    "spack_packages": ["/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"]}
+
+
+def plan_guard(plan, request):
+    require(plan.get("ok") is True and plan.get("state") == "ready" and plan.get("expired") is False,
+            "Prepared plan unavailable or expired")
+    entries = plan["plan"]["entries"]
+    require(len(entries) == 1, "Prepared plan has multiple jobs")
+    prepared = entries[0]["plan"]
+    spec = prepared["spec"]
+    require(prepared["seconds"] == MAXIMUM and spec["time"] == "11:00:00", "Prepared wall allocation differs")
+    for field in ("command", "arch", "cpus_per_task", "mem_gb", "gpus_per_node", "workdir", "spack_packages"):
+        require(spec[field] == request[field], "Prepared field differs: " + field)
+    require(spec["nodes"] == 1 and spec["ntasks_per_node"] == 1 and spec["gpus_per_task"] == 0,
+            "Prepared hardware scope differs")
+
+
+async def scheduler(rpc, job):
+    try:
+        return current_status(await rpc.call("job_status", job_id=job), job, time.time())
+    except RuntimeError as initial:
+        observed = time.time()
+        efficiency = await rpc.call("job_efficiency", job_id=job)
+        require(efficiency.get("ok") is True and efficiency.get("found") is True
+                and str(efficiency.get("job_id")) == str(job), "Fresh accounting fallback unavailable")
+        state = efficiency["state"]
+        return {"ok": True, "job_id": str(job), "state": state, "finished": state in TERMINAL,
+                "exit_code": efficiency.get("exit_code"),
+                "observation": {"observed_at": observed, "current_state_observed": True,
+                                "source": "fresh job_efficiency RPC"},
+                "initial_status_refusal": str(initial), "accounting": efficiency}
+
+
+async def runtime_guard(rpc, other_terminal_status=None, own_allowed=False, allow_other_transition=False):
+    state = read(COMPARE / "coordinator-state.json")
+    current = next(g for g in state["queue"] if g["key"] == state["current_key"])
+    if current["key"] == OTHER_KEY and current.get("state") != "received_and_audited":
+        status = await scheduler(rpc, OTHER_JOB)
+        current_status(status, OTHER_JOB, time.time(), terminal=True)
+        other_terminal_status = HERE / "other-terminal-current.json"
+        durable_json(other_terminal_status, status)
+    return process_guard(other_terminal_status, own_allowed, allow_other_transition)
+
+
+async def run(other_terminal_status=None):
+    legacy = load_module("continuation_r1_helpers", ROOT / "coordonner-matrice.py")
+    with legacy.FileLock(ROOT / "coordinator.lock"):
+        verified = preflight(other_terminal_status)
+        validation = read(HERE / "validation-locale.json")
+        require(validation.get("ok") is True and validation.get("dispatcher_sha256") == digest(__file__),
+                "Current dispatcher has no passing neutral validation")
+        durable_json(HERE / ("prevol-" + str(time.time_ns()) + ".json"), verified, exclusive=True)
+        state = read(ROOT / "coordinator-state.json")
+        cell = choose_next(state)
+        folder = ROOT / "runs" / KEY
+        folder.mkdir()
+        durable_json(folder / "cli-migration.json", read(HERE / "migration-cli-continuation-r1.json"), exclusive=True)
+        authorization = legacy.Coordinator(None).authorization(cell, folder)
+
+        def save():
+            state["updated_at"] = time.time()
+            durable_json(ROOT / "coordinator-state.json", state)
+
+        state.update(current_key=KEY, error=None, strict_dispatcher=str(Path(__file__).resolve()),
+                     strict_coordinator_identity=legacy.process_identity(os.getpid()),
+                     stage="dispatching_next_r1_group_after_audit")
+        save()
+        try:
+            async with legacy.module.ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+                remote, request = job_request(cell)
+                durable_json(folder / "job-request.json", request, exclusive=True)
+                deadline_guard(time.time())
+                cli_guard()
+                await runtime_guard(rpc, other_terminal_status)
+                durable_json(folder / "prepare-intent.json", {"request_sha256": digest(folder / "job-request.json"),
+                             "at": time.time(), "key": KEY, "session_id": SESSION, "replay_forbidden": True}, exclusive=True)
+                prepared = await rpc.call("job_prepare", **request)
+                require(prepared.get("ok") is True and bool(prepared.get("plan_id")), "No prepared plan")
+                durable_json(folder / "prepared.json", prepared, exclusive=True)
+                cell.update(state="prepared", plan_id=prepared["plan_id"], remote_root=remote)
+                save()
+                plan = await rpc.call("plan_get", plan_id=cell["plan_id"])
+                durable_json(folder / "plan-reviewed.json", plan, exclusive=True)
+                plan_guard(plan, request)
+                deadline_guard(time.time())
+                cli_guard()
+                await runtime_guard(rpc, other_terminal_status)
+                durable_json(folder / "submission-intent.json", {
+                    "at": time.time(), "plan_id": cell["plan_id"], "plan_sha256": digest(folder / "plan-reviewed.json"),
+                    "key": KEY, "session_id": SESSION, "replay_without_reconciliation_forbidden": True}, exclusive=True)
+                cell["state"] = "submitting"
+                save()
+                submitted = await rpc.call("job_submit", plan_id=cell["plan_id"], confirm=True)
+                durable_json(folder / "submission.json", submitted, exclusive=True)
+                require(submitted.get("ok") is True and re.fullmatch(r"[0-9]+", str(submitted.get("job_id"))),
+                        "Submission outcome requires manual reconciliation")
+                cell.update(job_id=str(submitted["job_id"]), state="submitted", submitted_at=time.time())
+                save()
+                failures = 0
+                while True:
+                    try:
+                        status = await scheduler(rpc, cell["job_id"])
+                        cell["scheduler"] = status
+                        if status.get("finished"):
+                            state.update(stage="awaiting_audited_reception_after_strict_dispatch",
+                                recovery_next_action="Strict receipt, native audit and delivery reconciliation before any individual fully identified owned stop and same queue continuation")
+                            save()
+                            return
+                        if status["state"] == "RUNNING" and cell["state"] == "submitted":
+                            deadline_guard(time.time())
+                            cli_guard()
+                            await runtime_guard(rpc, other_terminal_status, allow_other_transition=True)
+                            data = await rpc.call("read_remote_file", path=remote + f"/results-{cell['job_id']}/channel.json",
+                                                  offset=1, limit=40, max_chars=6000)
+                            require(data.get("ok") is True, "Mailbox channel not yet readable")
+                            channel = json.loads(data["content"])["channel"]
+                            require(channel.startswith(("/scratch_p/nimarano/", "/gpfs/scratch/nimarano/"))
+                                    and channel.endswith(f"/results-{cell['job_id']}/mailbox") and KEY in channel,
+                                    "Remote mailbox scope differs")
+                            output = folder / "worker"
+                            require(not output.exists(), "Existing cache requires reconciliation")
+                            output.mkdir()
+                            seconds = int(cell["submitted_at"] + MAXIMUM + 900 - time.time())
+                            require(seconds > 0, "Original allocation and delivery grace elapsed")
+                            argv = [str(WORKSPACE / "work/.venv/Scripts/python.exe"), "-B", "-u", "-m", "hpc_forest.matrix_worker",
+                                    "--channel", channel, "--session-id", SESSION, "--output", str(output),
+                                    "--codex-config", "C:/Users/nicol/.codex/config.toml",
+                                    "--dependency-receipt", str(authorization), "--required-jobs", SCOPE,
+                                    "--max-seconds", str(min(MAXIMUM + 900, seconds)), "--executable", str(CLI)]
+                            durable_json(folder / "worker-start-intent.json", {"argv": argv, "at": time.time(),
+                                         "cli_sha256": CLI_SHA, "retry_without_reconciliation_forbidden": True}, exclusive=True)
+                            cell["state"] = "worker_starting"
+                            save()
+                            await runtime_guard(rpc, other_terminal_status, allow_other_transition=True)
+                            cli_guard()
+                            with (output / "stdout.log").open("ab") as stdout, (output / "stderr.log").open("ab") as stderr:
+                                process = await asyncio.to_thread(subprocess.Popen, argv, stdin=subprocess.DEVNULL,
+                                    stdout=stdout, stderr=stderr, env=child_environment(),
+                                    creationflags=NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                            durable_json(folder / "worker-created.json", {"pid": process.pid, "at": time.time(),
+                                         "session_id": SESSION, "retry_without_reconciliation_forbidden": True}, exclusive=True)
+                            identity = legacy.process_identity(process.pid)
+                            require(identity is not None and SESSION in (identity.get("CommandLine") or ""),
+                                    "Owned relay identity not established after Popen; never retry")
+                            durable_json(folder / "worker-lancement.json", {"argv": argv, "identity": identity,
+                                         "session_id": SESSION, "launched_at": time.time(), "cli_sha256": CLI_SHA}, exclusive=True)
+                            cell.update(state="working", worker_identity=identity, channel=channel, worker_started_at=time.time())
+                            state["stage"] = "running_next_r1_group_strict_observation"
+                        elif cell["state"] == "working":
+                            await runtime_guard(rpc, other_terminal_status, own_allowed=True)
+                        save()
+                        failures = 0
+                    except Exception as exc:
+                        failures += 1
+                        durable_json(HERE / ("refus-" + str(time.time_ns()) + ".json"),
+                            {"at": time.time(), "error": str(exc), "consecutive": failures,
+                             "submission_replayed": False, "worker_restarted": False}, exclusive=True)
+                        if failures >= 3 or cell["state"] == "worker_starting":
+                            raise
+                    await asyncio.sleep(30)
+        except Exception as exc:
+            state.update(stage="attention_required", error=str(exc))
+            save()
+            raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", action="store_true", help="Dispatch exactly this one group then observe")
+    parser.add_argument("--other-terminal-status", type=Path)
+    args = parser.parse_args()
+    if args.run:
+        asyncio.run(run(args.other_terminal_status))
+    else:
+        legacy = load_module("continuation_preflight_lock", ROOT / "coordonner-matrice.py")
+        with legacy.FileLock(ROOT / "coordinator.lock"):
+            result = preflight(args.other_terminal_status)
+            target = HERE / ("prevol-" + str(time.time_ns()) + ".json")
+            durable_json(target, result, exclusive=True)
+            print(json.dumps({"verified": True, "preflight": str(target), "model_calls": 0}))
+
+
+if __name__ == "__main__":
+    main()

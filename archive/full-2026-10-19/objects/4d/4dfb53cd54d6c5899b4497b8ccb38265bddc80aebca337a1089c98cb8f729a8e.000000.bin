@@ -1,0 +1,360 @@
+"""Describe immutable received results; never provide a generator context."""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import sqlite3
+import statistics
+from datetime import UTC, datetime
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE.parent
+COMPARISON = OUT / "Marathon22-GPT61Sol-MAX/harnais-r2"
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write(path, value):
+    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def table(headers, rows):
+    return "\n".join(["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers),
+                      *["| " + " | ".join(str(x).replace("|", "/").replace("\n", " ") for x in r) + " |" for r in rows]])
+
+
+def csvwrite(path, rows):
+    with Path(path).open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
+                         for k, v in row.items()} for row in rows)
+
+
+def validate_calls(calls, model, effort):
+    assert len({(c["session_id"], c["nonce"]) for c in calls}) == len(calls)
+    for call in calls:
+        assert call["model"] == model and call["effort"] == effort and call["state"] != "pending"
+        assert sha(call["request_path"]) == call["request_file_sha256"]
+        assert sha(call["response_path"]) == call["response_file_sha256"]
+        invocation = read(Path(call["request_path"]).parent / "invocation.json")
+        argv = invocation["argv"]
+        assert argv[argv.index("--model") + 1] == model
+        assert f'model_reasoning_effort="{effort}"' in argv
+        assert not read(call["response_path"])["usage"].get("tool_events")
+
+
+def confirmation_data(campaign, result):
+    path = campaign / "registry.sqlite3"
+    before = sha(path)
+    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+        rows = [{"experiment_id": exp, "outcome": json.loads(payload)} for exp, payload in
+                db.execute("SELECT experiment_id,payload FROM evaluations WHERE phase='confirmation' ORDER BY id")]
+    assert sha(path) == before
+    for row in rows:
+        outcome = row["outcome"]
+        if outcome["correct"]:
+            assert len(outcome["times"]) == 5
+            assert abs(statistics.mean(outcome["times"]) - outcome["mean_seconds"]) < 1e-12
+        else:
+            assert not outcome["times"] and outcome["mean_seconds"] is None and outcome["score"] == 0
+    winner = result["best_confirmed"]
+    chosen = next(r["outcome"] for r in rows if r["experiment_id"] == winner["experiment_id"])
+    baseline = next(r["outcome"] for r in rows if r["experiment_id"] == "baseline-e1")
+    assert chosen["commit"] == winner["commit"] and chosen["correct"] and baseline["correct"]
+    assert abs(chosen["mean_seconds"] - winner["mean_seconds"]) < 1e-12
+    assert abs(1 - chosen["mean_seconds"] / baseline["mean_seconds"] - result["confirmed_gain_fraction"]) < 1e-12
+    return {"registry_sha256": before, "all_finalists": rows,
+            "reference_times": baseline["times"], "chosen_times": chosen["times"],
+            "reference_stdev": statistics.stdev(baseline["times"]),
+            "chosen_stdev": statistics.stdev(chosen["times"])}
+
+
+def roles(calls):
+    return {role: {"calls": sum(c["kind"] == role for c in calls),
+                   "known_exact_tokens": sum(c["exact_total"] or 0 for c in calls if c["kind"] == role),
+                   "unmetered_calls": sum(c["kind"] == role and c["state"] != "exact" for c in calls)}
+            for role in sorted({c["kind"] for c in calls})}
+
+
+def draw_tree(ax, topology, trials, title):
+    positions, nodes, offset = {}, {}, 0
+    colors = {"A": "#1f638f", "B": "#a26a16", "C": "#298066", "G": "#8a4f89"}
+    for tree in topology["trees"]:
+        by_id = {n["id"]: n for n in tree["nodes"]}
+        nodes.update(by_id)
+        children = {key: [] for key in by_id}
+        for n in tree["nodes"]:
+            if n["parent"] in children:
+                children[n["parent"]].append(n["id"])
+        leaf = [float(offset)]
+
+        def place(key):
+            child_y = [place(k) for k in children[key]]
+            if child_y:
+                y = statistics.mean(child_y)
+            else:
+                y = leaf[0]
+                leaf[0] += 1.3
+            positions[key] = (by_id[key]["depth"], y)
+            return y
+
+        for n in tree["nodes"]:
+            if n["parent"] is None:
+                place(n["id"])
+        offset = leaf[0] + 1.7
+        for n in tree["nodes"]:
+            if n["parent"] is not None:
+                a, b = positions[n["parent"]], positions[n["id"]]
+                ax.plot([a[0], b[0]], [a[1], b[1]], color=colors[tree["role"]], alpha=.55, lw=1)
+            x, y = positions[n["id"]]
+            ax.scatter(x, y, s=40, color="white" if n["depth"] == 0 else colors[tree["role"]],
+                       edgecolors=colors[tree["role"]], zorder=3)
+            label = "racine " + tree["role"] if n["depth"] == 0 else n["id"][:6]
+            ax.annotate(label, (x, y), xytext=(5, 3), textcoords="offset points", fontsize=7)
+    for trial in trials:
+        if trial["role"] != "G" or trial["id"] not in positions:
+            continue
+        for source in trial["integration_sources"]:
+            if source in positions:
+                a, b = positions[source], positions[trial["id"]]
+                ax.plot([a[0], b[0]], [a[1], b[1]], color="#999999", ls=":", lw=.7, alpha=.45)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("Profondeur enregistrée")
+    ax.set_xticks(range(0, max(n["depth"] for n in nodes.values()) + 1))
+    ax.set_yticks([])
+    ax.set_xlim(-.2, max(n["depth"] for n in nodes.values()) + .7)
+    ax.set_ylim(-1, offset)
+    ax.invert_yaxis()
+    return {"topology": topology, "recorded_integration_sources": [
+        {"id": r["id"], "sources": r["integration_sources"]} for r in trials if r["role"] == "G"]}
+
+
+def main():
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
+                         "axes.spines.top": False, "axes.spines.right": False})
+    now = datetime.now(UTC).isoformat()
+    inventory = read(OUT / "HPC-Forest-Mere-Dynamique-r3/tokens-par-modele.json")
+    state = read(HERE / "coordinator-state.json")
+    group = next(g for g in state["queue"] if g["key"] == "coverage-gpt-6-luna-max")
+    assert group["state"] == "received_and_audited"
+    audit = read(group["audit_path"])
+    assert audit["coverage_and_final_confirmations_verified"] and audit["read_only_file_verification_before_and_after"]
+    base = HERE / "runs/coverage-gpt-6-luna-max"
+    assert sha(base / "results-748259.tar.gz") == group["archive_sha256"]
+    calls = [c for c in inventory["native_calls"] if c["campaign"] == "grille-r1/coverage-gpt-6-luna-max"]
+    validate_calls(calls, "gpt-6-luna", "max")
+    assert len(calls) == sum(s["archived_native_invocations"] for s in audit["subjects"])
+    assert sum(c["exact_total"] or 0 for c in calls) == sum(s["archived_exact_native_tokens"] for s in audit["subjects"])
+    root = base / "preuves/results-748259"
+    rows, missions, episodes, trees = [], [], [], []
+    for subject in audit["subjects"]:
+        slug = subject["subject"]
+        campaign = root / slug
+        samples = confirmation_data(campaign, subject)
+        topology = read(root / (slug + "-progress.json"))
+        trees.append({"subject": slug, "topology": topology,
+                      "trials": subject["detailed_trials"]})
+        config, contract = read(campaign / "trusted/config.json"), read(campaign / "trusted/contract.json")
+        assert config["seed"] == 23 and config["protocol"]["repetitions"] == 3 and config["protocol"]["confirmation_repetitions"] == 5
+        rows.append({"subject": slug, "job_id": "748259", "model": "gpt-6-luna", "effort": "max",
+                     "campaign_root": str(campaign.resolve()), "confirmation": subject["best_confirmed"],
+                     "gain_fraction": subject["confirmed_gain_fraction"], "statuses": subject["statuses"],
+                     "topology": subject["topology"], "native_calls": subject["archived_native_invocations"],
+                     "exact_tokens": subject["archived_exact_native_tokens"],
+                     "harness_repaired_proposals": subject["automatically_repaired_proposals"],
+                     "mother_requests": subject["published_mother_requests"], "samples": samples,
+                     "contract_sha256": sha(campaign / "trusted/contract.json"), "contract": contract,
+                     "budget": config["budget"], "operator_algorithm_hints": 0})
+        for trial in subject["detailed_trials"]:
+            missions.append({"subject": slug, **trial})
+            path = campaign / "logs" / trial["id"] / "node-harness.json"
+            episode = read(path)
+            assert not episode["holdout_access"] and not episode["outer_tree_reward_assigned"]
+            episodes.append({"subject": slug, "path": str(path.resolve()), "sha256": sha(path), **episode})
+    luna = {"schema": "hpc-forest-received-fourteen-subject-luna-max-v1", "observed_utc": now,
+            "job_id": "748259", "archive_sha256": group["archive_sha256"], "rows": rows,
+            "received_subjects": len(rows), "native_calls": len(calls),
+            "exact_native_tokens": sum(c["exact_total"] for c in calls), "tokens_by_role": roles(calls),
+            "scored_nodes": sum(r["topology"]["scored_nodes"] for r in rows),
+            "retained_baselines": sum(r["confirmation"]["is_baseline"] for r in rows),
+            "harness_repaired_proposals": sum(r["harness_repaired_proposals"] for r in rows),
+            "mother_requests": sum(r["mother_requests"] for r in rows),
+            "model_input": False, "universal_correctness_or_model_ranking_proved": False}
+    write(HERE / "resultats-couverture-luna-max.json", luna)
+    write(HERE / "details-missions-couverture-luna-max.json", missions)
+    write(HERE / "episodes-harnais-couverture-luna-max.json", episodes)
+    write(HERE / "arbres-couverture-luna-max.json", trees)
+    csvwrite(HERE / "jetons-par-appel-couverture-luna-max.csv", calls)
+    fig, ax = plt.subplots(figsize=(7.5, 7.2))
+    ax.barh([r["subject"] for r in rows], [100 * r["gain_fraction"] for r in rows], color="#2e6f94")
+    ax.invert_yaxis(); ax.set_xlim(0, 105); ax.set_xlabel("Réduction confirmée contre la référence propre (%)", fontsize=9)
+    for i, r in enumerate(rows):
+        ax.text(100 * r["gain_fraction"] + 1, i, f"{100*r['gain_fraction']:.2f}", va="center", fontsize=8)
+    ax.set_title("Luna MAX : quatorze autres sujets reçus\nune recherche et une graine par sujet ; référence conservée = 0 %")
+    fig.tight_layout(); fig.savefig(HERE / "couverture-luna-max.png", dpi=220); plt.close(fig)
+    text = f'''# Couverture Luna MAX : quatorze autres sujets reçus et audités
+
+Instantané du {now}. Le job **748259** est terminé et reçu : archive SHA-256 `{group['archive_sha256']}`. Le coordinateur R1 a audité les quatorze sujets, leurs parents et sources, les fichiers protégés, les compteurs et les confirmations. Avec la cellule count déjà livrée, Luna MAX dispose de quinze cellules reçues. La matrice des quatre modèles et cinq efforts compte maintenant 34 cellules reçues sur 300 ; les groupes de couverture suivants continuent. Une seule recherche et la graine 23 sont disponibles pour chaque cellule.
+
+Le lot comporte **{len(calls)} appels natifs et {luna['exact_native_tokens']} jetons exacts**, **{luna['scored_nodes']} sommets notés**, profondeur deux et deux fils maximum. Les 112 missions de programme restent distinctes des 28 épisodes de mère et des appels internes. Deux doublons ne créent pas de nouveaux sommets ; un programme Jacobi 2021 incorrect conserve son score nul. Les références tropical et Sokoban sont conservées : aucun gain ne leur est attribué. Douze sujets ont un programme amélioré confirmé sur les cas finis.
+
+## Résultats et mesures d'origine
+
+Les références propres et les temps retenus proviennent de cinq passages de confirmation intercalés, après les vérifications sur d'autres entrées. Le seuil de promotion reste 3 %. Trois chronométrages alimentent la recherche. Chaque nouveau programme, y compris G, est compilé et évalué indépendamment. Les cinq temps bruts, dispersions descriptives, finalistes rejetés éventuels, commits et empreintes sont conservés dans le JSON ; ils ne sont pas fusionnés avec les mesures de cœurs.
+
+{table(['Sujet','Référence (s)','Retenu (s)','Réduction','Sommets','Appels','Jetons exacts'], [[r['subject'],f"{r['confirmation']['reference_seconds']:.9f}",f"{r['confirmation']['mean_seconds']:.9f}",f"{100*r['gain_fraction']:.4f} %",r['topology']['scored_nodes'],r['native_calls'],r['exact_tokens']] for r in rows])}
+
+![Réductions confirmées des quatorze sujets Luna MAX](couverture-luna-max.png)
+
+## Mère, harnais et reprises réellement observés
+
+La mère R1 utilise ici la même identité exacte gpt-6-luna et le même effort max que les enfants. Ses deux épisodes par sujet préparent puis orientent les missions A/B/C/G ; ce protocole statique diffère de R4 à racines indépendantes, qui n'a toujours pas de pilote natif. Les contextes et réponses de la mère sont archivés. Une description d'intention dans une réponse ne révèle pas la pensée interne du modèle et ne démontre pas l'effet causal du conseil.
+
+{table(['Rôle comptable','Appels','Jetons exacts'], [[k,v['calls'],v['known_exact_tokens']] for k,v in luna['tokens_by_role'].items()])}
+
+L'audit relève **{luna['harness_repaired_proposals']} propositions réparées avec succès par le modèle**. Ce nombre est distinct des reprises de sérialisation et du nombre d'appels supplémentaires. Les 112 journaux d'épisode conservent chaque tentative, contrôle de développement et observation. Le harnais partage au plus trois appels et 600 secondes dans une mission ; il s'arrête au premier programme correct, sans score de vitesse intérieur ni accès au holdout. Les échecs, doublons, diagnostics bruts et corrections autonomes restent dans les annexes. Aucun programme n'a été réparé par l'opérateur.
+
+## Cible et budgets
+
+R1 utilise quatre cœurs ARM64, 16 GiB demandés et zéro GPU pour les compilations et mesures, avec TreeQuest réel 0.3.2. Le modèle est hébergé et appelé par la CLI authentifiée du PC ; aucun poids GPT n'est chargé sur ROMEO. La réservation de mémoire n'est pas une consommation mesurée, et les arguments OpenMP ne prouvent pas à eux seuls l'emploi de plusieurs cœurs. Chaque sujet est borné à 1800 secondes et 1,5 million de jetons, huit missions de programme et deux épisodes de mère maximum. Les usages exacts incluent le cache dans l'entrée et le raisonnement dans la sortie ; ils ne sont pas additionnés deux fois. Aucun débit de décodage natif ni prix API en euros n'est déduit de ces compteurs.
+
+## Domaine, format et fidélité à l'énoncé
+
+Les sorties exactes testées sont observables et les contrôles GCC contre la non-initialisation sont maintenus. Cette réception n'est pas une preuve sur tout le domaine mathématique ni une certification du matériel, de l'emballage ou du classement du concours. Les quatre exclusions historiques demeurent des exclusions de préparation : primes et Jacobi 2020, Johnson 2021, path 2023. Elles ne sont pas des échecs des modèles. Jacobi 2021 reçu ici est un autre sujet que Jacobi 2020 exclu.
+
+Le quicksort 2020 reçoit un programme ayant modifié partitionnement et chemin de repli selon sa déclaration archivée. Le gain observé doit donc rester accompagné d'une revue de fidélité à l'algorithme demandé ; le conflit entre description argv et source stdin n'est pas résolu par une simple égalité des sorties. Les contrôles indépendants préparés pour tropical et permutations n'ont pas encore validé le transport de nouvelles mesures. Les neuf autres sujets de ce lot restent hors du préparateur de cœurs à cinq sujets jusqu'à leur revue propre. La qualification source-compatible de l'en-tête binaire N-body est conservée.
+
+## Mesures de cœurs séparées et provenance
+
+La série 07, job 748359, mesure uniquement les quatre nouveaux programmes Luna 2022 sur les sujets déjà qualifiés. Ses 280 points et 1400 durées sont reçus et audités sans modèle, édition ou compilation. Sur 4096 particules, le même N-body passe de 0,680797111 s à un cœur à 0,044580729 s à seize cœurs, facteur 15,271. Les trois autres programmes ont une montée proche de un sur leurs plus grandes entrées. Cela ne remplace pas leurs confirmations initiales à quatre cœurs et ne justifie aucune nouvelle recherche opérateur.
+
+Annexes : [résultats et cinq temps bruts](resultats-couverture-luna-max.json), [112 missions avec hypothèses déclarées](details-missions-couverture-luna-max.json), [épisodes du harnais](episodes-harnais-couverture-luna-max.json), [liens complets des arbres](arbres-couverture-luna-max.json), [jetons par appel](jetons-par-appel-couverture-luna-max.csv), [audit immuable de réception](runs/coverage-gpt-6-luna-max/audit.json), [série 07 et ses CSV](../HPC-Forest-Conformite-Coeurs-r2/serie-07/RAPPORT-DETAILLE.md). Ces documents restent des observations destinées au propriétaire, jamais des contextes des générateurs.
+'''
+    (HERE / "BILAN-COUVERTURE-LUNA-MAX.md").write_text(text, encoding="utf8")
+
+    comp = read(COMPARISON / "receptions/audit-comparaison-747885.json")
+    assert comp["all_final_confirmations_verified"] and comp["matched_gain_comparison_verified"] and comp["read_only_evidence_verified"]
+    reconciliation = read(COMPARISON / "receptions/reconciliation-locale-747885.json")
+    stop = read(COMPARISON / "receptions/arret-relais-verifie-747885.json")
+    assert stop["remaining_pids"] == [] and reconciliation["pending_or_undelivered_requests"] == 0
+    native = [c for c in inventory["native_calls"] if c["session_id"] == "e102a585de23492ca9019858dac5af4d"]
+    validate_calls(native, "gpt-6.1-sol", "max")
+    assert len(native) == reconciliation["native_calls"] == 125
+    assert sum(c["exact_total"] or 0 for c in native) == reconciliation["exact_tokens_known"] == 3218520
+    root = COMPARISON / "preuves-747885/results-747885"
+    comp_rows, comp_trees, comp_trials = [], [], []
+    for p in comp["problems"]:
+        campaign = root / p["arm"] / p["problem"]
+        samples = confirmation_data(campaign, p)
+        comp_rows.append({**{k:v for k,v in p.items() if k not in ['detailed_trials','best_search_only']},
+                          "campaign_root": str(campaign.resolve()), "samples": samples})
+        comp_trials.extend({"arm":p["arm"],"problem":p["problem"],**r} for r in p["detailed_trials"])
+    result = {"schema":"hpc-forest-received-six-arm-comparison-v1", "observed_utc":now,
+              "job_id":"747885", "archive_sha256":comp["archive_sha256"], "rows":comp_rows,
+              "native_calls":len(native), "known_exact_tokens":3218520,
+              "unmetered_native_calls":sum(c["state"]!='exact' for c in native),
+              "tokens_by_role":roles(native), "all_arms_received_and_audited":True,
+              "all_three_paired_input_sets_identical":comp["matched_inputs_verified"],
+              "infrastructure_confounders_preserved":True, "relay_stopped_after_reception":True,
+              "causal_harness_superiority_established":False, "model_input":False}
+    write(COMPARISON / "resultats-comparaison-recus.json",result)
+    write(COMPARISON / "details-missions-comparaison.json",comp_trials)
+    csvwrite(COMPARISON / "jetons-par-appel-comparaison.csv",native)
+    sample_rows=[]
+    for r in comp_rows:
+        for kind in ['reference','chosen']:
+            for i,t in enumerate(r['samples'][kind+'_times']):
+                sample_rows.append({'arm':r['arm'],'problem':r['problem'],'kind':kind,'sample':i,'seconds':t})
+    csvwrite(COMPARISON / "confirmations-cinq-temps.csv",sample_rows)
+    for slug in ['knn','sum','nbody']:
+        for arm in ['reference','mixed-harness']:
+            fig,ax=plt.subplots(figsize=(7.2,7.5))
+            p=next(r for r in comp['problems'] if r['problem']==slug and r['arm']==arm)
+            topology=read(root/arm/(slug+'-progress.json'))
+            graph=draw_tree(ax,topology,p['detailed_trials'],arm+' : '+str(p['topology']['scored_nodes'])+' sommets notés')
+            comp_trees.append({'problem':slug,'arm':arm,**graph})
+            fig.suptitle(slug+' — liens réellement archivés\ncercles vides : racines ; pointillés : sources G enregistrées',fontsize=11)
+            fig.tight_layout(rect=(0,0,1,.93));fig.savefig(COMPARISON/('arbres-comparaison-'+slug+'-'+arm+'.png'),dpi=230);plt.close(fig)
+    write(COMPARISON/'arbres-comparaison.json',comp_trees)
+    text=f'''# Comparaison GPT-6.1 Sol MAX : six bras reçus et audités
+
+Bilan du {now}. Le job **747885** est terminé depuis le 16 octobre à 07:19:27 UTC. L'archive annoncée, distante, téléchargée et recalculée a le SHA-256 `{comp['archive_sha256']}`. Les **8328 fichiers** ont été restaurés dans un dossier neuf puis revérifiés avant et après audit en lecture seule. Les six gagnants sont confirmés et les trois paires utilisent les mêmes sources officielles et empreintes d'entrées. Les 126 requêtes publiées ont toutes reçu leur réponse ; l'une a expiré avant tout appel natif. Après réconciliation des preuves locales tardives, le relais possédé a été arrêté par identité complète, sans toucher au coordinateur R1.
+
+## Résultats appariés et temps absolus
+
+{table(['Sujet','Bras','Référence (s)','Retenu (s)','Réduction','Sommets','Appels natifs','Jetons connus / appels inconnus'],[[r['problem'],r['arm'],f"{r['best_confirmed']['reference_seconds']:.9f}",f"{r['best_confirmed']['mean_seconds']:.9f}",f"{100*r['confirmed_gain_fraction']:.4f} %",r['topology']['scored_nodes'],r['archived_native_invocations'],str(r['archived_exact_native_tokens'])+' / '+str(r['archived_unmetered_native_invocations'])] for r in comp_rows])}
+
+Chaque temps retenu et chaque référence propre est la moyenne de cinq mesures intercalées, avec une chauffe et des contrôles exacts sur trois entrées de confirmation indépendantes des trois entrées de recherche. Le benchmark de vitesse est décrit et empreinté dans chaque contrat. Les 60 temps référence/ret enus figurent dans le CSV ; les autres finalistes, leurs résultats négatifs et dispersions sont dans le JSON. La réduction vaut 1−T_retenu/T_référence. Les temps des deux bras ne sont pas fusionnés.
+
+Le témoin est légèrement plus rapide en temps brut sur k-NN et somme. Pour somme, le pourcentage normalisé est pourtant un peu plus élevé avec harnais parce que sa référence mesurée est aussi plus lente : ces deux observables ne sont pas interchangeables. N-body avec harnais est plus rapide dans cette paire, mais une recherche par bras et les incidents ne démontrent pas une supériorité causale ou un classement général des modèles.
+
+## Exigences, cible et exécution réelle
+
+Le modèle exact est **gpt-6.1-sol**, effort **max**, via la CLI Codex authentifiée du PC et une inférence hébergée. Les arguments réels imposent ce modèle et cet effort, un contexte natif de 65536, des réponses structurées et l'absence d'outils natifs. ROMEO exécute la préparation, Git, les compilations et les tests avec quatre cœurs ARM64, 16 GiB demandés et zéro GPU. Le PC reste nécessaire aux générations. Aucune pensée interne, mémoire effective, fréquence CPU ou vitesse de décodage native n'est inventée.
+
+Les plafonds par bras sont 7200 secondes et 1,5 million de jetons, 24 possibilités de programme, profondeur six autorisée et un seul travailleur. La profondeur effectivement atteinte vaut trois ; les deux arbres N-body ont cinq fils maximum, les quatre autres quatre. Le contrôleur utilise TreeQuest 0.3.2, graine 23, trois mesures de recherche, cinq confirmations intercalées, oracle exact et diagnostics GCC contre les variables non initialisées. Les 126 missions enregistrées comprennent 114 programmes valides, un échec de compilation et onze erreurs d'infrastructure ; les 115 sommets notés incluent l'échec de compilation à score nul. Une panne sans score n'est pas dessinée comme un programme incorrect.
+
+L'allocation a duré 11:07:25, avec 474,1 secondes CPU comptabilisées pour 160180 secondes CPU réservées, et un maximum RSS de 249,9 Mo. L'attente de l'inférence hébergée domine ce ratio global ; ce n'est pas une mesure du nombre exact de threads des candidats. La réservation de 16 GiB reste distincte de la mémoire observée. Les mesures post-hoc des mêmes exécutables sur 1/2/4/8/16 cœurs sont un lot séparé.
+
+## Harnais effectivement exercé
+
+Le mode mixed-harness peut utiliser jusqu'à trois appels partageant 600 secondes, des contrôles mécaniques de compilation/correction et des lectures HTTPS choisies par le modèle sur les seuls hôtes préparés. Aucun corpus de solutions n'est préchargé. Le premier programme correct termine l'épisode, sans score de vitesse intérieur ni holdout révélé. Le témoin n'a pas cet épisode intérieur. Les deux modes reçoivent les mêmes plafonds globaux, mais les réservations d'admission diffèrent : 196608 jetons pour le témoin contre 589824 pour une mission avec harnais.
+
+Les traces reçues comptent 53 contrôles de développement dans les trois bras avec harnais, **zéro proposition réparée avec succès** et **zéro lecture documentaire choisie en recherche**. Les deux sondes techniques documentaires antérieures sont séparées des résultats d'optimisation. Cette expérience ne mesure donc pas l'efficacité d'un parcours de réparation ou d'une recherche documentaire réellement utilisée. Les appels internes, missions, lectures et sommets restent distincts.
+
+## Appels et jetons exacts ou inconnus
+
+Les **125 appels natifs** réconciliés consomment **3218520 jetons exacts connus**, avec **huit appels non mesurés**. Le total réel reste inconnu pour ces huit appels. Les caches sont inclus dans les entrées, le raisonnement dans les sorties ; les réservations de 196608 ne deviennent jamais des consommations exactes. La requête expirée avant génération a zéro appel et zéro jeton exact. Les invocations locales et archivées concordent après déduplication session/nonce.
+
+{table(['Rôle','Appels','Jetons exacts connus','Appels non mesurés'],[[k,v['calls'],v['known_exact_tokens'],v['unmetered_calls']] for k,v in result['tokens_by_role'].items()])}
+
+## Incidents conservés et interprétation bornée
+
+La panne de transfert du 16 octobre vers 01:07 UTC a nécessité une reprise technique du même dossier, canal, session et registre. Les trois G de somme avec harnais cd668f95e96141d8, a1bba36fb36c43da et 13fe17f8bdc64724 ont expiré. Le deuxième n'a donné aucun appel natif ; le troisième n'a pas de compteur exact. La réponse d94576ad89f34d258d56a7dd9e37e3c0, déjà produite avec 37924 jetons exacts, a été retransmise depuis le cache après expiration sans injecter son candidat tardif. La nouvelle génération évaluée à 01:36:45 UTC prouve la reprise du transport, sans rejouer la recherche interrompue. **Cet incident confond le bras somme avec harnais.**
+
+Un nouvel échec de connexion vers 04:44 UTC a été résolu automatiquement : la réponse 45b27d701ffe4f0592313876ef5930d2, 25294 jetons exacts, a été livrée avec le même SHA depuis le cache, puis acceptée comme candidat 3e6e906996b04b7d. Une seule invocation native est enregistrée. Cette retransmission n'est pas une nouvelle génération ni un nouveau sommet.
+
+Les délais bornés c83588281fa24725 et 3ac053b3298141b9 du témoin somme, b88ae0ea394848fb et d94e7e90a6d140df de N-body avec harnais, ainsi que les autres pannes recensées restent dans les traces. Les appels sans compteur final exact restent inconnus et leurs charges budgétaires sont séparées. Le dernier G N-body a manqué de temps ; il n'a pas été relancé. Aucun candidat, oracle ou seuil n'a été réparé par l'opérateur. Les octets des 545 fichiers de la source figée sont inchangés.
+
+## Arbres et données recalculables
+
+Les figures suivantes montrent seulement les nœuds notés et liens présents dans les checkpoints, avec quatre racines virtuelles A/B/C/G par bras. Les sources G en pointillés sont enregistrées séparément des parents de recherche ; le parent de délégation R/A, R/B, R/C ou R/G est une troisième relation. Un programme d'intégration est évalué neuf, sans recopier le score des sources. Les hypothèses et transformations déclarées par les modèles sont dans le JSON, sans être présentées comme explication causale vérifiée.
+
+![Arbres réels k-NN des deux bras](arbres-comparaison-knn.png)
+
+![Arbres réels somme des deux bras](arbres-comparaison-sum.png)
+
+![Arbres réels N-body des deux bras](arbres-comparaison-nbody.png)
+
+Les cas finis, l'adaptation CPU et la qualification de format N-body ne certifient pas tout le domaine, les ressources officielles ou l'emballage de soumission. Aucune supériorité générale d'un modèle ou du harnais ni aucun rang de concours n'est déduit. La référence GPT96 demeure une nouvelle campagne, avec racine, session et programmes neufs ; les résultats de cette comparaison ne l'amorcent pas.
+
+Annexes : [audit avant/après des 8328 fichiers](receptions/audit-comparaison-747885.json), [résultats et finalistes](resultats-comparaison-recus.json), [60 temps retenus et références](confirmations-cinq-temps.csv), [126 missions](details-missions-comparaison.json), [jetons par appel](jetons-par-appel-comparaison.csv), [arbres et liens complets](arbres-comparaison.json), [réconciliation des 126 réponses](receptions/reconciliation-locale-747885.json), [arrêt du seul relais possédé](receptions/arret-relais-verifie-747885.json). Aucun de ces rapports n'est envoyé aux modèles.
+'''
+    text=text.replace('référence/ret enus','référence/retenus')
+    for slug,title in [('knn','k-NN'),('sum','somme'),('nbody','N-body')]:
+        text=text.replace(f'![Arbres réels {title} des deux bras](arbres-comparaison-{slug}.png)',
+                          f'![Arbres réels {title}, témoin](arbres-comparaison-{slug}-reference.png)\n\n'
+                          f'![Arbres réels {title}, harnais](arbres-comparaison-{slug}-mixed-harness.png)')
+    (COMPARISON/'BILAN-COMPARAISON-747885.md').write_text(text,encoding='utf8')
+    print(json.dumps({'luna_subjects':len(rows),'luna_calls':len(calls),'luna_tokens':luna['exact_native_tokens'],
+                      'luna_scored_nodes':luna['scored_nodes'],'luna_repairs':luna['harness_repaired_proposals'],
+                      'comparison_arms':len(comp_rows),'comparison_calls':len(native),
+                      'comparison_known_tokens':result['known_exact_tokens'],'comparison_unknown_calls':result['unmetered_native_calls']},ensure_ascii=True))
+
+
+if __name__ == '__main__':
+    main()

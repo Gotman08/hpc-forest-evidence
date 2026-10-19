@@ -1,0 +1,170 @@
+"""Synthetic closed negative metadata only; no real model data, census or RPC."""
+import copy
+import json
+import unittest
+from datetime import datetime
+
+import test_observer_neutre as positive
+
+m, pair = positive.m, positive.pair
+
+
+class NegativeTerminalTests(unittest.TestCase):
+    setUp = positive.ObserverTests.setUp
+    artifact = positive.ObserverTests.artifact
+    route = positive.ObserverTests.route
+    bundle = positive.ObserverTests.bundle
+    verify = positive.ObserverTests.verify
+    def negative(self):
+        route = self.route(stage="terminal_received")
+        expected = m.cell(route)
+        owned = pair(expected["session_id"], 20)
+        snapshot = self.temp / "NEUTRAL-cold-snapshot"
+        snapshot.mkdir()
+        nonce = "a" * 32
+        names = {"OWNER.json", "worker-ready.json", "CLI-IDENTITY-VERIFIED.json", "CELL-BINDING.json", "worker.lock"}
+        names |= {nonce + "/" + name for name in ("downloaded-request.json", "download-receipt.json", "generation-claimed.json",
+            "instructions.txt", "output-schema.json", "invocation.json", "request.json", "codex.jsonl", "codex.jsonl.json",
+            "process.json", "response.json", "response-ready.json", "delivered.json", "agent-result.json")}
+        authorization = {**expected, "neutral_fixture_only": True}
+        for name in sorted(names):
+            path = snapshot / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"0" if name == "worker.lock" else b"NEUTRAL opaque bytes only")
+        (snapshot / "worker-ready.json").write_text(json.dumps({"pid": 21, "neutral_fixture_only": True}), encoding="utf-8")
+        (snapshot / "CELL-BINDING.json").write_text(json.dumps(authorization), encoding="utf-8")
+        route.update(relay_identities=owned, authorization=self.artifact("NEUTRAL-authorization.json", authorization),
+                     cell_binding=m.reference(snapshot / "CELL-BINDING.json"), worker_ready=m.reference(snapshot / "worker-ready.json"),
+                     cache_root=str(m.BOOTSTRAP.parent / ("worker-" + expected["session_id"])),
+                     codex_config=self.artifact("NEUTRAL-config.json", {"neutral_fixture_only": True}),
+                     owner=m.reference(snapshot / "OWNER.json"))
+        census = self.artifact("NEUTRAL-exit-census.json", {"schema": "hpc-forest-dynamic-r4b-full-cim-v1",
+            "complete_census": True, "strict_utf8_decoding": True, "captured_at_utc": "2026-10-18T00:00:00Z",
+            "rows_count": len(self.rows), "rows": self.rows, "other_native_groups": [], "neutral_fixture_only": True})
+        exit_evidence = self.artifact("NEUTRAL-process-exit.json", {"natural_exit": True, "neutral_fixture_only": True})
+        exit_proof = {**expected, "schema": "hpc-forest-dynamic-r4b-once-worker-natural-exit-v1", "verified": True,
+            "natural_exit_observed": True, "no_stop_or_replay": True, "all_owned_full_identities_absent": True,
+            "worker_exit_code": 0, "owned_full_identities": owned, "fresh_full_cim": census,
+            "observed_at": datetime.fromisoformat("2026-10-18T00:00:00+00:00").timestamp(),
+            "snapshot_root": str(snapshot.resolve()), "source_cache": str((m.BOOTSTRAP.parent / ("worker-" + expected["session_id"])).resolve()),
+            "evidence_refs": [census, exit_evidence], "neutral_fixture_only": True}
+        del exit_proof["remote_root"]  # Actual frozen once-exit ABI binds source_cache/snapshot_root instead.
+        inventory = {path.relative_to(snapshot).as_posix(): m.digest(path) for path in snapshot.rglob("*") if path.is_file()}
+        before = self.artifact("NEUTRAL-inventory-before.json", inventory)
+        after = self.artifact("NEUTRAL-inventory-after.json", inventory)
+        refusal = self.artifact("NEUTRAL-strict-refusal.json", {"verified": False, "error": "Neutral closed schema rejected", "neutral_fixture_only": True})
+        locations = {"request_downloaded": "downloaded-request.json", "request_native": "request.json",
+            "claim": "generation-claimed.json", "invocation": "invocation.json", "process": "process.json", "jsonl": "codex.jsonl",
+            "response": "response.json", "ready": "response-ready.json", "delivered": "delivered.json", "agent_result": "agent-result.json"}
+        refs = {name: m.reference(snapshot / nonce / file) for name, file in locations.items()}
+        refs.update(cli_identity=m.reference(snapshot / "CLI-IDENTITY-VERIFIED.json"), worker_ready=route["worker_ready"], cell_binding=route["cell_binding"])
+        sidecar = m.reference(snapshot / nonce / "codex.jsonl.json")
+        receipt = {**expected, "schema": "hpc-forest-dynamic-r4b-negative-phase-reconciliation-v1", "verified": True,
+            "metadata_reconciliation_verified": True, "all_started_calls_reconciled": True,
+            "unknown_invocations": 0, "unresolved_invocations": [], "native_invocation_count": 1, "native_calls_replayed": 0,
+            "closed_schema_verified": False, "normal_native_delivery_verified": False, "transport_delivery_verified": True,
+            "first_normal_candidate_delivery_and_evaluation_verified": False, "global_admission_verified": False,
+            "independent_performance_audit_verified": False, "usage_exact": True, "tokens": 9,
+            "worker_natural_exit": exit_proof, "fresh_full_cim": census, "cache_snapshot": str(snapshot.resolve()),
+            "complete_snapshot_after_natural_exit_only": True, "complete_cache_inventory": inventory,
+            "inventory_before": before, "inventory_after": after, "cache_inventory_before_after_identical": True,
+            "strict_audit_refusal": refusal, "known_source_sidecar": sidecar, "refs": refs,
+            "evidence_refs": [*refs.values(), census, exit_evidence, before, after, refusal, sidecar], "neutral_fixture_only": True}
+        route["terminal_reception"] = self.artifact("NEUTRAL-negative-receipt.json", receipt)
+        return route, receipt
+
+    def replace_receipt(self, route, receipt):
+        route["terminal_reception"] = self.artifact("NEUTRAL-negative-receipt.json", receipt)
+
+    def test_negative_terminal_inert_only_SO_RPC_historical_receipt_does_not_expire(self):
+        route, receipt = self.negative()
+        history, jobs, _ = self.verify([route])
+        self.assertEqual(jobs, {m.SO_JOB})
+        self.assertFalse(receipt["closed_schema_verified"])
+        self.assertEqual(self.verify([route], history=history)[1], {m.SO_JOB})
+        with self.assertRaises(ValueError):
+            m.check_rpc("job_status", {"job_id": route["job_id"]}, jobs)
+
+    def test_negative_unknown_false_zero_replay_or_positive_limit_refused(self):
+        route, receipt = self.negative()
+        for key, value in [("unknown_invocations", 1), ("unknown_invocations", False), ("native_calls_replayed", 1),
+                           ("native_calls_replayed", False), ("native_invocation_count", 2), ("unresolved_invocations", ["unknown"]),
+                           ("closed_schema_verified", True), ("normal_native_delivery_verified", True), ("usage_exact", False)]:
+            altered = copy.deepcopy(receipt)
+            altered[key] = value
+            self.replace_receipt(route, altered)
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self.verify([route])
+
+    def test_negative_pair_live_in_current_census_refused(self):
+        route, _ = self.negative()
+        with self.assertRaises(ValueError):
+            self.verify([route], self.rows + route["relay_identities"])
+
+    def test_negative_historical_census_pair_live_or_wrong_date_refused(self):
+        route, receipt = self.negative()
+        for live, seconds in ((True, 0), (False, 121)):
+            altered = copy.deepcopy(receipt)
+            census = m.read(m.bound(altered["fresh_full_cim"]))
+            if live:
+                census["rows"] += route["relay_identities"]
+                census["rows_count"] = len(census["rows"])
+            newref = self.artifact("NEUTRAL-altered-census.json", census)
+            altered["fresh_full_cim"] = newref
+            altered["worker_natural_exit"]["fresh_full_cim"] = newref
+            altered["worker_natural_exit"]["observed_at"] += seconds
+            altered["worker_natural_exit"]["evidence_refs"].append(newref)
+            altered["evidence_refs"].append(newref)
+            self.replace_receipt(route, altered)
+            with self.subTest(live=live, seconds=seconds), self.assertRaises(ValueError):
+                self.verify([route])
+
+    def test_negative_duplicate_or_unlinked_nonce_refused(self):
+        route, receipt = self.negative()
+        altered = copy.deepcopy(receipt)
+        altered["refs"]["claim"] = altered["refs"]["invocation"]
+        self.replace_receipt(route, altered)
+        with self.assertRaises(ValueError):
+            self.verify([route])
+        self.replace_receipt(route, receipt)
+        snapshot = m.Path(receipt["cache_snapshot"])
+        extra = snapshot / ("b" * 32) / "generation-claimed.json"
+        extra.parent.mkdir()
+        extra.write_bytes(b"NEUTRAL orphan call")
+        with self.assertRaises(ValueError):
+            self.verify([route])
+
+    def test_negative_terminal_rollback_and_receipt_replacement_refused(self):
+        route, receipt = self.negative()
+        history, _, _ = self.verify([route])
+        with self.assertRaises(ValueError):
+            self.verify([dict(route, stage="allocated_pending")], history=history)
+        altered = copy.deepcopy(receipt)
+        altered["tokens"] = 10
+        self.replace_receipt(route, altered)
+        with self.assertRaises(ValueError):
+            self.verify([route], history=history)
+
+    def test_negative_sha_mutation_and_missing_evidence_refused(self):
+        route, receipt = self.negative()
+        altered = copy.deepcopy(receipt)
+        altered["evidence_refs"] = altered["evidence_refs"][:-1]
+        self.replace_receipt(route, altered)
+        with self.assertRaises(ValueError):
+            self.verify([route])
+        self.replace_receipt(route, receipt)
+        m.bound(receipt["refs"]["response"]).write_bytes(b"NEUTRAL changed bytes")
+        with self.assertRaises(ValueError):
+            self.verify([route])
+
+    def test_negative_pilot_never_admitted(self):
+        route, receipt = self.negative()
+        route.update(phase="pilot", session_id=m.SESSIONS["pilot"])
+        expected = m.cell(route)
+        receipt.update(expected)
+        with self.assertRaises(ValueError):
+            m.verify_negative_terminal(receipt, expected, route, self.rows, [])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

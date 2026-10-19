@@ -1,0 +1,576 @@
+--- R1/recevoir-paire-observateur-R8-froide.py
++++ R2/recevoir-paire-observateur-R8-froide-r2.py
+@@ -20,7 +20,8 @@
+ import stat
+ import time
+ 
+-HERE = Path(__file__).resolve().parent
++CODE = Path(__file__).resolve().parent
++HERE = CODE.parent
+ OP = HERE.parent.parent
+ PREP = OP.parent
+ BASE = PREP.parents[1]
+@@ -29,8 +30,8 @@
+ P8 = OP / 'preparation-derivee-R8-apres-raccord-r1'
+ PHASE1 = P8 / 'preparer-plan-R8-phase1-parent.py'
+ PHASE1_SHA = '83bc0810fca205d5548fbd78fb7f6ff86e81e3ca279a60e4d095a7b7bbb56efc'
+-SELF = HERE / 'recevoir-paire-observateur-R8-froide.py'
+-TEST_SOURCE = HERE / 'test_reception_paire_R8_neutre.py'
++SELF = CODE / 'recevoir-paire-observateur-R8-froide-r2.py'
++TEST_SOURCE = CODE / 'test_reception_paire_R8_neutre_r2.py'
+ SOURCE = 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48'
+ PLAN = 'f927d37098f3fd50cc4916195da3e300bd7c29597ba7ece4b9669abd715897fe'
+ COMPONENTS = 'd7d7d240198fc487efbede15c1328a366bc0c5bd59614d5064e19d81d1cf7122'
+@@ -288,6 +289,180 @@
+     return pair, list(owned.values())
+ 
+ 
++def cold_copy_name(path):
++    # Windows aliases are closed before any metadata or content access.
++    path = Path(path)
++    need(path.name.rstrip(' .').casefold() not in
++         {'observer-state.json','stdout.log','stderr.log','observer.lock','worker.lock','routes-obs4.json'},
++         'Cold copy cannot use any live state/log/lock/routes basename')
++    return path
++
++
++def cold_copy_specs(documents, refs):
++    """Validate receipt bindings before any of the four copy payloads is read."""
++    specs = []
++    for label, source_path, copy_ref in (
++            ('routes', documents['start_intent']['routes']['path'], refs['routes_initial_copy']),
++            ('state', str(CHAIN/'observer/observer-state.json'), refs['cold_state'])):
++        receipt = documents['routes_initial_copy_receipt' if label == 'routes' else 'cold_state_receipt']
++        need(receipt.get('schema') == 'hpc-forest-r8-ROOT-byte-exact-cold-copy-v1'
++             and receipt.get('source_before') == receipt.get('source_after')
++             and receipt.get('source_before',{}).get('path') == source_path
++             and receipt.get('source_before',{}).get('sha256') == copy_ref['sha256']
++             and receipt.get('copy') == copy_ref and receipt.get('two_source_reads_equal_copy') is True
++             and receipt.get('live_source_read_by_ROOT_only') is True,
++             'Stable ROOT state/routes copy metadata required before copy bytes')
++        specs.append({'label':label, 'source':Path(source_path), 'copy':cold_copy_name(copy_ref['path'])})
++    logs = documents['cold_logs_receipt']
++    need(logs.get('schema') == 'hpc-forest-r8-ROOT-two-cold-log-copies-v1'
++         and isinstance(logs.get('copies'),list) and len(logs['copies']) == 2,
++         'Actual two cold log copy receipts required before bytes')
++    for item, name in zip(logs['copies'], ('stdout.log','stderr.log')):
++        source_path = documents['start_observed']['stdout' if name == 'stdout.log' else 'stderr']
++        need(item.get('source_before') == item.get('source_after')
++             and item.get('source_before',{}).get('path') == source_path
++             and Path(source_path).name == name
++             and item['source_before'].get('sha256') == item.get('copy',{}).get('sha256')
++             and item.get('two_source_reads_equal_copy') is True,
++             'Stable ROOT log copy metadata required before copy bytes')
++        specs.append({'label':name, 'source':Path(source_path), 'copy':cold_copy_name(item['copy']['path'])})
++    need(all(spec['source'] != spec['copy'] for spec in specs),
++         'Live source and cold copy must be canonically distinct before bytes')
++    return specs
++
++
++class HeldDistinctColdCopies:
++    """Metadata-only source handles; held, distinct, single-link copies before raw.
++
++    No ReadFile/read/open-data operation exists in this class. Source handles
++    admit concurrent writers but exclude replacement; copy handles exclude both
++    WRITE and DELETE sharing until every qualified no-follow payload read ends.
++    """
++    def __init__(self, specs, ordinary_path, *, source_boundary=BASE, copy_boundary=OBS):
++        self.specs, self.ordinary_path = specs, ordinary_path
++        self.source_boundary, self.copy_boundary = source_boundary, copy_boundary
++        self.handles, self.directory_handles, self.before = [], [], []
++
++    def _info(self, handle):
++        c = self.ctypes
++        tag = (self.wintypes.DWORD * 2)()
++        need(self.query(handle, 9, c.byref(tag), c.sizeof(tag))
++             and not tag[0] & (0x10 | 0x400) and tag[1] == 0,
++             'Held cold-copy/source metadata is not an ordinary non-reparse file')
++        identity = self.FileIdInfo()
++        standard = self.StandardInfo()
++        basic = self.BasicInfo()
++        need(self.query(handle, 18, c.byref(identity), c.sizeof(identity))
++             and self.query(handle, 1, c.byref(standard), c.sizeof(standard))
++             and self.query(handle, 0, c.byref(basic), c.sizeof(basic))
++             and not standard.Directory and not standard.DeletePending,
++             'Exact held FileID/native metadata query required; no fallback')
++        file_id = bytes(identity.FileId).hex()
++        need(identity.VolumeSerialNumber != 0 and file_id != '00'*16,
++             'Nonzero full Windows VolumeSerial/FileID128 required')
++        return {'volume_serial':int(identity.VolumeSerialNumber), 'file_id128':file_id,
++                'links':int(standard.NumberOfLinks), 'bytes':int(standard.EndOfFile),
++                'allocation_bytes':int(standard.AllocationSize), 'attributes':int(basic.FileAttributes),
++                'creation_ticks':int(basic.CreationTime), 'write_ticks':int(basic.LastWriteTime),
++                'change_ticks':int(basic.ChangeTime), 'reparse_tag':int(tag[1])}
++
++    def _hold_parents(self, path):
++        # Parent handles also exclude DELETE: a held child is never reached
++        # through a renamed/reparse-substituted directory during raw's read.
++        for parent in reversed(path.parents):
++            if any(previous == parent for previous,_ in self.directory_handles):
++                continue
++            handle = self.create(str(parent),0x80,0x1 | 0x2,None,3,0x00200000 | 0x02000000,None)
++            need(handle not in (None,self.ctypes.c_void_p(-1).value), 'Cannot hold ordinary source/copy parent')
++            self.directory_handles.append((parent,handle))
++            tag = (self.wintypes.DWORD * 2)()
++            need(self.query(handle,9,self.ctypes.byref(tag),self.ctypes.sizeof(tag))
++                 and tag[0] & 0x10 and not tag[0] & 0x400 and tag[1] == 0,
++                 'Source/copy parent must remain an ordinary held directory')
++
++    def _hold(self, path, *, is_copy):
++        path = self.ordinary_path(path, beneath=self.copy_boundary if is_copy else self.source_boundary)
++        self._hold_parents(path)
++        self.ordinary_path(path,beneath=self.copy_boundary if is_copy else self.source_boundary)
++        facts = path.lstat()
++        need(stat.S_ISREG(facts.st_mode), 'Ordinary source/copy metadata required')
++        # FILE_READ_ATTRIBUTES only: source bytes are never opened for reading.
++        handle = self.create(str(path), 0x80, 0x1 if is_copy else 0x1 | 0x2,
++                             None, 3, 0x00200000, None)
++        need(handle not in (None, self.ctypes.c_void_p(-1).value), 'Cannot hold source/copy metadata without replacement')
++        self.handles.append((path,handle,is_copy))
++        info = self._info(handle)
++        need(not is_copy or info['links'] == 1, 'Cold copy hardlink refused before payload read')
++        return info
++
++    def __enter__(self):
++        need(os.name == 'nt', 'Windows held source/copy identity boundary required')
++        import ctypes
++        from ctypes import wintypes
++        self.ctypes, self.wintypes = ctypes, wintypes
++        class FileIdInfo(ctypes.Structure):
++            _fields_ = [('VolumeSerialNumber',ctypes.c_ulonglong), ('FileId',ctypes.c_ubyte*16)]
++        class StandardInfo(ctypes.Structure):
++            _fields_ = [('AllocationSize',ctypes.c_longlong),('EndOfFile',ctypes.c_longlong),
++                        ('NumberOfLinks',wintypes.DWORD),('DeletePending',ctypes.c_ubyte),('Directory',ctypes.c_ubyte)]
++        class BasicInfo(ctypes.Structure):
++            _fields_ = [('CreationTime',ctypes.c_longlong),('LastAccessTime',ctypes.c_longlong),
++                        ('LastWriteTime',ctypes.c_longlong),('ChangeTime',ctypes.c_longlong),('FileAttributes',wintypes.DWORD)]
++        self.FileIdInfo, self.StandardInfo, self.BasicInfo = FileIdInfo, StandardInfo, BasicInfo
++        kernel = ctypes.WinDLL('kernel32',use_last_error=True)
++        self.create = kernel.CreateFileW
++        self.create.argtypes = [wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
++        self.create.restype = wintypes.HANDLE
++        self.query = kernel.GetFileInformationByHandleEx
++        self.query.argtypes = [wintypes.HANDLE,ctypes.c_int,ctypes.c_void_p,wintypes.DWORD]
++        self.query.restype = wintypes.BOOL
++        self.close = kernel.CloseHandle
++        self.close.argtypes, self.close.restype = [wintypes.HANDLE],wintypes.BOOL
++        try:
++            need(len(self.specs) == 4 and {s['label'] for s in self.specs} == {'routes','state','stdout.log','stderr.log'},
++                 'Exact four cold copy roles required')
++            sources, copies = [], []
++            for spec in self.specs:
++                cold_copy_name(spec['copy'])
++                need(spec['source'] != spec['copy'], 'Live source and cold copy must be distinct before bytes')
++                sources.append(self._hold(spec['source'],is_copy=False))
++            for spec in self.specs:
++                copies.append(self._hold(spec['copy'],is_copy=True))
++            key = lambda info:(info['volume_serial'],info['file_id128'])
++            need(len({key(info) for info in sources}) == 4
++                 and len({key(info) for info in copies}) == 4
++                 and not {key(info) for info in sources}.intersection(key(info) for info in copies),
++                 'Source/copy FileIDs alias or repeat; refuse before first payload byte')
++            self.before = [self._info(handle) for _,handle,_ in self.handles]
++            return self
++        except BaseException:
++            self.__exit__(None,None,None)
++            raise
++
++    def verify_unchanged(self):
++        after = [self._info(handle) for _,handle,_ in self.handles]
++        need(after == self.before, 'Held source/copy full native metadata changed')
++        for path,_,is_copy in self.handles:
++            self.ordinary_path(path,beneath=self.copy_boundary if is_copy else self.source_boundary)
++        return after
++
++    def evidence(self):
++        after = self.verify_unchanged()
++        return {'metadata_source_bytes_read':False,'source_metadata_only':True,
++                'copy_file_IDs_distinct_from_all_four_sources':True,'copies_single_link':True,
++                'copy_WRITE_and_DELETE_sharing_excluded':True,
++                'source_and_copy_native_metadata_before':self.before,
++                'source_and_copy_native_metadata_after':after}
++
++    def __exit__(self,*_args):
++        for _,handle,_ in reversed(self.handles):
++            self.close(handle)
++        self.handles.clear()
++        for _,handle in reversed(self.directory_handles):
++            self.close(handle)
++        self.directory_handles.clear()
++
++
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     for name in ('input','helper-review','neutral-test-receipt','output-directory'):
+@@ -304,7 +479,7 @@
+     tree.body.pop();ns={'__file__':str(PHASE1),'__name__':'pair_receiver_IO_only'};exec(compile(tree,str(PHASE1),'exec'),ns)
+     need(ns['BASE']==BASE and ns['PREP']==PREP,'Exact primitive anchors required')
+     store=ns['ColdStore']()
+-    review_path=ns['ordinary_path'](args.helper_review,beneath=HERE/'revue-preparation-independante-r1')
++    review_path=ns['ordinary_path'](args.helper_review,beneath=CODE/'revue-preparation-independante-r1')
+     review_ref=ns['ref'](review_path,args.helper_review_sha256);review=store.reference(review_ref)
+     need(review.get('schema')=='hpc-forest-r8-dynamic-pair-receiver-independent-preparation-review-v1'
+          and review.get('verified_source_preparation_only') is True and review.get('blocking_findings')==[]
+@@ -312,16 +487,16 @@
+          and review.get('native_generation_admitted') is False,'Actual independent receiver preparation review required')
+     test_source=store.raw(TEST_SOURCE)
+     need(review.get('reviewed_files',{}).get(TEST_SOURCE.name)==sha(test_source),'Independent review must bind the prepared test code too')
+-    test_path=ns['ordinary_path'](args.neutral_test_receipt,beneath=HERE)
++    test_path=ns['ordinary_path'](args.neutral_test_receipt,beneath=CODE)
+     tests=store.reference(ns['ref'](test_path,args.neutral_test_receipt_sha256))
+     need(tests.get('schema')=='hpc-forest-r8-dynamic-pair-neutral-test-completion-v1'
+          and tests.get('receiver_sha256')==sha(store.raw(SELF)) and tests.get('test_source_sha256')==sha(test_source)
+-         and type(tests.get('tests_run')) is int and tests['tests_run']==21
++         and type(tests.get('tests_run')) is int and tests['tests_run']==31
+          and all(type(tests.get(k)) is int and tests[k]==0 for k in ('exit_code','failures','errors','skipped'))
+          and tests.get('source_observer_before_after_equal') is True and tests.get('receiver_main_executed') is False
+          and tests.get('receiver_and_test_before_after_equal') is True
+          and tests.get('fixture_results_are_live_observation') is False,
+-         'Actual ROOT execution of exact21 prepared neutral cases required, never an ancestor PASS')
++         'Actual ROOT execution of exact31 prepared neutral cases required, never an ancestor PASS')
+     input_path=ns['ordinary_path'](args.input,beneath=OBS)
+     inputs=store.reference(ns['ref'](input_path,args.input_sha256));not_inert(inputs)
+     names={'start_intent','start_observed','startup_census_before','startup_census_after','policy','routes_initial_copy',
+@@ -331,105 +506,112 @@
+     refs={name:inputs[name] for name in names}
+     def read_cold(reference):
+         path=ns['ordinary_path'](reference['path'],beneath=OBS)
+-        need(path.name.rstrip(' .').casefold() not in {'observer-state.json','stdout.log','stderr.log','observer.lock','worker.lock'},'Only ROOT cold copies, never live state/log/lock')
++        need(path.name.rstrip(' .').casefold() not in {'observer-state.json','stdout.log','stderr.log','observer.lock','worker.lock','routes-obs4.json'},'Only ROOT cold copies, never live state/log/lock')
+         return store.reference(reference)
+-    docs={name:read_cold(ref) for name,ref in refs.items()}
+-    refs['immediate_before']=docs['start_intent']['full_cim'];docs['immediate_before']=read_cold(refs['immediate_before'])
+-    component=ns['strict_json'](store.pinned(CHAIN/'COMPONENTS.json',COMPONENTS))
+-    need(len(component['code_pins'])==62 and component['source_zip_sha256']==SOURCE and component['plan_sha256']==PLAN,'Exact current R8 source/plan/62')
+-    for name,checksum in component['code_pins'].items():store.pinned(CHAIN/name,checksum)
+-    real_review=store.reference(ns['ref'](REVIEW,REVIEW_SHA))
+-    need(real_review['reviewed_files']==component['code_pins'] and real_review['blocking_findings']==[]
+-         and real_review['observer_sha256']==OBSERVER_SHA,'Actual independent R8 integration binding')
+-    external=docs['external_preparation_review']
+-    external_names={'verifier-absence-ancien-OBS4-R8.py','preparer-observation-froide-R8.py',
+-                    'preparer-policy-routes-R8.py','lancer-observateur-R8-r2.ps1'}
+-    need(external.get('schema')=='hpc-forest-r8-observation-preparation-review-v1'
+-         and external.get('verified_source_preparation_only') is True and external.get('blocking_findings')==[]
+-         and external.get('passive_observer_only') is True and external.get('native_generation_admitted') is False
+-         and set(external.get('reviewed_files',{}))==external_names,'Actual four-component external preparation review required')
+-    for name,checksum in external['reviewed_files'].items():
+-        path=OBS/('revision-r2-frontieres/'+name if name.endswith('.ps1') else name)
+-        store.pinned(path,checksum)
+-    pure_contract={ 'Path':Path,'json':json,'need':need,'BASE_IDENTITY':{'scope_id':SCOPE,'source_zip_sha256':SOURCE,'plan_sha256':PLAN},
+-        'Q_REVISION':'r4b-source110-external-adapters-r2','read':store.reference,
+-        'artifact':lambda ref: (store.pinned(Path(ref['path']),ref['sha256']) and Path(ref['path'])),
+-        'sha':lambda path:sha(store.raw(Path(path)))}
+-    contract_nodes=[n for n in ast.parse(store.raw(CHAIN/'chain_contract.py')).body if isinstance(n,ast.FunctionDef) and n.name in {'bind','qualification'}]
+-    need({n.name for n in contract_nodes}=={'bind','qualification'},'Closed exact Q contract graph')
+-    exec(compile(ast.Module(body=contract_nodes,type_ignores=[]),'<qualified-R8-Q-contract-only>','exec'),pure_contract)
+-    pure_contract['qualification'](docs['policy']['qualification_reception'],components_manifest_sha256=COMPONENTS)
+-    api=observer_api(store.pinned(CHAIN/'observer/observer-mixte.py',OBSERVER_SHA))
+-    templates=context_templates(ns['strict_json'](store.pinned(CONTEXT_SOURCE,CONTEXT_SHA)),api)
+-    for name in ('source_only_absence','observer3_absence'):
+-        proof=docs[name];prior_ref=proof['prior_full_cim']
+-        ns['ordinary_path'](prior_ref['path'],beneath=BASE/'outputs')
+-        historical=store.reference(prior_ref)
+-        need(historical.get('schema')=='hpc-forest-dynamic-r4b-full-cim-v1'
+-             and historical.get('complete_census') is True and historical.get('strict_utf8_decoding') is True
+-             and type(historical.get('rows_count')) is int and historical['rows_count']==len(historical.get('rows',[]))
+-             and ticks(historical['captured_at_utc'])<=ticks(docs['startup_census_before']['captured_at_utc'])
+-             and all(any(api['same_identity'](old,row) for row in historical['rows']) for old in proof['owned_full_identities']),
+-             'Original historical full-pair presence/provenance required; never a current freshness source')
+-    # A second exact IO namespace admits only two literal binary paths outside/inside BASE.
+-    io_source=store.pinned(ns['RAW_SOURCE'],ns['RAW_SHA'])
+-    nodes=[n for n in ast.parse(io_source).body if isinstance(n,ast.FunctionDef) and n.name in ns['RAW_NAMES']]
+-    binary_io={'Path':Path,'os':os,'stat':stat,'Q':Path('C:/Users/nicol'),'json':json}
+-    exec(compile(ast.Module(body=nodes,type_ignores=[]),'<qualified-IO-two-executable-hashes-only>','exec'),binary_io)
+-    def exe_hashes():
+-        return {path:sha(binary_io['raw'](Path(path))) for path in EXE_PINS}
+-    hashes=exe_hashes()
+-    pair,context=validate_startup(docs,refs,api,templates,hashes,now_ticks=time.time_ns()//100)
+-    # Root-copy receipts never cause source/live reads; only their cold copy refs are read.
+-    for name,source_path,copy_ref in (('routes_initial_copy_receipt',docs['start_intent']['routes']['path'],refs['routes_initial_copy']),
+-                                      ('cold_state_receipt',str(CHAIN/'observer/observer-state.json'),refs['cold_state'])):
+-        receipt=docs[name]
+-        need(receipt.get('schema')=='hpc-forest-r8-ROOT-byte-exact-cold-copy-v1' and receipt.get('source_before')==receipt.get('source_after')
+-             and receipt.get('source_before',{}).get('path')==source_path and receipt.get('source_before',{}).get('sha256')==copy_ref['sha256']
+-             and receipt.get('copy')==copy_ref and receipt.get('two_source_reads_equal_copy') is True
+-             and receipt.get('live_source_read_by_ROOT_only') is True
+-             and type(receipt.get('bytes')) is int and receipt['bytes']==len(store.raw(Path(copy_ref['path'])))
+-             and ticks(docs['start_observed']['observed_at_utc'])<=ticks(receipt['observed_at_utc'])<=time.time_ns()//100,
+-             'Actual stable byte-exact ROOT copy receipt required')
+-    logs=docs['cold_logs_receipt']
+-    need(logs.get('schema')=='hpc-forest-r8-ROOT-two-cold-log-copies-v1' and isinstance(logs.get('copies'),list) and len(logs['copies'])==2,'Actual two cold log copies required')
+-    for item,name in zip(logs['copies'],('stdout.log','stderr.log')):
+-        need(item['source_before']['path']==docs['start_observed']['stdout' if name=='stdout.log' else 'stderr']
+-             and Path(item['source_before']['path']).name==name and item['source_before']==item['source_after']
+-             and item['source_before']['sha256']==item['copy']['sha256'] and item.get('two_source_reads_equal_copy') is True,'Logs source/copy bindings differ')
+-        path=ns['ordinary_path'](item['copy']['path'],beneath=OBS);raw=store.pinned(path,item['copy']['sha256'])
+-        need(type(item['bytes']) is int and item['bytes']==len(raw)==0,'Actual initial cold logs must be empty; preserve unknown/error output and refuse')
+-    store.unchanged();need(exe_hashes()==hashes,'An exact interpreter changed before receipt')
+-    validate_startup(docs,refs,api,templates,hashes,now_ticks=time.time_ns()//100)
+-    out=ns['ordinary_path'](args.output_directory,beneath=OBS,missing_leaf=True)
+-    need(out.parent==OBS and re.fullmatch(r'reception-paire-root-\d{2,4}',out.name),'New direct startup receipt output under actual observer boundary')
+-    ns['require_missing'](out)
+-    before=dict(store.pins)
+-    metadata_before={p:list(store.api['metadata'](Path(p).lstat())) for p in before}
+-    with ns['DirectoryLeases']() as leases:
+-        leases.hold(OBS);ns['require_missing'](out);out.mkdir();leases.hold(out)
+-        pair_bytes=ns['json_bytes'](pair);ns['write_new'](out/'IDENTITES-PAIRE-DEUX-REELLES.json',pair_bytes)
+-        pair_ref=ns['ref'](out/'IDENTITES-PAIRE-DEUX-REELLES.json',sha(pair_bytes))
+-        graph={'schema':'hpc-forest-r8-owned-passive-startup-evidence-v1','refs':{name:(pair_ref if name=='received_pair' else refs[name]) for name in TEN}}
+-        graph_bytes=ns['json_bytes'](graph);ns['write_new'](out/'DEMARRAGE-REEL-DIX-REFERENCES.json',graph_bytes)
+-        receipt={'schema':'hpc-forest-r8-actual-passive-pair-cold-reception-v1','verified_metadata_only':True,
+-            'source_zip_sha256':SOURCE,'plan_sha256':PLAN,'components_sha256':COMPONENTS,'observer_code_sha256':OBSERVER_SHA,
+-            'helper_review':review_ref,'actual_input':ns['ref'](input_path,args.input_sha256),'pair':pair_ref,
+-            'actual_neutral_test_receipt':ns['ref'](test_path,args.neutral_test_receipt_sha256),
+-            'startup_graph':ns['ref'](out/'DEMARRAGE-REEL-DIX-REFERENCES.json',sha(graph_bytes)),
+-            'received_full_context':context,'actual_interpreter_SHA_before':hashes,'actual_interpreter_SHA_after':exe_hashes(),
+-            'context_scope':'Full five-field same-census parent/creation/argv metadata only; no equality of installed and loaded MCP source claimed',
+-            'observer_pair_count':1,'LLM_worker_pairs_attributed_to_this_passive_pair':0,
+-            'raw_pair_independent_admission_flag_preserved_false':True,'independent_actual_pair_review_received':False,
+-            'input_SHA_before':before,'input_SHA_after':dict(store.pins),'input_metadata_before':metadata_before,
+-            'input_metadata_after':{p:list(store.api['metadata'](Path(p).lstat())) for p in before},'historical_templates_are_not_new_PIDs':True,
+-            'live_state_logs_locks_or_auth_read':False,'process_RPC_CLI_model_or_source_execution_effects':0,
+-            'current_or_future_presence_absence_or_global_model_inflight_promised':False,'native_generation_admitted':False}
+-        ns['write_new'](out/'RECEPTION-PAIRE-PASSIVE-METADATA-SEULEMENT.json',ns['json_bytes'](receipt))
+-        need(store.api['raw'](Path(pair_ref['path']))==pair_bytes and store.api['raw'](out/'DEMARRAGE-REEL-DIX-REFERENCES.json')==graph_bytes,'New receipt bytes changed')
+-        store.unchanged();need(dict(store.pins)==before and exe_hashes()==hashes
+-             and {p:list(store.api['metadata'](Path(p).lstat())) for p in before}==metadata_before,'Inputs SHA/metadata changed during new cold receipt')
+-    print(json.dumps({'receipt_directory':str(out),'observer_pairs':1,'native_workers_started':0,'native_generation_admitted':False}))
++    # Copy payloads are excluded until all source/copy handle identities are closed.
++    docs={name:read_cold(ref) for name,ref in refs.items() if name not in {'routes_initial_copy','cold_state'}}
++    specs=cold_copy_specs(docs,refs)
++    with HeldDistinctColdCopies(specs,ns['ordinary_path']) as copy_lease:
++        for name in ('routes_initial_copy','cold_state'):
++            docs[name]=read_cold(refs[name])
++        refs['immediate_before']=docs['start_intent']['full_cim'];docs['immediate_before']=read_cold(refs['immediate_before'])
++        component=ns['strict_json'](store.pinned(CHAIN/'COMPONENTS.json',COMPONENTS))
++        need(len(component['code_pins'])==62 and component['source_zip_sha256']==SOURCE and component['plan_sha256']==PLAN,'Exact current R8 source/plan/62')
++        for name,checksum in component['code_pins'].items():store.pinned(CHAIN/name,checksum)
++        real_review=store.reference(ns['ref'](REVIEW,REVIEW_SHA))
++        need(real_review['reviewed_files']==component['code_pins'] and real_review['blocking_findings']==[]
++             and real_review['observer_sha256']==OBSERVER_SHA,'Actual independent R8 integration binding')
++        external=docs['external_preparation_review']
++        external_names={'verifier-absence-ancien-OBS4-R8.py','preparer-observation-froide-R8.py',
++                        'preparer-policy-routes-R8.py','lancer-observateur-R8-r2.ps1'}
++        need(external.get('schema')=='hpc-forest-r8-observation-preparation-review-v1'
++             and external.get('verified_source_preparation_only') is True and external.get('blocking_findings')==[]
++             and external.get('passive_observer_only') is True and external.get('native_generation_admitted') is False
++             and set(external.get('reviewed_files',{}))==external_names,'Actual four-component external preparation review required')
++        for name,checksum in external['reviewed_files'].items():
++            path=OBS/('revision-r2-frontieres/'+name if name.endswith('.ps1') else name)
++            store.pinned(path,checksum)
++        pure_contract={ 'Path':Path,'json':json,'need':need,'BASE_IDENTITY':{'scope_id':SCOPE,'source_zip_sha256':SOURCE,'plan_sha256':PLAN},
++            'Q_REVISION':'r4b-source110-external-adapters-r2','read':store.reference,
++            'artifact':lambda ref: (store.pinned(Path(ref['path']),ref['sha256']) and Path(ref['path'])),
++            'sha':lambda path:sha(store.raw(Path(path)))}
++        contract_nodes=[n for n in ast.parse(store.raw(CHAIN/'chain_contract.py')).body if isinstance(n,ast.FunctionDef) and n.name in {'bind','qualification'}]
++        need({n.name for n in contract_nodes}=={'bind','qualification'},'Closed exact Q contract graph')
++        exec(compile(ast.Module(body=contract_nodes,type_ignores=[]),'<qualified-R8-Q-contract-only>','exec'),pure_contract)
++        pure_contract['qualification'](docs['policy']['qualification_reception'],components_manifest_sha256=COMPONENTS)
++        api=observer_api(store.pinned(CHAIN/'observer/observer-mixte.py',OBSERVER_SHA))
++        templates=context_templates(ns['strict_json'](store.pinned(CONTEXT_SOURCE,CONTEXT_SHA)),api)
++        for name in ('source_only_absence','observer3_absence'):
++            proof=docs[name];prior_ref=proof['prior_full_cim']
++            ns['ordinary_path'](prior_ref['path'],beneath=BASE/'outputs')
++            historical=store.reference(prior_ref)
++            need(historical.get('schema')=='hpc-forest-dynamic-r4b-full-cim-v1'
++                 and historical.get('complete_census') is True and historical.get('strict_utf8_decoding') is True
++                 and type(historical.get('rows_count')) is int and historical['rows_count']==len(historical.get('rows',[]))
++                 and ticks(historical['captured_at_utc'])<=ticks(docs['startup_census_before']['captured_at_utc'])
++                 and all(any(api['same_identity'](old,row) for row in historical['rows']) for old in proof['owned_full_identities']),
++                 'Original historical full-pair presence/provenance required; never a current freshness source')
++        # A second exact IO namespace admits only two literal binary paths outside/inside BASE.
++        io_source=store.pinned(ns['RAW_SOURCE'],ns['RAW_SHA'])
++        nodes=[n for n in ast.parse(io_source).body if isinstance(n,ast.FunctionDef) and n.name in ns['RAW_NAMES']]
++        binary_io={'Path':Path,'os':os,'stat':stat,'Q':Path('C:/Users/nicol'),'json':json}
++        exec(compile(ast.Module(body=nodes,type_ignores=[]),'<qualified-IO-two-executable-hashes-only>','exec'),binary_io)
++        def exe_hashes():
++            return {path:sha(binary_io['raw'](Path(path))) for path in EXE_PINS}
++        hashes=exe_hashes()
++        pair,context=validate_startup(docs,refs,api,templates,hashes,now_ticks=time.time_ns()//100)
++        # Root-copy receipts never cause source/live reads; only their cold copy refs are read.
++        for name,source_path,copy_ref in (('routes_initial_copy_receipt',docs['start_intent']['routes']['path'],refs['routes_initial_copy']),
++                                          ('cold_state_receipt',str(CHAIN/'observer/observer-state.json'),refs['cold_state'])):
++            receipt=docs[name]
++            need(receipt.get('schema')=='hpc-forest-r8-ROOT-byte-exact-cold-copy-v1' and receipt.get('source_before')==receipt.get('source_after')
++                 and receipt.get('source_before',{}).get('path')==source_path and receipt.get('source_before',{}).get('sha256')==copy_ref['sha256']
++                 and receipt.get('copy')==copy_ref and receipt.get('two_source_reads_equal_copy') is True
++                 and receipt.get('live_source_read_by_ROOT_only') is True
++                 and type(receipt.get('bytes')) is int and receipt['bytes']==len(store.raw(Path(copy_ref['path'])))
++                 and ticks(docs['start_observed']['observed_at_utc'])<=ticks(receipt['observed_at_utc'])<=time.time_ns()//100,
++                 'Actual stable byte-exact ROOT copy receipt required')
++        logs=docs['cold_logs_receipt']
++        need(logs.get('schema')=='hpc-forest-r8-ROOT-two-cold-log-copies-v1' and isinstance(logs.get('copies'),list) and len(logs['copies'])==2,'Actual two cold log copies required')
++        for item,name in zip(logs['copies'],('stdout.log','stderr.log')):
++            need(item['source_before']['path']==docs['start_observed']['stdout' if name=='stdout.log' else 'stderr']
++                 and Path(item['source_before']['path']).name==name and item['source_before']==item['source_after']
++                 and item['source_before']['sha256']==item['copy']['sha256'] and item.get('two_source_reads_equal_copy') is True,'Logs source/copy bindings differ')
++            path=ns['ordinary_path'](cold_copy_name(item['copy']['path']),beneath=OBS);raw=store.pinned(path,item['copy']['sha256'])
++            need(type(item['bytes']) is int and item['bytes']==len(raw)==0,'Actual initial cold logs must be empty; preserve unknown/error output and refuse')
++        copy_lease.verify_unchanged()
++        store.unchanged();need(exe_hashes()==hashes,'An exact interpreter changed before receipt')
++        validate_startup(docs,refs,api,templates,hashes,now_ticks=time.time_ns()//100)
++        out=ns['ordinary_path'](args.output_directory,beneath=OBS,missing_leaf=True)
++        need(out.parent==OBS and re.fullmatch(r'reception-paire-root-\d{2,4}',out.name),'New direct startup receipt output under actual observer boundary')
++        ns['require_missing'](out)
++        before=dict(store.pins)
++        metadata_before={p:list(store.api['metadata'](Path(p).lstat())) for p in before}
++        with ns['DirectoryLeases']() as leases:
++            leases.hold(OBS);ns['require_missing'](out);out.mkdir();leases.hold(out)
++            pair_bytes=ns['json_bytes'](pair);ns['write_new'](out/'IDENTITES-PAIRE-DEUX-REELLES.json',pair_bytes)
++            pair_ref=ns['ref'](out/'IDENTITES-PAIRE-DEUX-REELLES.json',sha(pair_bytes))
++            graph={'schema':'hpc-forest-r8-owned-passive-startup-evidence-v1','refs':{name:(pair_ref if name=='received_pair' else refs[name]) for name in TEN}}
++            graph_bytes=ns['json_bytes'](graph);ns['write_new'](out/'DEMARRAGE-REEL-DIX-REFERENCES.json',graph_bytes)
++            receipt={'schema':'hpc-forest-r8-actual-passive-pair-cold-reception-v1','verified_metadata_only':True,
++                'source_zip_sha256':SOURCE,'plan_sha256':PLAN,'components_sha256':COMPONENTS,'observer_code_sha256':OBSERVER_SHA,
++                'helper_review':review_ref,'actual_input':ns['ref'](input_path,args.input_sha256),'pair':pair_ref,
++                'actual_neutral_test_receipt':ns['ref'](test_path,args.neutral_test_receipt_sha256),
++                'startup_graph':ns['ref'](out/'DEMARRAGE-REEL-DIX-REFERENCES.json',sha(graph_bytes)),
++                'received_full_context':context,'actual_interpreter_SHA_before':hashes,'actual_interpreter_SHA_after':exe_hashes(),
++                'context_scope':'Full five-field same-census parent/creation/argv metadata only; no equality of installed and loaded MCP source claimed',
++                'observer_pair_count':1,'LLM_worker_pairs_attributed_to_this_passive_pair':0,
++                'raw_pair_independent_admission_flag_preserved_false':True,'independent_actual_pair_review_received':False,
++                'input_SHA_before':before,'input_SHA_after':dict(store.pins),'input_metadata_before':metadata_before,
++                'input_metadata_after':{p:list(store.api['metadata'](Path(p).lstat())) for p in before},'historical_templates_are_not_new_PIDs':True,
++                'live_state_logs_locks_or_auth_read':False,'cold_copy_distinctness':copy_lease.evidence(),'process_RPC_CLI_model_or_source_execution_effects':0,
++                'current_or_future_presence_absence_or_global_model_inflight_promised':False,'native_generation_admitted':False}
++            ns['write_new'](out/'RECEPTION-PAIRE-PASSIVE-METADATA-SEULEMENT.json',ns['json_bytes'](receipt))
++            need(store.api['raw'](Path(pair_ref['path']))==pair_bytes and store.api['raw'](out/'DEMARRAGE-REEL-DIX-REFERENCES.json')==graph_bytes,'New receipt bytes changed')
++            store.unchanged();need(dict(store.pins)==before and exe_hashes()==hashes
++                 and {p:list(store.api['metadata'](Path(p).lstat())) for p in before}==metadata_before,'Inputs SHA/metadata changed during new cold receipt')
++        copy_lease.verify_unchanged()
++        print(json.dumps({'receipt_directory':str(out),'observer_pairs':1,'native_workers_started':0,'native_generation_admitted':False}))
+ 
+ 
+ if __name__ == '__main__':
+--- R1/test_reception_paire_R8_neutre.py
++++ R2/test_reception_paire_R8_neutre_r2.py
+@@ -6,6 +6,10 @@
+ as pure AST by the receiver, without importing its observer module or main.
+ """
+ import copy
++import ast
++import os
++import stat
++import tempfile
+ import argparse
+ import hashlib
+ import importlib.util
+@@ -15,7 +19,7 @@
+ import unittest
+ 
+ HERE = Path(__file__).resolve().parent
+-spec = importlib.util.spec_from_file_location('prepared_R8_pair_receiver', HERE/'recevoir-paire-observateur-R8-froide.py')
++spec = importlib.util.spec_from_file_location('prepared_R8_pair_receiver', HERE/'recevoir-paire-observateur-R8-froide-r2.py')
+ receiver = importlib.util.module_from_spec(spec)
+ spec.loader.exec_module(receiver)
+ 
+@@ -201,6 +205,91 @@
+         self.refused(lambda d,r:d['cold_state'].update(active_native_workers=False))
+ 
+ 
++class ColdCopyBoundaryNeutral(unittest.TestCase):
++    """Real tiny new files/handles only; no mocked content-reader or live data."""
++    @classmethod
++    def setUpClass(cls):
++        raw=receiver.PHASE1.read_bytes()
++        if receiver.sha(raw)!=receiver.PHASE1_SHA:
++            raise ValueError('Exact ordinary-path source required')
++        nodes=[n for n in ast.parse(raw).body if isinstance(n,ast.FunctionDef) and n.name in {'need','ordinary_path'}]
++        if {n.name for n in nodes}!={'need','ordinary_path'}:
++            raise ValueError('Exact ordinary-path definitions missing')
++        namespace={'Path':Path,'stat':stat,'BASE':receiver.BASE}
++        exec(compile(ast.Module(body=nodes,type_ignores=[]),'<qualified-ordinary-path-only>','exec'),namespace)
++        cls.ordinary=staticmethod(namespace['ordinary_path'])
++
++    def setUp(self):
++        if os.name!='nt':
++            raise ValueError('Real Windows native FileID tests required; no skip/fallback')
++        self.temp=tempfile.TemporaryDirectory(prefix='ROOT-INERT-copy-boundary-',dir=HERE)
++        self.addCleanup(self.temp.cleanup)
++        self.boundary=Path(self.temp.name)
++        self.sources=self.boundary/'sources';self.sources.mkdir()
++        self.copies=self.boundary/'cold-copies';self.copies.mkdir()
++        self.specs=[]
++        for label,name in [('routes','ROUTES-OBS4.json'),('state','observer-state.json'),('stdout.log','stdout.log'),('stderr.log','stderr.log')]:
++            source=self.sources/name;source.write_bytes(b'')
++            target=self.copies/('cold-'+name+'.txt');target.write_bytes(b'')
++            self.specs.append({'label':label,'source':source,'copy':target})
++
++    def lease(self):
++        return receiver.HeldDistinctColdCopies(self.specs,self.ordinary,source_boundary=self.boundary,copy_boundary=self.boundary)
++
++    def test_equal_source_log_path_refuses_before_payload(self):
++        self.specs[2]['copy']=self.specs[2]['source']
++        with self.assertRaises(ValueError):
++            with self.lease():self.fail('Payload-read stage must be unreachable')
++
++    def test_equal_routes_path_refuses_before_payload(self):
++        self.specs[0]['copy']=self.specs[0]['source']
++        with self.assertRaises(ValueError):
++            with self.lease():self.fail('Payload-read stage must be unreachable')
++
++    def test_equal_state_path_refuses_before_payload(self):
++        self.specs[1]['copy']=self.specs[1]['source']
++        with self.assertRaises(ValueError):
++            with self.lease():self.fail('Payload-read stage must be unreachable')
++
++    def test_windows_active_basename_aliases_refuse_before_metadata(self):
++        for name in ('STDOUT.LOG','StDeRr.LoG','OBSERVER.LOCK','WORKER.LOCK','ROUTES-OBS4.JSON','OBSERVER-STATE.JSON','stdout.log.','worker.lock '):
++            with self.subTest(name=name),self.assertRaises(ValueError):
++                receiver.cold_copy_name(self.copies/name)
++
++    def test_hardlink_to_source_refuses_before_payload(self):
++        target=self.specs[2]['copy'];target.unlink();os.link(self.specs[2]['source'],target)
++        with self.assertRaises(ValueError):
++            with self.lease():self.fail('Hardlink payload-read stage must be unreachable')
++
++    def test_two_copy_roles_same_file_refuse_before_payload(self):
++        self.specs[3]['copy']=self.specs[2]['copy']
++        with self.assertRaises(ValueError):
++            with self.lease():self.fail('Aliased payload-read stage must be unreachable')
++
++    def test_distinct_files_remain_held_and_metadata_stable(self):
++        with self.lease() as held:
++            facts=held.evidence()
++            self.assertIs(facts['metadata_source_bytes_read'],False)
++            self.assertEqual(facts['source_and_copy_native_metadata_before'],facts['source_and_copy_native_metadata_after'])
++            self.assertEqual(len({(x['volume_serial'],x['file_id128']) for x in held.before}),8)
++
++    def test_live_source_writer_handle_is_metadata_only(self):
++        with self.specs[2]['source'].open('ab'):
++            with self.lease() as held:
++                self.assertIs(held.evidence()['source_metadata_only'],True)
++
++    def test_copy_write_is_denied_while_held(self):
++        with self.lease() as held:
++            with self.assertRaises(PermissionError):
++                with self.specs[2]['copy'].open('ab') as stream:stream.write(b'INERT')
++            held.verify_unchanged()
++
++    def test_source_replacement_is_denied_while_held(self):
++        with self.lease() as held:
++            with self.assertRaises(PermissionError):self.specs[2]['source'].unlink()
++            held.verify_unchanged()
++
++
+ if __name__=='__main__':
+     parser=argparse.ArgumentParser(description=__doc__)
+     parser.add_argument('--receipt',type=Path,required=True)
+@@ -214,13 +303,14 @@
+             raise ValueError('Receipt ancestor reparse refused')
+     observer_path=receiver.CHAIN/'observer/observer-mixte.py'
+     before=hashlib.sha256(observer_path.read_bytes()).hexdigest()
+-    source_before={p:hashlib.sha256(p.read_bytes()).hexdigest() for p in (Path(__file__),HERE/'recevoir-paire-observateur-R8-froide.py')}
+-    result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(PairReceiverNeutral))
++    source_before={p:hashlib.sha256(p.read_bytes()).hexdigest() for p in (Path(__file__),HERE/'recevoir-paire-observateur-R8-froide-r2.py')}
++    suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(PairReceiverNeutral),unittest.defaultTestLoader.loadTestsFromTestCase(ColdCopyBoundaryNeutral)])
++    result=unittest.TextTestRunner(verbosity=2).run(suite)
+     after=hashlib.sha256(observer_path.read_bytes()).hexdigest()
+     source_after={p:hashlib.sha256(p.read_bytes()).hexdigest() for p in source_before}
+     ok=result.wasSuccessful() and before==after==receiver.OBSERVER_SHA and source_before==source_after
+     record={'schema':'hpc-forest-r8-dynamic-pair-neutral-test-completion-v1',
+-        'receiver_sha256':hashlib.sha256((HERE/'recevoir-paire-observateur-R8-froide.py').read_bytes()).hexdigest(),
++        'receiver_sha256':hashlib.sha256((HERE/'recevoir-paire-observateur-R8-froide-r2.py').read_bytes()).hexdigest(),
+         'test_source_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+         'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'skipped':len(result.skipped),
+         'exit_code':0 if ok else 1,'source_observer_before_after_equal':before==after==receiver.OBSERVER_SHA,

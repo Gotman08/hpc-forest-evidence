@@ -1,0 +1,80 @@
+"""Submit the already authorized no-model, unchanged-binary diagnostic once."""
+import asyncio
+import importlib.util
+import json
+import shlex
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("private_rpc", HERE.parent / "HPC-Forest-Etude-2020-2024-r1/romeo-prive.py")
+rpc_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rpc_module)
+
+
+def write(name, data):
+    (HERE / name).write_text(json.dumps(data, indent=2) + "\n", encoding="utf8")
+
+
+async def main():
+    if (HERE / "soumission-commencee.json").exists():
+        raise RuntimeError("Reconcile this submission; never submit it twice")
+    payload = HERE / "diagnostic-conformite-r1.tar.gz"
+    import hashlib
+    checksum = hashlib.sha256(payload.read_bytes()).hexdigest()
+    root = "/scratch_p/nimarano/hpc-forest-compliance-diagnostic-20261016-r1"
+    archive = "/scratch_p/nimarano/hpc-forest-compliance-diagnostic-20261016-r1.tar.gz"
+    command = f'''set -euo pipefail
+archive={shlex.quote(archive)}
+root={shlex.quote(root)}
+test ! -e "$root"
+printf '%s  %s\\n' {shlex.quote(checksum)} "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" --strip-components=1 -C "$root"
+chmod 700 "$root/bin/"*
+export OPENBLAS_NUM_THREADS=1
+export CUDA_VISIBLE_DEVICES=
+exec /scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python -u "$root/diagnostic-romeo.py" "$root"
+'''
+    request = {"name": "forest-compliance-diagnostic-r1", "command": "bash -lc " + shlex.quote(command),
+               "arch": "armgpu", "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0,
+               "time_limit": "00:20:00", "workdir": "/scratch_p/nimarano",
+               "spack_packages": ["/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"]}
+    write("demande.json", request)
+    async with rpc_module.ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+        upload = await rpc.call("upload_to_romeo", local_path=str(payload.resolve()), remote_path=archive, verify=True)
+        write("transfert-verifie.json", upload)
+        if upload.get("remote_sha256") != checksum or upload.get("verifie") is not True:
+            raise RuntimeError("Uploaded bytes not verified")
+        if (HERE / "preparation.json").exists():
+            prepared = json.loads((HERE / "preparation.json").read_text())
+        else:
+            prepared = await rpc.call("job_prepare", **request)
+            write("preparation.json", prepared)
+        plan = await rpc.call("plan_get", plan_id=prepared["plan_id"])
+        write("plan-relu.json", plan)
+        # Read and verify the concrete scheduler plan before authorizing submission.
+        data = plan.get("plan", plan)
+        entries = data.get("entries", [])
+        if len(entries) != 1:
+            raise RuntimeError("The diagnostic must have exactly one reviewed job")
+        stored = entries[0]["plan"]
+        specification = stored.get("spec", {})
+        if not specification:
+            raise RuntimeError("Inspect unfamiliar scheduler plan shape before submission")
+        if not (specification["cpus_per_task"] == 4 and specification["mem_gb"] == 16
+                and specification["gpus_per_node"] == 0 and specification["nodes"] == 1
+                and specification["command"] == request["command"] and specification["time"] == "00:20:00"):
+            raise RuntimeError("Concrete allocation differs from the reviewed request")
+        write("soumission-commencee.json", {"plan_id": prepared["plan_id"],
+              "started_utc": datetime.now(timezone.utc).isoformat(), "payload_sha256": checksum})
+        submitted = await rpc.call("job_submit", plan_id=prepared["plan_id"], confirm=True)
+        write("soumission.json", submitted)
+        write("current-job.json", {"job_id": submitted["job_id"], "remote_root": root,
+              "payload_sha256": checksum, "purpose": "read-only posthoc candidate verification",
+              "model_calls": 0, "old_candidates_used_as_new_search_seeds": False})
+        print(json.dumps({"job_id": submitted["job_id"], "submitted": True, "model_calls": 0}))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

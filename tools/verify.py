@@ -6,6 +6,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 from .manifest import public_files
+from .qualification import verify as verify_qualification
 from .received_r4 import verify as verify_received_r4
 from .received import verify as verify_received
 from .recompute import ROOT, EvidenceError, compare, compute, load_json
@@ -55,12 +56,14 @@ def main():
     count = verify_manifest(ROOT)
     compare(compute(), load_json((ROOT / "evidence/results.json").read_text(encoding="utf-8")))
     received = verify_received(ROOT)
+    qualification = verify_qualification(ROOT)
     revision4 = verify_received_r4(ROOT)
     links = verify_links(ROOT)
     print(f"Verified {count} file hashes and {links} relative links.")
     print("Recomputed 144 controller series (2,400 measured cycles) and 200 CPU samples (40 configurations).")
     print(f"Received update: {received['cpu_samples']} CPU samples, {received['confirmations']} confirmations, "
           f"{received['registers']} search registers and {received['cost_exports']} separate cost views.")
+    print(f"Separate zero-model qualification: {qualification['subjects']} baselines and {qualification['samples']} timings.")
     print(f"Revision r4: {revision4['matrix_cells']} matrix cells, {revision4['r2_NA']} R2 missing values and no complete comparison.")
     print("This checks integrity and arithmetic; it does not execute or certify the evaluated programs.")
 

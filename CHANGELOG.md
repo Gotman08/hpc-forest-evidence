@@ -4,6 +4,7 @@ _Public versions preserve the evidence and its interpretation._
 
 ## Received evidence update — 2026-10-19
 
+- Add the subsequently received zero-model qualification of all fifteen references: 75 timings, exact arithmetic checks, private provenance digests and explicit baseline-only scope
 - Receive the exact article r4 edition at the 08:40 UTC technical cutoff: 19 article pages, 308 appendix pages and 275 figures, with PDF, Markdown and HTML views
 - Add a separate r4 inventory, provenance, operational status and sixty-cell MAX/seed-23 matrix; retain all R2 cells as `NA` and zero R1/R2 pairs
 - Record failed A2/A3 allocations, preserved partial files and local-only encoding validation; A4 remains preparation with no submitted job or worker at the cutoff

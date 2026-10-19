@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <vector>\n#include <cstdio>\n#include <cassert>\n#include <algorithm>\n#include <cstdint>\n#include <cstddef>\n\n#if defined(__aarch64__)\n#include <arm_neon.h>\n#endif\n\nusing Sum = std::int64_t;\n\nclass FastInput {\n    unsigned char buffer_[1 << 16];\n    std::size_t position_ = 0;\n    std::size_t length_ = 0;\n\n    inline int next() {\n        if (position_ == length_) {\n            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);\n            position_ = 0;\n            if (length_ == 0)\n                return EOF;\n        }\n        return buffer_[position_++];\n    }\n\npublic:\n    inline bool readInt(int& result) {\n        int c;\n        do {\n            c = next();\n            if (c == EOF)\n                return false;\n        } while (c <= ' ');\n\n        const bool negative = c == '-';\n        if (negative || c == '+')\n            c = next();\n\n        std::uint32_t value = 0;\n        while (static_cast<unsigned>(c - '0') < 10U) {\n            value = value * 10U + static_cast<unsigned>(c - '0');\n            c = next();\n        }\n        result = negative\n               ? static_cast<int>(-static_cast<Sum>(value))\n               : static_cast<int>(value);\n        return true;\n    }\n};\n\ntemplate<bool Accumulate>\nstatic inline Sum update_range(Sum* column, const int* incoming,\n                               const int* outgoing, int begin, int end) {\n#if defined(__aarch64__)\n    int col = begin;\n    int64x2_t total0 = vdupq_n_s64(0);\n    int64x2_t total1 = vdupq_n_s64(0);\n    for (; col + 4 <= end; col += 4) {\n        const int32x4_t in = vld1q_s32(incoming + col);\n        const int32x4_t out = vld1q_s32(outgoing + col);\n        const int64x2_t delta0 = vsubl_s32(vget_low_s32(in), vget_low_s32(out));\n        const int64x2_t delta1 = vsubl_s32(vget_high_s32(in), vget_high_s32(out));\n        vst1q_s64(column + col, vaddq_s64(vld1q_s64(column + col), delta0));\n        vst1q_s64(column + col + 2,\n                  vaddq_s64(vld1q_s64(column + col + 2), delta1));\n        if (Accumulate) {\n            total0 = vaddq_s64(total0, delta0);\n            total1 = vaddq_s64(total1, delta1);\n        }\n    }\n    Sum total = 0;\n    if (Accumulate)\n        total = vaddvq_s64(vaddq_s64(total0, total1));\n    for (; col < end; ++col) {\n        const Sum delta = static_cast<Sum>(incoming[col])\n                        - static_cast<Sum>(outgoing[col]);\n        column[col] += delta;\n        if (Accumulate)\n            total += delta;\n    }\n    return total;\n#else\n    Sum total = 0;\n    #pragma omp simd reduction(+:total)\n    for (int col = begin; col < end; ++col) {\n        const Sum delta = static_cast<Sum>(incoming[col])\n                        - static_cast<Sum>(outgoing[col]);\n        column[col] += delta;\n        if (Accumulate)\n            total += delta;\n    }\n    return total;\n#endif\n}\n\n#if defined(__aarch64__)\nstatic inline int64x2_t maximum64(int64x2_t a, int64x2_t b) {\n    return vbslq_s64(vcgtq_s64(a, b), a, b);\n}\n#endif\n\nstatic inline Sum horizontal_max(const Sum* column, int n, int s,\n                                 Sum first, Sum last_sum) {\n#if defined(__aarch64__)\n    int left = 0;\n    int right = n - s;\n    int64x2_t sums = vdupq_n_s64(first);\n    sums = vsetq_lane_s64(last_sum, sums, 1);\n    int64x2_t maxima0 = sums;\n    int64x2_t maxima1 = sums;\n\n    // The lanes follow independent windows from opposite ends of the row.\n    while (right - left >= 4) {\n        const int64x2_t forward = vsubq_s64(\n            vld1q_s64(column + left + s), vld1q_s64(column + left));\n        const int64x2_t backward = vsubq_s64(\n            vld1q_s64(column + right - 2),\n            vld1q_s64(column + right + s - 2));\n        const int64x2_t reversed = vextq_s64(backward, backward, 1);\n\n        sums = vaddq_s64(sums, vzip1q_s64(forward, reversed));\n        maxima0 = maximum64(maxima0, sums);\n        sums = vaddq_s64(sums, vzip2q_s64(forward, reversed));\n        maxima1 = maximum64(maxima1, sums);\n        left += 2;\n        right -= 2;\n    }\n\n    const int64x2_t maxima = maximum64(maxima0, maxima1);\n    Sum best = std::max(vgetq_lane_s64(maxima, 0),\n                        vgetq_lane_s64(maxima, 1));\n    if (right - left >= 2) {\n        const Sum value = vgetq_lane_s64(sums, 0)\n                        + column[left + s] - column[left];\n        best = std::max(best, value);\n    }\n    if (right - left >= 3) {\n        const Sum value = vgetq_lane_s64(sums, 1)\n                        + column[right - 1] - column[right + s - 1];\n        best = std::max(best, value);\n    }\n    return best;\n#else\n    Sum sum = first;\n    Sum best = std::max(first, last_sum);\n    for (int col = s; col < n; ++col) {\n        sum += column[col] - column[col - s];\n        best = std::max(best, sum);\n    }\n    return best;\n#endif\n}\n\nint main() {\n    FastInput input;\n    int n, s;\n    if (!input.readInt(n) || !input.readInt(s))\n        return 0;\n\n    assert(s < n);\n    assert(n < 8000);\n    assert(s > 0);\n    assert(n > 0);\n\n    std::vector<std::vector<int> > matrix(n, std::vector<int>(n));\n    for (int row = 0; row < n; ++row)\n        for (int col = 0; col < n; ++col)\n            input.readInt(matrix[row][col]);\n\n    std::vector<Sum> columns(n, 0);\n    Sum* column = columns.data();\n    for (int row = 0; row < s; ++row) {\n        const int* values = matrix[row].data();\n        #pragma omp simd\n        for (int col = 0; col < n; ++col)\n            column[col] += static_cast<Sum>(values[col]);\n    }\n\n    const int last = n - s;\n    Sum first = 0;\n    Sum last_sum = 0;\n    #pragma omp simd reduction(+:first,last_sum)\n    for (int col = 0; col < s; ++col) {\n        first += column[col];\n        last_sum += column[last + col];\n    }\n\n    Sum best = first;\n    for (int top = 0; top <= last; ++top) {\n        best = std::max(best, horizontal_max(column, n, s, first, last_sum));\n        if (top == last)\n            break;\n\n        const int* outgoing = matrix[top].data();\n        const int* incoming = matrix[top + s].data();\n        Sum first_delta;\n        Sum last_delta;\n        if (s <= last) {\n            first_delta = update_range<true>(column, incoming, outgoing, 0, s);\n            update_range<false>(column, incoming, outgoing, s, last);\n            last_delta = update_range<true>(column, incoming, outgoing, last, n);\n        } else {\n            first_delta = update_range<true>(column, incoming, outgoing, 0, last);\n            const Sum overlap = update_range<true>(column, incoming, outgoing, last, s);\n            first_delta += overlap;\n            last_delta = overlap\n                       + update_range<true>(column, incoming, outgoing, s, n);\n        }\n        first += first_delta;\n        last_sum += last_delta;\n    }\n\n    std::printf(\"%d\\n\", static_cast<int>(best));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Maintaining both edge-window sums enables independent bidirectional NEON lanes, eliminating horizontal prefix-scan carry broadcasts and shortening loop dependencies.",
+    "notes": "Retains exact 64-bit arithmetic, handles overlapping edge ranges and short tails, and preserves output formatting. Not executed or measured.",
+    "sources_kept": [],
+    "transformations": [
+      "Maintain both edge-window seeds during widening SIMD column updates, sharing reductions where their ranges overlap.",
+      "Scan inward using independent 64-bit NEON lanes and separate maximum accumulators, with a scalar fallback.",
+      "Replace formatted input with buffered, sign-safe integer parsing."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "7542a2ebb50b4e69b9825482f0273af5",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "93e4c1b4142e30e09e2af9846b272034b742e5e27a05bc95014847ecbba49fed",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "c719e072a5ef032044d9a922da7bf0c0a225d80861853a1541c7e6c75162530f",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 15916,
+        "output_tokens": 19416,
+        "reasoning_output_tokens": 17062
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 35332,
+    "tool_events": []
+  }
+}

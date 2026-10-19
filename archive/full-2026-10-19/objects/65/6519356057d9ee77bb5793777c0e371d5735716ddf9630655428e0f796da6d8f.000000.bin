@@ -1,0 +1,79 @@
+"""R3-only central Git metadata handling. Pure Python NEUTRAL Git objects."""
+from __future__ import annotations
+
+import audit_common as c
+import pytest
+from audit_source_binding_r2 import worktree_evidence
+from git_loose_readonly import LooseGit
+from test_audit_neutral import git_object
+
+
+def central_fixture(tmp_path):
+    repo = tmp_path / ("results-" + c.JOB) / c.CAMPAIGN / "repo"
+    files = {".gitignore": b"NEUTRAL ignore rules\n", "data.txt": b"NEUTRAL tracked bytes\n"}
+    entries = []
+    for name, raw in files.items():
+        oid = git_object(repo, "blob", raw)
+        entries.append(b"100644 " + name.encode() + b"\0" + bytes.fromhex(oid))
+        (repo / name).write_bytes(raw)
+    tree = git_object(repo, "tree", b"".join(entries))
+    commit = git_object(repo, "commit", ("tree " + tree + "\n\nNEUTRAL central repository\n").encode())
+    (repo / ".git/HEAD").write_text("NEUTRAL metadata, never interpreted as a command", encoding="utf8")
+    git = LooseGit(repo)
+    original = str(c.REMOTE_ROOTS[1]) + "/results-" + c.JOB + "/" + c.CAMPAIGN + "/repo"
+    return repo, commit, git, original
+
+
+def test_exact_verified_central_git_directory_is_metadata_only(tmp_path):
+    repo, commit, git, original = central_fixture(tmp_path)
+    before = c.inventory(tmp_path)
+    assert any(name.startswith("results-751992/" + c.CAMPAIGN + "/repo/.git/objects/") for name in before)
+    assert worktree_evidence(tmp_path, original, commit, git) == repo
+    assert c.inventory(tmp_path) == before  # Metadata bytes remain fully inventoried and untouched.
+
+
+def test_gitignore_remains_a_tracked_source_file(tmp_path):
+    repo, commit, git, original = central_fixture(tmp_path)
+    (repo / ".gitignore").write_bytes(b"SUBSTITUTED")
+    with pytest.raises(c.AuditError, match="selected Git commit"):
+        worktree_evidence(tmp_path, original, commit, git)
+
+
+@pytest.mark.parametrize("nested", ["nested/.git/x", "nested/.git", ".git/.git/extra"])
+def test_nested_git_path_not_generic_metadata(tmp_path, nested):
+    repo, commit, git, original = central_fixture(tmp_path)
+    path = repo / nested
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"NEUTRAL unexpected nested metadata")
+    with pytest.raises(c.AuditError, match="Nested"):
+        worktree_evidence(tmp_path, original, commit, git)
+
+
+def test_central_exception_requires_the_actual_verified_git_reader(tmp_path):
+    _, commit, _, original = central_fixture(tmp_path)
+    class UnverifiedReader:
+        def files_at(self, commit):
+            return {}
+    with pytest.raises(c.AuditError, match="already-verified central"):
+        worktree_evidence(tmp_path, original, commit, UnverifiedReader())
+
+
+def test_another_repo_or_unexpected_worktree_cannot_gain_central_exception(tmp_path):
+    _, commit, git, _ = central_fixture(tmp_path)
+    original = str(c.REMOTE) + "/results-751992/OTHER/repo"
+    wrong = c.rebased(original, tmp_path)
+    (wrong / ".git").mkdir(parents=True)
+    (wrong / "data.txt").write_bytes(b"NEUTRAL tracked bytes\n")
+    with pytest.raises(c.AuditError, match="Unexpected worktree"):
+        worktree_evidence(tmp_path, original, commit, git)
+
+
+def test_secondary_worktree_directory_git_not_ignored(tmp_path):
+    _, commit, git, _ = central_fixture(tmp_path)
+    original = str(c.REMOTE) + "/results-751992/" + c.CAMPAIGN + "/worktrees/NEUTRAL"
+    wrong = c.rebased(original, tmp_path)
+    (wrong / ".git").mkdir(parents=True)
+    for name, raw in git.files_at(commit).items():
+        (wrong / name).write_bytes(raw)
+    with pytest.raises(c.AuditError, match="Unexpected worktree"):
+        worktree_evidence(tmp_path, original, commit, git)

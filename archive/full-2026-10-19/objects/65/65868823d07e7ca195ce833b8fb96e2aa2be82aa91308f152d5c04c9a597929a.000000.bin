@@ -1,0 +1,279 @@
+"""Owned local coordinator: sequential allocations, one exact native identity per job.
+
+No candidate text or algorithm advice is produced here. Resumption retains the
+same job, session and worker directory. Unknown submissions are never replayed.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import importlib.util
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PROJECT = ROOT.parents[1] / "work/marathon-archive-mother-r1/project"
+sys.path.insert(0, str(PROJECT / "src"))
+from hpc_forest.core import FileLock, _kill_owned, atomic_json, file_digest
+from hpc_forest.native_matrix import SCOPE
+
+spec = importlib.util.spec_from_file_location("private_romeo", ROOT / "romeo-prive.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+SHARED = "/scratch_p/nimarano/hpc-forest-native-matrix-20261015-r1-launchfix1"
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+PREFLIGHT_JOB = "747946"
+
+
+def process_identity(pid):
+    script = (f"Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}' | "
+              "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json")
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script],
+                            capture_output=True, text=True, timeout=20,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    return json.loads(result.stdout) if result.stdout.strip() else None
+
+
+def same_process(saved):
+    current = process_identity(saved["ProcessId"])
+    return current is not None and all(current.get(k) == saved.get(k) for k in
+        ["ProcessId", "ExecutablePath", "CommandLine", "CreationDate"])
+
+
+def queue_for(plan, prepared):
+    ready = [k for k, v in prepared["records"].items() if v["status"] == "ready"]
+    if not ready:
+        raise RuntimeError("No independently prepared subject is admissible")
+    first = plan["first_subject"] if plan["first_subject"] in ready else sorted(ready)[0]
+    remaining = [k for k in plan["subjects"] if k != first]
+    queue = []
+    for phase, subjects in [("screen", [first]), ("coverage", remaining)]:
+        for effort in plan["efforts"]:
+            for model in plan["model_order"]:
+                key = f"{phase}-{model}-{effort}"
+                queue.append({"key": key, "phase": phase, "subjects": subjects,
+                              "model": model, "effort": effort, "state": "not_started",
+                              "session_id": uuid.uuid4().hex})
+    assert sum(len(item["subjects"]) for item in queue) == 380
+    return queue, first
+
+
+class Coordinator:
+    def __init__(self, rpc):
+        self.rpc = rpc
+        self.path = ROOT / "coordinator-state.json"
+        self.state = json.loads(self.path.read_text()) if self.path.exists() else {
+            "schema": "hpc-forest-native-matrix-coordinator-v1", "stage": "awaiting_preflight",
+            "preflight_job": PREFLIGHT_JOB, "source_zip_sha256": file_digest(ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip")}
+        self.owned = {}
+
+    def save(self):
+        self.state["updated_at"] = time.time()
+        atomic_json(self.path, self.state)
+
+    async def scheduler(self, job_id):
+        try:
+            return await self.rpc.call("job_status", job_id=job_id)
+        except RuntimeError as exc:
+            # The status tool can return an incomplete observation even while
+            # the separate accounting reader has a complete, matching record.
+            accounting = await self.rpc.call("job_efficiency", job_id=job_id)
+            if not accounting.get("found") or str(accounting.get("job_id")) != str(job_id):
+                raise
+            state = accounting["state"]
+            self.state["status_fallback"] = {"job_id": job_id, "initial_error": str(exc),
+                                              "source": "Slurm accounting via job_efficiency"}
+            terminal = state in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED"}
+            return {"ok": True, "job_id": job_id, "state": state, "finished": terminal,
+                    "exit_code": accounting.get("exit_code"), "observation_source": "job_efficiency",
+                    "result_validated": False}
+
+    async def preflight(self):
+        while self.state["stage"] == "awaiting_preflight":
+            status = await self.scheduler(PREFLIGHT_JOB)
+            self.state["preflight_status"] = status
+            self.save()
+            if not status.get("finished"):
+                await asyncio.sleep(30)
+                continue
+            efficiency = await self.rpc.call("job_efficiency", job_id=PREFLIGHT_JOB)
+            atomic_json(ROOT / "efficacite-prevol-747946.json", efficiency)
+            if status["state"] != "COMPLETED":
+                raise RuntimeError("The official preparation failed; inspect its logs before generation")
+            await self.rpc.download(SHARED + "/prepared/prepared-manifest.json", ROOT / "prepared-manifest-recu.json")
+            await self.rpc.download(SHARED + "/preflight-junit.xml", ROOT / "preflight-arm64.xml")
+            suites = list(ET.parse(ROOT / "preflight-arm64.xml").getroot().iter("testsuite"))
+            assert sum(int(s.get("tests", "0")) for s in suites) >= 194
+            assert not sum(int(s.get("failures", "0")) + int(s.get("errors", "0")) for s in suites)
+            prepared = json.loads((ROOT / "prepared-manifest-recu.json").read_text())
+            plan = json.loads((ROOT / "matrix-plan.json").read_text())
+            self.state["queue"], self.state["screen_subject"] = queue_for(plan, prepared)
+            self.state["preparation_exclusions"] = {k: v for k, v in prepared["records"].items() if v["status"] != "ready"}
+            self.state["stage"] = "running"
+            self.save()
+
+    def authorization(self, cell, folder):
+        record = {"schema": "hpc-forest-native-matrix-authorization-v1", "status": "explicit_archive_matrix_authorized",
+                  "scope_id": SCOPE, "model": cell["model"], "effort": cell["effort"],
+                  "session_id": cell["session_id"], "expires_at": time.time() + 21 * 86400,
+                  "deepseek_completion_claimed": False, "old_candidates_imported": False,
+                  "operator_algorithm_advice": False, "mother_and_children_same_identity": True,
+                  "user_messages": [
+                      "Essaie GPT 6.1 Sol MAX avec le nouveau harnais sur k-NN, la somme et N-body, sans aider l’arbre.",
+                      "Faire un rapport complet et un article de recherche, tester les anciens sujets avec un modèle mère qui prépare et aide les arbres puis récolte et vérifie les optimisations.",
+                      "Essaye aussi GPT 6 Luna, GPT 6 Astra et GPT 5.6 Terra ; le plus possible de sujets de 2024 à 2020.",
+                      "Tester tous les modèles avec différents efforts thinking de Max à low."],
+                  "user_messages_are_transcribed_scope_not_model_context": True,
+                  "plan": {"path": str((ROOT / "matrix-plan.json").resolve()), "sha256": file_digest(ROOT / "matrix-plan.json")},
+                  "source_zip": {"path": str((ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip").resolve()), "sha256": self.state["source_zip_sha256"]}}
+        path = folder / "autorisation.json"
+        if not path.exists():
+            atomic_json(path, record)
+        return path
+
+    async def submit(self, cell, folder):
+        remote = "/scratch_p/nimarano/hpc-forest-gpt61sol-max-archive-matrix-20261015-r1-" + cell["key"]
+        argv = [PYTHON, "-u", SHARED + "/project/examples/marathon22/archive_matrix.py",
+                "--root", remote, "--shared", SHARED, "--model", cell["model"], "--effort", cell["effort"],
+                "--session-id", cell["session_id"], "--subjects", *cell["subjects"]]
+        shell = ("set -euo pipefail\nexport PYTHONPATH=" + shlex.quote(SHARED + "/project/src:" + SHARED + "/qa-deps")
+                 + "\nexport PYTHONDONTWRITEBYTECODE=1\nexport OPENBLAS_NUM_THREADS=1\nulimit -s unlimited\nexec " + shlex.join(argv))
+        request = {"name": "forest-matrix-" + cell["key"], "command": "bash -lc " + shlex.quote(shell),
+                   "arch": "armgpu", "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0,
+                   "time_limit": "01:00:00" if cell["phase"] == "screen" else "11:00:00",
+                   "workdir": "/scratch_p/nimarano", "spack_packages": ["/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"]}
+        atomic_json(folder / "job-request.json", request)
+        prepared = await self.rpc.call("job_prepare", **request)
+        cell.update(state="prepared", plan_id=prepared["plan_id"], remote_root=remote)
+        self.save()
+        plan = await self.rpc.call("plan_get", plan_id=cell["plan_id"])
+        atomic_json(folder / "plan-reviewed.json", plan)
+        spec = plan["plan"]["entries"][0]["plan"]["spec"]
+        assert plan["state"] == "ready" and not plan["expired"] and spec["command"] == request["command"]
+        assert spec["cpus_per_task"] == 4 and spec["mem_gb"] == 16 and spec["gpus_per_node"] == 0 and spec["arch"] == "armgpu"
+        cell["state"] = "submitting"
+        self.save()  # A crash here requires reconciliation, never another submission.
+        submitted = await self.rpc.call("job_submit", plan_id=cell["plan_id"], confirm=True)
+        atomic_json(folder / "submission.json", submitted)
+        cell.update(job_id=submitted["job_id"], state="submitted")
+        self.save()
+
+    async def worker(self, cell, folder, receipt):
+        if cell.get("worker_identity") and same_process(cell["worker_identity"]):
+            return
+        channel_file = cell["remote_root"] + f"/results-{cell['job_id']}/channel.json"
+        data = await self.rpc.call("read_remote_file", path=channel_file, offset=1, limit=40, max_chars=6000)
+        channel = json.loads(data["content"])["channel"]
+        output = folder / "worker"
+        output.mkdir(exist_ok=True)
+        argv = [sys.executable, "-m", "hpc_forest.matrix_worker", "--channel", channel,
+                "--session-id", cell["session_id"], "--output", str(output.resolve()),
+                "--codex-config", "C:/Users/nicol/.codex/config.toml", "--dependency-receipt", str(receipt.resolve()),
+                "--required-jobs", SCOPE, "--max-seconds", "43200"]
+        environment = {**os.environ, "PYTHONPATH": str(PROJECT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
+        with (output / "stdout.log").open("ab") as stdout, (output / "stderr.log").open("ab") as stderr:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                env=environment, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.owned[cell["key"]] = process
+        identity = process_identity(process.pid)
+        if identity is None:
+            raise RuntimeError("The owned model worker exited before identity verification")
+        cell.update(worker_identity=identity, channel=channel, worker_started_at=time.time(), state="working")
+        atomic_json(output / f"process-identity-{process.pid}.json", {**identity, "argv": argv, "session_id": cell["session_id"]})
+        self.save()
+
+    async def receive(self, cell, folder):
+        efficiency = await self.rpc.call("job_efficiency", job_id=cell["job_id"])
+        atomic_json(folder / "efficiency.json", efficiency)
+        worker_folder = folder / "worker"
+        for _ in range(12):
+            pending = [p for p in worker_folder.glob("*/generation-claimed.json") if not (p.parent / "delivered.json").exists()]
+            if not pending:
+                break
+            await asyncio.sleep(10)
+        if pending:
+            raise RuntimeError("Final generation deliveries are incomplete; preserve the owned worker")
+        owned = self.owned.get(cell["key"])
+        if owned is not None and owned.poll() is None and same_process(cell["worker_identity"]):
+            _kill_owned(owned)
+            atomic_json(folder / "owned-worker-stopped.json", {"pid": owned.pid, "after_deliveries": True, "after_job_end": True})
+        elif owned is None and cell.get("worker_identity") and same_process(cell["worker_identity"]):
+            identity = cell["worker_identity"]
+            assert cell["session_id"] in identity["CommandLine"] and str(worker_folder.resolve()) in identity["CommandLine"]
+            subprocess.run(["taskkill.exe", "/PID", str(identity["ProcessId"]), "/T", "/F"],
+                           check=True, capture_output=True, timeout=20,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            atomic_json(folder / "owned-worker-stopped.json", {"identity": identity, "after_deliveries": True, "after_job_end": True})
+        archive = folder / f"results-{cell['job_id']}.tar.gz"
+        await self.rpc.download(cell["remote_root"] + "/" + archive.name, archive)
+        restored = folder / "preuves"
+        command = [sys.executable, str(OUTPUTS_RESTORE), str(archive), str(ROOT / "sources-officielles-restauration"), str(restored)]
+        if not restored.exists():
+            with (folder / "restore.log").open("wb") as log:
+                subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT, timeout=600)
+        audit = [sys.executable, str(ROOT / "auditer-matrice.py"), str(restored / f"results-{cell['job_id']}"),
+                 str(folder / "audit.json"), "--source-zip", str(ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip"), "--archive", str(archive)]
+        with (folder / "audit.log").open("wb") as log:
+            subprocess.run(audit, check=True, stdout=log, stderr=subprocess.STDOUT, timeout=600)
+        cell.update(state="received_and_audited", archive_sha256=file_digest(archive), audit_path=str(folder / "audit.json"))
+        self.save()
+
+    async def run(self):
+        await self.preflight()
+        for cell in self.state["queue"]:
+            if cell["state"] == "received_and_audited":
+                continue
+            if (ROOT / "STOP-AFTER-CURRENT").exists() and cell["state"] == "not_started":
+                self.state["stage"] = "stopped_at_requested_marker";self.save();return
+            folder = ROOT / "runs" / cell["key"]
+            folder.mkdir(parents=True, exist_ok=True)
+            self.state["current_key"] = cell["key"]
+            receipt = self.authorization(cell, folder)
+            if cell["state"] == "not_started":
+                await self.submit(cell, folder)
+            if cell["state"] in {"prepared", "submitting"}:
+                raise RuntimeError("Reconcile the recorded plan before resuming an uncertain submission")
+            while cell["state"] not in {"received_and_audited"}:
+                status = await self.scheduler(cell["job_id"])
+                cell["scheduler"] = status;self.save()
+                if status.get("finished"):
+                    await self.receive(cell, folder)
+                    break
+                if status["state"] == "RUNNING":
+                    cell.setdefault("first_running_observed_at", time.time())
+                    try:
+                        await self.worker(cell, folder, receipt)
+                    except RuntimeError as exc:
+                        # A newly RUNNING job may not have created its mailbox yet.
+                        cell["last_worker_start_error"] = str(exc)[:1000]
+                        self.save()
+                        if time.time() - cell["first_running_observed_at"] > 300:
+                            raise
+                await asyncio.sleep(30)
+        self.state["stage"] = "all_results_received_and_audited";self.save()
+
+
+OUTPUTS_RESTORE = ROOT.parent / "Marathon22-DeepSeek-v11/cadre-execution/restaurer-preuves.py"
+
+
+async def main():
+    with FileLock(ROOT / "coordinator.lock"):
+        async with module.ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+            coordinator = Coordinator(rpc)
+            try:
+                await coordinator.run()
+            except Exception as exc:
+                coordinator.state.update(stage="attention_required", error=type(exc).__name__ + ": " + str(exc))
+                coordinator.save()
+                raise
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

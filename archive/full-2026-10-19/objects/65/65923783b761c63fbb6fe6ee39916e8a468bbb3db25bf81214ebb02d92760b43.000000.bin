@@ -1,0 +1,271 @@
+"""Publish all finite scaling evidence and explicit specification qualifications."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE.parent
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf8"))
+
+
+def table(headers, rows):
+    def cell(x): return str(x).replace("|", "/")
+    return "\n".join(["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers),
+        *["| " + " | ".join(cell(x) for x in row) + " |" for row in rows]])
+
+
+def num(value):
+    return f"{value:.9f}" if value is not None else "non valide / absent"
+
+
+def label(row):
+    value = row["model"].replace("gpt-6.1-sol", "Sol 6.1").replace("gpt-6-luna", "Luna").replace("gpt-6-astra", "Astra").replace("gpt-5.6-terra", "Terra")
+    value = value.replace("hpcforest-deepseek-v4flash:mxfp4", "DeepSeek V4-Flash").replace("qwen2.5-coder:", "Qwen ")
+    if row["effort"] != "not_applicable": value += " / " + row["effort"]
+    if row["retained_baseline"]: value += " (référence retenue)"
+    return value
+
+
+def main(root):
+    data = read(root / "resultats-verifies.json"); audit = data["audit"]
+    if not audit["evidence_integrity_verified"] or not audit["all_cases_and_physical_core_counts_received"]:
+        raise RuntimeError("Publish only a received, audited complete measurement series")
+    plan = read(root / "payload/plan.json"); rows = data["rows"]; raw = read(root / "preuves/results/results.json")
+    compiler_records = []
+    for campaign in plan["campaigns"]:
+        original = Path(campaign["campaign_root"])
+        database = original / "registry.sqlite3"
+        before = hashlib.sha256(database.read_bytes()).hexdigest()
+        with sqlite3.connect(database.resolve().as_uri()+"?mode=ro&immutable=1",uri=True) as db:
+            identity = json.loads(db.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
+        contract = read(original / "trusted/contract.json")
+        compiler_records.append({"job_id":campaign["job_id"],"subject":campaign["subject"],"model":campaign["model"],
+            "language":contract["language"],"configured_compiler_flags":contract["compiler_flags"],
+            "compiler_identity_as_recorded":identity.get("compiler"),"target_as_recorded":identity.get("target"),
+            "confirmed_binary_sha256":next(b["sha256"] for b in plan["binaries"] if b["key"]==campaign["keys"]["chosen"]),
+            "recompiled_for_this_series":False})
+        assert before == hashlib.sha256(database.read_bytes()).hexdigest()
+    (root/"compilations-origine.json").write_text(json.dumps(compiler_records,ensure_ascii=False,indent=2)+"\n",encoding="utf8")
+    now = datetime.now(UTC).isoformat()
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 13, "axes.spines.top": False,
+        "axes.spines.right": False, "savefig.bbox": "tight"})
+    names = {"2022-knn": "k-NN 2022", "2022-sum": "Somme 2022", "2022-nbody": "N-body 2022",
+             "2022-bucketsort": "Bucket sort 2022", "2023-count": "Chemins dans une grille 2023"}
+    summaries = []; plot_names = []
+    for subject in audit["subjects"]:
+        values = [r for r in rows if r["subject"] == subject]
+        biggest = max(r["size"] for r in values)
+        selected = [r for r in values if r["size"] == biggest]
+        fig, axes = plt.subplots(1, 2, figsize=(11, 6.2))
+        identities = sorted({(r["job_id"], r["model"], r["effort"]) for r in selected})
+        plotted = set()
+        for job, model, effort in identities:
+            curve = sorted([r for r in selected if (r["job_id"],r["model"],r["effort"]) == (job,model,effort)], key=lambda r:r["cores"])
+            identity = curve[0]["chosen_binary_sha256"]
+            if identity not in plotted and all(r["full_valid_measurement"] for r in curve):
+                plotted.add(identity)
+                title = label(curve[0]) if not curve[0]["retained_baseline"] else "Référence inchangée"
+                line = axes[0].errorbar([r["cores"] for r in curve], [r["chosen_seconds"] for r in curve],
+                    yerr=[r["stdev_seconds"] for r in curve], marker="o", capsize=3, label=title)
+                axes[1].plot([r["cores"] for r in curve], [r["own_speedup_vs_one_core"] for r in curve],
+                    marker="o", color=line[0].get_color(), label=title)
+            a, b = curve[0], curve[-1]
+            summaries.append({"subject": subject, "job_id": job, "model": model, "effort": effort,
+                "retained_baseline": a["retained_baseline"], "size": biggest, "time_1": a["chosen_seconds"],
+                "time_16": b["chosen_seconds"], "reference_16": b["reference_seconds"],
+                "saved_16": b["seconds_saved"], "reduction_16": b["time_reduction_fraction"],
+                "own_speedup_16": b["own_speedup_vs_one_core"], "cpu_utilization_16": b["mean_average_used_cores"],
+                "full_valid": all(r["full_valid_measurement"] for r in curve)})
+        for ax in axes:
+            ax.set_xticks([1,2,4,8,16]); ax.set_xlabel("Cœurs physiques accessibles à la même tâche")
+            ax.grid(alpha=.2)
+        axes[0].set_yscale("log"); axes[0].set_ylabel("Temps mural du programme (s, échelle log)")
+        axes[0].set_title("Temps absolus\nbarres : écart-type (5 mesures)", fontsize=13)
+        axes[1].axhline(1, color="gray", lw=1, linestyle="--")
+        axes[1].set_ylabel("T(programme, 1) / T(programme, p)")
+        axes[1].set_title("Montée en cœurs\ndu même exécutable", fontsize=13)
+        handles, legends = axes[0].get_legend_handles_labels()
+        fig.legend(handles, legends, loc="lower center", ncol=2, fontsize=12, bbox_to_anchor=(.5,-.09))
+        fig.suptitle(names.get(subject, subject) + f" — taille {biggest}\nprogrammes figés, job {audit['job_id']}", fontsize=15)
+        fig.tight_layout(rect=(0,.11,1,.93))
+        stem = "courbes-" + subject
+        fig.savefig(root / (stem + ".png"), dpi=220); fig.savefig(root / (stem + ".svg")); plt.close(fig)
+        plot_names.append(stem)
+    (root / "synthese-plus-grandes-entrees.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2)+"\n",encoding="utf8")
+    inventory = table(["Sujet", "Campagnes", "Modèles distincts", "Entrées", "Exécutables uniques"],
+        [[s, sum(c["subject"]==s for c in plan["campaigns"]), len({c["model"] for c in plan["campaigns"] if c["subject"]==s}),
+          sum(c["subject"]==s for c in plan["cases"]), sum(b["subject"]==s for b in plan["binaries"])] for s in audit["subjects"]])
+    cases_table = table(["Sujet / cas", "Taille", "Paramètres", "Origine"],
+        [[c["subject"]+" / "+c["name"], c["input_domain_review"]["size"], json.dumps(c["input_domain_review"]["parameters"],ensure_ascii=False), c["phase"]] for c in plan["cases"]])
+    text = f'''# Comparaison étendue des programmes figés sur 1, 2, 4, 8 et 16 cœurs
+
+Version reçue et recalculée le **{now}**, job **{audit['job_id']}**. Ce document est une observation de l’opérateur. Il ne devient jamais un contexte des modèles. L’archive annoncée et reçue a le SHA-256 **{audit['archive_sha256']}**. Le détail machine et les sorties d’oracle sont conservés dans `preuves/results/`.
+
+## 1. Question expérimentale et périmètre réellement couvert
+
+La question est de déterminer comment les programmes effectivement retenus par les recherches antérieures réagissent à un nombre différent de cœurs accessibles. Nous ne demandons à aucun modèle de produire un autre algorithme. Le même fichier exécutable confirmé est utilisé à tous les points d’une courbe. Les données ne sont ni des graines de nouvelles recherches ni des conseils à leurs arbres. Une recherche optimisant spécifiquement pour seize cœurs serait une expérience distincte, qui n’a pas eu lieu dans cette série.
+
+Ce lot couvre **{audit['campaign_count']} campagnes auditées**, **{audit['model_count']} identités de modèles**, {len(audit['subjects'])} problèmes et {len(plan['cases'])} entrées. Les {len(plan['binaries'])} exécutables distincts par sujet sont dédupliqués par empreinte ; plusieurs campagnes qui ont conservé les mêmes octets de référence partagent la même mesure, avec toutes leurs provenances conservées. Une référence retenue ne constitue pas une amélioration trouvée par le modèle. Les couples modèle/sujet sans programme reçu et audité restent absents, et non des échecs artificiellement évalués à zéro. Les méthodes communes décrites ci-dessous peuvent porter sur des sujets traités dans d’autres lots ; l’inventaire précise ceux réellement exécutés ici.
+
+{inventory}
+
+Les sujets 2020–2021 et les autres problèmes 2023 attendent les recherches de la matrice et leur audit de domaine propre. Nous ne prétendons pas avoir déjà mesuré toutes les combinaisons. Les modèles de ce lot sont : {', '.join(sorted({c['model'] for c in plan['campaigns']}))}. Le 7B des anciens tests techniques n’avait pas ici de programme de concours confirmé admissible. Les efforts natifs sont conservés tels qu’audités, sans inventer un niveau MAX pour Ollama.
+
+## 2. Identité, provenance et contrôle des programmes
+
+Chaque campagne admise possède un audit antérieur positif. L’inventaire ouvre SQLite avec `mode=ro&immutable=1`, relève `best_confirmed`, son commit, les évaluations de confirmation et leur empreinte binaire. Il vérifie tous les fichiers protégés inscrits au manifeste et copie exactement le binaire dont le SHA correspond à l’évaluation. Le registre est réempreinté après lecture. Le code du commit est exporté par `git show` à des fins d’audit ; aucun commentaire de source n’est suivi comme une instruction. Les références originales de chaque campagne sont conservées en plus d’une référence commune par sujet.
+
+La sélection N-body 32B utilise la version corrigée **747165**, dont la réduction historique était d’environ 8,18 %. Le résultat antérieur 747112 invalidé n’est pas réintroduit. Les pilotes GPT non confirmés, le premier harnais Qwen avec anomalies de compteurs et les archives non reçues ne sont pas admis. Une nouvelle validation post-hoc ne transforme pas rétroactivement un résultat invalidé en résultat accepté.
+
+Les champs `chosen_is_unchanged_baseline`, `job_id`, `audit_path`, `audit_sha256`, `registry_sha256`, `source_files`, `static_parallelism_evidence`, `best_confirmed`, et les deux clés de binaire figurent dans le plan. Ils permettent d’identifier la provenance exacte des {audit['campaign_count']} lignes de campagne, y compris quand leurs mesures sont partagées. La recherche initiale comportait une seule exécution indépendante par cellule ; les cinq répétitions de chronométrage ne sont pas cinq nouvelles recherches.
+
+## 3. Matériel demandé, alloué et réellement accessible
+
+Le job utilise une tâche sur un nœud ARM64, **16 cœurs physiques distincts**, 16 GiB et zéro GPU. Son hôte est **{raw['host']}**. `srun --cpus-per-task=16 --cpu-bind=cores` fixe le périmètre accessible. Les identifiants de paquet et de cœur sous `/sys/devices/system/cpu` sont contrôlés : seize identifiants physiques distincts sont nécessaires, pas seulement seize threads matériels. La liste complète d’affinité et la topologie sont dans les données brutes.
+
+Avant chaque exécution, le parent borne son affinité au préfixe de 1, 2, 4, 8 ou 16 CPU physiques de cette liste. L’enfant hérite de ce périmètre. `OMP_NUM_THREADS` et `OMP_THREAD_LIMIT` prennent p, `OMP_DYNAMIC=FALSE`, `OMP_PROC_BIND=close`, `OMP_PLACES=cores`. L’affinité est restaurée dans un bloc `finally`. Cela garantit des CPU accessibles ; cela ne garantit pas que le programme crée p threads ou les occupe. Les secondes CPU et le temps mural donnent une occupation moyenne approximative, distincte d’un dénombrement de threads. Sur les durées très courtes, la granularité de comptabilité limite cette interprétation.
+
+Le nœud peut être partagé ; la fréquence et les effets de cache ne sont pas verrouillés. Le modèle précis de CPU et ses fréquences ne sont pas capturés dans cette série, contrairement à l’architecture, l’hôte, la topologie et les affinités. Le maximum RSS n’est pas renseigné par la comptabilité Slurm reçue : 16 GiB décrit la réservation, pas une consommation mesurée. Les programmes ont été compilés pendant leurs anciennes allocations, avec leurs compilateurs et options archivés ; **aucune recompilation** n’a eu lieu. `compilations-origine.json` donne par campagne le langage, les options, l’identité de compilateur telle qu’enregistrée et le SHA du binaire confirmé. La cible et les compilateurs diffèrent des machines historiques du concours. Cette série n’est ni un test MPI à seize rangs ni une reproduction des quatre nœuds de l’auto-juge.
+
+## 4. Entrées, tailles et indépendance de la vérification
+
+Les cas k-NN, somme, N-body et bucket sort sont copiés à l’octet depuis les contrats protégés d’une campagne canonique reçue. Ils comprennent trois cas de recherche, trois cas de confirmation et un benchmark par sujet. Tous les programmes d’un même sujet reçoivent le même fichier à chaque nombre de cœurs. Count reprend les cinq nouvelles entrées du premier diagnostic, sans les regénérer ni copier ses temps. Les empreintes et origines sont publiques dans le plan local ; elles ne sont jamais révélées aux recherches en cours par ce rapport.
+
+Le contrôle indépendant de domaine vérifie les formats, nombres d’éléments, bornes et valeurs finies pertinents. Pour la somme, il vérifie 0<S<N<8000 et une borne conservative garantissant l’absence de dépassement 32 bits pour la somme des fenêtres. Pour k-NN, il vérifie groupes, labels uniques, longueurs, coordonnées finies et 1≤k≤nombre de points. Pour N-body, il vérifie le compteur de référence puis exactement six float32 finis par particule. Pour bucket sort, il contrôle le nombre de chaînes décimales et leur longueur. Pour count, les coordonnées, dimensions et unicité des obstacles sont vérifiées ; les entrées retenues respectent aussi M<0,01N² lorsque N>1000.
+
+{cases_table}
+
+Une entrée légale ne suffit pas à prouver une correction universelle. Les distributions sont celles des fixtures archivées et, pour count, d’obstacles issus de la graine 23. Les cas limites et distributions absentes restent des limites documentées. Les temps de petite entrée ne doivent pas être interprétés comme le coût isolé du noyau mathématique.
+
+## 5. Ordre des mesures, temps et résultats négatifs
+
+Pour chaque entrée, la référence commune est exécutée à un cœur ; sa sortie doit reproduire les octets attendus archivés lorsqu’ils existent. Cette sortie est sauvegardée et empreintée. Chaque couple exécutable/p reçoit une chauffe puis cinq passages. L’ordre des couples est mélangé à chaque tour par un générateur déterministe dérivé de la graine 23 et de l’indice du cas. Chaque sortie doit être exactement égale à l’oracle ; aucune tolérance numérique nouvelle n’est ajoutée.
+
+Le temps est `perf_counter()` autour de `Popen` et `communicate` : lancement, travail du programme et ses entrées/sorties sont inclus. La création du répertoire temporaire et l’ouverture du fichier stdin se font avant le démarrage du chronomètre. Le programme s’exécute dans un répertoire temporaire propre ; aucun échantillonneur `/proc` ne perturbe les chronométrages. `getrusage(RUSAGE_CHILDREN)` relève séparément les temps utilisateur+système de l’enfant. Un délai de vingt secondes borne chaque exécution. Le plafond de mesure est de 3000 secondes, dans une allocation d’une heure. Les seules terminaisons forcées possibles concernent le groupe du sous-processus créé par ce diagnostic, jamais les workers de recherche.
+
+Une erreur de sortie est conservée ; une erreur d’exécution ou un timeout borne les répétitions du point. Un point incomplet ou incorrect n’a pas de moyenne acceptée ni de gain. Il n’entraîne aucune réparation ou nouvelle recherche. L’audit de cette série a reçu **{audit['configuration_count']} configurations uniques**, **{audit['raw_sample_count']} temps mesurés**, {audit['failed_or_incomplete_configurations']} configurations incorrectes ou incomplètes ; il recalcule la couverture et toutes les moyennes. Les {audit['campaign_comparison_rows']} lignes de comparaison par campagne contiennent aussi les alias de références et ne représentent donc pas autant d’exécutions indépendantes supplémentaires.
+
+## 6. Formules et lecture scientifique
+
+Pour une entrée fixée et p cœurs, Tref(p) est la moyenne des cinq temps de la référence originale, Tcand(p) celle du programme retenu. Les secondes gagnées valent ΔT(p)=Tref(p)−Tcand(p). La réduction relative est 1−Tcand(p)/Tref(p). L’accélération contre la référence est Tref(p)/Tcand(p). La montée en cœurs du même programme est S(p)=Tcand(1)/Tcand(p), et son efficacité correspondante S(p)/p. Ces rapports répondent à des questions différentes : une amélioration algorithmique peut donner une forte réduction sans aucune montée en cœurs.
+
+L’écart-type est calculé sur les cinq durées avec le dénominateur n−1 ; les graphiques le montrent comme dispersion descriptive. Nous ne déclarons pas de supériorité statistique générale entre modèles. Les très petits écarts peuvent refléter démarrage, caches, charge et fréquence. Le seuil de 3 % appartenait à la sélection initiale confirmée ; les nouvelles courbes ne constituent pas une nouvelle promotion de candidat ni une ablation causalement isolée du modèle.
+
+## 7. Temps absolus sur les plus grandes entrées
+
+Les tableaux suivants reprennent tous les nombres de cœurs. Le gain est calculé contre la référence propre à la campagne. La référence commune, les références originales et leurs empreintes sont aussi dans le CSV ; cela empêche de confondre une différence de compilation avec une nouvelle optimisation. Les références retenues ont le même temps mesuré des deux côtés et un gain nul, par identité de programme.
+
+'''
+    for subject in audit["subjects"]:
+        v = [r for r in summaries if r["subject"] == subject]
+        text += "### " + names[subject] + "\n\n"
+        detailed = []
+        for s in v:
+            curve = sorted([r for r in rows if r["subject"]==subject and r["job_id"]==s["job_id"] and r["model"]==s["model"]
+                            and r["effort"]==s["effort"] and r["size"]==s["size"]], key=lambda r:r["cores"])
+            assert [r["cores"] for r in curve] == [1,2,4,8,16]
+            detailed.append([label(curve[0])+" ; "+s["job_id"], *[num(r["chosen_seconds"]) for r in curve],
+                f"{s['own_speedup_16']:.3f}" if s["full_valid"] else "absent",
+                f"{100*s['reduction_16']:.3f} %" if s["full_valid"] else "absent"])
+        text += table(["Modèle / campagne", "1 cœur (s)", "2 (s)", "4 (s)", "8 (s)", "16 (s)", "S(16)", "Réduction à 16"],detailed)+"\n\n"
+        text += f"![Temps absolus et montée en cœurs : {names[subject]}](courbes-{subject}.png)\n\n"
+    text += '''## 8. Audit des exigences propres à chaque énoncé
+
+Les PDF officiels et pages de règles/environnement ont été retéléchargés et leurs empreintes vérifiées dans le premier complément. Ils restent les sources primaires. Le PDF 2022 demande que les sorties soient comparées à l’implémentation fournie ; ses règles générales autorisent les changements sauf restriction contraire du problème. L’exemple OpenMP à 32 threads n’est pas une obligation. MPI est conditionnel, avec au plus quatre processus dans les règles 2022/2023. Aucune obligation de douze nœuds n’a été trouvée. Nos essais à seize cœurs concernent une tâche CPU.
+
+Pour **k-NN 2022**, le programme doit classer le point selon les k distances et la fréquence des labels, lire le format de groupes sur stdin et écrire un caractère. Les fixtures respectent ce contrat observable. La conformité est vérifiée sur ces ensembles et contre les départages de l’oracle fourni ; l’équivalence mathématique sur toutes les égalités de distance et de fréquence n’est pas prouvée par ces essais.
+
+Pour **somme 2022**, l’objectif est la somme maximale d’une sous-matrice S×S dans N×N, avec 0<S<N<8000 et un résultat signé 32 bits. Les dimensions et valeurs des fichiers sont contrôlées. La formulation du sujet décrit le problème et la référence à fenêtre glissante ; elle ne justifie pas d’exiger de chaque candidat le même algorithme que cette référence.
+
+Pour **N-body 2022**, le texte exige explicitement une version parallèle du simulateur fourni, préservant sa correction. Les six flottants position/vitesse par particule sont conservés ; les octets de résultat sont comparés exactement. Le texte synthétique omet le compteur placé en tête par la source C fournie : notre test suit cette source little-endian, et documente cette différence au lieu de prétendre résoudre la portabilité du format. Un gain sur ce simulateur ne démontre ni validité d’un autre modèle physique ni conformité à toutes les architectures. Le parallélisme doit être observé ou justifié, pas inféré du seul `-fopenmp`.
+
+Pour **bucket sort 2022**, le résultat est la suite triée correspondant aux paramètres et entiers fournis. Les sorties sont comparées octet par octet. Le nom du sujet décrit bucket sort, tandis que la clause générale permet les transformations sauf restriction explicite ; ce complément décrit le code et ses résultats sans usurper une décision des juges sur un autre algorithme de tri.
+
+Pour **count 2023**, il faut compter modulo 1000000007 les chemins de (0,0) à (N−1,N−1), avec mouvements droite/haut, obstacles et N<200000. Le sujet demande un programme parallèle. Les dimensions et obstacles des cinq entrées sont conformes aux bornes citées, mais ne couvrent pas toutes les valeurs. SIMD, plusieurs threads et MPI sont des réalisations différentes : aucune n’est déduite automatiquement d’un gain de temps. L’ancien diagnostic a observé un thread pour Luna/Sol MAX et plusieurs pour Astra MAX, avec des instructions SIMD chez Luna/Sol ; il n’établit pas le nombre de threads des nouveaux programmes xhigh. Les sources et secondes CPU de ceux-ci sont conservées séparément.
+
+Les noms des scripts, règles Makefile `all`, variables CC/CXX, bibliothèques, format ZIP et matériel de l’auto-juge exigeraient encore une validation dédiée. Le paquet interne n’est pas certifié pour un dépôt au concours. **Aucun rang officiel ni conformité intégrale n’est attribué**, même si toutes les sorties finies de cette série sont exactes.
+
+## 9. Interprétation des gains et absence de raccourci causal
+
+Le fait qu’un programme reste rapide à un seul cœur indique qu’une part de son avantage peut venir de la transformation du calcul, de la vectorisation, des accès mémoire ou de l’analyse des entrées. Une courbe plate sur 1–16 cœurs ne distingue pas seule ces explications. Une hausse de l’occupation CPU accompagnée d’une baisse du temps constitue une observation de parallélisme utile ; elle ne donne pas automatiquement une loi de performance générale. Le code, le profil et les mesures sont des faits ; les explications causales supplémentaires restent des hypothèses à tester.
+
+Les modèles n’ont pas tous trouvé un nouveau programme confirmé. Leur référence conservée est une issue de recherche, et les configurations partagées empêchent de multiplier artificiellement le nombre d’observations. Les comparaisons entre un petit modèle et DeepSeek ou GPT doivent aussi tenir compte des nombres d’essais, budgets, contextes, versions de harnais, efforts et contrôles différents. Cette série réexécute des artefacts finaux ; elle ne corrige pas ces différences de protocole de recherche.
+
+## 10. Rôle de la mère : diriger sans contaminer les branches
+
+La demande humaine est de donner à la mère un rôle actif d’orientation vers des pistes et des solutions plausibles. Dans le protocole dynamique R4, elle choisit elle-même n objectifs, puis peut proposer la prochaine direction à chaque branche à partir de son objectif, de son code et de ses seules observations. Elle ne reçoit pour ce conseil ni code, ni mesure, ni diagnostic, ni document d’une branche sœur. Les requêtes de conseil sont sans mémoire de conversation commune. Cette séparation n’interdit pas le conseil algorithmique produit par le modèle ; elle interdit celui de l’opérateur et la contamination latérale.
+
+La récolte est un canal global distinct. La mère peut y choisir plusieurs sources admissibles ; le modèle intégrateur doit écrire un nouveau programme, le harnais le vérifie, puis l’évaluateur le mesure. Ni le score de G ni son programme ne réamorcent les racines d’origine. Les pourcentages ne s’additionnent pas. La mère ne connaît pas à l’avance la bonne solution, et la réussite de ses conseils est une question expérimentale, pas une propriété garantie par son nom.
+
+R4 est désormais figée. Son prévol ARM64 **748158** est reçu et vérifié : 262 tests réussis, un MCP optionnel ignoré, vraies sondes GCC/G++ produisant quatre threads OpenMP, quinze sujets admis à la recherche. Aucun appel natif R4 ni efficacité de conseil n’est encore démontré à cette date. Les trois contrats synthétiques roots/advice/harvest puis le pilote Luna/Sol MAX/low restent requis. R1 conserve son protocole fixe A/B/C/G et n’est pas présenté comme cette architecture dynamique. Les deux voies de génération déjà occupées ne sont pas interrompues pour cette préparation.
+
+## 11. Jetons, coûts et historique
+
+La série de cœurs a utilisé **zéro appel de modèle et zéro nouveau jeton de génération**. Les consommations des recherches qui ont produit les programmes restent dans leurs audits propres ; elles ne sont pas recomptées à chaque exécution ou alias. Le registre `Mere-Dynamique-r3/tokens-par-modele.json` déduplique session/nonce et sépare entrée, sortie, cache, raisonnement, mère, enfants, intégrations, usages exacts, inconnus et en cours. Une réservation n’est ni une consommation exacte ni un plafond de service démontré. Aucun coût API en euros ni débit de décodage natif n’est inventé.
+
+L’efficacité Slurm du diagnostic et ses temps CPU alloués sont conservés dans `efficacite.json`. Une moyenne d’allocation sur une série comprenant volontairement des phases à un seul cœur et des références séquentielles ne mesure pas l’efficacité parallèle d’un candidat à seize cœurs. Les coûts CPU de mesure sont séparés du temps de génération et des gains d’exécution.
+
+Le supplément primes 2020 reste retenu : des fragments décimaux indépendants ne certifient pas la garantie d’origine première de l’énoncé. Sa réussite mécanique de préparation ne lève pas cette objection. Les trois autres exclusions historiques sont Jacobi 2020 (observabilité), Johnson 2021 (checksum) et path 2023 (initialisation GCC). Les exclusions sont des limites de préparation, pas des échecs attribués aux modèles. La grille R1 admise reste 300 cellules sur quinze sujets ; la couverture 320 antérieure était conditionnelle.
+
+## 12. Provenance, reproduction et suites
+
+`payload/plan.json` donne les programmes, empreintes, entrées et alias. `payload/FILES.sha256.json` fige les octets expédiés. `demande.json`, `plan-relu.json`, `transfert.json` et les reçus de soumission décrivent le lancement. `reception.json` relie l’archive annoncée à son SHA recalculé localement. L’archive est restaurée sans liens, membres spéciaux ou chemins sortants. L’auditeur contrôle tous les fichiers avant/après lecture, topologie, affinités, sorties, nombres de cas, statistiques et rapports.
+
+Un incident éditorial a été corrigé avant cette livraison finale : deux petits modèles partageaient le même job et le même sujet. Une clé réduite à ces deux champs mélangeait leurs lignes dans un tableau et sous-comptait les campagnes dans un cumul. La clé inclut maintenant modèle, effort et racine ; les lignes des tableaux sont contrôlées pour avoir exactement cinq nombres de cœurs. Les CSV et mesures brutes étaient distincts et restent inchangés. Les versions éditoriales antérieures sont conservées dans `HPC-Forest-Conformite-Coeurs-r2/versions/avant-correction-cle-modeles/`. Aucun candidat, oracle ou résultat de modèle n’a été réparé pour cette correction.
+
+Les annexes `mesures-brutes.csv`, `configurations-executables-uniques.csv`, `comparaisons-par-campagne.csv`, `synthese-plus-grandes-entrees.json`, `resultats-verifies.json` et `preuves/results/oracle-outputs/` permettent de recalculer les résultats sans nouveau modèle. Les chauffe, ordres des passages, erreurs et durées CPU restent dans le JSON brut. `sources/` contient les sources exactes des commits retenus ; ces fichiers sont consultés pour audit uniquement.
+
+Les nouvelles cellules reçues seront ajoutées par lots distincts après revue du domaine et du format de leurs sujets. Aucun ancien résultat, artefact ou registre n’est écrasé. Les bilans et l’article doivent être versionnés, datés et corrigés au fil de ces réceptions, avant l’échéance humaine exclusive du 1 novembre 2026 à 00:00 Paris. Les parties non réalisées à cette date seront nommées avec leur cause.
+
+Sources primaires : [énoncé officiel 2022](http://lspd.mackenzie.br/marathon/22/problemset.pdf), [énoncé officiel 2023](http://lspd.mackenzie.br/marathon/23/problemset.pdf), copies et SHA-256 sous `HPC-Forest-Conformite-Sujets-r1/`.
+'''
+    (root / "RAPPORT-DETAILLE.md").write_text(text, encoding="utf8")
+    reviews = []
+    for c in plan["campaigns"]:
+        s = next(r for r in summaries if r["job_id"]==c["job_id"] and r["subject"]==c["subject"]
+                 and r["model"]==c["model"] and r["effort"]==(c["effort"] or "not_applicable"))
+        cpu = s["cpu_utilization_16"]
+        observed = cpu is not None and cpu > 1.2
+        signals = c["static_parallelism_evidence"]
+        reviews.append({"job_id":c["job_id"],"subject":c["subject"],"model":c["model"],"effort":c["effort"],
+            "retained_baseline":c["chosen_is_unchanged_baseline"],"finite_exact_outputs_verified":s["full_valid"],
+            "input_syntax_and_stated_bounds_checked":True,"complete_mathematical_domain_verified":False,
+            "explicit_parallel_assignment":c["subject"] in {"2022-nbody","2023-count"},
+            "multicore_cpu_work_observed_at_largest_case":observed,"average_used_cpu_at_16":cpu,
+            "cpu_ratio_is_not_exact_thread_count":True,"static_parallelism_evidence":signals,
+            "simd_static_evidence_is_not_machine_code_proof":True,
+            "native_format_qualification":c["subject"]=="2022-nbody",
+            "official_hardware_reproduced":False,"official_submission_package_certified":False,
+            "full_official_contest_compliance_certified":False})
+    (root / "conformite-par-campagne.json").write_text(json.dumps(reviews,ensure_ascii=False,indent=2)+"\n",encoding="utf8")
+    review_table = table(["Sujet / campagne", "Modèle / effort", "CPU moyens à 16", "OpenMP explicite", "Indices SIMD explicites", "Plusieurs CPU observés"],
+        [[r["subject"]+" / "+r["job_id"],r["model"]+" / "+(r["effort"] or "sans effort natif"),
+          f"{r['average_used_cpu_at_16']:.3f}" if r["average_used_cpu_at_16"] is not None else "absent",
+          len(r["static_parallelism_evidence"]["openmp_parallel"]),
+          len(r["static_parallelism_evidence"]["arm_neon"])+len(r["static_parallelism_evidence"]["openmp_simd"])+len(r["static_parallelism_evidence"]["compiler_vector_hint"]),
+          "oui sur ce cas" if r["multicore_cpu_work_observed_at_largest_case"] else "non démontré"] for r in reviews])
+    text = text.replace("## 9. Interprétation", "### Vérification distincte pour chaque campagne\n\n"+review_table+
+        "\n\nLes colonnes de code comptent des lignes d’indices, pas des threads ou des instructions exécutées. Le rapport CPU/mural est une occupation moyenne ; la mention de plusieurs CPU utilise ici le seuil descriptif 1,2 sur le plus grand cas. Un résultat inférieur ne prouve pas l’absence de SIMD, de threads dormants ou de phases parallèles très courtes. Le JSON par campagne conserve séparément exigences explicites, domaine fini, format, parallélisme, matériel et emballage.\n\n## 9. Interprétation")
+    (root / "RAPPORT-DETAILLE.md").write_text(text, encoding="utf8")
+    hashes = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in root.iterdir() if p.is_file() and p.name != "MANIFEST-RAPPORT.json"}
+    (root / "MANIFEST-RAPPORT.json").write_text(json.dumps({"generated_utc": now, "files": hashes},indent=2)+"\n",encoding="utf8")
+    print(json.dumps({"campaigns":len(plan["campaigns"]),"figures":len(plot_names),"configurations":audit["configuration_count"],"timed_runs":audit["raw_sample_count"]}))
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("root",type=Path)
+    main(p.parse_args().root.resolve(strict=True))

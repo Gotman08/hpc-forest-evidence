@@ -1,0 +1,107 @@
+"""Two inert census regressions plus static payload/command checks only."""
+
+import ast
+import hashlib
+import importlib.util
+import json
+import shlex
+import sys
+import tarfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent / "lancement-modeles-max-r2"
+REV = ROOT / "revision-r3-census"
+QUAL = ROOT / "qualification-stage-r1"
+
+
+def ref(path):
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf8"))
+
+
+assert ref(REV / "LIVRAISON-LOCALE.json")["sha256"] == "930d7abc0f99605303db9e757ec14a9058af5f54b8cfca4f935fb5bc62ac8b61"
+assert ref(REV / "PINS-POUR-REVUE.json")["sha256"] == "dc421b49288c7bee6a23ebae6d442c910e33576350de668be64fddc08637bc46"
+pins = load(REV / "PINS-POUR-REVUE.json")
+for item in pins["code"].values():
+    assert ref(Path(item["path"])) == item
+assert ref(ROOT / "LIVRAISON-LOCALE.json")["sha256"] == "163ee825e560fb869e97a895d4d25c0367c99fe1a9c94eb2828cbc02aefa8c57"
+spec = importlib.util.spec_from_file_location("review_fixed_factory_neutral_census", REV / "assemble_admissions.py")
+factory = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(factory)
+assert factory.CACHE_ROOT == ROOT and factory.BASE == HERE.parent.parents[1]
+
+
+def row(pid, command):
+    return {"ProcessId": pid, "ParentProcessId": 100, "ExecutablePath": "C:/NEUTRAL/python.exe",
+            "CommandLine": command, "CreationDate": "2026-10-18T00:00:00.1234567Z"}
+
+
+cases = []
+for name, command in (("unknown_hpc_worker", "python -m hpc_forest.unrecognized_worker --session-id unknown"),
+                      ("uppercase_windows_bootstrap", '"C:/NEUTRAL/python.exe" "C:/NEUTRAL/BOOTSTRAP_WORKER.PY" "--session-id" "unknown"')):
+    so = [row(pid, "python -m hpc_forest.ablation_worker --session-id 665743a02b824021a697b6a4884a667c") for pid in (37900, 37848)]
+    rows = so + [row(999, command)]
+    census = {"schema": "hpc-forest-dynamic-r4b-full-cim-v1", "complete_census": True, "strict_utf8_decoding": True,
+              "captured_at_utc": 1000, "rows": rows, "rows_count": len(rows), "other_native_groups": []}
+    closure = {"schema": "hpc-forest-r2c-owned-main-only-stop-receipt-v1", "verified": True,
+               "all_three_main_identities_absent": True, "source_only_identities_preserved": True,
+               "source_only": so, "actions": [{"identity": row(pid, "NEUTRAL absent")} for pid in (1, 2, 3)]}
+    try:
+        factory.check_census(census, closure, now=1000)
+    except ValueError:
+        cases.append({"case": name, "rejected": True})
+    else:
+        raise AssertionError("Previously invisible worker still accepted")
+
+proposal = load(QUAL / "PROPOSITION-PREFLIGHT.json")
+assert ref(QUAL / "PROPOSITION-PREFLIGHT.json")["sha256"] == "7ee5fb6993ade9105964d1304a8ad49ec79177ffdafa24413642338cd701d928"
+for name in ("packet", "command", "job_prepare_arguments"):
+    assert ref(Path(proposal[name]["path"])) == proposal[name]
+assert proposal["packet"]["sha256"] == "f4474313599f571b7ad41f92a3cf1c9a1d6db220254b85ac83590536eb8cd430"
+command = (QUAL / "commande-allouee-zero-modele.sh").read_text(encoding="utf8")
+job = load(QUAL / "job-prepare-propose.json")
+assert shlex.split(job["command"]) == ["bash", "-lc", command]
+assert {k: job[k] for k in ("cpus_per_task", "mem_gb", "gpus_per_node", "time_limit")} == {
+    "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0, "time_limit": "00:10:00"}
+assert command.count("srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores") == 1
+assert 'test ! -e "$root"' in command and 'exist_ok=False' in command and 'sha256sum "$root/preflight-results-$SLURM_JOB_ID.tar.gz"' in command
+assert not any(word in command for word in ("sbatch ", "codex.exe", "app-server", "prepare_target_profile", "romeo_load_armgpu_env", "spack load"))
+with tarfile.open(QUAL / "qualification-stage-zero-model-r1.tar.gz") as archive:
+    members = archive.getmembers()
+    names = {"qualify_stage_zero_model.py", "native_worker_detection.py", "native-interface-models-max-r2.tar.gz", "packet-manifest.json"}
+    assert len(members) == len(names) == 4 and {m.name for m in members} == names and all(m.isfile() for m in members)
+    raw = {m.name: archive.extractfile(m).read() for m in members}
+assert json.loads(raw["packet-manifest.json"]) == {n: hashlib.sha256(data).hexdigest() for n, data in raw.items() if n != "packet-manifest.json"}
+assert all(raw[name] == (QUAL / name).read_bytes() for name in ("qualify_stage_zero_model.py", "native_worker_detection.py"))
+assert raw["native-interface-models-max-r2.tar.gz"] == (REV / "native-interface-models-max-r2.tar.gz").read_bytes()
+assert raw["native_worker_detection.py"] == (REV / "native_worker_detection.py").read_bytes()
+with tarfile.open(REV / "native-interface-models-max-r2.tar.gz") as archive:
+    members = archive.getmembers()
+    assert len(members) == 3 and {m.name for m in members} == {"remote_stage.py", "cell_selection.py", "stage-manifest.json"} and all(m.isfile() for m in members)
+    stage = {m.name: archive.extractfile(m).read() for m in members}
+assert all(stage[name] == (REV / name).read_bytes() for name in ("remote_stage.py", "cell_selection.py"))
+source = raw["qualify_stage_zero_model.py"].decode("utf8")
+tree = ast.parse(source)
+called_names = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+assert not {"prepare_target_profile", "one_contract", "install_identity", "wait_authorization"}.intersection(called_names)
+assert not any(isinstance(node, ast.Starred) for node in ast.walk(tree))
+assert "sys.addaudithook(guard)" in source and "subprocess.Popen" in source and "socket.connect" in source
+assert "before == after and not blocked" in source
+result = {"schema": "hpc-forest-fixed-census-and-zero-model-packet-independent-checks-v1", "verified": True,
+          "scope": "two invented census regressions and static command/archive/AST verification; allocated preflight not run",
+          "observed_at_utc": datetime.now(timezone.utc).isoformat(), "census_cases": cases,
+          "closed_packet_members": sorted(names), "resources_requested": {k: job[k] for k in ("cpus_per_task", "mem_gb", "gpus_per_node", "time_limit")},
+          "proposal": ref(QUAL / "PROPOSITION-PREFLIGHT.json"), "packet": proposal["packet"], "command": proposal["command"],
+          "qualifier": ref(QUAL / "qualify_stage_zero_model.py"), "launcher_pins": ref(REV / "PINS-POUR-REVUE.json"),
+          "no_packet_or_main_executed": True, "model_calls": 0, "live_actions": 0, "native_generation_admitted": False}
+path = HERE / "CONTROLES-CENSUS-R3-PREFLIGHT.json"
+with path.open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    stream.write("\n")
+print(json.dumps(ref(path)))

@@ -1,0 +1,45 @@
+"""One scoped call through a fresh owned ROMEO MCP connection; no global restart."""
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parents[1] / "work/marathon-archive-mother-r2/project/src"))
+from hpc_forest.codex_worker import RomeoFiles
+
+
+class ScopedRomeo(RomeoFiles):
+    async def call(self, tool_name, **arguments):
+        # job_prepare has its own `name` field: keep the tool-name parameter distinct.
+        response = await self.session.call_tool(tool_name, arguments)
+        result = response.structuredContent
+        if result is None:
+            result = json.loads(next(c.text for c in response.content if c.type == "text"))
+        if response.isError or not isinstance(result, dict) or result.get("ok") is not True:
+            raise RuntimeError(str(result))
+        return result
+
+
+async def main(args):
+    values = json.loads(args.arguments.read_text(encoding="utf8"))
+    async with ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+        try:
+            result = await asyncio.wait_for(rpc.call(args.tool, **values), timeout=args.timeout)
+        except Exception as exc:
+            result = {"ok": False, "error": type(exc).__name__ + ": " + str(exc),
+                      "outcome_unknown_for_mutations": not isinstance(exc, TypeError), "tool": args.tool}
+    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    brief = {k: result[k] for k in ["ok", "job_id", "state", "plan_id", "submitted", "verifie", "error"] if k in result}
+    print(json.dumps(brief, ensure_ascii=True))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("tool")
+    parser.add_argument("arguments", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--timeout", type=int, default=120)
+    raise SystemExit(asyncio.run(main(parser.parse_args())))

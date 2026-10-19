@@ -1,0 +1,156 @@
+[CmdletBinding()]
+param(
+ [Parameter(Mandatory=$true)][string]$PreparationReview,
+ [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$PreparationReviewSha256,
+ [ValidatePattern('^execution-root-[0-9]{2}$')][string]$RunName='execution-root-02',
+ [Parameter(Mandatory=$true)][string]$QualificationReception,
+ [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$QualificationReceptionSha256,
+ [Parameter(Mandatory=$true)][string]$LifecycleInput,
+ [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$LifecycleInputSha256,
+ [switch]$Execute
+)
+$ErrorActionPreference='Stop'
+if($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.5'){throw 'Use the documented PowerShell7.6.5 executable; no capture with Windows PowerShell5.1'}
+$taskBase='C:\Users\nicol\Documents\Codex\2026-10-15\cr'
+$parentBase=Join-Path $taskBase 'outputs\HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3\operations-parent-premier-roots-source110-r1'
+$expectedHere=Join-Path $parentBase 'preparation-observation-R8-r1'
+$expectedCode=Join-Path $parentBase 'preparation-parcours-vivant-R8-r1\reprise-passive-externe-R8-r1\revision-r2-terminal-distinct'
+$chain=Join-Path $taskBase 'outputs\HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3\adaptateurs-source110-r1\revision-r8-racines-techniques-neuves'
+$py=Join-Path $taskBase 'work\.venv\Scripts\python.exe'
+$observer=Join-Path $chain 'observer\observer-mixte.py'
+$q=$QualificationReception
+$review=Join-Path $parentBase 'preparation-derivee-R8-apres-raccord-r1\revue-integration-complete-R8-r1\REVUE-INTEGRATION-COMPLETE-R8-PREPARATION.json'
+$oldReview=Join-Path $parentBase 'fermeture-observateur-r5-preparee-r1\revue-fermeture-reelle-r3-r1\REVUE-FERMETURE-OBS4-REELLE-R3.json'
+$utf8=[Text.UTF8Encoding]::new($false,$true)
+function Ordinary([string]$path){
+ if(-not [IO.Path]::IsPathFullyQualified($path) -or $path -match '(^|[\\/])\.\.([\\/]|$)' -or $path.StartsWith('\\')){throw 'Absolute non-UNC path without parent traversal required'}
+ $full=[IO.Path]::GetFullPath($path)
+ if($full -cne $path -or -not $full.StartsWith($taskBase+'\',[StringComparison]::OrdinalIgnoreCase) -or $full.Substring(3).Contains(':')){throw 'Exact canonical workspace path required'}
+ $part=$full
+ while($part){
+  # GetAttributes queries the final entry's own metadata, including a dangling
+  # reparse point. Never predicate this inspection on target-following Exists.
+  try{
+   $attributes=[IO.File]::GetAttributes($part)
+   if(($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Reparse input/output parent refused'}
+  }catch{
+   $failure=$_.Exception
+   while($null -ne $failure.InnerException){$failure=$failure.InnerException}
+   if($failure -isnot [IO.FileNotFoundException] -and $failure -isnot [IO.DirectoryNotFoundException]){throw}
+   # Only a genuinely absent future output component is allowed. Every
+   # ancestor is independently inspected by the same unconditional API.
+  }
+  $parent=[IO.Path]::GetDirectoryName($part)
+  if($parent -eq $part){break}; $part=$parent
+ }
+ return $full
+}
+function Sha([string]$path){Ordinary $path|Out-Null; return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+function Ref([string]$path){return [ordered]@{path=$path;sha256=(Sha $path)}}
+function Save-NewJson([string]$path,$value){
+ Ordinary $path|Out-Null
+ $bytes=$utf8.GetBytes(($value|ConvertTo-Json -Depth 30))
+ $stream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+ try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
+}
+function Check-Frozen{
+ if((Sha $py) -ne '819c07dbf55c179f77a71d6f041c74c57b18d86f637f5f5e76ea882a50c9ed8b'){throw 'Exact worker Python pin differs'}
+ if((Sha (Join-Path $chain 'COMPONENTS.json')) -ne 'd7d7d240198fc487efbede15c1328a366bc0c5bd59614d5064e19d81d1cf7122'){throw 'Exact R8 COMPONENTS differs'}
+ $components=$utf8.GetString([IO.File]::ReadAllBytes((Join-Path $chain 'COMPONENTS.json')))|ConvertFrom-Json -Depth 30
+ if(@($components.code_pins.PSObject.Properties).Count -ne 62){throw 'Exactly62 components required'}
+ foreach($item in $components.code_pins.PSObject.Properties){
+  if($item.Name -match '(^|/)\.\.(/|$)' -or (Sha (Join-Path $chain $item.Name)) -ne $item.Value){throw 'Frozen R8 component changed'}
+ }
+ if((Sha $q) -ne $QualificationReceptionSha256 -or (Sha $review) -ne '2dd0ca5099e428ad877796744ee754f0e51969cac7bbd08db01e0b97dde2a48c' -or (Sha $oldReview) -ne '7d2ba9c37b3a811d59039073608ff95f95c12473fa3156f60e79afe85c9a0a66'){throw 'Actual Q/integration/old closure review changed'}
+}
+function Check-ActualQ{
+ Ordinary $q|Out-Null
+ if((Sha $q) -ne $QualificationReceptionSha256){throw 'Actual caller Q bytes changed'}
+ $received=$utf8.GetString([IO.File]::ReadAllBytes($q))|ConvertFrom-Json -Depth 40
+ if($received.schema -cne 'hpc-forest-dynamic-r4b-mechanical-reception-v1' -or $received.verified -ne $true -or $received.source_zip_sha256 -cne 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48' -or $received.plan_sha256 -cne 'f927d37098f3fd50cc4916195da3e300bd7c29597ba7ece4b9669abd715897fe' -or $received.native_model_calls -isnot [long] -and $received.native_model_calls -isnot [int] -or $received.native_model_calls -ne 0){throw 'True received source110 R8 Q only; full contract is rechecked by policy before start'}
+}
+function Check-Preparation{
+ if((Sha $PreparationReview) -ne $PreparationReviewSha256){throw 'Independent external preparation review changed'}
+ $approved=$utf8.GetString([IO.File]::ReadAllBytes($PreparationReview))|ConvertFrom-Json -Depth 30
+ $names=@('cycle-passif-externe-R8.py','preparer-observation-froide-R8.py','preparer-policy-routes-R8.py','lancer-observateur-R8-r2.ps1')
+ if($approved.schema -ne 'hpc-forest-r8-observation-preparation-review-v1' -or $approved.verified_source_preparation_only -ne $true -or @($approved.blocking_findings).Count -ne 0 -or $approved.passive_observer_only -ne $true -or $approved.native_generation_admitted -ne $false){throw 'Independent preparation review does not authorize this passive preparation code'}
+ $keys=@($approved.reviewed_files.PSObject.Properties.Name|Sort-Object)
+ if(($keys -join '|') -cne (($names|Sort-Object) -join '|')){throw 'Exact four reviewed preparation components required'}
+ foreach($name in $names){$codePath=if($name -in @('lancer-observateur-R8-r2.ps1','cycle-passif-externe-R8.py')){Join-Path $expectedCode $name}else{Join-Path $expectedHere $name};if((Sha $codePath) -ne $approved.reviewed_files.$name){throw 'External preparation component changed'}}
+}
+function Check-LifecycleInput{
+ if((Sha $LifecycleInput) -cne $LifecycleInputSha256){throw 'Actual lifecycle input bytes changed'}
+ $value=$utf8.GetString([IO.File]::ReadAllBytes($LifecycleInput))|ConvertFrom-Json -Depth 40
+ $keys=@('schema','closure','closure_review','archive','previous_sequence_terminal','helper_review','neutral_completion')
+ if($value.schema -cne 'hpc-forest-r8-new-external-passive-lifecycle-actual-input-v1' -or ((@($value.PSObject.Properties.Name|Sort-Object)) -join '|') -cne (($keys|Sort-Object) -join '|')){throw 'Exact actually received lifecycle references required; proposals/null refuse'}
+ foreach($name in $keys|Where-Object {$_ -ne 'schema'}){
+  $reference=$value.$name
+  if($null -eq $reference -or $reference.sha256 -cnotmatch '^[0-9a-f]{64}$' -or ((@($reference.PSObject.Properties.Name|Sort-Object)) -join '|') -cne 'path|sha256' -or (Sha $reference.path) -cne $reference.sha256){throw 'Absent/changed actual lifecycle reference'}
+ }
+ return $value
+}
+function Check-CurrentLifecycle([string]$cim,[string]$output){
+ $lifecycle=Check-LifecycleInput
+ $flags=@('--mode','current','--closure',$lifecycle.closure.path,'--closure-sha256',$lifecycle.closure.sha256,
+ '--closure-review',$lifecycle.closure_review.path,'--closure-review-sha256',$lifecycle.closure_review.sha256,
+ '--archive',$lifecycle.archive.path,'--archive-sha256',$lifecycle.archive.sha256,
+ '--previous-sequence-terminal',$lifecycle.previous_sequence_terminal.path,'--previous-sequence-terminal-sha256',$lifecycle.previous_sequence_terminal.sha256,
+ '--helper-review',$lifecycle.helper_review.path,'--helper-review-sha256',$lifecycle.helper_review.sha256,
+ '--neutral-completion',$lifecycle.neutral_completion.path,'--neutral-completion-sha256',$lifecycle.neutral_completion.sha256,
+ '--full-cim',$cim,'--full-cim-sha256',(Sha $cim),'--output',$output)
+ & $py -I -B (Join-Path $expectedCode 'cycle-passif-externe-R8.py') @flags
+ if($LASTEXITCODE -ne 0){throw 'Actual postclosure/runtime archive/new fullCIM lifecycle refused; no start'}
+}
+function Census{
+ $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop|Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{n='CreationDate';e={if($null -eq $_.CreationDate){$null}else{$_.CreationDate.ToUniversalTime().ToString('o')}}})
+ $captured=[DateTime]::UtcNow
+ $value=[ordered]@{schema='hpc-forest-dynamic-r4b-full-cim-v1';observed_at=([DateTimeOffset]$captured).ToUnixTimeMilliseconds()/1000.0;captured_at_utc=$captured.ToString('o');complete_census=$true;strict_utf8_decoding=$true;rows_count=$rows.Count;rows=$rows}
+ $decoded=$utf8.GetString($utf8.GetBytes(($value|ConvertTo-Json -Depth 20)))|ConvertFrom-Json -Depth 20
+ if($decoded.rows.Count -ne $rows.Count){throw 'Full strict census roundtrip failed'}
+ return $value
+}
+if($PSScriptRoot -cne $expectedCode){throw 'Exact external preparation directory required'}
+Ordinary $expectedHere|Out-Null
+Check-Frozen
+Check-ActualQ
+Check-Preparation
+$lifecycle=Check-LifecycleInput
+if(-not $Execute){[ordered]@{prepared_only=$true;execute_required=$true;native_generation_admitted=$false;captured_or_started=$false}|ConvertTo-Json -Compress;return}
+$intentPath=Join-Path $expectedHere 'INTENTION-UNIQUE-OBS4-R8-REPRISE-02.json'
+if([IO.File]::Exists($intentPath) -or [IO.Directory]::Exists($intentPath)){throw 'A prior start intention forbids every new attempt, including an unknown outcome'}
+if($RunName -cne 'execution-root-02'){throw 'One new external lifecycle uses only execution-root-02'}
+$run=Join-Path $expectedHere $RunName
+$absence=Join-Path $expectedHere ($RunName+'-absence')
+$policy=Join-Path $expectedHere ($RunName+'-policy')
+foreach($path in @($run,$absence,$policy)){Ordinary $path|Out-Null;if([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)){throw 'Never overwrite prior preparation/effect evidence'}}
+New-Item -ItemType Directory -Path $run -ErrorAction Stop|Out-Null
+$cimFile=Join-Path $run 'CIM-PRIVE-AVANT-PREPARATION.json'
+Save-NewJson $cimFile (Census)
+Check-CurrentLifecycle $cimFile (Join-Path $run 'ABSENCE-CYCLE-PRECEDENT-AVANT-PREPARATION.json')
+& $py -I -B (Join-Path $expectedHere 'preparer-observation-froide-R8.py') --full-cim $cimFile --full-cim-sha256 (Sha $cimFile) --output-directory $absence --require-fresh --old-observer-review $oldReview --old-observer-review-sha256 7d2ba9c37b3a811d59039073608ff95f95c12473fa3156f60e79afe85c9a0a66
+if($LASTEXITCODE -ne 0){throw 'Full fresh SO/OBS3/oldOBS4 absence preparation failed; no start attempted'}
+& $py -I -B (Join-Path $expectedHere 'preparer-policy-routes-R8.py') --absence-directory $absence --output-directory $policy --qualification-reception $q --qualification-reception-sha256 $QualificationReceptionSha256 --integration-review $review --integration-review-sha256 2dd0ca5099e428ad877796744ee754f0e51969cac7bbd08db01e0b97dde2a48c
+if($LASTEXITCODE -ne 0){throw 'Exact actual R8 policy preparation failed; no start attempted'}
+$commandsPath=Join-Path $policy 'COMMANDES-OBS4.json'
+$commands=$utf8.GetString([IO.File]::ReadAllBytes($commandsPath))|ConvertFrom-Json -Depth 20
+$argv=@($commands.run_argv)
+$expectedArgv=@($py,'-I','-B','-u',$observer,'--policy',(Join-Path $policy 'POLICY-OBS4.json'),'--routes',(Join-Path $policy 'ROUTES-OBS4.json'),'--transition',(Join-Path $absence 'TRANSITION-OBS3-OBS4.json'),'--run')
+if(($argv -join [char]0) -cne ($expectedArgv -join [char]0) -or @($argv|Where-Object {$_ -match '\s'}).Count){throw 'Exact whitespace-free passive run argv required'}
+$latestCim=Join-Path $run 'CIM-PRIVE-IMMEDIAT-AVANT-START.json'
+Save-NewJson $latestCim (Census)
+$latestProof=Join-Path $run 'ABSENCE-OBS4-R5-ET-R7-IMMEDIATE.json'
+Check-Frozen
+Check-ActualQ
+Check-Preparation
+Check-CurrentLifecycle $latestCim $latestProof
+if($LASTEXITCODE -ne 0){throw 'Latest full oldOBS4/equivalent/ambiguous-context absence gate refused; no start attempted'}
+$intent=[ordered]@{schema='hpc-forest-r8-owned-passive-start-intent-v1';previous_R8_closure=$lifecycle.closure;previous_R8_closure_review=$lifecycle.closure_review;previous_R8_runtime_archive=$lifecycle.archive;previous_sequence_terminal=$lifecycle.previous_sequence_terminal;lifecycle_preparation_review=$lifecycle.helper_review;lifecycle_neutral_completion=$lifecycle.neutral_completion;created_at_utc=[DateTime]::UtcNow.ToString('o');argv=$argv;observer_sha256='70bb498896602652b9999cf25d53b5282454ed4368359d8a91e826bcca45307e';external_preparation_review=(Ref $PreparationReview);old_observer_current_absence=(Ref $latestProof);full_cim=(Ref $latestCim);initial_full_cim=(Ref $cimFile);policy=(Ref $expectedArgv[6]);routes=(Ref $expectedArgv[8]);transition=(Ref $expectedArgv[10]);model_generation_admitted=$false;stop_or_submission_authorized=$false;one_start_only=$true;unknown_outcome_forbids_retry=$true}
+Save-NewJson $intentPath $intent
+# The intent is durable BEFORE the only effect call. Any exception thereafter is UNKNOWN; never retry.
+$process=Start-Process -FilePath $py -ArgumentList ($argv[1..($argv.Count-1)] -join ' ') -WorkingDirectory $taskBase -WindowStyle Hidden -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError (Join-Path $run 'stderr.log') -PassThru
+Start-Sleep -Milliseconds 700
+$after=Census
+Save-NewJson (Join-Path $run 'CIM-PRIVE-APRES.json') $after
+$observed=[ordered]@{schema='hpc-forest-r8-owned-passive-start-observed-v1';observed_at_utc=[DateTime]::UtcNow.ToString('o');start_intent=(Ref $intentPath);launcher_pid=$process.Id;launcher_has_exited=$process.HasExited;five_fields=[object[]]@($after.rows|Where-Object {$_.ProcessId -eq $process.Id -or $_.ParentProcessId -eq $process.Id});stdout=(Join-Path $run 'stdout.log');stderr=(Join-Path $run 'stderr.log');observed_full_pair_independently_verified=$false;native_generation_admitted=$false;source_or_native_workers_started=0}
+Save-NewJson (Join-Path $run 'LANCEMENT-OBSERVE.json') $observed
+[ordered]@{receipt=(Join-Path $run 'LANCEMENT-OBSERVE.json');launcher_pid=$process.Id;identified_rows=$observed.five_fields.Count;native_generation_admitted=$false}|ConvertTo-Json -Compress

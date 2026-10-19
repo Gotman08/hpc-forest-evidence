@@ -10,6 +10,8 @@ L’[article de recherche (19 pages)](docs/article/ARTICLE.pdf), les [annexes te
 
 La paire de programmes Sol MAX sur les nombres premiers a été remesurée sur une allocation distincte : 43,8546 ms pour la référence contre 4,9124 ms pour le candidat (8,9273×), douze entrées certifiées et cinq paires de mesures. La portée reste ce benchmark fini et la même implémentation de l’évaluateur. Les échecs et les coûts inconnus restent distingués. Voir les [observations actualisées et la suite de campagne](docs/RECEIVED-2026-10-19.md).
 
+La [qualification des quinze références sans modèle](evidence/qualification-2026-10-19/README.md) est également reçue et vérifiée : 75 durées de confirmation issues d'une allocation ARM de 65 secondes. Ces mesures de référence ne constituent aucun résultat de modèle R2 ni gain d'optimisation.
+
 HPC Forest étudie une question concrète : **un système peut-il produire des programmes corrects et plus rapides dans un budget fixé ?** L’évaluation repose sur un programme de départ figé, un contrôle externe des sorties, des temps bruts et une confirmation finale séparée. Un autre système peut suivre ce contrat sans exposer son fonctionnement interne.
 
 Ce dépôt rassemble le protocole, une sélection explicite de données auditées et des vérificateurs publics. Le moteur interne et les entrées réservées à l’évaluateur restent hors de ce dépôt.

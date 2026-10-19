@@ -4,6 +4,7 @@ _Public versions preserve the evidence and its interpretation._
 
 ## Received evidence update — 2026-10-19
 
+- Add the subsequently received zero-model qualification of all fifteen references: 75 timings, exact arithmetic checks, private provenance digests and explicit baseline-only scope
 - Publish the reviewed research article, technical appendices, Markdown and all linked figures
 - Extend the public projection to all admitted historical CPU samples, confirmations, search records and reconciled cost views
 - Report the completed Sol MAX primes pilot and separate-allocation remeasurement, with finite correctness and independence limits

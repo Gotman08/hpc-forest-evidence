@@ -1,0 +1,151 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Read a binary dataset with initialized bodies.
+ */
+void read_dataset(int *nbodies, float **restrict x, float **restrict y,
+                  float **restrict z, float **restrict vx,
+                  float **restrict vy, float **restrict vz) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Allocate aligned memory for SoA layout
+  size_t alignment = 32;
+  size_t sz = *nbodies * sizeof(float);
+  if (posix_memalign((void**)x, alignment, sz) != 0 ||
+      posix_memalign((void**)y, alignment, sz) != 0 ||
+      posix_memalign((void**)z, alignment, sz) != 0 ||
+      posix_memalign((void**)vx, alignment, sz) != 0 ||
+      posix_memalign((void**)vy, alignment, sz) != 0 ||
+      posix_memalign((void**)vz, alignment, sz) != 0) {
+    fprintf(stderr,"\nError allocating aligned memory\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Read interleaved AoS data and convert to SoA
+  float *tmp = (float*)malloc(*nbodies * 6 * sizeof(float));
+  if (!tmp) {
+    fprintf(stderr,"\nError allocating temporary buffer\n");
+    exit(EXIT_FAILURE);
+  }
+  b = fread(tmp, *nbodies * 6 * sizeof(float), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  for (int i = 0; i < *nbodies; ++i) {
+    (*x)[i] = tmp[i*6 + 0];
+    (*y)[i] = tmp[i*6 + 1];
+    (*z)[i] = tmp[i*6 + 2];
+    (*vx)[i] = tmp[i*6 + 3];
+    (*vy)[i] = tmp[i*6 + 4];
+    (*vz)[i] = tmp[i*6 + 5];
+  }
+
+  free(tmp);
+}
+
+/*
+ * Write simulation results into a binary dataset (AoS format).
+ */
+void write_dataset(const int nbodies, const float *restrict x,
+                   const float *restrict y, const float *restrict z,
+                   const float *restrict vx, const float *restrict vy,
+                   const float *restrict vz) {
+  // Convert SoA back to AoS for output
+  float *tmp = (float*)malloc(nbodies * 6 * sizeof(float));
+  if (!tmp) {
+    fprintf(stderr,"\nError allocating temporary buffer\n");
+    exit(EXIT_FAILURE);
+  }
+  for (int i = 0; i < nbodies; ++i) {
+    tmp[i*6 + 0] = x[i];
+    tmp[i*6 + 1] = y[i];
+    tmp[i*6 + 2] = z[i];
+    tmp[i*6 + 3] = vx[i];
+    tmp[i*6 + 4] = vy[i];
+    tmp[i*6 + 5] = vz[i];
+  }
+
+  int b = fwrite(tmp, nbodies * 6 * sizeof(float), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+
+  free(tmp);
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  float *x = NULL, *y = NULL, *z = NULL;
+  float *vx = NULL, *vy = NULL, *vz = NULL;
+
+  read_dataset(&nbodies, &x, &y, &z, &vx, &vy, &vz);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  #pragma omp parallel default(none) shared(x,y,z,vx,vy,vz,nbodies)
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      // Force computation: each thread handles a subset of bodies i
+      #pragma omp for schedule(static)
+      for (int i = 0; i < nbodies; ++i) {
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
+
+        const float xi = x[i];
+        const float yi = y[i];
+        const float zi = z[i];
+
+        #pragma omp simd reduction(+:fx,fy,fz) aligned(x,y,z:32)
+        for (int j = 0; j < nbodies; ++j) {
+          float dx = x[j] - xi;
+          float dy = y[j] - yi;
+          float dz = z[j] - zi;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1.0f / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+          fx += dx * inv_dist3;
+          fy += dy * inv_dist3;
+          fz += dz * inv_dist3;
+        }
+
+        vx[i] += DT*fx;
+        vy[i] += DT*fy;
+        vz[i] += DT*fz;
+      } // implicit barrier after force loop
+
+      // Position update: each thread updates its assigned subset of bodies
+      #pragma omp for schedule(static)
+      for (int i = 0; i < nbodies; ++i) {
+        x[i] += vx[i] * DT;
+        y[i] += vy[i] * DT;
+        z[i] += vz[i] * DT;
+      } // implicit barrier before next iteration
+    }
+  } // end parallel region
+
+  write_dataset(nbodies, x, y, z, vx, vy, vz);
+
+  free(x); free(y); free(z);
+  free(vx); free(vy); free(vz);
+
+  exit(EXIT_SUCCESS);
+}

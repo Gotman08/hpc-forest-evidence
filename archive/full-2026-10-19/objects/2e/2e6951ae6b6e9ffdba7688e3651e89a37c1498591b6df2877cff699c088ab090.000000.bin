@@ -1,0 +1,320 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<stdint.h>
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+typedef struct {
+  int id;
+  int record_plus_one;
+} IdEntry;
+
+typedef struct {
+  int *direct;
+  IdEntry *hash;
+  size_t capacity;
+  int minimum;
+} IdIndex;
+
+typedef struct {
+  float cost;
+  unsigned char ready;
+} CachedCost;
+
+/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  Node* data = NULL;
+  FILE *fl = NULL;
+
+  if (fname == NULL)
+    fl = stdin;
+  else
+    fl = fopen(fname, "r");
+
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  // header
+  fscanf(fl, "%d %[^\n]", n, list);
+
+  if (*n > 0) {
+    data = (Node*) malloc((*n) * sizeof(Node));
+    if (data == NULL) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  for (int i = 0; i < *n; i++)
+    fscanf(fl, "%d %f %[^\n]", &data[i].id, &data[i].value, data[i].neighbors);
+
+  fclose(fl);
+  return data;
+}
+
+/* Returns the index of the first node with the given id or -1 if not found. */
+int find_by_id(Node g[], int id, int size) {
+  int i = 0;
+  while ((i < size) && g[i].id != id)
+    i++;
+  if (i < size)
+    return i;
+  return -1;
+}
+
+static size_t hash_id(int id) {
+  uint32_t x = (uint32_t)id;
+  x ^= x >> 16;
+  x *= UINT32_C(0x7feb352d);
+  x ^= x >> 15;
+  x *= UINT32_C(0x846ca68b);
+  x ^= x >> 16;
+  return (size_t)x;
+}
+
+/* Zero slots mean absent; occupied slots retain the first matching record. */
+static void build_id_index(IdIndex *index, const Node *g, int size) {
+  index->direct = NULL;
+  index->hash = NULL;
+  index->capacity = 0;
+  index->minimum = 0;
+
+  if (size < 16)
+    return;
+
+  int minimum = g[0].id;
+  int maximum = g[0].id;
+  for (int i = 1; i < size; i++) {
+    if (g[i].id < minimum)
+      minimum = g[i].id;
+    if (g[i].id > maximum)
+      maximum = g[i].id;
+  }
+
+  uint64_t span = (uint64_t)((int64_t)maximum - (int64_t)minimum) + 1;
+
+  /* Bound direct-address storage by the number of input records. */
+  if (span <= (uint64_t)size * 4 &&
+      span <= SIZE_MAX / sizeof(int)) {
+    int *direct = (int*)calloc((size_t)span, sizeof(int));
+    if (direct == NULL)
+      return;
+
+    for (int i = 0; i < size; i++) {
+      size_t offset = (size_t)((int64_t)g[i].id - (int64_t)minimum);
+      if (direct[offset] == 0)
+        direct[offset] = i + 1;
+    }
+
+    index->direct = direct;
+    index->capacity = (size_t)span;
+    index->minimum = minimum;
+    return;
+  }
+
+  size_t count = (size_t)size;
+  if (count > SIZE_MAX / 2)
+    return;
+
+  size_t capacity = 16;
+  while (capacity < count * 2) {
+    if (capacity > SIZE_MAX / 2)
+      return;
+    capacity *= 2;
+  }
+  if (capacity > SIZE_MAX / sizeof(IdEntry))
+    return;
+
+  IdEntry *table = (IdEntry*)calloc(capacity, sizeof(IdEntry));
+  if (table == NULL)
+    return;
+
+  size_t mask = capacity - 1;
+  for (int i = 0; i < size; i++) {
+    size_t slot = hash_id(g[i].id) & mask;
+    while (table[slot].record_plus_one != 0 && table[slot].id != g[i].id)
+      slot = (slot + 1) & mask;
+    if (table[slot].record_plus_one == 0) {
+      table[slot].id = g[i].id;
+      table[slot].record_plus_one = i + 1;
+    }
+  }
+
+  index->hash = table;
+  index->capacity = capacity;
+}
+
+static void free_id_index(IdIndex *index) {
+  free(index->direct);
+  free(index->hash);
+  index->direct = NULL;
+  index->hash = NULL;
+  index->capacity = 0;
+}
+
+static int find_indexed(const IdIndex *index, Node g[], int id, int size) {
+  if (index->direct != NULL) {
+    int64_t offset = (int64_t)id - (int64_t)index->minimum;
+    if (offset < 0 || (uint64_t)offset >= index->capacity)
+      return -1;
+    return index->direct[(size_t)offset] - 1;
+  }
+
+  if (index->hash != NULL) {
+    size_t mask = index->capacity - 1;
+    size_t slot = hash_id(id) & mask;
+    while (index->hash[slot].record_plus_one != 0) {
+      if (index->hash[slot].id == id)
+        return index->hash[slot].record_plus_one - 1;
+      slot = (slot + 1) & mask;
+    }
+    return -1;
+  }
+
+  return find_by_id(g, id, size);
+}
+
+/* Recursive fallback preserves neighbor order and parent-plus-child additions. */
+static float get_costly_indexed(Node *g, int id, int size, const IdIndex *index) {
+  int nd = find_indexed(index, g, id, size);
+  if (nd < 0)
+    return 0.0f;
+
+  int idmax = -1;
+  float max = 0.0f;
+  char aux[MAX];
+  char *auxptr;
+  char *t;
+
+  strcpy(aux, g[nd].neighbors);
+  for (t = strtok_r(aux, " ", &auxptr); t != NULL;
+       t = strtok_r(NULL, " ", &auxptr)) {
+    int neighbor_id = atoi(t);
+    int d = find_indexed(index, g, neighbor_id, size);
+    if (d >= 0 && max < g[d].value) {
+      max = g[d].value;
+      idmax = neighbor_id;
+    }
+  }
+
+  float r = g[nd].value;
+  if (idmax != -1)
+    r += get_costly_indexed(g, idmax, size, index);
+  return r;
+}
+
+/* Standalone calls own their index and retain no graph-dependent state. */
+float get_costly(Node *g, int id, int size) {
+  IdIndex index;
+  build_id_index(&index, g, size);
+  float result = get_costly_indexed(g, id, size, &index);
+  free_id_index(&index);
+  return result;
+}
+
+/* Evaluate demanded chains, sharing completed suffixes across this graph's queries. */
+static float get_costly_cached(Node *g, int id, int size, const IdIndex *index,
+                               CachedCost *cache, int *path) {
+  int nd = find_indexed(index, g, id, size);
+  int depth = 0;
+
+  if (nd < 0)
+    return 0.0f;
+
+  while (!cache[nd].ready) {
+    int idmax = -1;
+    int next = -1;
+    float max = 0.0f;
+    char aux[MAX];
+    char *auxptr;
+    char *t;
+
+    strcpy(aux, g[nd].neighbors);
+    for (t = strtok_r(aux, " ", &auxptr); t != NULL;
+         t = strtok_r(NULL, " ", &auxptr)) {
+      int neighbor_id = atoi(t);
+      int d = find_indexed(index, g, neighbor_id, size);
+      if (d >= 0 && max < g[d].value) {
+        max = g[d].value;
+        idmax = neighbor_id;
+        next = d;
+      }
+    }
+
+    /* A selected ID of -1 terminates even when that ID exists in the graph. */
+    if (idmax == -1) {
+      cache[nd].cost = g[nd].value;
+      cache[nd].ready = 1;
+      break;
+    }
+
+    /* A path in the input DAG contains at most size nodes. */
+    path[depth++] = nd;
+    nd = next;
+  }
+
+  float result = cache[nd].cost;
+  while (depth > 0) {
+    int parent = path[--depth];
+    float r = g[parent].value;
+    /* Match recursive grouping and float rounding; terminals never add zero. */
+    r += result;
+    cache[parent].cost = r;
+    cache[parent].ready = 1;
+    result = r;
+  }
+
+  return result;
+}
+
+/* Main program - calls read input, computes sum for each node in the list, prints output */
+int main() {
+  char *fileN = NULL;
+  char computelist[MAX];
+  int n = -1;
+  Node* input = NULL;
+  CachedCost *cache = NULL;
+  int *path = NULL;
+
+  input = read_input(fileN, &n, computelist);
+  IdIndex index;
+  build_id_index(&index, input, n);
+
+  if (n > 0) {
+    cache = (CachedCost*)calloc((size_t)n, sizeof(*cache));
+    if (cache != NULL) {
+      path = (int*)malloc((size_t)n * sizeof(*path));
+      if (path == NULL) {
+        free(cache);
+        cache = NULL;
+      }
+    }
+  }
+
+  // process
+  for (char *c = strtok(computelist, " "); c != NULL; c = strtok(NULL, " ")) {
+    float cost;
+    if (cache != NULL)
+      cost = get_costly_cached(input, atoi(c), n, &index, cache, path);
+    else
+      cost = get_costly_indexed(input, atoi(c), n, &index);
+    printf("%s: %f\n", c, cost);
+  }
+
+  free(path);
+  free(cache);
+  free_id_index(&index);
+  free(input);
+
+  return 0;
+}

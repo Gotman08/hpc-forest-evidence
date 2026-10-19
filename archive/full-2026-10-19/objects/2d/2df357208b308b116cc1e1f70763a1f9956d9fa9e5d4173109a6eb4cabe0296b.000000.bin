@@ -1,0 +1,157 @@
+"""Reference graphs only: inert non-admitted fixtures, plus read-only actual R6 JSON pairs."""
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import audit_context as context
+import pytest
+from audit_cli_namespaces import verify_cli_namespaces
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(json.dumps(value, sort_keys=True).encode())
+    return path
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": context.sha(path.read_bytes())}
+
+
+@pytest.fixture
+def graph(tmp_path):
+    cell = {"scope_id": context.SCOPE_VALUE, "model": "gpt-6-astra", "effort": "max",
+        "session_id": context.CELLS["gpt-6-astra"], "job_id": "999999999",
+        "source_zip_sha256": context.SOURCE_VALUE, "plan_sha256": context.PLAN_VALUE}
+    root = "/scratch_p/nimarano/" + context.SCOPE_VALUE + "-admission-" + cell["session_id"]
+    files = [{"path": "C:\\NEUTRAL-NOT-EXECUTED\\codex.exe", "sha256": "0" * 64}]
+    core = {**cell, "schema": "NEUTRAL-NOT-AN-ADMISSION", "verified": False, "version": "NEUTRAL",
+        "executable_path": files[0]["path"], "executable_sha256": files[0]["sha256"],
+        "source_execution_allowed": False, "files": files, "unit_only": True}
+    minimal = {"schema": "hpc-forest-max-cell-cli-files-rehash-v1", "verified": True,
+        **{key: core[key] for key in ("version", "executable_path", "executable_sha256", "files")},
+        "authentication_exported": False, "cli_executed": False, "unit_only": True}
+    original = write(tmp_path / "NEUTRAL-local/cli-file-hashes-minimal.json", minimal)
+    local = {**core, "evidence_refs": [ref(original)]}
+    remote = {**core, "evidence_refs": [{"path": root + "/cli-file-hashes-minimal.json", "sha256": ref(original)["sha256"]}]}
+    local_cli = write(tmp_path / "NEUTRAL-local/cli-identity.json", local)
+    remote_cli = write(tmp_path / "NEUTRAL-remote/cli_identity.json", remote)
+    readback = tmp_path / "NEUTRAL-readback"
+    mirrored_minimal = write(readback / "cli-file-hashes-minimal.json", minimal)
+    mirrored_cli = write(readback / "cli_identity.json", remote)
+    inventory = {path.name: {"sha256": ref(path)["sha256"], "bytes": path.stat().st_size}
+                 for path in (mirrored_minimal, mirrored_cli)}
+    upload = write(tmp_path / "NEUTRAL-upload.json", {"schema": "hpc-forest-max-cell-explicit-upload-proposal-v1",
+        "verified": False, "job_id": cell["job_id"], "dependencies": [
+            {"remote_path": root + "/cli-file-hashes-minimal.json", "local": ref(original)},
+            {"remote_path": root + "/cli_identity.json", "local": ref(remote_cli)}]})
+    publication_value = {**cell, "schema": "hpc-forest-max-cell-minimal-directory-publication-v1", "verified": False,
+        "remote_root": root, "inventory": inventory, "allocation_marker": {"path": "NEVER-READ", "sha256": "0" * 64},
+        "ready": {"local": {"path": "NEVER-READ", "sha256": "0" * 64}}}
+    publication = write(tmp_path / "NEUTRAL-publication.json", publication_value)
+    download = write(tmp_path / "NEUTRAL-download.json", {"structuredContent": {
+        "ok": True, "downloaded": root, "to": str(readback), "transport": "scp", "verifie": False,
+        "unit_only_not_a_real_transfer": True}})
+    expectation = {"synthetic_fixture": True, "verified": False, "admission_namespace_aliases": {
+        "upload_manifest": ref(upload), "publication": ref(publication), "download_receipt": ref(download)}}
+    parsed = {"controller": {"cli_identity": local}, "worker": {"cli_identity": remote}}
+    auths = {"controller": {"artifacts": {"cli_identity": ref(local_cli)}},
+        "worker": {"artifacts": {"cli_identity": {"path": root + "/cli_identity.json", "sha256": ref(remote_cli)["sha256"]}}}}
+    return {"expectation": expectation, "cell": cell, "parsed": parsed, "authorizations": auths,
+        "readback": readback, "publication": publication, "publication_value": publication_value,
+        "minimal": original, "local_cli": local_cli, "remote_cli": remote_cli, "upload": upload,
+        "download": download, "remote_root": root}
+
+
+def verify(data):
+    return verify_cli_namespaces(data["expectation"], data["cell"], data["parsed"], data["authorizations"])
+
+
+def test_exact_windows_posix_aliases_without_global_or_binary_admission(graph):
+    protected, result = verify(graph)
+    assert result["paired_windows_posix_evidence_refs_verified"] == 1
+    assert result["directory_tool_hash_verification_assumed"] is False
+    assert result["external_cli_executable_bytes_independently_verified"] is False
+    assert graph["parsed"]["controller"]["cli_identity"]["verified"] is False
+    assert protected
+    with pytest.raises(ValueError):
+        context.validate_identity(graph["expectation"])
+
+
+@pytest.mark.parametrize("field", ["version", "executable_path", "executable_sha256", "files", "source_execution_allowed", "unit_only"])
+def test_cli_facts_are_never_relaxed_for_namespaces(graph, field):
+    graph["parsed"]["worker"]["cli_identity"][field] = "NEUTRAL-TAMPERED"
+    with pytest.raises(ValueError):
+        verify(graph)
+
+
+@pytest.mark.parametrize("mutation", ["sha", "foreign_root", "same_basename", "traversal", "unc", "missing_matrix", "matrix_sha", "readback_bytes", "extra_file", "missing_file", "duplicate_alias", "job", "source", "minimal_facts"])
+def test_mismatched_or_unreceived_namespace_aliases_refused(graph, mutation):
+    d = graph
+    remote = d["parsed"]["worker"]["cli_identity"]["evidence_refs"][0]
+    if mutation == "sha":
+        remote["sha256"] = "1" * 64
+    elif mutation == "foreign_root":
+        remote["path"] = "/scratch_p/nimarano/FOREIGN/cli-file-hashes-minimal.json"
+    elif mutation == "same_basename":
+        remote["path"] = d["remote_root"] + "/FOREIGN/cli-file-hashes-minimal.json"
+    elif mutation == "traversal":
+        remote["path"] = d["remote_root"] + "/../cli-file-hashes-minimal.json"
+    elif mutation == "unc":
+        d["parsed"]["controller"]["cli_identity"]["evidence_refs"][0]["path"] = "\\\\NEUTRAL-NETWORK-NEVER-READ\\share\\file.json"
+    elif mutation == "missing_matrix":
+        d["expectation"].pop("admission_namespace_aliases")
+    elif mutation == "matrix_sha":
+        d["expectation"]["admission_namespace_aliases"]["upload_manifest"]["sha256"] = "1" * 64
+    elif mutation == "readback_bytes":
+        (d["readback"] / "cli-file-hashes-minimal.json").write_bytes(b"NEUTRAL-TAMPERED")
+    elif mutation == "extra_file":
+        (d["readback"] / "NEUTRAL-unrecognized.json").write_bytes(b"NEUTRAL")
+    elif mutation == "missing_file":
+        # A different empty fixture directory simulates a missing received member; no deletion.
+        empty = d["readback"].with_name("NEUTRAL-empty-readback")
+        empty.mkdir()
+        value = json.loads(d["download"].read_bytes())
+        value["structuredContent"]["to"] = str(empty)
+        write(d["download"], value)
+        d["expectation"]["admission_namespace_aliases"]["download_receipt"] = ref(d["download"])
+    elif mutation == "duplicate_alias":
+        value = json.loads(d["upload"].read_bytes())
+        value["dependencies"].append(value["dependencies"][0])
+        write(d["upload"], value)
+        d["expectation"]["admission_namespace_aliases"]["upload_manifest"] = ref(d["upload"])
+    elif mutation in {"job", "source"}:
+        value = copy.deepcopy(d["publication_value"])
+        value["job_id" if mutation == "job" else "source_zip_sha256"] = "NEUTRAL-OTHER"
+        write(d["publication"], value)
+        d["expectation"]["admission_namespace_aliases"]["publication"] = ref(d["publication"])
+    else:
+        value = json.loads(d["minimal"].read_bytes())
+        value["version"] = "NEUTRAL-OTHER"
+        write(d["minimal"], value)
+    with pytest.raises(ValueError):
+        verify(d)
+
+
+@pytest.mark.parametrize(("slug", "model", "job"), [("astra-max", "gpt-6-astra", "752139"),
+    ("terra-max", "gpt-5.6-terra", "752140"), ("sol-max", "gpt-6.1-sol", "752141")])
+def test_actual_received_r6_json_namespace_graph_readonly_without_native_audit(slug, model, job):
+    base = Path(__file__).resolve().parents[3]
+    launch = base / "outputs/HPC-Forest-Primes-Natif-Lancement-r2b"
+    admissions = launch / "revision-r6-commandes" / ("admissions-" + slug + "-reelles")
+    ops = launch / "operations-parent-max4" / slug
+    cell = {"scope_id": context.SCOPE_VALUE, "model": model, "effort": "max", "job_id": job,
+        "session_id": context.CELLS[model], "source_zip_sha256": context.SOURCE_VALUE, "plan_sha256": context.PLAN_VALUE}
+    original = {"controller": json.loads((admissions / "authorization-local.json").read_bytes()),
+        "worker": json.loads((admissions / "authorization-remote.json").read_bytes())}
+    parsed = {"controller": {"cli_identity": json.loads((admissions / "local/cli-identity.json").read_bytes())},
+        "worker": {"cli_identity": json.loads((admissions / "remote/cli_identity.json").read_bytes())}}
+    expectation = {"admission_namespace_aliases": {"upload_manifest": ref(admissions / "upload-manifest-propose.json"),
+        "publication": ref(admissions / "publication-locale/publication-arguments.json"),
+        "download_receipt": ref(ops / "directory-readback-result.json")}}
+    protected, facts = verify_cli_namespaces(expectation, cell, parsed, original)
+    assert facts["paired_windows_posix_evidence_refs_verified"] == 1
+    assert all(context.sha(Path(path).read_bytes()) == expected for path, expected in protected)
+    assert facts["external_cli_executable_bytes_independently_verified"] is False

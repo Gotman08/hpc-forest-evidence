@@ -1,0 +1,51 @@
+"""Follow only new AgentRole/source-path anchors; export identifier shapes only."""
+import hashlib
+import json
+import mmap
+import re
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+scan = json.loads((HERE / "IDENTIFIANTS-ET-OFFSETS.json").read_text("utf8"))
+binary = Path(scan["binary"]["path"])
+assert hashlib.sha256(binary.read_bytes()).hexdigest() == scan["binary"]["sha256"]
+anchors = []
+symbols, paths, envs, scopes = [], [], [], []
+with binary.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+    for row in scan["exact_tokens_only"]:
+        if row["token"] in {"AgentRole", "agent-roles\\src\\"}:
+            for offset in row["outside_previous_window_max20"]:
+                anchors.append((row["token"], offset))
+        if row["token"] == "CODEX_AGENT":
+            for offset in row["first_offsets_max20"]:
+                match = re.match(rb"CODEX_AGENT[A-Z0-9_]{0,80}", data[offset:offset + 100])
+                if match:
+                    envs.append({"offset": offset, "identifier": match[0].decode("ascii")})
+    for kind, offset in anchors:
+        if kind == "AgentRole":
+            match = re.match(rb"AgentRole[A-Za-z0-9_]{0,80}", data[offset:offset + 100])
+            if match:
+                symbols.append({"offset": offset, "identifier_run_not_a_field_schema": match[0].decode("ascii")})
+        else:
+            match = re.match(rb"agent-roles\\src\\[A-Za-z0-9_\\.-]{1,100}\.rs(?::[0-9]+)?", data[offset:offset + 150])
+            if match:
+                paths.append({"offset": offset, "public_source_path": match[0].decode("ascii")})
+        start, end = offset - 256, offset + 768
+        chunk = data[start:end]
+        rows = []
+        for match in re.finditer(rb"[A-Za-z_][A-Za-z0-9_]{3,79}", chunk):
+            token = match[0].decode("ascii")
+            if any(key in token.lower() for key in ("agent", "role", "config", "discover", "directory", "disable", "skip_", "enabled", "include_")):
+                rows.append({"offset": start + match.start(), "identifier_run_only": token})
+        scopes.append({"anchor_kind": kind, "anchor_offset": offset, "window": [start, end],
+                       "window_sha256": hashlib.sha256(chunk).hexdigest(), "identifier_runs_only": rows[:40]})
+result = {"schema": "hpc-forest-static-new-agent-role-anchor-followup-v1", "binary": scan["binary"],
+          "exact_new_anchor_count": len(anchors), "agent_role_symbol_runs": symbols,
+          "source_paths": paths, "uppercase_CODEX_AGENT_identifier_runs_first20_only": envs,
+          "bounded_windows": scopes, "previous_loader_window_not_read": scan["previous_window_not_read"],
+          "raw_text_windows_exported": False, "binary_executed": False,
+          "role_config_auth_or_model_text_opened": False,
+          "identifier_runs_are_not_config_grammar_or_admission": True}
+with (HERE / "SYMBOLES-PUBLICS-BORNES.json").open("x", encoding="utf8") as output:
+    output.write(json.dumps(result, indent=2) + "\n")
+print(json.dumps({key: result[key] for key in ("agent_role_symbol_runs", "source_paths", "uppercase_CODEX_AGENT_identifier_runs_first20_only")}, indent=2))

@@ -1,0 +1,584 @@
+"""Local-only selected MAX cell preparation. Never invokes shell, CLI, network or processes."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import json
+import re
+import sys
+import time
+from pathlib import Path, PurePosixPath
+
+OUT = Path(__file__).resolve().parent
+LAUNCH = OUT.parent
+BASE = LAUNCH.parents[1]
+PROJECT = None
+SEALED = None
+SCOPE = None
+MODEL, SESSION = None, None
+EFFORT = 'max'
+CELLS = {'gpt-6-astra': '110cefccf16b439eb226e475c875c8df',
+         'gpt-5.6-terra': '5d8811082a1842f5836a2bdda982500f',
+         'gpt-6.1-sol': '13eaca4e39cf4147a3f677a32fb5a52d'}
+BINDING = None
+MAX_NATIVE_WORKERS = 4
+SESSION = None
+SOURCE = None
+PLAN = None
+PREP = 'd260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd'
+QRECEPTION = None
+QARCHIVE = None
+QAUDIT = None
+QJSON = None
+RUNTIME = None
+LUNA_CLOSURE = '85bfc47183123556d0ac2f8317ad00fcd6e52f5a5a86f4687306b3641bb8fdb6'
+LUNA_AUDIT = '3346d1676dad4ef055d0bce367ec8402ab4df4d4fb7290d7dcd9246b061ef638'
+LUNA_STOP = '3db66ffa941e9309bd45cfaa8641fe7477f1c752a6a4a1cc0e5df152ddc6f790'
+LUNA_SOURCE = '3e290f835570a8746be3c52144932b8c6866564980fd858cf4c0495a7b1e68c5'
+LUNA_PLAN = '54ffd49f4dc868085d22208f773c4b4883590b25251b5992232509a1dc197024'
+CLI_VERSION = 'codex-cli 0.163.0-alpha.10.2'
+CLI_FILES = {'codex.exe': 'f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312',
+    'codex-code-mode-host.exe': '3b6a9179a4da17fa5fc6948219cd61486dc3b534c683838076d8c61bd311c68e',
+    'codex-command-runner.exe': 'ce80b56a2f37f808815fde33cceb97ac858ceecde296425ad3860f0f37fb4877',
+    'codex-windows-sandbox-setup.exe': 'c4da812016cbfb92d9a62791f78460c59e9662faadb0a2720d3aa5d0535b80bd'}
+CLI_SHA = 'f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312'
+CLI = BASE / 'outputs/HPC-Forest-Etude-2020-2024-r1/reprises/incident-double-liaison-20261017T2012/cli-0.163.0-alpha.10.2/codex.exe'
+CONFIG = Path('C:/Users/nicol/.codex/config.toml')
+PYTHON_LOCAL = BASE / 'work/.venv/Scripts/python.exe'
+PYTHON_ARM = '/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python'
+EXTRACTION = None
+REMOTE_ROOT = None
+ADMISSION_ROOT = None
+SPACK_GCC = '/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf'
+POLICY_DIRECTORY = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2g/operations-parent/politiques-cli-locales'
+SKILL_METADATA = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2g/operations-parent/SKILLS-CHEMINS-CANDIDATS.json'
+SKILL_METADATA_SHA = '34164b26e1c86da6e30d9d72a2b2587aa5c4d061fb9b4f116b9dac335a83e47a'
+
+
+class Refusal(RuntimeError):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise Refusal(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {'path': str(Path(path).resolve()), 'sha256': sha(path)}
+
+
+def artifact(value):
+    require(isinstance(value, dict) and set(value) == {'path', 'sha256'}, 'Closed absolute path/SHA reference required')
+    p = Path(value['path'])
+    require(p.is_absolute() and not p.is_symlink() and p.is_file(), 'Missing/linked artifact')
+    require(re.fullmatch('[0-9a-f]{64}', value['sha256']) and sha(p) == value['sha256'], 'Changed artifact')
+    return p
+
+
+def read(path):
+    p = Path(path)
+    require(not p.is_symlink() and p.is_file() and p.stat().st_size < 8 * 1024 * 1024, 'Missing/oversized JSON')
+    value = json.loads(p.read_text(encoding='utf8'))
+    require(isinstance(value, dict), 'JSON object required')
+    return value
+
+
+def save(directory, name, value):
+    p = directory / name
+    with p.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+    return ref(p)
+
+
+def selected_cell(model):
+    require(model in CELLS, 'One explicit Astra/Terra/Sol MAX cell required; Luna cannot be replayed')
+    return model, CELLS[model]
+
+
+def configure(binding_ref, selected_model):
+    global BINDING, MODEL, SESSION, SCOPE, SOURCE, PLAN, RUNTIME, RUNTIME_PATH, SOURCE_ZIP
+    global PROJECT, SEALED, SOURCE_MEMBERS, EXTRACTION, REMOTE_QUALIFICATION_ROOT, REMOTE_ROOT, ADMISSION_ROOT
+    global QRECEPTION, QAUDIT, QARCHIVE, QJSON, QUALIFICATION_JOB
+    value = read(artifact(binding_ref))
+    fields = {'schema', 'verified', 'scope_id', 'source_zip', 'plan', 'runtime_manifest', 'project_path',
+              'source_member_count', 'remote_extraction', 'remote_qualification_root', 'qualification',
+              'qualification_reception', 'source_review', 'maximum_native_workers', 'cells'}
+    require(set(value) == fields and value.get('schema') == 'hpc-forest-max-cap4-source-bindings-v1'
+            and value.get('verified') is True and value.get('maximum_native_workers') == 4
+            and value.get('cells') == CELLS, 'Actual independently reviewed cap4 source/plan/qualification bindings required')
+    MODEL, SESSION = selected_cell(selected_model)
+    for key in ('source_zip', 'plan', 'runtime_manifest', 'qualification', 'qualification_reception', 'source_review'):
+        artifact(value[key])
+    plan = read(artifact(value['plan']))
+    review = read(artifact(value['source_review']))
+    require(plan.get('scope_id') == value['scope_id'] and plan.get('source_zip_sha256') == value['source_zip']['sha256']
+            and plan.get('cells') == CELLS and plan.get('maximum_native_workers_total') == 4
+            and plan.get('maximum_cells_per_authorization') == 1 and plan.get('automatic_extension') is False
+            and plan.get('efforts') == ['max']
+            and plan.get('preparation_manifest_sha256') == PREP
+            and all(plan.get(k) == v for k, v in {'tokens_ceiling': 1500000, 'search_seconds_ceiling': 1800,
+                'maximum_program_missions': 8, 'maximum_mother_calls': 2, 'confirmation_seconds': 120}.items()), 'The actual sealed plan must authorize cap4 and one cell per command')
+    require(review.get('verified') is True and review.get('blocking_findings') == []
+            and review.get('source_zip_sha256') == value['source_zip']['sha256']
+            and review.get('plan_sha256') == value['plan']['sha256']
+            and review.get('native_research_admitted') is False, 'Actual new source independent review required')
+    SCOPE, SOURCE, PLAN = value['scope_id'], value['source_zip']['sha256'], value['plan']['sha256']
+    require(isinstance(SCOPE, str) and re.fullmatch(r'hpc-forest-primes-native-max-r2[a-z]', SCOPE), 'Closed new derivative scope required')
+    SOURCE_ZIP, SEALED = artifact(value['source_zip']), artifact(value['plan']).parent
+    require(SOURCE_ZIP.parent == SEALED and artifact(value['plan']).name == 'native-max-plan.json', 'One sealed local source package required')
+    PROJECT, RUNTIME_PATH = Path(value['project_path']), artifact(value['runtime_manifest'])
+    require(PROJECT.is_absolute() and PROJECT.is_dir() and not PROJECT.is_symlink(), 'Actual local project required')
+    RUNTIME, SOURCE_MEMBERS = value['runtime_manifest']['sha256'], value['source_member_count']
+    require(type(SOURCE_MEMBERS) is int and 90 <= SOURCE_MEMBERS <= 200, 'Exact independently inventoried member count required')
+    EXTRACTION, REMOTE_QUALIFICATION_ROOT = value['remote_extraction'], value['remote_qualification_root']
+    for path in (EXTRACTION, REMOTE_QUALIFICATION_ROOT):
+        pp = PurePosixPath(path)
+        require(pp.is_absolute() and '..' not in pp.parts and str(pp) == path and '\\' not in path
+                and path.startswith('/scratch_p/nimarano/'), 'Exact reviewed absolute deployment roots required')
+    require(EXTRACTION == REMOTE_QUALIFICATION_ROOT + '/extraction', 'Deployment roots must be the same qualified extraction')
+    REMOTE_ROOT = '/scratch_p/nimarano/' + SCOPE + '-' + SESSION
+    ADMISSION_ROOT = '/scratch_p/nimarano/' + SCOPE + '-admission-' + SESSION
+    reception = read(artifact(value['qualification_reception']))
+    q = read(artifact(value['qualification']))
+    audit = read(artifact(reception['audit']))
+    QRECEPTION, QAUDIT, QARCHIVE = value['qualification_reception']['sha256'], reception['audit']['sha256'], reception['archive']['sha256']
+    QJSON, QUALIFICATION_JOB = value['qualification']['sha256'], str(q.get('allocation', {}).get('job_id', ''))
+    require(QUALIFICATION_JOB.isdigit() and q.get('source_zip_sha256') == SOURCE and q.get('plan_sha256') == PLAN
+            and reception.get('qualification_sha256') == QJSON and audit.get('verified') is True
+            and audit.get('source_zip_sha256') == SOURCE and audit.get('plan_sha256') == PLAN
+            and audit.get('qualification_sha256') == QJSON and audit.get('archive_sha256') == QARCHIVE
+            and audit.get('native_model_calls') == 0, 'Actual NEW cap4 mechanical qualification and reception required')
+    artifact(reception['archive'])
+    BINDING = value
+    return value
+
+
+def render_preflight():
+    require(BINDING is not None and MODEL in CELLS and SESSION == CELLS[MODEL], 'Actual selected cell bindings required')
+    payload = {'scope_id': SCOPE, 'model': MODEL, 'effort': EFFORT, 'session_id': SESSION,
+        'source_sha256': SOURCE, 'plan_sha256': PLAN, 'runtime_sha256': RUNTIME, 'source_members': SOURCE_MEMBERS,
+        'remote_extraction': EXTRACTION, 'remote_root': REMOTE_ROOT, 'admission_root': ADMISSION_ROOT,
+        'source_zip_name': SOURCE_ZIP.name,
+        'cells': CELLS, 'maximum_native_workers': 4}
+    return render_payload(payload)
+
+
+def render_payload(payload):
+    require(payload.get('model') in CELLS and payload.get('session_id') == CELLS[payload['model']]
+            and payload.get('effort') == 'max' and payload.get('maximum_native_workers') == 4, 'One closed MAX static payload required')
+    template = (OUT / 'allocated-preflight-template.py').read_text(encoding='utf8')
+    require(template.count('__CELL_BINDINGS_LITERAL__') == 1, 'Exact one-cell preflight template required')
+    return template.replace('__CELL_BINDINGS_LITERAL__', repr(payload))
+
+
+def native():
+    require(BINDING is not None, 'Actual cap4 source/plan/qualification bindings required')
+    require(sha(SOURCE_ZIP) == SOURCE, 'Sealed source changed')
+    require(sha(SEALED / 'native-max-plan.json') == PLAN, 'Sealed plan changed')
+    manifest = RUNTIME_PATH
+    require(sha(manifest) == RUNTIME, 'Runtime inventory changed')
+    expected = read(manifest)
+    actual = {p.relative_to(PROJECT).as_posix(): sha(p) for p in PROJECT.rglob('*') if p.is_file()
+              and not any(x in {'__pycache__', '.pytest_cache', '.ruff_cache'} for x in p.relative_to(PROJECT).parts)}
+    require(len(expected) == SOURCE_MEMBERS and actual == expected, 'Executing source must equal the new independently inventoried runtime')
+    sys.path.insert(0, str(PROJECT / 'src'))
+    module = importlib.import_module('hpc_forest.native_r2max')
+    require(Path(module.__file__).resolve() == PROJECT / 'src/hpc_forest/native_r2max.py'
+            and module.SCOPE == SCOPE and module.CELLS == CELLS and module.EFFORT == 'max', 'Wrong imported runtime/cell/scope')
+    module.verify_runtime(SOURCE_ZIP)
+    return module
+
+
+def cell_identity(value):
+    require(all(value.get(k) == v for k, v in {'scope_id': SCOPE, 'model': MODEL, 'effort': EFFORT,
+            'session_id': SESSION, 'remote_root': REMOTE_ROOT}.items()), 'Only the reserved single selected MAX cell cell is allowed')
+    require(str(value.get('job_id', '')).isdigit(), 'Actual future submitted job ID required')
+
+
+def checked_task_cli_policy(policy_ref, job, cli_identity=None):
+    """Validate the exact LOCAL selector policy; never export it or read skill bodies."""
+    path = artifact(policy_ref)
+    require(path.parent == POLICY_DIRECTORY and path.name == 'cli-policy-' + SESSION + '.json',
+            'Only the exact per-cell local policy directory and basename are permitted')
+    binding = {'scope_id': SCOPE, 'model': MODEL, 'effort': EFFORT, 'session_id': SESSION,
+        'job_id': job, 'remote_root': REMOTE_ROOT, 'source_zip_sha256': SOURCE, 'plan_sha256': PLAN}
+    native()  # Independently inventoried source bytes before importing its pure policy validator.
+    client = importlib.import_module('hpc_forest.codex_process')
+    require(Path(client.__file__).resolve() == PROJECT / 'src/hpc_forest/codex_process.py',
+            'Wrong source-bound pure policy loader')
+    policy = client.load_task_cli_policy(path, policy_ref['sha256'], binding, CLI_SHA)
+    require(sha(SKILL_METADATA) == SKILL_METADATA_SHA, 'Local filesystem metadata changed')
+    metadata = read(SKILL_METADATA)
+    require(metadata.get('candidate_count') == 236
+            and metadata.get('is_actual_CLI_discovery_receipt') is False
+            and metadata.get('instruction_or_SKILL_body_read') is False
+            and policy.get('filesystem_metadata_sha256') == SKILL_METADATA_SHA
+            and policy.get('skill_candidate_directories') == metadata.get('candidate_directories'),
+            'Local selector table must equal the received path-only metadata, never effective discovery')
+    if cli_identity is not None:
+        require(cli_identity.get('task_cli_policy_sha256') == policy_ref['sha256'],
+                'Authorization CLI identity differs from the local policy')
+    return policy
+
+
+def checked_luna(closure_ref):
+    require(closure_ref['sha256'] == LUNA_CLOSURE, 'Exact actual bounded Luna closure required')
+    closure = read(artifact(closure_ref))
+    require(closure.get('schema') == 'hpc-forest-r2max-luna-bounded-closure-v1'
+            and closure.get('closed_received_audited_reconciled_with_explicit_raw_limit') is True
+            and closure.get('source_only_preserved') is True and closure.get('model_calls_replayed') == 0,
+            'Actual bounded closure is not complete')
+    require(closure['audit']['sha256'] == LUNA_AUDIT and closure['owned_stop']['sha256'] == LUNA_STOP,
+            'Actual post-stop audit/owned stop changed')
+    audit, stop = read(artifact(closure['audit'])), read(artifact(closure['owned_stop']))
+    common = {'job_id': '751992', 'session_id': 'c8044062692149138d826d3f388a08ef', 'model': 'gpt-6-luna', 'effort': 'max'}
+    for value in (closure, audit, stop):
+        require(all(value.get(k) == v for k, v in common.items()), 'Luna identity changed')
+    require(audit.get('source_zip_sha256') == LUNA_SOURCE and audit.get('plan_sha256') == LUNA_PLAN
+            and audit.get('audit_error') is None and audit.get('evidence_inventory_before_after_identical') is True
+            and audit.get('received_cohort_audited_with_explicit_raw_attribution_limit') is True,
+            'Post-stop cohort audit is required')
+    require(all(audit.get(k) is False for k in ('verified', 'native_research_admitted',
+            'independent_performance_audit_verified', 'independent_raw_stdout_per_candidate_verified',
+            'hardware_or_process_isolation_proved')), 'Bounded audit limits must remain false')
+    cache = audit.get('cache_preservation', {})
+    require(cache.get('phase') == 'complete_after_owned_stop' and cache.get('snapshot_files_verified') == 133
+            and cache.get('readable_files_verified_before_stop') == 132
+            and cache.get('total_cache_bytes_preservation_complete') is True
+            and cache.get('owned_operational_lock_pending') is False
+            and cache.get('worker_lock_sha256_before') is None, 'Separate post-stop lock preservation required')
+    transport = audit.get('transport_cost_reconciliation', {})
+    require(transport.get('unique_session_nonce_pairs') == 10 and transport.get('exact_known_tokens') == 243141
+            and transport.get('unknown_native_invocations') == 0 and transport.get('unresolved_nonces') == [],
+            'Luna call reconciliation incomplete')
+    require(stop.get('owned_stop_verified') is True and stop.get('all_owned_process_identities_absent_after_stop') is True
+            and stop.get('foreign_processes_targeted') is False and stop.get('worker_lock_sha256_before') is None
+            and stop.get('source_only_relay_identities_preserved') is True,
+            'Owned absence and source-only preservation required')
+    first_reception = read(artifact(closure['first_start']))
+    require(first_reception.get('verified') is True and first_reception.get('all_33_direct_remote_refs_SHA_verified') is True,
+            'Actual first-start reception required')
+    first = first_reception['produced_remote_first_start_receipt']
+    first_data = read(artifact(first))
+    require(first_data.get('verified') is True and first_data.get('technical_errors_found') is False
+            and first_data.get('invocation_unknown') is False, 'Actual first normal delivered call/evaluation required')
+    for key in ('archive', 'recorded_role_costs'):
+        artifact(closure[key])
+    receipt_root = Path(closure['audit']['path']).parent
+    cache_path, lock_path = receipt_root / 'cache-preservation-phase-complete-r4.json', receipt_root / 'reception-verrou-apres-arret.json'
+    require(sha(cache_path) == '41b739341c3cfeed4905ffb4f17868945857d6919361efb74e445f4a4e6775c6'
+            and sha(lock_path) == 'e58c08d7950e3068888b4f8873dc368c8c5775260907357713de800cff0365a4',
+            'Exact separate complete-cache and post-stop-lock receipts required')
+    lock = read(lock_path)
+    require(lock.get('verified') is True and lock.get('sha256_before') is None
+            and lock.get('readable_132_equal_pre_stop') is True and lock.get('source_133_stable_after_stop') is True,
+            'Post-stop lock chronology/132 data preservation required')
+    return closure, first
+
+
+def closure_admission(closure_ref):
+    closure, first = checked_luna(closure_ref)
+    return {'schema': 'hpc-forest-primes-r2max-luna-closure-admission-v1', 'verified': True,
+        'scope_id': 'hpc-forest-primes-native-max-r1', 'model': 'gpt-6-luna', 'effort': 'max',
+        'session_id': 'c8044062692149138d826d3f388a08ef', 'job_id': '751992',
+        'source_zip_sha256': LUNA_SOURCE, 'plan_sha256': LUNA_PLAN, 'preparation_manifest_sha256': PREP,
+        'first_start_sha256': first['sha256'], 'operator_bounded_acceptance': True,
+        'received_cohort_audited_with_explicit_raw_attribution_limit': True, 'raw_attribution_limit_preserved': True,
+        'all_started_calls_reconciled': True, 'owned_worker_absence_verified': True,
+        'independent_performance_validation': False, 'native_research_admitted': False,
+        'hardware_or_process_isolation_proved': False, 'independent_raw_stdout_per_candidate_verified': False,
+        'archive': closure['archive'], 'audit': closure['audit'],
+        'reconciliation': closure['recorded_role_costs'], 'owned_worker_absence': closure['owned_stop'],
+        'evidence_refs': [closure_ref, closure['first_start'],
+            ref(Path(closure['audit']['path']).parent / 'cache-preservation-phase-complete-r4.json'),
+            ref(Path(closure['audit']['path']).parent / 'reception-verrou-apres-arret.json')],
+        'limits': ['Operator bounded closure/reconciliation only; no independent raw/performance or global admission.',
+                   '132 data files were preserved before stop; the 133rd lock byte only after owned absence.']}
+
+
+def qualification(module, reception_ref, qref):
+    require(reception_ref.get('sha256') == QRECEPTION, 'Exact independently received NEW cap4 qualification required')
+    reception = read(artifact(reception_ref))
+    require(reception['audit']['sha256'] == QAUDIT and qref.get('sha256') == QJSON, 'Qualification/audit SHA changed')
+    require(reception.get('verified') is True and reception.get('scope_id') == SCOPE
+            and reception.get('source_zip_sha256') == SOURCE and reception.get('plan_sha256') == PLAN
+            and reception.get('preparation_manifest_sha256') == PREP, 'Actual cap4 qualification reception required')
+    # Exact received archive + independently hashed audit; never trust summary booleans alone.
+    audit = read(artifact(reception['audit']))
+    require(audit.get('verified') is True and audit.get('native_model_calls') == 0, 'Actual reception audit required')
+    archive = artifact(reception['archive'])
+    import tarfile
+    with tarfile.open(archive, 'r:gz') as stream:
+        item = stream.extractfile('qualification/qualification.json')
+        require(item is not None, 'Original qualification member missing')
+        raw = item.read()
+    q = json.loads(raw)
+    require(hashlib.sha256(raw).hexdigest() == reception['qualification_sha256'], 'Original qualification SHA changed')
+    require(str(q.get('allocation', {}).get('job_id')) == QUALIFICATION_JOB, 'Actual NEW cap4 qualification required')
+    # The supplied qualification reference is mandatory; no extraction or external write here.
+    require(qref.get('sha256') == reception['qualification_sha256'], 'Original restored qualification reference required')
+    qpath = artifact(qref)
+    require(qpath.read_bytes() == raw, 'Restored qualification differs from original archive member')
+    module.verify_qualification(q, SOURCE, prepared=False)
+    module.verify_reception(reception, qpath, SEALED / 'certified-preparation')
+    return qref
+
+
+def proposal_command():
+    return command_from_preflight(render_preflight())
+
+
+def command_from_preflight(body):
+    return ('set -euo pipefail\n'
+        '[[ ${SLURM_JOB_ID:-} =~ ^[0-9]+$ ]] || exit 70\n'
+        '[[ ${SLURM_JOB_NUM_NODES:-} == 1 && ${SLURM_NTASKS:-} == 1 && ${SLURM_CPUS_PER_TASK:-} == 4 && ${SLURM_MEM_PER_NODE:-} == 16384 ]] || exit 71\n'
+        '[[ ${SLURM_RESTART_COUNT:-0} == 0 ]] || exit 72\n'
+        'export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4\n'
+        f'srun --nodes=1 --ntasks=1 --cpus-per-task=4 --mem=16G --cpu-bind=cores --time=03:00:00 {PYTHON_ARM} -I -B -u - <<\'ONE_SELECTED_MAX_CELL_PREFLIGHT\'\n'
+        + body + '\nONE_SELECTED_MAX_CELL_PREFLIGHT\n')
+
+
+def remote_resolver(rows):
+    require(isinstance(rows, list) and rows, 'Explicit POSIX-to-local mirrors required')
+    mapping = {}
+    for row in rows:
+        require(set(row) == {'remote_path', 'local'}, 'Closed remote mirror row required')
+        remote = row['remote_path']
+        p = PurePosixPath(remote)
+        require(p.is_absolute() and '..' not in p.parts and '\\' not in remote and str(p) == remote
+                and remote.startswith((ADMISSION_ROOT + '/', EXTRACTION + '/',
+                     REMOTE_QUALIFICATION_ROOT + '/Q/')),
+                'Remote path is outside the two exact deployment roots')
+        require(remote not in {ADMISSION_ROOT + '/authorization.json', ADMISSION_ROOT + '/authorization-ready.json'},
+                'Authorization and ready are reserved for final publication')
+        require(remote not in mapping, 'Duplicate remote mirror')
+        mapping[remote] = row['local']
+        artifact(row['local'])
+
+    def resolve(value):
+        require(isinstance(value, dict) and set(value) == {'path', 'sha256'}, 'Closed remote ref required')
+        require(value['path'] in mapping and mapping[value['path']]['sha256'] == value['sha256'],
+                'Missing mirror or differing remote SHA')
+        return artifact(mapping[value['path']])
+    return resolve
+
+
+def qualified_reception_links(value):
+    require(value['archive']['sha256'] == QARCHIVE and value['audit']['sha256'] == QAUDIT,
+            'Both authorizations must bind the exact original received archive and audit')
+
+
+def same_cli(left, right):
+    for key in ('version', 'executable_path', 'executable_sha256', 'source_execution_allowed', 'files'):
+        require(left.get(key) == right.get(key), 'Local/POSIX immutable CLI identities differ')
+
+
+def validate_authorizations(module, local_path, remote_path, mirrors):
+    local = module.validate_receipt(local_path, {SCOPE}, runtime=False, prepared=False)
+    cell_identity(local)
+    require(local['artifacts']['source_zip']['sha256'] == SOURCE and local['artifacts']['plan']['sha256'] == PLAN,
+            'Source/plan must equal the sealed cap4 derivative')
+    original = module.artifact
+    module.artifact = remote_resolver(mirrors)
+    try:
+        remote = module.validate_receipt(remote_path, {SCOPE}, runtime=False, prepared=False)
+    finally:
+        module.artifact = original
+    cell_identity(remote)
+    for key in set(local) - {'artifacts'}:
+        require(local[key] == remote[key], 'Local/POSIX authorization identity or limits differ')
+    for key in ('source_zip', 'plan', 'preparation_manifest', 'preparation_review'):
+        require(local['artifacts'][key]['sha256'] == remote['artifacts'][key]['sha256'], 'Immutable cross-environment bytes differ')
+    cli = read(artifact(local['artifacts']['cli_identity']))
+    require(Path(cli.get('executable_path', '')).resolve() == CLI.resolve()
+            and cli.get('executable_sha256') == CLI_SHA and cli.get('version') == CLI_VERSION and sha(CLI) == CLI_SHA,
+            'Exact preserved CLI copy required; no new connection/CLI call')
+    require(CONFIG.is_file() and not CONFIG.is_symlink(), 'Existing local transport config required')
+    require(not (LAUNCH / ('worker-' + SESSION)).exists(), 'Fresh cell cache required')
+    for value, resolver in ((local, artifact), (remote, remote_resolver(mirrors))):
+        other_cli = read(resolver(value['artifacts']['cli_identity']))
+        same_cli(cli, other_cli)
+        for key in set(module.SCHEMAS) - {'allocated_contract_qualification'}:
+            proof = read(resolver(value['artifacts'][key]))
+            evidence = proof.get('evidence_refs')
+            require(isinstance(evidence, list) and bool(evidence), 'Each future positive proof needs real hashed evidence')
+            for item in evidence:
+                resolver(item)
+        reception = read(resolver(value['artifacts']['allocated_contract_reception']))
+        qualified_reception_links(reception)
+        lane = read(resolver(value['artifacts']['worker_lane_admission']))
+        reservation = {'job_id': value['job_id'], 'model': MODEL, 'effort': EFFORT, 'session_id': SESSION}
+        require(lane.get('job_reservation') == reservation, 'Worker lane is not reserved to the full selected cell')
+        transport = read(resolver(value['artifacts']['transport_admission']))
+        require(transport.get('cli_identity_sha256') == value['artifacts']['cli_identity']['sha256']
+                and transport.get('allocated_contract_qualification_sha256') == value['artifacts']['allocated_contract_qualification']['sha256']
+                and transport.get('neutral_tests_passed') is True, 'Transport is not linked to exact CLI/qualification/neutral controls')
+        for proof in value['artifacts'].values():
+            resolver(proof)
+    files = cli.get('files', [])
+    require(len(files) == 4 and {Path(row['path']).name: row['sha256'] for row in files} == CLI_FILES,
+            'Exact four preserved CLI files required')
+    remote_read = remote_resolver(mirrors)
+    ignored = {'evidence_refs', 'archive', 'audit', 'cli_identity_sha256',
+               'luna_first_start_sha256', 'luna_closure_sha256', 'lane_v2'}
+    for key in module.SCHEMAS:
+        left, right = read(artifact(local['artifacts'][key])), read(remote_read(remote['artifacts'][key]))
+        require({k: v for k, v in left.items() if k not in ignored}
+                == {k: v for k, v in right.items() if k not in ignored}, 'Local/POSIX admission facts differ')
+        if key == 'worker_lane_admission':
+            a, b = dict(left['lane_v2']), dict(right['lane_v2'])
+            ar, br = a.pop('minimal_owned_observations'), b.pop('minimal_owned_observations')
+            require(a == b and ar['sha256'] == br['sha256']
+                and read(artifact(ar)) == read(remote_read(br)), 'Local/POSIX nested lane projection differs')
+    require(local['artifacts']['allocated_contract_qualification']['sha256']
+            == remote['artifacts']['allocated_contract_qualification']['sha256'] == QJSON,
+            'Both environments must use the exact original qualification bytes')
+    for item in files:
+        require(Path(item['path']).resolve().parent == CLI.parent.resolve(), 'CLI companion moved outside exact preserved copy')
+        artifact(item)
+    return local, remote
+
+
+def parent_review_guard(review_ref, spec, authorization):
+    review = read(artifact(review_ref))
+    expected = {'schema': 'hpc-forest-max-cell-parent-admission-review-v1', 'verified': True,
+        'scope_id': SCOPE, 'model': MODEL, 'effort': EFFORT, 'session_id': SESSION,
+        'job_id': authorization['job_id'], 'source_zip_sha256': SOURCE, 'plan_sha256': PLAN,
+        'complete_utf8_cim_fresh_checked': True, 'source_only_full_identities_preserved': False, 'source_only_state': 'received_absent',
+        'luna_full_owned_identities_absent': True, 'no_unreserved_native_workers': True,
+        'local_cache_absent_checked': True, 'remote_root_registry_channel_absent_checked': True,
+        'no_prior_session_claims': True, 'existing_transport_only': True,
+        'independent_remote_observation_by_generator': False}
+    require(all(review.get(k) == v for k, v in expected.items()), 'Actual parent lane/freshness review required')
+    refs = {'worker_lane_admission': authorization['artifacts']['worker_lane_admission'],
+            'session_freshness': authorization['artifacts']['session_freshness'],
+            'submission_intent': spec['submission_intent'], 'submission_observed': spec['submission_observed']}
+    require(review.get('reviewed_refs') == refs, 'Parent review refers to different immutable admissions/submission')
+    evidence = review.get('evidence_refs')
+    require(isinstance(evidence, list) and evidence, 'Real parent census/remote freshness evidence required')
+    for item in [*refs.values(), *evidence]:
+        artifact(item)
+    return review
+
+
+def submission_guard(intent_ref, submitted_ref, authorization):
+    intent = read(artifact(intent_ref))
+    raw = read(artifact(submitted_ref))
+    submitted = raw.get('structuredContent', raw)
+    require(isinstance(submitted, dict), 'Actual submission result must be an object')
+    expected = {'schema': 'hpc-forest-max-cell-submit-intent-v1', 'verified': True,
+        'scope_id': SCOPE, 'model': MODEL, 'effort': EFFORT, 'session_id': SESSION,
+        'source_zip_sha256': SOURCE, 'research_plan_sha256': PLAN,
+        'full_script_reviewed': True, 'one_submit_only': True, 'no_resubmit_if_unknown': True,
+        'normal_first_call_proved': False, 'allocation_max_seconds': 10800, 'maximum_native_workers': 4,
+        'source_only_preserved': False, 'source_only_state': 'received_absent'}
+    require(all(intent.get(k) == v for k, v in expected.items()), 'Actual reviewed single-submit intent required')
+    require(submitted.get('ok') is True and submitted.get('submitted') is True
+            and submitted.get('submission_observed') is True
+            and str(submitted.get('job_id')) == authorization['job_id'], 'Actual observed submission/job required')
+    require(all(submitted.get(k) == intent.get(k) and intent.get(k) for k in ('plan_id', 'plan_sha256')),
+            'Submission differs from the exact reviewed scheduler plan')
+    command = artifact(intent['command']).read_text(encoding='utf8')
+    require(command == proposal_command(), 'Submission intent command differs from reviewed selected-cell proposal')
+    script = artifact(intent['job_script']).read_text(encoding='utf8')
+    require(command in script and script.count('srun ') == 1, 'Actual reviewed script must contain the unique exact srun command')
+    directives = ['#SBATCH --partition=short', '#SBATCH --time=03:00:00', '#SBATCH --cpus-per-task=4',
+                  '#SBATCH --mem=16G', '#SBATCH --nodes=1', '#SBATCH --ntasks-per-node=1']
+    require(all(line in script.splitlines() for line in directives), 'Exact reviewed Slurm resource directives required')
+    resolved = submitted.get('resolved', {})
+    require(all(resolved.get(k) == v for k, v in {'arch': 'armgpu', 'partition': 'short', 'total_cpus': 4,
+            'total_gpus': 0, 'mem_gb': 16, 'time': '03:00:00', 'ntasks_per_node': 1}.items()),
+            'Observed submission resources differ from the single-cell ceiling')
+    evidence = intent.get('evidence_refs')
+    require(isinstance(evidence, list) and evidence, 'Submit intent requires real hashed fresh census/review evidence')
+    for item in evidence:
+        artifact(item)
+    return {'intent': intent_ref, 'submission_observed': submitted_ref, 'job_id': authorization['job_id']}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=['proposal', 'authorization'])
+    parser.add_argument('--bindings', type=Path, required=True)
+    parser.add_argument('--bindings-sha256', required=True)
+    parser.add_argument('--model', choices=sorted(CELLS), required=True)
+    parser.add_argument('--input', type=Path, required=True)
+    parser.add_argument('--input-sha256', required=True)
+    parser.add_argument('--output-name', required=True)
+    args = parser.parse_args()
+    configure({'path': str(args.bindings.resolve()), 'sha256': args.bindings_sha256}, args.model)
+    require(re.fullmatch('[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.output_name), 'Simple fresh output subfolder required')
+    spec = read(artifact({'path': str(args.input.resolve()), 'sha256': args.input_sha256}))
+    require(set(spec) == {'schema', 'qualification_reception', 'qualification', 'luna_bounded_closure', 'local_authorization',
+                         'remote_authorization_mirror', 'remote_files', 'submission_intent', 'submission_observed', 'parent_admission_review',
+                         'task_cli_policy'}, 'Closed preparation input required')
+    require(spec['schema'] == 'hpc-forest-max-cell-local-preparation-input-v1', 'Wrong preparation input schema')
+    module = native()
+    qref = qualification(module, spec['qualification_reception'], spec['qualification'])
+    bounded = closure_admission(spec['luna_bounded_closure'])
+    generated = None
+    if args.mode == 'authorization':
+        lp, rp = artifact(spec['local_authorization']), artifact(spec['remote_authorization_mirror'])
+        local, remote = validate_authorizations(module, lp, rp, spec['remote_files'])
+        require(local['artifacts']['allocated_contract_qualification']['sha256'] == qref['sha256'], 'Different qualification in authorization')
+        require(read(artifact(local['artifacts']['luna_closure'])) == bounded, 'Actual bounded closure adapter required')
+        submission_guard(spec['submission_intent'], spec['submission_observed'], local)
+        parent_review_guard(spec['parent_admission_review'], spec, local)
+        checked_task_cli_policy(spec['task_cli_policy'], local['job_id'], read(artifact(local['artifacts']['cli_identity'])))
+        generated = local, remote
+    directory = OUT / args.output_name
+    directory.mkdir(exist_ok=False)
+    save(directory, 'luna-closure-admission-local.json', bounded)
+    command = proposal_command()
+    (directory / 'commande-allouee-proposee.sh').write_text(command, encoding='utf8', newline='\n')
+    save(directory, 'demande-job-prepare-proposee.json', {'arch': 'armgpu', 'partition': 'short',
+        'nodes': 1, 'ntasks_per_node': 1, 'cpus_per_task': 4, 'mem_gb': 16, 'gpus_per_node': 0,
+        'time_limit': '03:00:00', 'cpu_bind': 'cores', 'spack_packages': [],
+        'name': 'forest-primes-' + MODEL.replace('.', '-') + '-max-cap4', 'workdir': '/scratch_p/nimarano', 'command': command})
+    if generated:
+        local, remote = generated
+        save(directory, 'authorization-local.json', local)
+        remote_ref = save(directory, 'authorization-remote.json', remote)
+        save(directory, 'authorization-ready.json', {'schema': 'hpc-forest-primes-r2max-authorization-upload-ready-v1',
+            'scope_id': SCOPE, 'job_id': remote['job_id'], 'session_id': SESSION,
+            'sha256': remote_ref['sha256'], 'bytes': (directory / 'authorization-remote.json').stat().st_size})
+        worker = [str(PYTHON_LOCAL), '-B', '-u', '-m', 'hpc_forest.r2max_worker', '--channel',
+            REMOTE_ROOT + '/results-' + local['job_id'] + '/mailbox', '--session-id', SESSION,
+            '--output', str(LAUNCH / ('worker-' + SESSION)), '--codex-config', str(CONFIG), '--dependency-receipt',
+            str(directory / 'authorization-local.json'), '--required-jobs', SCOPE, '--max-seconds', '10800', '--executable', str(CLI),
+            '--cli-policy', str(artifact(spec['task_cli_policy'])), '--cli-policy-sha256', spec['task_cli_policy']['sha256']]
+        save(directory, 'upload-manifest-propose.json', {'schema': 'hpc-forest-max-cell-explicit-upload-proposal-v1',
+            'scope_id': SCOPE, 'model': MODEL, 'effort': EFFORT, 'session_id': SESSION, 'job_id': remote['job_id'],
+            'verified': False, 'performed': False,
+            'dependencies': [row for row in spec['remote_files'] if row['remote_path'].startswith(ADMISSION_ROOT + '/')],
+            'existing_qualified_files': [row for row in spec['remote_files'] if not row['remote_path'].startswith(ADMISSION_ROOT + '/')],
+            'authorization_publish_after_dependencies': {'remote_path': ADMISSION_ROOT + '/authorization.json', 'local': remote_ref},
+            'ready_publish_last': {'remote_path': ADMISSION_ROOT + '/authorization-ready.json', 'local': ref(directory / 'authorization-ready.json')},
+            'parent_submission_intent': spec['submission_intent'], 'actual_observed_submission': spec['submission_observed'],
+            'parent_admission_review': spec['parent_admission_review']})
+        save(directory, 'worker-argv-only.json', {'argv': worker, 'cwd': str(PROJECT),
+            'environment': {'PYTHONPATH': str(PROJECT / 'src'), 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONUTF8': '1'},
+            'executed': False, 'existing_config_ref': ref(CONFIG), 'cli_sha256': CLI_SHA})
+    save(directory, 'preparation-local-only.json', {'schema': 'hpc-forest-max-cell-local-preparation-v1',
+        'scope_id': SCOPE, 'model': MODEL, 'effort': EFFORT, 'session_id': SESSION, 'source_zip_sha256': SOURCE,
+        'plan_sha256': PLAN, 'preparation_manifest_sha256': PREP, 'verified': False,
+        'input': ref(args.input), 'qualification': qref, 'luna_closure': spec['luna_bounded_closure'],
+        'native_research_admitted': False, 'tools_invoked': [], 'native_model_calls': 0,
+        'automatic_extension': False, 'other_cells_started': 0, 'allocation_seconds': 10800,
+        'search_seconds': 1800, 'tokens': 1500000, 'program_missions': 8, 'mother_calls': 2,
+        'inference_cpu_count_inferred': False, 'created_at': time.time(),
+        'parent_upload_required': True, 'remote_paths_created_by_this_generator': False,
+        'post_submit_job_id_required_before_authorization_upload': True,
+        'first_normal_delivered_call_and_real_evaluation_required_before_extension': True})
+    print(json.dumps({'directory': str(directory), 'status': 'local_files_only_not_executed'}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

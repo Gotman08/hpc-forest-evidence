@@ -1,0 +1,280 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static float *allocate_positions(int n) {
+  if (n <= 0) {
+    return NULL;
+  }
+  const size_t count = (size_t)n;
+  if (count > ((size_t)-1) / (3 * sizeof(float))) {
+    return NULL;
+  }
+  return (float *)malloc(3 * count * sizeof(float));
+}
+
+/* Called collectively by the current OpenMP team. */
+static void pack_positions_work(const Body *p, float *positions, int n) {
+  const size_t count = (size_t)n;
+  float *x = positions;
+  float *y = x + count;
+  float *z = y + count;
+
+  #pragma omp for schedule(static)
+  for (int i = 0; i < n; ++i) {
+    x[i] = p[i].x;
+    y[i] = p[i].y;
+    z[i] = p[i].z;
+  }
+}
+
+/* Allocation-failure path, also called collectively. */
+static void body_force_scalar_work(Body *p, float dt, int n) {
+  #pragma omp for schedule(static)
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; ++j) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+/* Four independent targets share packed source-coordinate loads. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-math-errno")))
+#endif
+static void body_force_work(Body *p, const float *positions, float dt, int n) {
+  const size_t count = (size_t)n;
+  const float *px = positions;
+  const float *py = px + count;
+  const float *pz = py + count;
+  const int nblocks = n / 4 + (n % 4 != 0);
+
+  #pragma omp for schedule(static)
+  for (int block = 0; block < nblocks; ++block) {
+    const int i = 4 * block;
+
+    if (n - i >= 4) {
+      float x[4], y[4], z[4];
+      float fx[4] = {0.0f};
+      float fy[4] = {0.0f};
+      float fz[4] = {0.0f};
+
+      for (int lane = 0; lane < 4; ++lane) {
+        x[lane] = px[i + lane];
+        y[lane] = py[i + lane];
+        z[lane] = pz[i + lane];
+      }
+
+      int j = 0;
+      for (; n - j >= 2; j += 2) {
+        const float j0x = px[j];
+        const float j0y = py[j];
+        const float j0z = pz[j];
+        const float j1x = px[j + 1];
+        const float j1y = py[j + 1];
+        const float j1z = pz[j + 1];
+
+        #pragma omp simd simdlen(4)
+        for (int lane = 0; lane < 4; ++lane) {
+          float dx0 = j0x - x[lane];
+          float dy0 = j0y - y[lane];
+          float dz0 = j0z - z[lane];
+          float dx1 = j1x - x[lane];
+          float dy1 = j1y - y[lane];
+          float dz1 = j1z - z[lane];
+          float sqrd_dist0 = dx0*dx0 + dy0*dy0 + dz0*dz0 + SOFTENING;
+          float sqrd_dist1 = dx1*dx1 + dy1*dy1 + dz1*dz1 + SOFTENING;
+          float inv_dist0 = 1 / sqrt(sqrd_dist0);
+          float inv_dist1 = 1 / sqrt(sqrd_dist1);
+          float inv_dist30 = inv_dist0 * inv_dist0 * inv_dist0;
+          float inv_dist31 = inv_dist1 * inv_dist1 * inv_dist1;
+
+          fx[lane] += dx0 * inv_dist30;
+          fy[lane] += dy0 * inv_dist30;
+          fz[lane] += dz0 * inv_dist30;
+          fx[lane] += dx1 * inv_dist31;
+          fy[lane] += dy1 * inv_dist31;
+          fz[lane] += dz1 * inv_dist31;
+        }
+      }
+
+      if (j < n) {
+        const float jx = px[j];
+        const float jy = py[j];
+        const float jz = pz[j];
+
+        #pragma omp simd simdlen(4)
+        for (int lane = 0; lane < 4; ++lane) {
+          float dx = jx - x[lane];
+          float dy = jy - y[lane];
+          float dz = jz - z[lane];
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+          fx[lane] += dx * inv_dist3;
+          fy[lane] += dy * inv_dist3;
+          fz[lane] += dz * inv_dist3;
+        }
+      }
+
+      for (int lane = 0; lane < 4; ++lane) {
+        p[i + lane].vx += dt*fx[lane];
+        p[i + lane].vy += dt*fy[lane];
+        p[i + lane].vz += dt*fz[lane];
+      }
+    } else {
+      for (int k = i; k < n; ++k) {
+        const float x = px[k];
+        const float y = py[k];
+        const float z = pz[k];
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
+
+        for (int j = 0; j < n; ++j) {
+          float dx = px[j] - x;
+          float dy = py[j] - y;
+          float dz = pz[j] - z;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+          fx += dx * inv_dist3;
+          fy += dy * inv_dist3;
+          fz += dz * inv_dist3;
+        }
+
+        p[k].vx += dt*fx;
+        p[k].vy += dt*fy;
+        p[k].vz += dt*fz;
+      }
+    }
+  }
+}
+
+/* Independent calls own their scratch storage and OpenMP team. */
+void body_force(Body *p, float dt, int n) {
+  if (n <= 0) {
+    return;
+  }
+
+  float *positions = allocate_positions(n);
+  #pragma omp parallel
+  {
+    if (positions != NULL) {
+      pack_positions_work(p, positions, n);
+      body_force_work(p, positions, dt, n);
+    } else {
+      body_force_scalar_work(p, dt, n);
+    }
+  }
+  free(positions);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+  float *positions = allocate_positions(nbodies);
+
+  /* Keep one team and refresh packed positions during integration.
+   * Implicit barriers separate packing, force updates and integration.
+   */
+  #pragma omp parallel
+  {
+    float *x = positions;
+    float *y = positions != NULL ? positions + (size_t)nbodies : NULL;
+    float *z = positions != NULL ? y + (size_t)nbodies : NULL;
+
+    if (positions != NULL) {
+      pack_positions_work(bodies, positions, nbodies);
+    }
+
+    for (int iter = 0; iter < N_ITER; iter++) {
+      if (positions != NULL) {
+        body_force_work(bodies, positions, DT, nbodies);
+      } else {
+        body_force_scalar_work(bodies, DT, nbodies);
+      }
+
+      #pragma omp for schedule(static)
+      for (int i = 0; i < nbodies; i++) {
+        bodies[i].x += bodies[i].vx * DT;
+        bodies[i].y += bodies[i].vy * DT;
+        bodies[i].z += bodies[i].vz * DT;
+
+        if (positions != NULL) {
+          x[i] = bodies[i].x;
+          y[i] = bodies[i].y;
+          z[i] = bodies[i].z;
+        }
+      }
+    }
+  }
+
+  free(positions);
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

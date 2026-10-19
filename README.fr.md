@@ -14,6 +14,8 @@ La paire de programmes Sol MAX sur les nombres premiers a été remesurée sur u
 
 La [qualification des quinze références sans modèle](evidence/qualification-2026-10-19/README.md) est également reçue et vérifiée : 75 durées de confirmation issues d'une allocation ARM de 65 secondes. Ces mesures de référence ne constituent aucun résultat de modèle R2 ni gain d'optimisation.
 
+Le [premier lot natif R2](evidence/native-first-batch-2026-10-19/README.md), avec un arrêté ultérieur à 11:11:41,348 UTC, décrit Luna MAX sur 2020-quicksort : trois durées initiales de recherche, une référence contemporaine, deux appels livrés et 32 765 jetons exacts. L'audit privé CLI et l'acceptation ARM de la libération sont reçus. Ce premier lot n'apporte aucune confirmation finale ni gain scientifique admis ; il n'établit ni l'achèvement de la cellule ou de la campagne ni le lancement des 59 autres cellules. L'instantané r4 antérieur reste inchangé.
+
 HPC Forest étudie une question concrète : **un système peut-il produire des programmes corrects et plus rapides dans un budget fixé ?** L’évaluation repose sur un programme de départ figé, un contrôle externe des sorties, des temps bruts et une confirmation finale séparée. Un autre système peut suivre ce contrat sans exposer son fonctionnement interne.
 
 Ce dépôt rassemble le protocole, une sélection explicite de données auditées et des vérificateurs publics. Le moteur interne et les entrées réservées à l’évaluateur restent hors de ce dépôt.

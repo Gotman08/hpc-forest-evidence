@@ -4,6 +4,8 @@ _Public versions preserve the evidence and its interpretation._
 
 ## Received evidence update — 2026-10-19
 
+- Add the first audited native R2 search batch for Luna MAX on 2020-quicksort: three initial timings, contemporary reference, two calls and 32,765 exact tokens, with a separate 11:11:41.348 UTC ARM acceptance cutoff
+- Preserve command-stream-v1 limitations, pre-admission bootstrap and audit-reader incidents, original deadlines, and the absence of final confirmation, admitted scientific gain or campaign completion
 - Add the subsequently received zero-model qualification of all fifteen references: 75 timings, exact arithmetic checks, private provenance digests and explicit baseline-only scope
 - Receive the exact article r4 edition at the 08:40 UTC technical cutoff: 19 article pages, 308 appendix pages and 275 figures, with PDF, Markdown and HTML views
 - Add a separate r4 inventory, provenance, operational status and sixty-cell MAX/seed-23 matrix; retain all R2 cells as `NA` and zero R1/R2 pairs

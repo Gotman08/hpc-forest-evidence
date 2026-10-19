@@ -1,0 +1,95 @@
+"""Seal the two-case historical-worker derivative without changing R2 or its Q."""
+from __future__ import annotations
+
+import difflib
+import gzip
+import hashlib
+import io
+import json
+import tarfile
+from pathlib import Path
+from xml.etree import ElementTree
+
+HERE = Path(__file__).resolve().parent
+OLD = HERE.parent
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": sha(path)}
+
+
+def save(path, value):
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+def main():
+    preservation = json.loads((HERE / "PRESERVATION-R2.json").read_text())
+    assert all(sha(Path(path)) == digest for path, digest in preservation["before"].items())
+    old = json.loads((OLD / "COMPONENTS.json").read_text())
+    manifest = {**old, "adapter_fix_revision": "r3-existing-worker-history-only",
+                "code_pins": {name: sha(HERE / name) for name in old["code_pins"]}}
+    # This is the first/final R3 seal; the copied R2 manifest is retained separately.
+    copied = HERE / "COMPONENTS.json"
+    copied.rename(HERE / "COMPONENTS-R2-COPIE-CONSERVEE.json")
+    save(copied, manifest)
+    portable = [copied, *(HERE / name for name in manifest["code_pins"])]
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, filename="", mode="wb", mtime=0) as zipped, tarfile.open(fileobj=zipped, mode="w") as archive:
+        for path in sorted(portable):
+            raw = path.read_bytes()
+            item = tarfile.TarInfo(path.relative_to(HERE).as_posix())
+            item.size, item.mode, item.mtime = len(raw), 0o600, 0
+            archive.addfile(item, io.BytesIO(raw))
+    package = HERE / "adapters-lane-r2-existing-worker-r3-zero-model.tar.gz"
+    with package.open("xb") as stream:
+        stream.write(buffer.getvalue())
+    differences = []
+    changed = []
+    for name, previous_digest in old["code_pins"].items():
+        if manifest["code_pins"][name] == previous_digest:
+            continue
+        changed.append(name)
+        if Path(name).suffix in {".py", ".json"}:
+            differences.extend(difflib.unified_diff((OLD / name).read_text(encoding="utf8").splitlines(True),
+                (HERE / name).read_text(encoding="utf8").splitlines(True), fromfile=str(OLD / name), tofile=name))
+    (HERE / "DIFF-EXISTING-WORKER-R3.patch").write_text("".join(differences), encoding="utf8", newline="\n")
+    suite = ElementTree.parse(HERE / "tests-cibles-premier.xml").getroot().find("testsuite")
+    assert suite.get("tests") == "2" and suite.get("failures") == "0" and suite.get("errors") == "0"
+    description = {"schema": "hpc-forest-lane-r2-portable-package-v1", "verified": False,
+        "archive": ref(package), "components_manifest": ref(copied), "file_count": len(portable), "root_prefix": "",
+        "Q_REVISION_unchanged": "lane-r2-integration", "new_manifest_is_required_not_old_R2_Q": True,
+        "portable_test_cases_present": 21, "portable_new_cases_actually_run_here": 2, "old19_not_rerun": True,
+        "new_cases_junit": ref(HERE / "tests-cibles-premier.xml"), "source105_and_plan_unchanged": True,
+        "actual_Windows_CIM_observed_on_ARM": False, "native_generation_admitted": False}
+    save(HERE / "PAQUET-PORTABLE-R3.json", description)
+    delta = {"schema": "hpc-forest-lane-r3-existing-worker-delta-v1", "verified": True,
+        "semantics": "initial=False only for exact already-present five-field pair, same-cell authorization; proposed start still initial=True with600s bound",
+        "code_path_rebinding_for_new_nested_copy": True, "changed_components": changed,
+        "unchanged_components": len(old["code_pins"]) - len(changed), "old_R2_files_identical": len(preservation["before"]),
+        "preservation": ref(HERE / "PRESERVATION-R2.json"), "diff": ref(HERE / "DIFF-EXISTING-WORKER-R3.patch"),
+        "targeted_tests_passed": 2, "old19_and_local21_suites_rerun": False,
+        "source_modified": False, "model_CLI_RPC_job_CIM_live_cache_lock_transition_stop_calls": 0}
+    save(HERE / "DELTA-R3.json", delta)
+    delivery = {"schema": "hpc-forest-lane-r3-existing-worker-integration-delivery-v1", "verified": False,
+        "local_fix_implemented": True, "scope_id": manifest["scope_id"], "source_zip_sha256": manifest["source_zip_sha256"],
+        "plan_sha256": manifest["plan_sha256"], "components": ref(copied), "package": ref(package), "package_file_count": len(portable),
+        "predecessor_delivery": ref(OLD / "LIVRAISON-INTEGRATION-LANE-R2-NON-ADMISE.json"),
+        "predecessor_package_preserved": ref(OLD / "adapters-lane-r2-zero-model.tar.gz"), "delta": ref(HERE / "DELTA-R3.json"),
+        "targeted_tests_passed": 2, "portable_cases_to_qualify": 21, "ruff_passed": True,
+        "existing_older600s_owned_worker_counted_without_new_start": True,
+        "same_stale_lane_new_start_refused_initial_true": True,
+        "actual_source_state_r3_review_bound": False, "new_allocated_Q_received": False,
+        "independent_complete_integration_review_received": False, "production_authorizations_created": False,
+        "native_generation_admitted": False, "activation_admitted": False}
+    save(HERE / "LIVRAISON-INTEGRATION-EXISTING-WORKER-R3-NON-ADMISE.json", delivery)
+    print(json.dumps({"delivery": ref(HERE / "LIVRAISON-INTEGRATION-EXISTING-WORKER-R3-NON-ADMISE.json"),
+                      "package": description["archive"], "components": description["components_manifest"], "file_count": len(portable)}))
+
+
+if __name__ == "__main__":
+    main()

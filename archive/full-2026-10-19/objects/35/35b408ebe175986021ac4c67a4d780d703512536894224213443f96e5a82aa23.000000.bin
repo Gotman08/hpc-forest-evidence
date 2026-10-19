@@ -1,0 +1,126 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+constexpr uint32_t MOD = 1000000007u;
+constexpr int TILE = 256;
+
+#if defined(__aarch64__)
+static inline uint32x4_t add_mod(uint32x4_t a, uint32x4_t b) {
+    const uint32x4_t modulus = vdupq_n_u32(MOD);
+    const uint32x4_t sum = vaddq_u32(a, b);
+    return vsubq_u32(sum, vandq_u32(vcgeq_u32(sum, modulus), modulus));
+}
+#endif
+
+static inline uint32_t scan_span(uint32_t* row, int begin, int end, uint32_t left) {
+    int x = begin;
+#if defined(__aarch64__)
+    const uint32x4_t zero = vdupq_n_u32(0);
+    uint32x4_t carry = vdupq_n_u32(left);
+    for (; end - x >= 4; x += 4) {
+        uint32x4_t values = vld1q_u32(row + x);
+        values = add_mod(values, vextq_u32(zero, values, 3));
+        values = add_mod(values, vextq_u32(zero, values, 2));
+        values = add_mod(values, carry);
+        vst1q_u32(row + x, values);
+        carry = vdupq_laneq_u32(values, 3);
+    }
+    left = vgetq_lane_u32(carry, 0);
+#endif
+    for (; x < end; ++x) {
+        left += row[x];
+        if (left >= MOD) left -= MOD;
+        row[x] = left;
+    }
+    return left;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n, m;
+    if (!(cin >> n >> m)) return 0;
+    vector<vector<int>> blocked(n);
+    for (int c = 0; c < m; ++c) {
+        int i, j;
+        cin >> i >> j;
+        blocked[i].push_back(j);
+    }
+    for (int i = 0; i < n; ++i) {
+        sort(blocked[i].begin(), blocked[i].end());
+        blocked[i].erase(unique(blocked[i].begin(), blocked[i].end()), blocked[i].end());
+    }
+
+    vector<uint32_t> bottom(n, 0), right(n, 0);
+    bottom[0] = 1;
+
+    if (n < 512) {
+        for (int i = 0; i < n; ++i) {
+            uint32_t left = 0;
+            size_t obstacle = 0;
+            for (int j = 0; j < n; ++j) {
+                if (obstacle < blocked[i].size() && blocked[i][obstacle] == j) {
+                    left = 0;
+                    ++obstacle;
+                } else {
+                    left += bottom[j];
+                    if (left >= MOD) left -= MOD;
+                }
+                bottom[j] = left;
+            }
+        }
+    } else {
+        const int tiles = (n + TILE - 1) / TILE;
+        // Each diagonal uses disjoint boundary segments. Its implicit barrier
+        // publishes both edges before dependent tiles on the next diagonal.
+        #pragma omp parallel
+        {
+            uint32_t local[TILE];
+            for (int diagonal = 0; diagonal < 2 * tiles - 1; ++diagonal) {
+                const int first = max(0, diagonal - tiles + 1);
+                const int last = min(tiles - 1, diagonal);
+                #pragma omp for schedule(static)
+                for (int tr = first; tr <= last; ++tr) {
+                    const int tc = diagonal - tr;
+                    const int rowBegin = tr * TILE;
+                    const int rowEnd = min(n, rowBegin + TILE);
+                    const int colBegin = tc * TILE;
+                    const int colEnd = min(n, colBegin + TILE);
+                    const int width = colEnd - colBegin;
+                    for (int x = 0; x < width; ++x)
+                        local[x] = bottom[colBegin + x];
+                    for (int row = rowBegin; row < rowEnd; ++row) {
+                        uint32_t left = right[row];
+                        auto obstacle = lower_bound(blocked[row].begin(), blocked[row].end(), colBegin);
+                        int x = 0;
+                        while (x < width) {
+                            const int stop = obstacle == blocked[row].end()
+                                ? width : min(width, *obstacle - colBegin);
+                            left = scan_span(local, x, stop, left);
+                            x = stop;
+                            if (x < width) {
+                                local[x++] = 0;
+                                left = 0;
+                                ++obstacle;
+                            }
+                        }
+                        right[row] = left;
+                    }
+                    for (int x = 0; x < width; ++x)
+                        bottom[colBegin + x] = local[x];
+                }
+            }
+        }
+    }
+
+    cout << bottom[n - 1] << '\n';
+    return 0;
+}

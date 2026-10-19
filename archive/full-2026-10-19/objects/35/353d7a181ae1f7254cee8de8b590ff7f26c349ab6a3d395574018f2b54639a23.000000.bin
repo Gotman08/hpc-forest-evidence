@@ -1,0 +1,143 @@
+#include "knn.h"
+#include <omp.h>
+#include <string.h>
+
+typedef struct {
+    float d;
+    int idx;
+} Candidate;
+
+static int compare_candidates(const void *a, const void *b) {
+    const Candidate *ca = (const Candidate *)a;
+    const Candidate *cb = (const Candidate *)b;
+    if (ca->d < cb->d) return -1;
+    if (ca->d > cb->d) return 1;
+    if (ca->idx < cb->idx) return -1;
+    if (ca->idx > cb->idx) return 1;
+    return 0;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    // Compute total number of points
+    int total = 0;
+    for (int i = 0; i < n_groups; i++) total += groups[i].length;
+
+    // Flatten points and labels into contiguous arrays
+    Point * all_points = (Point *) malloc(sizeof(Point) * total);
+    char * all_labels = (char *) malloc(sizeof(char) * total);
+    int pos = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            all_points[pos] = g.points[j];
+            all_labels[pos] = g.label;
+            pos++;
+        }
+    }
+
+    int nt = omp_get_max_threads();
+    Candidate ** local_tops = (Candidate **) malloc(sizeof(Candidate *) * nt);
+    int * local_sizes = (int *) calloc(nt, sizeof(int));
+    for (int t = 0; t < nt; t++) {
+        local_tops[t] = (Candidate *) malloc(sizeof(Candidate) * k);
+    }
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+        // Static contiguous partition for balanced work sharing
+        int chunk = (total + nthreads - 1) / nthreads;
+        int start = tid * chunk;
+        int end = start + chunk;
+        if (end > total) end = total;
+
+        Candidate * top = local_tops[tid];
+        int size = 0;
+
+        for (int i = start; i < end; i++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, all_points[i]);
+            Candidate cand;
+            cand.d = d;
+            cand.idx = i;
+
+            // Insert into sorted per-thread top-k list (by distance, then index)
+            int p = 0;
+            while (p < size && compare_candidates(&top[p], &cand) <= 0) {
+                p++;
+            }
+            if (p < size || size < k) {
+                int max_idx = (size < k ? size : k - 1);
+                for (int q = max_idx; q > p; q--) {
+                    top[q] = top[q - 1];
+                }
+                top[p] = cand;
+                if (size < k) size++;
+            }
+        }
+        local_sizes[tid] = size;
+    }
+
+    // Merge per-thread candidate lists and select global top-k
+    int total_cand = 0;
+    for (int t = 0; t < nt; t++) total_cand += local_sizes[t];
+    Candidate * all_cands = (Candidate *) malloc(sizeof(Candidate) * total_cand);
+    pos = 0;
+    for (int t = 0; t < nt; t++) {
+        memcpy(all_cands + pos, local_tops[t], sizeof(Candidate) * local_sizes[t]);
+        pos += local_sizes[t];
+    }
+    qsort(all_cands, total_cand, sizeof(Candidate), compare_candidates);
+
+    // Extract labels of the k nearest neighbors
+    char * labels = (char *) malloc(sizeof(char) * k);
+    for (int i = 0; i < k; i++) {
+        labels[i] = all_labels[all_cands[i].idx];
+    }
+
+    // Free temporary arrays
+    free(all_points);
+    free(all_labels);
+    for (int t = 0; t < nt; t++) free(local_tops[t]);
+    free(local_tops);
+    free(local_sizes);
+    free(all_cands);
+
+    // Count label frequencies in parallel using an OpenMP reduction on a fixed-size array
+    int counts[256] = {0};
+    #pragma omp parallel for reduction(+:counts[:256])
+    for (int i = 0; i < k; i++) {
+        unsigned char c = (unsigned char) labels[i];
+        counts[c]++;
+    }
+
+    free(labels);
+
+    // Select the label with highest frequency, breaking ties by smallest character value
+    char most_frequent = 0;
+    int best_count = -1;
+    for (int c = 0; c < 256; c++) {
+        if (counts[c] > best_count) {
+            best_count = counts[c];
+            most_frequent = (char)c;
+        }
+    }
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

@@ -16,7 +16,9 @@ python -m tools.recompute --check
 
 No package installation, account, token, model, compiler or cluster access is required for these commands. The tools read public JSON/JSONL files and calculate hashes and statistics. They do not execute received programs or load executable checkpoints.
 
-Expected evidence coverage is 144 controller series, including 24 excluded warmups and 2,400 measured cycles, plus 200 CPU timings / 40 configurations. The 20 verifier tests check arithmetic, warmup exclusion and rejection of incomplete designs, duplicates, changed inputs/binaries, invalid outputs, nonfinite values, modified or unlisted files and unsafe paths.
+Expected initial-release coverage is 144 controller series, including 24 excluded warmups and 2,400 measured cycles, plus 200 CPU timings / 40 configurations. The rejection tests check arithmetic, warmup exclusion, incomplete designs, duplicates, changed inputs/binaries, invalid outputs, nonfinite values, modified or unlisted files and unsafe paths.
+
+The [native first-batch projection](../evidence/native-first-batch-2026-10-19/README.md) adds three initial search timings and three contemporary reference timings, two delivered calls with exact role-level costs, private-audit digests and later ARM release acceptance. Its verifier recalculates statistics and the descriptive initial ratio, rejects private extra fields and unsupported confirmation/completion claims, and preserves the original search score as a separate observation. It does not execute the private programs, re-audit their SQLite registry or independently certify their performance. The earlier paused snapshot and later acceptance are separate dated records; neither changes the original budget or deadlines.
 
 To emit all recalculated results without changing files:
 

@@ -4,6 +4,8 @@ _Observed on 16 October 2026 · two distinct experiments · no model ranking._
 
 The sections below retain the initial release and its explicit subset. The [19 October update](RECEIVED-2026-10-19.md) adds the complete admitted historical projection and the separately audited Sol R2h supplement. The [article](article/ARTICLE.pdf) and [appendices](article/ANNEXES-TECHNIQUES.pdf) describe those datasets without merging overlapping cohorts into independent replications.
 
+The later [native R2 first-batch supplement](../evidence/native-first-batch-2026-10-19/README.md) records three initial Luna MAX quicksort timings (mean 0.06133957331379255 s) and a contemporary reference (mean 0.07024732045829296 s). Their 1.1452202332567816 mean ratio is descriptive initial-search arithmetic, with no final confirmation or admitted scientific gain. Two delivered calls used 32,765 exact tokens; the private audit and ARM release acceptance are received at the 11:11:41.348 UTC cutoff. This is not a completed cell or campaign.
+
 ## Controller overhead
 
 The controller dataset uses four anonymous implementation variants. `kernel-A`/`kernel-B` compare two narrow kernels; `system-A`/`system-B` compare two policies within the same larger processing pipeline. The pair types perform different work and must not be mixed into a claim about whole-system speed.

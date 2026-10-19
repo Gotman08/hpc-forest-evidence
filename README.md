@@ -17,6 +17,8 @@ Sol MAX's frozen primes pair was remeasured in a separate allocation: 43.8546 ms
 
 The subsequent [zero-model baseline qualification](evidence/qualification-2026-10-19/README.md) has also completed: all fifteen references, 75 confirmation timings, received and checked from one 65-second ARM allocation. These are baseline measurements; no native R2 model result or speedup is claimed by this qualification.
 
+The separate [first native R2 batch](evidence/native-first-batch-2026-10-19/README.md), at the later 11:11:41.348 UTC cutoff, records Luna MAX on 2020-quicksort: three initial search timings, a contemporary reference, two delivered calls and 32,765 exact tokens. Private CLI audit and ARM release acceptance are received. This initial observation has no final confirmation or scientifically admitted gain; it does not complete the cell or campaign or establish launch of the other 59 cells. The earlier r4 snapshot remains unchanged.
+
 HPC Forest studies a practical question: **can a system produce correct programs that run faster under a fixed search budget?** The evaluation uses frozen starting programs, external correctness checks, raw timings and a separate final confirmation. Another system can follow the same contract without disclosing its internal implementation.
 
 This repository publishes the evaluation method, selected audited observations and the tools needed to recalculate them. It is the **public evidence repository**; the internal optimization engine and protected evaluation inputs are not distributed here.
@@ -87,7 +89,7 @@ Read the [full protocol](docs/PROTOCOL.md), [limitations](docs/LIMITATIONS.md), 
 
 ## Project status and citation
 
-The first release is **0.1.0**, dated 16 October 2026; the current checkout also includes the received evidence update of 19 October. Cite the exact commit for that update. The next campaign covers fifteen subjects and four models, all at MAX, after the completed primes pilot and baseline qualification, subject to the remaining deployment and worker checks. No unexecuted cell is counted as a result. Weight-learning experiments remain future work. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
+The first release is **0.1.0**, dated 16 October 2026; the current checkout also includes the received evidence update of 19 October. Cite the exact commit for that update. The native campaign plan covers fifteen subjects and four models, all at MAX, after the completed primes pilot and baseline qualification. Its first received batch is published separately with its audit and release acceptance; no unexecuted cell is counted as a result. Weight-learning experiments remain future work. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
 
 Authors: **Nicolas Marano and Romain Despoullain**. Use [CITATION.cff](CITATION.cff) and include the exact commit or release when citing a result. Code, original documentation and the published timing projection are provided under the [MIT license](LICENSE). Third-party benchmark statements and programs are not redistributed.
 

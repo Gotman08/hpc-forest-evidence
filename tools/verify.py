@@ -6,6 +6,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 from .manifest import public_files
+from .native_first import verify as verify_native_first
 from .qualification import verify as verify_qualification
 from .received_r4 import verify as verify_received_r4
 from .received import verify as verify_received
@@ -58,6 +59,7 @@ def main():
     received = verify_received(ROOT)
     qualification = verify_qualification(ROOT)
     revision4 = verify_received_r4(ROOT)
+    native = verify_native_first(ROOT)
     links = verify_links(ROOT)
     print(f"Verified {count} file hashes and {links} relative links.")
     print("Recomputed 144 controller series (2,400 measured cycles) and 200 CPU samples (40 configurations).")
@@ -65,6 +67,9 @@ def main():
           f"{received['registers']} search registers and {received['cost_exports']} separate cost views.")
     print(f"Separate zero-model qualification: {qualification['subjects']} baselines and {qualification['samples']} timings.")
     print(f"Revision r4: {revision4['matrix_cells']} matrix cells, {revision4['r2_NA']} R2 missing values and no complete comparison.")
+    print(f"Native first batch: {native['candidate_samples']} initial and {native['reference_samples']} reference timings, "
+          f"{native['delivered_calls']} delivered calls and {native['exact_tokens_used']} exact tokens; "
+          "audited release accepted on ARM, with no final confirmation or admitted scientific gain.")
     print("This checks integrity and arithmetic; it does not execute or certify the evaluated programs.")
 
 

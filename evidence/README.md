@@ -4,6 +4,8 @@ _A curated timing projection with explicit provenance and reproduction limits._
 
 The [19 October received-data inventory](received-2026-10-19/README.md) adds the complete admitted historical data and the Sol R2h supplement. The table below describes the preserved initial release subset; overlapping timings must not be counted twice as independent samples. The [article and appendices](../docs/RECEIVED-2026-10-19.md) explain the additional cohorts.
 
+The later [first native R2 batch](native-first-batch-2026-10-19/README.md) is a separate initial-search projection for Luna MAX on 2020-quicksort, with a contemporary reference, exact role-level costs, private audit and ARM release acceptance. It has no final confirmation or admitted scientific gain and does not replace the dated r4 missing-data snapshot.
+
 | File | Coverage | Unit |
 | --- | --- | --- |
 | [controller/timings.jsonl](controller/timings.jsonl) | 144 series; 24 warmups excluded; 2,400 measured cycles | Integer wall/CPU nanoseconds per cycle |

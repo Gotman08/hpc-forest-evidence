@@ -7384,7 +7384,7 @@ Le registre est repris à sa date, avec ses jalons et causes de non-clôture. ID
 
 ### J.3. Reprise R2 et arrêté technique du 19 octobre 2026
 
-Cet arrêté technique, mis à jour à 06 h 05 UTC, complète l’arrêté des résultats scientifiques sans le remplacer. Les quatorze cohortes natives admises et les 11 575 chronométrages CPU ne changent pas. Les chiffres ci-dessous restent hors de leurs agrégats. Les dossiers et empreintes complets se trouvent dans le snapshot éditorial lié par admissions.json.
+Cet arrêté technique, mis à jour à 08 h 40 UTC, complète l’arrêté des résultats scientifiques sans le remplacer. Les quatorze cohortes natives admises et les 11 575 chronométrages CPU ne changent pas. Les chiffres ci-dessous restent hors de leurs agrégats. Les dossiers et empreintes complets se trouvent dans le snapshot éditorial lié par admissions.json.
 
 | Périmètre | Preuve reçue | Limite à cet arrêté |
 |---|---|---|
@@ -7393,7 +7393,10 @@ Cet arrêté technique, mis à jour à 06 h 05 UTC, complète l’arrêté des r
 | R2h, premier lot Sol MAX | Deux appels fermés ; 32 062 jetons exacts ; premier NORMAL, correction sur six cas de recherche et trois mesures réelles ; revue privée indépendante | Sous-ensemble du déroulement Sol, pas coût final d’une cohorte ni confirmation finale |
 | R2h, audit final borné Sol | Job 755306 ; trois appels fermés, 59 037 jetons exacts, aucune consommation inconnue ; douze entrées et cinq confirmations vérifiées | Audit postarrêt clos avec limites explicites ; 52 fichiers de cache réconciliés ; libération scientifique Sol vérifiée |
 | R2h, remesure de la paire figée | Nouveau job 755388 ; cinq paires intercalées ; référence 43,85 ms, candidat 4,91 ms ; réduction 88,80 %, accélération 8,93 | Douze entrées certifiées, un benchmark ; même Evaluator et chronométreur ; résultat hors agrégats historiques |
-| R2h, allocations suivantes expirées | Astra 755395, Terra 755396 et Luna 755397 : FAILED avant le marqueur READY d’autorisation, pendant l’attente des autorisations ; dossiers de recherche et caches absents | Zéro appel natif, zéro jeton, aucun chronométrage ni résultat scientifique ; intentions consommées, aucune reprise de ces anciens jobs |
+| R2h, admission A1 expirée | Astra 755395, Terra 755396 et Luna 755397 : FAILED avant le marqueur READY d’autorisation, pendant l’attente des autorisations ; dossiers de recherche et caches absents | Zéro appel natif, zéro jeton, aucun chronométrage ni résultat scientifique ; intentions consommées, aucune reprise de ces anciens jobs |
+| R2h, admission A2 expirée | Astra 755409, Terra 755410, Luna 755408 ; trois FAILED ; 21 fichiers partiels reçus et vérifiés | Zéro appel natif, autorisations absentes ; aucun résultat scientifique ; intentions consommées |
+| R2h, admission A3 expirée | Astra 755433, Terra 755434, Luna 755435 ; fins à 08:15:44, 08:15:46 et 08:15:51 UTC ; 78 fichiers conservés et vérifiés | Trois autorisations présentes mais corrompues ; aucun authorization-ready ni worker ; zéro appel, jeton ou mesure scientifique pour ces trois modèles |
+| Correctif du flux JSON local | Diagnostic CP1252 puis décodage UTF-8 avec remplacement ; sortie JSON échappée en ASCII ; 23 empreintes et longueurs UTF-8 concordantes après décodage du vrai paquet Astra | Validation locale ; aucune réparation des anciennes autorisations, aucun transport distant réussi ni appel modèle supplémentaire |
 | Extension R2 aux quinze sujets | Plan de soixante cellules neuves : quatre modèles MAX × quinze sujets ; nombres premiers distincts | Aucune cellule lancée à cet arrêté ; plan et intention humaine ne constituent pas des résultats |
 
 La règle de suite demande d’abord une cellule Sol complète et auditée, puis Astra et Terra dans la même vague, avec Luna également prévu sur tout le périmètre. Les limites de capacité, budgets initiaux, sessions neuves et absence de rejeu restent applicables. Les tests et reçus de transport ne sont jamais comptés comme des gains scientifiques.
@@ -7403,6 +7406,17 @@ Les résultats bruts terminaux peuvent annoncer un pipeline complet ou un meille
 La remesure externe est reçue et auditée avec les sources, compilations, quatre exécutables physiques et vrais stdout/stderr de contrôle. Son exécution est indépendante de la recherche ; elle n’emploie pas une seconde implémentation de l’Evaluator. Elle ne suffit pas à établir une hiérarchie causale entre modèles ni un résultat sur les quinze sujets.
 
 Les trois allocations ont produit leur marqueur de disponibilité, allocation-ready.json. Le marqueur READY d’autorisation, authorization-ready.json, est resté absent ; aucun appel natif n’a démarré. La préparation d’une nouvelle tentative reste une opération technique, sans résultat scientifique supplémentaire.
+
+#### J.3.1. Comparaison préparatoire R1/R2
+
+| Périmètre | R1 MAX reçu et audité | État R2 à cet arrêté | Paires complètes |
+|---|---|---|---|
+| Quinze sujets × quatre modèles MAX, graine 23 | 60/60 confirmations historiques | 0/60 ; les 60 valeurs restent NA | 0/60 |
+| Nombres premiers, supplément distinct | Hors des quinze sujets R1 | Sol audité ; paire externe 8,9273× ; Astra, Terra et Luna sans recherche démarrée à cet arrêté | Hors matrice comparable |
+
+Le tableau détaillé de soixante lignes et ses sources sont liés par la référence matrix15_comparison_60_R1_60_R2_NA du snapshot. Les onze gains R1 nuls restent distincts des NA R2. Les chronométrages absolus R1 ne sont pas réutilisés comme remesures appariées R2. Le facteur interne Sol (8,951409×) et la remesure externe (8,927269×) sont deux mesures distinctes.
+
+Les 78 fichiers A3 représentent 26 fichiers par admission : ils incluent les autorisations corrompues, les marqueurs allocation-ready et les verrous auxiliaires. Ce sont des preuves techniques, pas 78 résultats scientifiques. Les inventaires préservent les octets erronés ; le correctif local ne les réécrit pas. À 08 h 40 UTC, A4 est seulement en préparation : aucun plan de job, soumission, passe de transport ou worker A4 n’est lancé. Ces statuts sont datés et ne constituent pas une observation en temps réel.
 
 
 ## K. Calculs, provenance et couverture documentaire

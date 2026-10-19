@@ -1,0 +1,147 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+void read_dataset(int *nbodies, float **px, float **py, float **pz,
+                  float **vx, float **vy, float **vz) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading nbodie value\n"); exit(EXIT_FAILURE); }
+  int n = *nbodies;
+  Body *tmp = (Body *)malloc(n * sizeof(Body));
+  b = fread(tmp, n * sizeof(Body), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading input values\n"); exit(EXIT_FAILURE); }
+  size_t arr_size = (size_t)n * sizeof(float);
+  if (posix_memalign((void**)px, 64, arr_size) != 0 ||
+      posix_memalign((void**)py, 64, arr_size) != 0 ||
+      posix_memalign((void**)pz, 64, arr_size) != 0 ||
+      posix_memalign((void**)vx, 64, arr_size) != 0 ||
+      posix_memalign((void**)vy, 64, arr_size) != 0 ||
+      posix_memalign((void**)vz, 64, arr_size) != 0) {
+    perror("aligned alloc");
+    exit(EXIT_FAILURE);
+  }
+  for (int i=0;i<n;i++){
+    (*px)[i] = tmp[i].x;
+    (*py)[i] = tmp[i].y;
+    (*pz)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+  free(tmp);
+}
+
+void write_dataset(const int nbodies, float *px, float *py, float *pz,
+                   float *vx, float *vy, float *vz) {
+  Body *out = (Body*)malloc(nbodies*sizeof(Body));
+  for (int i=0;i<nbodies;i++){
+    out[i].x = px[i];
+    out[i].y = py[i];
+    out[i].z = pz[i];
+    out[i].vx = vx[i];
+    out[i].vy = vy[i];
+    out[i].vz = vz[i];
+  }
+  int b = fwrite(out, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) { fprintf(stderr,"\nError writing to output\n"); exit(EXIT_FAILURE); }
+  free(out);
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  float *px,*py,*pz,*vx,*vy,*vz;
+  read_dataset(&nbodies,&px,&py,&pz,&vx,&vy,&vz);
+
+  const int TILE = 64;
+
+  #pragma omp parallel
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      // Force computation: static scheduling on tiles balances load.
+      #pragma omp for schedule(static)
+      for (int i0 = 0; i0 < nbodies; i0 += TILE) {
+        int i_end = i0 + TILE;
+        if (i_end > nbodies) i_end = nbodies;
+        int cnt = i_end - i0;
+
+        float fx[64] __attribute__((aligned(64)));
+        float fy[64] __attribute__((aligned(64)));
+        float fz[64] __attribute__((aligned(64)));
+        float xis[64] __attribute__((aligned(64)));
+        float yis[64] __attribute__((aligned(64)));
+        float zis[64] __attribute__((aligned(64)));
+
+        for (int t = 0; t < cnt; ++t) {
+          fx[t] = 0.0f;
+          fy[t] = 0.0f;
+          fz[t] = 0.0f;
+          int idx = i0 + t;
+          xis[t] = px[idx];
+          yis[t] = py[idx];
+          zis[t] = pz[idx];
+        }
+
+#define ACCUM(jj) \
+    do { \
+      float pjx = px[jj]; \
+      float pjy = py[jj]; \
+      float pjz = pz[jj]; \
+      _Pragma("omp simd aligned(px,py,pz,xis,yis,zis,fx,fy,fz:64)") \
+      for (int t = 0; t < cnt; ++t) { \
+        float dx = pjx - xis[t]; \
+        float dy = pjy - yis[t]; \
+        float dz = pjz - zis[t]; \
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING; \
+        float inv_dist = 1.0f / sqrt(sqrd_dist); \
+        float inv_dist3 = inv_dist * inv_dist * inv_dist; \
+        fx[t] += dx * inv_dist3; \
+        fy[t] += dy * inv_dist3; \
+        fz[t] += dz * inv_dist3; \
+      } \
+    } while (0)
+
+        int j = 0;
+        for (; j + 3 < nbodies; j += 4) {
+          ACCUM(j);
+          ACCUM(j+1);
+          ACCUM(j+2);
+          ACCUM(j+3);
+        }
+        for (; j < nbodies; ++j) {
+          ACCUM(j);
+        }
+#undef ACCUM
+
+        // Update velocities within this tile.
+        for (int t = 0; t < cnt; ++t) {
+          int idx = i0 + t;
+          vx[idx] += DT * fx[t];
+          vy[idx] += DT * fy[t];
+          vz[idx] += DT * fz[t];
+        }
+      }
+
+      // Position update: static schedule.
+      #pragma omp for schedule(static)
+      for (int i = 0; i < nbodies; ++i) {
+        px[i] += vx[i] * DT;
+        py[i] += vy[i] * DT;
+        pz[i] += vz[i] * DT;
+      }
+    }
+  }
+
+  write_dataset(nbodies, px, py, pz, vx, vy, vz);
+
+  free(px); free(py); free(pz);
+  free(vx); free(vy); free(vz);
+  exit(EXIT_SUCCESS);
+}

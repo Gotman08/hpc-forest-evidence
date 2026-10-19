@@ -1,0 +1,188 @@
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <inttypes.h>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+class FastInput {
+    static constexpr std::size_t bufferSize = 1U << 16;
+    char buffer[bufferSize];
+    std::size_t position = 0;
+    std::size_t available = 0;
+
+    int nextChar() {
+        if (position == available) {
+            available = std::fread(buffer, 1, bufferSize, stdin);
+            position = 0;
+            if (available == 0) {
+                return EOF;
+            }
+        }
+        return static_cast<unsigned char>(buffer[position++]);
+    }
+
+public:
+    bool readInt(int& value) {
+        int c;
+        do {
+            c = nextChar();
+        } while (c != EOF && c <= ' ');
+        if (c == EOF) {
+            return false;
+        }
+
+        bool negative = false;
+        if (c == '-') {
+            negative = true;
+            c = nextChar();
+        }
+
+        unsigned int magnitude = 0;
+        while (c >= '0' && c <= '9') {
+            magnitude = magnitude * 10U + static_cast<unsigned int>(c - '0');
+            c = nextChar();
+        }
+        const long long signedValue = negative ? -static_cast<long long>(magnitude)
+                                               : static_cast<long long>(magnitude);
+        value = static_cast<int>(signedValue);
+        return true;
+    }
+};
+
+static inline void addRow(std::int64_t* __restrict sums,
+                          const int* __restrict row,
+                          int n) {
+#if defined(__aarch64__)
+    int column = 0;
+    for (; column + 4 <= n; column += 4) {
+        const int32x4_t values = vld1q_s32(row + column);
+        const int64x2_t lower = vmovl_s32(vget_low_s32(values));
+        const int64x2_t upper = vmovl_s32(vget_high_s32(values));
+        vst1q_s64(sums + column, vaddq_s64(vld1q_s64(sums + column), lower));
+        vst1q_s64(sums + column + 2, vaddq_s64(vld1q_s64(sums + column + 2), upper));
+    }
+    for (; column < n; ++column) {
+        sums[column] += static_cast<std::int64_t>(row[column]);
+    }
+#else
+#pragma GCC ivdep
+    for (int column = 0; column < n; ++column) {
+        sums[column] += static_cast<std::int64_t>(row[column]);
+    }
+#endif
+}
+
+static inline void replaceRow(std::int64_t* __restrict sums,
+                              int* __restrict previous,
+                              const int* __restrict incoming,
+                              int n) {
+#if defined(__aarch64__)
+    int column = 0;
+    for (; column + 4 <= n; column += 4) {
+        const int32x4_t newValues = vld1q_s32(incoming + column);
+        const int32x4_t oldValues = vld1q_s32(previous + column);
+        const int64x2_t lower = vsubq_s64(vmovl_s32(vget_low_s32(newValues)),
+                                          vmovl_s32(vget_low_s32(oldValues)));
+        const int64x2_t upper = vsubq_s64(vmovl_s32(vget_high_s32(newValues)),
+                                          vmovl_s32(vget_high_s32(oldValues)));
+        vst1q_s64(sums + column, vaddq_s64(vld1q_s64(sums + column), lower));
+        vst1q_s64(sums + column + 2, vaddq_s64(vld1q_s64(sums + column + 2), upper));
+    }
+    for (; column < n; ++column) {
+        sums[column] += static_cast<std::int64_t>(incoming[column]) - previous[column];
+    }
+#else
+#pragma GCC ivdep
+    for (int column = 0; column < n; ++column) {
+        sums[column] += static_cast<std::int64_t>(incoming[column]) - previous[column];
+    }
+#endif
+    std::memcpy(previous, incoming, static_cast<std::size_t>(n) * sizeof(int));
+}
+
+static inline std::int64_t rowMaximum(const std::int64_t* sums, int n, int s) {
+    std::int64_t window = 0;
+    for (int column = 0; column < s; ++column) {
+        window += sums[column];
+    }
+
+    std::int64_t maximum = window;
+#if defined(__aarch64__)
+    int right = s;
+    for (; right + 3 < n; right += 4) {
+        const int64x2_t differences0 = vsubq_s64(vld1q_s64(sums + right),
+                                                  vld1q_s64(sums + right - s));
+        const int64x2_t differences1 = vsubq_s64(vld1q_s64(sums + right + 2),
+                                                  vld1q_s64(sums + right + 2 - s));
+        const int64x2_t prefix0 = vaddq_s64(
+            differences0, vcombine_s64(vdup_n_s64(0), vget_low_s64(differences0)));
+        const int64x2_t prefix1 = vaddq_s64(
+            differences1, vdupq_n_s64(vgetq_lane_s64(prefix0, 1)));
+        const int64x2_t windows0 = vaddq_s64(vdupq_n_s64(window), prefix0);
+        const int64x2_t windows1 = vaddq_s64(vdupq_n_s64(window), prefix1);
+        const std::int64_t blockMaximum = vmaxvq_s64(vmaxq_s64(windows0, windows1));
+        if (blockMaximum > maximum) {
+            maximum = blockMaximum;
+        }
+        window = vgetq_lane_s64(windows1, 1);
+    }
+    for (; right < n; ++right) {
+        window += sums[right] - sums[right - s];
+        if (window > maximum) {
+            maximum = window;
+        }
+    }
+#else
+    for (int right = s; right < n; ++right) {
+        window += sums[right] - sums[right - s];
+        if (window > maximum) {
+            maximum = window;
+        }
+    }
+#endif
+    return maximum;
+}
+
+int main() {
+    FastInput input;
+    int n;
+    int s;
+    if (!input.readInt(n) || !input.readInt(s)) {
+        return 0;
+    }
+
+    std::vector<std::int64_t> columnSums(static_cast<std::size_t>(n), 0);
+    std::vector<int> history(static_cast<std::size_t>(n) * static_cast<std::size_t>(s));
+    std::vector<int> incoming(static_cast<std::size_t>(n));
+
+    std::int64_t maximum = 0;
+    for (int row = 0; row < n; ++row) {
+        int* slot = history.data() + static_cast<std::size_t>(row % s) * static_cast<std::size_t>(n);
+        if (row < s) {
+            for (int column = 0; column < n; ++column) {
+                input.readInt(slot[column]);
+            }
+            addRow(columnSums.data(), slot, n);
+        } else {
+            for (int column = 0; column < n; ++column) {
+                input.readInt(incoming[column]);
+            }
+            replaceRow(columnSums.data(), slot, incoming.data(), n);
+        }
+
+        if (row + 1 >= s) {
+            const std::int64_t current = rowMaximum(columnSums.data(), n, s);
+            if (row + 1 == s || current > maximum) {
+                maximum = current;
+            }
+        }
+    }
+
+    std::printf("%" PRId64 "\n", maximum);
+    return 0;
+}

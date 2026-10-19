@@ -1,0 +1,175 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <stdint.h>
+
+#define MAXNUM 100
+#define MAXSTR 50
+#define MAXRESULTS 1000
+#define MASK_WORDS ((MAXNUM + 31) / 32)
+#define FILTER_LIMIT 53
+
+static const uint32_t small_primes[] = {
+    2, 3, 5, 7, 11, 13, 17, 19,
+    23, 29, 31, 37, 41, 43, 47, 53
+};
+
+static int isprime(uint32_t value, const uint32_t *divisors, size_t count)
+{
+    if (value < 2U)
+        return 0;
+    for (size_t k = 0; k < count; ++k) {
+        uint32_t factor = divisors[k];
+        if ((uint64_t)factor * factor > value)
+            break;
+        if (value % factor == 0U)
+            return 0;
+    }
+    return 1;
+}
+
+void quicksort(long int *primes,int first,int last)
+{ int i, j, pivot;
+  long int temp;
+
+  if (first<last)
+     { pivot=first;
+       i=first;
+       j=last;
+       while(i<j)
+         { while (primes[i]<=primes[pivot]&&i<last)
+             i++;
+           while(primes[j]>primes[pivot])
+             j--;
+           if (i<j)
+              { temp=primes[i];
+                primes[i]=primes[j];
+                primes[j]=temp;
+              }
+         }
+       temp=primes[pivot];
+       primes[pivot]=primes[j];
+       primes[j]=temp;
+       quicksort(primes,first,j-1);
+       quicksort(primes,j+1,last);
+     }
+}
+
+int main(void)
+{
+    int numPrimes;
+    uint32_t first[MAXNUM], second[MAXNUM], scale[MAXNUM], base[MAXNUM];
+    uint32_t largest_first = 0U, maximum = 0U;
+    int common_scale = 1;
+    char fragment[MAXSTR];
+
+    if (scanf("%d", &numPrimes) != 1 || numPrimes < 1 || numPrimes > MAXNUM)
+        return 0;
+    for (int i = 0; i < numPrimes; ++i) {
+        if (scanf("%49s", fragment) != 1)
+            return 0;
+        first[i] = (uint32_t)strtoul(fragment, NULL, 10);
+        if (first[i] > largest_first)
+            largest_first = first[i];
+    }
+    for (int j = 0; j < numPrimes; ++j) {
+        if (scanf("%49s", fragment) != 1)
+            return 0;
+        second[j] = (uint32_t)strtoul(fragment, NULL, 10);
+        scale[j] = 1U;
+        for (size_t k = 0; fragment[k]; ++k)
+            scale[j] *= 10U;
+        if (j > 0 && scale[j] != scale[0])
+            common_scale = 0;
+        uint32_t value = (uint32_t)((uint64_t)largest_first * scale[j] + second[j]);
+        if (value > maximum)
+            maximum = value;
+    }
+    for (int i = 0; i < numPrimes; ++i)
+        base[i] = (uint32_t)((uint64_t)first[i] * scale[0]);
+
+    uint32_t survivors[MAXNUM][MASK_WORDS] = {{0}};
+    int word_count = (numPrimes + 31) / 32;
+    for (int i = 0; i < numPrimes; ++i)
+        for (int j = 0; j < numPrimes; ++j)
+            survivors[i][j / 32] |= UINT32_C(1) << (j % 32);
+
+    for (size_t k = 0; k < sizeof small_primes / sizeof small_primes[0]; ++k) {
+        uint32_t p = small_primes[k];
+        if (common_scale) {
+            uint32_t residue_masks[FILTER_LIMIT + 1][MASK_WORDS] = {{0}};
+            for (int j = 0; j < numPrimes; ++j)
+                residue_masks[second[j] % p][j / 32] |= UINT32_C(1) << (j % 32);
+            for (int i = 0; i < numPrimes; ++i) {
+                uint32_t remainder = base[i] % p;
+                uint32_t needed = remainder ? p - remainder : 0U;
+                for (int w = 0; w < word_count; ++w)
+                    survivors[i][w] &= ~residue_masks[needed][w];
+                if (base[i] <= p) {
+                    for (int j = 0; j < numPrimes; ++j)
+                        if (base[i] + second[j] == p)
+                            survivors[i][j / 32] |= UINT32_C(1) << (j % 32);
+                }
+            }
+        } else {
+            for (int i = 0; i < numPrimes; ++i) {
+                for (int j = 0; j < numPrimes; ++j) {
+                    uint32_t value = (uint32_t)((uint64_t)first[i] * scale[j] + second[j]);
+                    if (value != p && value % p == 0U)
+                        survivors[i][j / 32] &= ~(UINT32_C(1) << (j % 32));
+                }
+            }
+        }
+    }
+
+    uint32_t limit = (uint32_t)sqrt((double)maximum);
+    while ((uint64_t)(limit + 1U) * (limit + 1U) <= maximum)
+        ++limit;
+    while ((uint64_t)limit * limit > maximum)
+        --limit;
+    unsigned char composite[limit + 1U];
+    uint32_t divisors[limit / 2U + 1U];
+    size_t divisor_count = 0;
+    memset(composite, 0, sizeof composite);
+    for (uint32_t p = 2U; (uint64_t)p * p <= limit; ++p) {
+        if (!composite[p])
+            for (uint32_t multiple = p * p; multiple <= limit; multiple += p)
+                composite[multiple] = 1;
+    }
+    for (uint32_t p = FILTER_LIMIT + 1U; p <= limit; ++p)
+        if (!composite[p])
+            divisors[divisor_count++] = p;
+
+    long int row_results[MAXNUM][MAXNUM];
+    int row_counts[MAXNUM];
+#ifdef _OPENMP
+    size_t work_estimate = 0;
+    for (int i = 0; i < numPrimes; ++i)
+        for (int j = 0; j < numPrimes; ++j)
+            if (survivors[i][j / 32] & (UINT32_C(1) << (j % 32)))
+                work_estimate += divisor_count;
+#pragma omp parallel for schedule(dynamic, 1) if (work_estimate >= 1000000U)
+#endif
+    for (int i = 0; i < numPrimes; ++i) {
+        int count = 0;
+        for (int j = 0; j < numPrimes; ++j) {
+            if (survivors[i][j / 32] & (UINT32_C(1) << (j % 32))) {
+                uint32_t value = (uint32_t)((uint64_t)first[i] * scale[j] + second[j]);
+                if (isprime(value, divisors, divisor_count))
+                    row_results[i][count++] = (long int)value;
+            }
+        }
+        row_counts[i] = count;
+    }
+
+    long int result[MAXRESULTS];
+    int numResults = 0;
+    for (int i = 0; i < numPrimes; ++i)
+        for (int j = 0; j < row_counts[i]; ++j)
+            result[numResults++] = row_results[i][j];
+    quicksort(result, 0, numResults - 1);
+    for (int i = 0; i < numResults; ++i)
+        printf("%ld\n", result[i]);
+    return 0;
+}

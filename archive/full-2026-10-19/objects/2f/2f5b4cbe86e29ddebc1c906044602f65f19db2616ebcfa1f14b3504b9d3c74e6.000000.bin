@@ -1,0 +1,168 @@
+#include <bits/stdc++.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using namespace std;
+
+typedef long long ll;
+
+int A[1000][1000];
+
+class PrefixFrequency {
+  struct Entry {
+    ll key = 0;
+    uint32_t count = 0;
+    uint32_t epoch = 0;
+  };
+
+  vector<Entry> entries;
+  size_t mask;
+  unsigned shift;
+  uint32_t epoch = 0;
+
+  size_t index(ll key) const {
+    return static_cast<size_t>(
+        (static_cast<uint64_t>(key) * 11400714819323198485ULL) >> shift);
+  }
+
+public:
+  explicit PrefixFrequency(size_t maximum_distinct) {
+    size_t capacity = 1;
+    unsigned bits = 0;
+    while (capacity < 2 * maximum_distinct) {
+      capacity <<= 1;
+      ++bits;
+    }
+    entries.resize(capacity);
+    mask = capacity - 1;
+    shift = 64 - bits;
+  }
+
+  void reset() {
+    if (++epoch == 0) {
+      for (Entry &entry : entries)
+        entry.epoch = 0;
+      epoch = 1;
+    }
+    add(0);
+  }
+
+  uint32_t get(ll key) const {
+    size_t slot = index(key);
+    while (entries[slot].epoch == epoch) {
+      if (entries[slot].key == key)
+        return entries[slot].count;
+      slot = (slot + 1) & mask;
+    }
+    return 0;
+  }
+
+  void add(ll key) {
+    size_t slot = index(key);
+    while (entries[slot].epoch == epoch) {
+      if (entries[slot].key == key) {
+        ++entries[slot].count;
+        return;
+      }
+      slot = (slot + 1) & mask;
+    }
+    entries[slot].key = key;
+    entries[slot].count = 1;
+    entries[slot].epoch = epoch;
+  }
+};
+
+ll solve(int m, int n, int k) {
+  const int boundaries = min(m, n);
+  const int scan_length = max(m, n);
+  vector<int> prefixes(static_cast<size_t>(boundaries + 1) * scan_length, 0);
+
+  // Store two-dimensional prefixes contiguously in the scan direction.
+  if (n <= m) {
+    for (int j = 0; j < n; ++j) {
+      const int *previous = prefixes.data() + static_cast<size_t>(j) * scan_length;
+      int *next = prefixes.data() + static_cast<size_t>(j + 1) * scan_length;
+      int column_sum = 0;
+      for (int i = 0; i < m; ++i) {
+        column_sum += A[i][j];
+        next[i] = previous[i] + column_sum;
+      }
+    }
+  } else {
+    for (int i = 0; i < m; ++i) {
+      const int *previous = prefixes.data() + static_cast<size_t>(i) * scan_length;
+      int *next = prefixes.data() + static_cast<size_t>(i + 1) * scan_length;
+      int row_sum = 0;
+      for (int j = 0; j < n; ++j) {
+        row_sum += A[i][j];
+        next[j] = previous[j] + row_sum;
+      }
+    }
+  }
+
+  const ll pair_count = static_cast<ll>(boundaries) * (boundaries + 1) / 2;
+  ll ans = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel if (static_cast<ll>(scan_length) * pair_count >= 32768) reduction(+:ans)
+#endif
+  {
+    int thread_id = 0;
+    int thread_count = 1;
+#ifdef _OPENMP
+    thread_id = omp_get_thread_num();
+    thread_count = omp_get_num_threads();
+#endif
+
+    const ll first_pair = pair_count * thread_id / thread_count;
+    const ll last_pair = pair_count * (thread_id + 1) / thread_count;
+
+    // Decode this worker's first pair once, then advance sequentially.
+    int first = 0;
+    ll offset = first_pair;
+    while (first < boundaries && offset >= boundaries - first) {
+      offset -= boundaries - first;
+      ++first;
+    }
+    int last = first + 1 + static_cast<int>(offset);
+
+    PrefixFrequency frequency(static_cast<size_t>(scan_length) + 1);
+    vector<int> band_prefix(scan_length);
+    for (ll pair = first_pair; pair < last_pair; ++pair) {
+      const int *lower = prefixes.data() + static_cast<size_t>(first) * scan_length;
+      const int *upper = prefixes.data() + static_cast<size_t>(last) * scan_length;
+
+      // Materialize independent differences before sequential frequency updates.
+#pragma GCC ivdep
+      for (int x = 0; x < scan_length; ++x)
+        band_prefix[x] = upper[x] - lower[x];
+
+      frequency.reset();
+      for (int x = 0; x < scan_length; ++x) {
+        const ll sum = band_prefix[x];
+        ans += frequency.get(sum - static_cast<ll>(k));
+        frequency.add(sum);
+      }
+
+      if (++last > boundaries) {
+        ++first;
+        last = first + 1;
+      }
+    }
+  }
+  return ans;
+}
+
+int main() {
+  int k, m, n;
+  cin >> k >> m >> n;
+  memset(A, 0, sizeof A);
+
+  for (int i = 0; i < m; i++)
+    for (int j = 0; j < n; j++)
+      cin >> A[i][j];
+
+  cout << solve(m, n, k) << endl;
+  return 0;
+}

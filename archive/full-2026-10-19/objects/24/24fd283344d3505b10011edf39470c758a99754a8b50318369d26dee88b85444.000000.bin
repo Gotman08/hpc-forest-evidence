@@ -1,0 +1,218 @@
+"""LOCAL verification of actual MCP readbacks; creates ready metadata, never uploads."""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("r4b_admissions_factory", HERE / "assemble_admissions.py")
+factory = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(factory)
+
+
+def flat_inventory(directory):
+    directory = Path(directory)
+    factory.require(directory.is_dir() and not directory.is_symlink(), "Exact ordinary publication directory required")
+    result = {}
+    for path in directory.rglob("*"):
+        factory.require(path.parent == directory and path.is_file() and not path.is_symlink()
+                        and not (hasattr(path, "is_junction") and path.is_junction()),
+                        "Publication subdirectory, link, or special file refused")
+        result[path.name] = {"sha256": factory.sha(path), "bytes": path.stat().st_size}
+    return result
+
+
+def stage_batch(manifest_ref, marker_ref):
+    manifest = factory.read(manifest_ref)
+    marker = factory.read(marker_ref)
+    cell = {k: manifest[k] for k in ("scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "session_id", "job_id", "remote_root")}
+    factory.bind(marker, cell)
+    factory.require(marker.get("schema") == "hpc-forest-dynamic-r4b-allocation-marker-v1"
+                    and marker.get("verified") is True and marker.get("native_model_calls") == 0,
+                    "Actual original allocation marker required")
+    admission = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + cell["session_id"]
+    output = factory.artifact(manifest_ref).parent / "publication-batch"
+    output.mkdir(exist_ok=False)
+    group = output / admission.rsplit("/", 1)[1]
+    group.mkdir()
+    rows = [*manifest["dependencies"], manifest["authorization_publish_after_readback"]]
+    names = set()
+    for row in rows:
+        name = row["remote_path"].removeprefix(admission + "/")
+        factory.require(row["remote_path"] == admission + "/" + name and name not in {"", ".", ".."}
+                        and "/" not in name and "\\" not in name and ":" not in name
+                        and name not in names | {"authorization-ready.json", "allocation-marker.json"},
+                        "Only exact unique flat declared admission files may be grouped")
+        names.add(name)
+        source = factory.artifact(row["local"])
+        (group / name).write_bytes(source.read_bytes())
+    factory.require("authorization.json" in names, "Grouped authorization missing")
+    expected = flat_inventory(group)
+    proposal = {"schema": "hpc-forest-dynamic-r4b-grouped-publication-v1", "verified": False, **cell,
+        "manifest": manifest_ref, "allocation_marker": marker_ref, "staged_directory": str(group.resolve()),
+        "inventory": expected, "ready_absent": True, "native_model_calls": 0, "uploaded": False,
+        "directory_tool_hash_verified": False, "filewise_SHA_readback_required": True,
+        "directory_upload": {"tool": "mcp__romeo__upload_to_romeo", "arguments": {
+            "local_path": str(group.resolve()), "remote_path": "/scratch_p/nimarano", "verify": False}},
+        "directory_readback": {"tool": "mcp__romeo__download_from_romeo", "arguments": {
+            "remote_path": admission, "local_path": str((output / "readback").resolve()), "recursive": True, "verify": False}},
+        "expected_readback_inventory": {**expected, "allocation-marker.json": {
+            "sha256": marker_ref["sha256"], "bytes": factory.artifact(marker_ref).stat().st_size}},
+        "ready_publish_last": admission + "/authorization-ready.json"}
+    path = output / "batch-arguments.json"
+    path.write_text(json.dumps(proposal, indent=2, ensure_ascii=False) + "\n", encoding="utf8", newline="\n")
+    return factory.reference(path)
+
+
+def result_object(value):
+    if isinstance(value.get("structuredContent"), dict):
+        return value["structuredContent"]
+    if "ok" in value:
+        return value
+    texts = [item["text"] for item in value.get("content", []) if item.get("type") == "text"]
+    factory.require(len(texts) == 1, "Unambiguous actual MCP result required")
+    return json.loads(texts[0])
+
+
+def verify_batch(batch_ref, upload_ref, download_ref, qualified_checks_ref):
+    batch = factory.read(batch_ref)
+    factory.require(batch.get("schema") == "hpc-forest-dynamic-r4b-grouped-publication-v1"
+                    and batch.get("verified") is False and batch.get("uploaded") is False
+                    and batch.get("ready_absent") is True, "Unexecuted strict grouped proposal required")
+    factory.require(flat_inventory(batch["staged_directory"]) == batch["inventory"], "Local grouped files changed")
+    upload, download = result_object(factory.read(upload_ref)), result_object(factory.read(download_ref))
+    destination = batch["directory_readback"]["arguments"]["remote_path"]
+    target = Path(batch["directory_readback"]["arguments"]["local_path"])
+    factory.require(upload.get("ok") is True and upload.get("sent") == batch["staged_directory"]
+                    and upload.get("to") == destination and download.get("ok") is True
+                    and download.get("downloaded") == destination and download.get("to") == str(target),
+                    "Actual exact directory upload/download results required; folder verified flag is not a SHA proof")
+    actual = flat_inventory(target)
+    factory.require(actual == batch["expected_readback_inventory"], "Directory readback differs: exact batch plus original marker required")
+    factory.require("authorization-ready.json" not in actual, "Ready must remain absent until complete readback")
+    manifest = factory.read(batch["manifest"])
+    dependencies = [{"remote_path": row["remote_path"], "downloaded": factory.reference(target / row["remote_path"].rsplit("/", 1)[1])}
+                    for row in manifest["dependencies"]]
+    auth_name = manifest["authorization_publish_after_readback"]["remote_path"]
+    checks = factory.read(qualified_checks_ref)
+    cell = {k: manifest[k] for k in ("scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "session_id", "job_id", "remote_root")}
+    observed = {"schema": "hpc-forest-dynamic-r4b-publication-readbacks-v1", "verified": True, **cell,
+        "actual_MCP_readbacks": True, "native_model_calls": 0, "observed_at": time.time(),
+        "evidence_refs": [batch_ref, upload_ref, download_ref, qualified_checks_ref], "dependencies": dependencies,
+        "existing_qualified_files": checks["existing_qualified_files"],
+        "authorization": {"remote_path": auth_name, "downloaded": factory.reference(target / "authorization.json")},
+        "directory_tool_hash_verified": False, "exact_grouped_readback_files": len(actual),
+        "grouped_filewise_SHA_verified": True}
+    verify_readbacks(manifest, observed)
+    factory.require(flat_inventory(target) == actual, "Readback changed during validation")
+    path = factory.artifact(batch_ref).parent / "batch-readbacks-observed.json"
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(observed, indent=2, ensure_ascii=False) + "\n")
+    return factory.reference(path)
+
+
+def verify_readbacks(manifest, observed):
+    factory.require(manifest.get("schema") == "hpc-forest-dynamic-r4b-upload-manifest-v1"
+                    and manifest.get("verified") is False and manifest.get("uploaded") is False,
+                    "Factory upload proposal required")
+    cell = {k: manifest[k] for k in ("scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "session_id", "job_id", "remote_root")}
+    factory.bind(observed, cell)
+    factory.require(observed.get("schema") == "hpc-forest-dynamic-r4b-publication-readbacks-v1"
+                    and observed.get("verified") is True and observed.get("actual_MCP_readbacks") is True
+                    and observed.get("native_model_calls") == 0, "Actual parent MCP readbacks required")
+    factory.fresh(observed["observed_at"])
+    factory.evidence(observed)
+    rows = observed.get("dependencies", [])
+    expected = {row["remote_path"]: row["local"] for row in manifest["dependencies"]}
+    factory.require(len(expected) == len(manifest["dependencies"])
+                    and len(rows) == len(expected) and {r["remote_path"] for r in rows} == set(expected),
+                    "Exhaustive exact dependency readback set required")
+    for row in rows:
+        actual = factory.artifact(row["downloaded"])
+        local = factory.artifact(expected[row["remote_path"]])
+        factory.require(actual.read_bytes() == local.read_bytes(), "Uploaded dependency readback differs from actual local bytes")
+    existing = {r["path"]: r["sha256"] for r in manifest["existing_qualified_files"]}
+    actual_existing = observed.get("existing_qualified_files", [])
+    factory.require(len(actual_existing) == len(existing)
+                    and {r["remote_path"] for r in actual_existing} == set(existing), "Qualified file remote hash checks required")
+    for row in actual_existing:
+        factory.require(row.get("sha256") == existing[row["remote_path"]] and row.get("actual_remote_checksum_verified") is True,
+                        "Actual existing qualified-file checksum differs")
+        for ref in row["evidence_refs"]:
+            factory.artifact(ref)
+        factory.require(row["evidence_refs"], "Real remote checksum evidence required")
+    auth = manifest["authorization_publish_after_readback"]
+    actual_auth = observed["authorization"]
+    factory.require(actual_auth.get("remote_path") == auth["remote_path"], "Wrong authorization destination")
+    remote_auth = factory.artifact(auth["local"])
+    downloaded = factory.artifact(actual_auth["downloaded"])
+    factory.require(downloaded.read_bytes() == remote_auth.read_bytes(), "Authorization readback differs from exact published bytes")
+    authorization = json.loads(remote_auth.read_text(encoding="utf8"))
+    factory.bind(authorization, cell)
+    factory.require(authorization.get("verified") is True and authorization.get("expires_at", 0) > time.time(),
+                    "Verified unexpired authorization required")
+    admission_root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + cell["session_id"]
+    factory.require(auth["remote_path"] == admission_root + "/authorization.json"
+                    and all(path.startswith(admission_root + "/") for path in expected), "Foreign upload path refused")
+    return cell, authorization, remote_auth
+
+
+def make_ready(manifest_ref, readbacks_ref, output):
+    manifest, observed = factory.read(manifest_ref), factory.read(readbacks_ref)
+    cell, authorization, auth_path = verify_readbacks(manifest, observed)
+    _, admission = factory.bootstrap_source()
+    local_path = auth_path.parent / "authorization-local.json"
+    local = admission.validate_authorization(local_path, {factory.SCOPE})
+    factory.require(all(local[k] == authorization[k] for k in ("purpose", "model", "effort", "session_id", "job_id", "remote_root")),
+                    "Local and remote full cells differ")
+    dependencies = [{"path": row["remote_path"], "sha256": row["local"]["sha256"]} for row in manifest["dependencies"]]
+    ready = {"schema": "hpc-forest-dynamic-r4b-authorization-ready-v1", "verified": True, **cell,
+             "authorization_sha256": factory.sha(auth_path), "dependencies": dependencies,
+             "readback_observation_sha256": readbacks_ref["sha256"], "native_model_calls": 0,
+             "ready_must_be_published_last": True, "global_admission_verified": False,
+             "normal_candidate_first_start_verified": False}
+    if authorization["purpose"] == "technical-contract":
+        ready["request_digest"] = authorization["allowed_request_sha256"]
+    with Path(output).open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(ready, indent=2, ensure_ascii=False) + "\n")
+    return ready
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=Path)
+    parser.add_argument("--batch-sha256")
+    parser.add_argument("--upload-result", type=Path)
+    parser.add_argument("--upload-result-sha256")
+    parser.add_argument("--download-result", type=Path)
+    parser.add_argument("--download-result-sha256")
+    parser.add_argument("--qualified-checks", type=Path)
+    parser.add_argument("--qualified-checks-sha256")
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument("--readbacks", type=Path)
+    parser.add_argument("--readbacks-sha256")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if args.batch:
+        for name in ("batch_sha256", "upload_result", "upload_result_sha256", "download_result", "download_result_sha256",
+                     "qualified_checks", "qualified_checks_sha256"):
+            factory.require(getattr(args, name), "All actual batch/result/checksum references required")
+        observed = verify_batch({"path": str(args.batch.resolve()), "sha256": args.batch_sha256},
+            {"path": str(args.upload_result.resolve()), "sha256": args.upload_result_sha256},
+            {"path": str(args.download_result.resolve()), "sha256": args.download_result_sha256},
+            {"path": str(args.qualified_checks.resolve()), "sha256": args.qualified_checks_sha256})
+    else:
+        factory.require(args.readbacks and args.readbacks_sha256, "Actual readback reference required")
+        observed = {"path": str(args.readbacks.resolve()), "sha256": args.readbacks_sha256}
+    result = make_ready({"path": str(args.manifest.resolve()), "sha256": args.manifest_sha256},
+                        observed, args.output)
+    print(json.dumps({"ready": str(args.output.resolve()), "session_id": result["session_id"],
+                      "uploaded": False, "native_model_calls": 0, "global_admission_verified": False}))
+
+
+if __name__ == "__main__":
+    main()

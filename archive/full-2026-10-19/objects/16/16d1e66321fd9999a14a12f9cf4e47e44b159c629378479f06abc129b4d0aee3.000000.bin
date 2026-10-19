@@ -1,0 +1,115 @@
+"""Offline ancestry trace of two already archived censuses; never run preflight."""
+import hashlib
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+R3 = HERE.parent
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def stamp(value):
+    assert isinstance(value, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z", value)
+    datetime.fromisoformat(value)
+    base, _dot, fraction = value[:-1].partition(".")
+    return base + "." + fraction.ljust(7, "0") + "Z"
+
+
+def same(a, b):
+    return all(a.get(k) == b.get(k) if k != "CreationDate" or a.get(k) is None or b.get(k) is None
+               else stamp(a[k]) == stamp(b[k]) for k in FIELDS)
+
+
+def invalid(row):
+    bad = [k for k in FIELDS if k not in row]
+    bad += [k for k in FIELDS[:2] if type(row.get(k)) is not int]
+    bad += [k for k in FIELDS[2:] if not isinstance(row.get(k), str) or not row.get(k)]
+    if "CreationDate" not in bad:
+        try:
+            stamp(row["CreationDate"])
+        except (AssertionError, ValueError):
+            bad.append("CreationDate")
+    return sorted(set(bad))
+
+
+plan = load(R3 / "plan-parent-01.json")
+baseline_path = Path(plan["baseline_cim"]["path"])
+assert sha(baseline_path) == plan["baseline_cim"]["sha256"]
+baseline = load(baseline_path)
+old = {r["ProcessId"]: r for r in baseline["rows"]}
+own = {r["ProcessId"] for r in plan["owned_targets_in_stop_order"] + plan["preserved_observer_transport_identities"]}
+results = []
+for filename in ("cim-prive-c161bdf08961460f96d66a756dd43ce9.json", "cim-prive-7ebcd15b337e472280334a7e5ad46414.json"):
+    path = R3 / filename
+    census = load(path)
+    current = {r["ProcessId"]: r for r in census["rows"]}
+    operators = {r["ProcessId"] for r in census["rows"]
+        if Path(r.get("ExecutablePath") or "").name.casefold() in {"pwsh.exe", "powershell.exe"}
+        and str(R3 / "arreter-individuellement.ps1").casefold() in (r.get("CommandLine") or "").casefold()
+        and "-file" in (r.get("CommandLine") or "").casefold()}
+    assert len(operators) == 1, "Unambiguous archived script operator required"
+    candidates = [r for r in census["rows"] if r["ProcessId"] not in own | operators
+        and (r["ProcessId"] not in old or not same(r, old[r["ProcessId"]]))]
+    traces = []
+    for candidate in candidates:
+        row = candidate
+        chain = []
+        seen = set()
+        while True:
+            pid = row["ProcessId"]
+            assert pid not in seen
+            seen.add(pid)
+            chain.append(pid)
+            if pid in {0, 4}:
+                traces.append({"candidate_pid": candidate["ProcessId"], "chain": chain, "status": "system_anchor"})
+                break
+            bad = invalid(row)
+            if bad:
+                is_anchor = pid in old
+                traces.append({"candidate_pid": candidate["ProcessId"], "candidate_parent_pid": candidate["ParentProcessId"],
+                    "chain": chain, "status": "strict_identity_failure", "failing_pid": pid,
+                    "failing_role": "candidate" if pid == candidate["ProcessId"] else "ancestor_before_baseline_anchor_check",
+                    "invalid_or_unavailable_fields": bad, "failing_pid_in_baseline": is_anchor,
+                    "all_five_observed_values_equal_baseline": is_anchor and same(row, old[pid]),
+                    "creation_date": row.get("CreationDate"), "parent_pid": row.get("ParentProcessId"),
+                    "creation_precise_and_equal_baseline": is_anchor and isinstance(row.get("CreationDate"), str)
+                        and stamp(row["CreationDate"]) == stamp(old[pid]["CreationDate"]),
+                    "candidate_full_identity_valid": not invalid(candidate), "failing_or_candidate_owned": pid in own or candidate["ProcessId"] in own,
+                    "minimal_existing_anchor_check_would_resolve_this_failure": is_anchor and same(row, old[pid])
+                        and isinstance(row.get("CreationDate"), str)})
+                break
+            if pid in old:
+                traces.append({"candidate_pid": candidate["ProcessId"], "chain": chain, "status": "full_identity_baseline_anchor", "anchor_pid": pid})
+                break
+            parent = row["ParentProcessId"]
+            if parent not in current:
+                traces.append({"candidate_pid": candidate["ProcessId"], "chain": chain, "status": "orphan", "missing_parent_pid": parent})
+                break
+            row = current[parent]
+    owned_checks = [{"pid": row["ProcessId"], "present": row["ProcessId"] in current,
+                     "full_identity_equal": row["ProcessId"] in current and same(row, current[row["ProcessId"]])}
+                    for row in plan["owned_targets_in_stop_order"]]
+    results.append({"census": {"path": str(path), "sha256": sha(path)}, "captured_at_utc": census["captured_at_utc"],
+        "rows_count": census["rows_count"], "archived_operator_pid": next(iter(operators)),
+        "new_or_changed_foreign_candidate_count": len(candidates), "traces": traces, "nine_owned_identity_checks": owned_checks,
+        "pid42180_present": 42180 in current})
+output = {"schema": "hpc-forest-source-only-stop-offline-null-ancestry-diagnostic-v1", "verified": True,
+    "scope": "metadata trace only of stored census snapshots, no current identity/exclusivity assertion",
+    "baseline": {"path": str(baseline_path), "sha256": sha(baseline_path)},
+    "source_helper": {"path": str(R3 / "preparer-arret.py"), "sha256": sha(R3 / "preparer-arret.py")},
+    "censuses": results, "raw_foreign_commands_or_executable_paths_exported": False,
+    "production_preflight_or_live_CIM_or_cache_or_stop_called": False}
+with (HERE / "DIAGNOSTIC-NULLS-ETRANGERS.json").open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(output, indent=2, ensure_ascii=False) + "\n")
+print(json.dumps({"sha256": sha(HERE / "DIAGNOSTIC-NULLS-ETRANGERS.json"),
+    "failures": [[t for t in item["traces"] if t["status"] == "strict_identity_failure"] for item in results]}))

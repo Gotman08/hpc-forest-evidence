@@ -1,0 +1,90 @@
+"""Exact static command proofs; no qualification/model/CLI/shell is executed."""
+import ast
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('r6_renderer_tests', ROOT / 'rendre-trois-dossiers.py')
+r = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r)
+m = r.m
+
+
+@pytest.mark.parametrize('short,model', r.MODELS)
+def test_exact_request_command_and_selected_cell(short, model):
+    directory = ROOT / short
+    command = (directory / 'commande-allouee-proposee.sh').read_text(encoding='utf8')
+    request = json.loads((directory / 'job-prepare-arguments-proposes.json').read_text(encoding='utf8'))
+    assert command == r.make_command(model) == request['command']
+    assert command.count('\nsrun ') == 1 and '--time=03:00:00' in command
+    assert {k: request[k] for k in ('partition', 'nodes', 'ntasks_per_node', 'cpus_per_task', 'mem_gb', 'gpus_per_node', 'time_limit', 'cpu_bind')} == {
+        'partition': 'short', 'nodes': 1, 'ntasks_per_node': 1, 'cpus_per_task': 4,
+        'mem_gb': 16, 'gpus_per_node': 0, 'time_limit': '03:00:00', 'cpu_bind': 'cores'}
+    marker = "<<'ONE_SELECTED_MAX_CELL_PREFLIGHT'\n"
+    body = command.split(marker, 1)[1].rsplit('\nONE_SELECTED_MAX_CELL_PREFLIGHT\n', 1)[0]
+    tree = ast.parse(body)
+    assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == 'CELL')
+    cell = ast.literal_eval(assignment.value)
+    assert cell == r.payload(model)
+    assert cell['model'] == model and cell['session_id'] == m.CELLS[model]
+    assert cell['maximum_native_workers'] == 4
+    assert 'qualification_job' not in cell and 'qualification_sha256' not in cell
+    strings = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert 'set -euo pipefail\nromeo_load_armgpu_env\nspack load ' in strings
+    assert '\nexec ' in strings
+
+
+@pytest.mark.parametrize('model', list(m.CELLS))
+def test_future_qualification_does_not_change_command_bytes(monkeypatch, model):
+    static = r.make_command(model)
+    globals_after_real_q = {'BINDING': {'NEUTRAL_POST_Q_TEST_ONLY': True}, 'MODEL': model, 'SESSION': m.CELLS[model],
+        'SCOPE': r.SCOPE, 'SOURCE': r.SOURCE, 'PLAN': r.PLAN, 'RUNTIME': r.RUNTIME,
+        'SOURCE_MEMBERS': 109, 'EXTRACTION': r.EXTRACTION, 'REMOTE_ROOT': r.payload(model)['remote_root'],
+        'ADMISSION_ROOT': r.payload(model)['admission_root'], 'SOURCE_ZIP': r.SOURCE_ZIP,
+        'QUALIFICATION_JOB': 'NEUTRAL_FUTURE_JOB', 'QJSON': 'a' * 64, 'QARCHIVE': 'b' * 64, 'QAUDIT': 'c' * 64}
+    for key, value in globals_after_real_q.items():
+        monkeypatch.setattr(m, key, value, raising=False)
+    assert m.proposal_command() == static
+    monkeypatch.setattr(m, 'QUALIFICATION_JOB', 'DIFFERENT_NEUTRAL_Q_JOB')
+    monkeypatch.setattr(m, 'QJSON', 'd' * 64)
+    assert hashlib.sha256(m.proposal_command().encode()).hexdigest() == hashlib.sha256(static.encode()).hexdigest()
+
+
+def test_source_and_review_are_actual_frozen_bytes():
+    r.verify_static_source()
+    assert m.sha(r.REVIEW_PATH) == r.REVIEW
+
+
+def test_distinct_sessions_roots_caches_and_no_positive_admission():
+    payloads = [r.payload(model) for _, model in r.MODELS]
+    for field in ('model', 'session_id', 'remote_root', 'admission_root'):
+        assert len({cell[field] for cell in payloads}) == 3
+    for short, _model in r.MODELS:
+        for name in ('cellule-source-revue-non-admise.json', 'submission-intent-non-admise.json',
+                     'remote-freshness-non-admise.json', 'transport-non-admis.json',
+                     'parent-observations-non-admises.json', 'human-scope-non-admis.json'):
+            assert json.loads((ROOT / short / name).read_text(encoding='utf8'))['verified'] is False
+    production = [x for name in ('authorization-ready.json', 'authorization-local.json') for x in ROOT.rglob(name)
+                  if not any(part.startswith('test-temp-') for part in x.relative_to(ROOT).parts)]
+    assert not production
+    assert all(not (m.LAUNCH / ('worker-' + session)).exists() for session in m.CELLS.values())
+
+
+def test_common_bindings_still_refuse_missing_actual_q():
+    value = ROOT / 'commun-non-admis/source-bindings-non-admis.json'
+    with pytest.raises(m.Refusal, match='Actual independently reviewed cap4'):
+        m.configure(m.ref(value), 'gpt-6-astra')
+
+
+def test_renderer_has_no_process_network_cli_or_secret_content_read():
+    text = (ROOT / 'rendre-trois-dossiers.py').read_text(encoding='utf8')
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Import):
+            assert not ({n.name.split('.')[0] for n in node.names} & {'subprocess', 'socket', 'requests', 'asyncio'})
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            assert node.func.attr not in {'Popen', 'run', 'execvpe', 'system', 'connect'}
+    assert 'm.CONFIG.read_text' not in text and 'm.CONFIG.read_bytes' not in text

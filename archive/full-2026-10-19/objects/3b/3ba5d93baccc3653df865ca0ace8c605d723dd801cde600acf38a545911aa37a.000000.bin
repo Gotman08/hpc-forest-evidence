@@ -1,0 +1,192 @@
+"""New admission lifetime/snapshot tests only: fake census, no process/RPC/model."""
+import ast
+import importlib.util
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('external_admission_neutral', HERE / 'admettre-cellule-externe.py')
+h = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(h)
+
+
+def sealed_absence_namespace():
+    text = h.OBSERVER.read_text()
+    names = {'require', 'utc_creation', 'identity', 'same_identity', 'verify_pair', 'complete_cim', 'verify_cold_absence'}
+    tree = ast.parse(text)
+    selected = ast.Module([node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names], [])
+    namespace = {'re': __import__('re'), 'datetime': datetime, 'UTC': UTC, 'time': SimpleNamespace(time=lambda: 1000),
+        'FIELDS': ('ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate')}
+    exec(compile(ast.fix_missing_locations(selected), '<sealed-absence-synthetic-only>', 'exec'), namespace)  # noqa: S102 -- pinned pure functions on synthetic metadata only; no main.
+    return namespace
+
+
+def absence_fixture():
+    ns = sealed_absence_namespace()
+    pair = [{'ProcessId': pid, 'ParentProcessId': parent, 'ExecutablePath': 'SYNTHETIC/python.exe',
+        'CommandLine': 'SYNTHETIC never executed', 'CreationDate': '1970-01-01T00:01:40.0000000Z'}
+        for pid, parent in [(11, 0), (12, 11)]]
+    other = {'ProcessId': 99, 'ParentProcessId': 0, 'ExecutablePath': None, 'CommandLine': None,
+        'CreationDate': '1970-01-01T00:01:40.0000000Z'}
+    ref0, ref1 = {'path': 'SYNTHETIC-before', 'sha256': 'a' * 64}, {'path': 'SYNTHETIC-after', 'sha256': 'b' * 64}
+    def census(rows, seconds):
+        return {'schema': 'hpc-forest-dynamic-r4b-full-cim-v1', 'complete_census': True, 'strict_utf8_decoding': True,
+            'rows_count': len(rows), 'rows': rows, 'captured_at_utc': datetime.fromtimestamp(seconds, UTC).isoformat()}
+    docs = {'SYNTHETIC-before': census(pair, 200), 'SYNTHETIC-after': census([other], 300)}
+    ns['bound'] = lambda ref: ref['path']
+    ns['read'] = lambda path: docs[path]
+    proof = {'schema': 'hpc-forest-passive-owned-pair-absence-v1', 'verified': True, 'subject': 'source-only',
+        'no_stop_or_replay': True, 'owned_full_identities': pair, 'evidence_refs': [ref0, ref1],
+        'prior_full_cim': ref0, 'fresh_full_cim': ref1, 'observed_at': 300}
+    return ns, proof, pair, [other]
+
+
+def test_old_valid_absence_remains_historical_after_watch_start():
+    ns, proof, pair, rows = absence_fixture()
+    ns['verify_cold_absence'](proof, pair, rows, 'source-only', initial=False)
+
+
+def test_same_old_proof_cannot_start_a_new_observer():
+    ns, proof, pair, rows = absence_fixture()
+    with pytest.raises(ValueError, match='Fresh <=120seconds'):
+        ns['verify_cold_absence'](proof, pair, rows, 'source-only', initial=True)
+
+
+@pytest.mark.parametrize('mode', ['reappeared_pair', 'equivalent_command', 'opaque_same_PID', 'no_stop_false'])
+def test_historical_mode_preserves_absence_ownership_and_no_replay(mode):
+    ns, proof, pair, rows = absence_fixture()
+    if mode == 'reappeared_pair':
+        rows += pair
+    elif mode == 'equivalent_command':
+        rows.append({**pair[0], 'ProcessId': 50})
+    elif mode == 'opaque_same_PID':
+        rows.append({**pair[0], 'ExecutablePath': None})
+    else:
+        proof['no_stop_or_replay'] = False
+    with pytest.raises(ValueError):
+        ns['verify_cold_absence'](proof, pair, rows, 'source-only', initial=False)
+
+
+class FakeObserver:
+    def __init__(self, root, args, *, mutate_state=False):
+        self.HERE = root / 'SYNTHETIC-OBSERVER'; self.HERE.mkdir()
+        self.state = self.HERE / 'observer-state.json'; self.state.write_bytes(b'{"SYNTHETIC-state":1}')
+        self.calls = []; self.args = args; self.mutate_state = mutate_state
+
+    def bound(self, ref):
+        assert h.digest(ref['path']) == ref['sha256']
+        return Path(ref['path'])
+
+    def read(self, path):
+        return json.loads(Path(path).read_text())
+
+    def verify_local_validation(self):
+        self.calls.append('existing-validation-read-only')
+
+    def census(self):
+        self.calls.append('fresh-census')
+        return [{'ProcessId': 900, 'ParentProcessId': 0, 'ExecutablePath': None,
+            'CommandLine': None, 'CreationDate': None}]
+
+    def verify_pair(self, pair, rows):
+        self.calls.append('pair-current-census')
+
+    def guard(self, policy, bundle, history, rows, *, initial):
+        self.calls.append(('guard', initial))
+        return rows, {}, set(), {}, None, None
+
+    def transition_state(self, policy, bundle, rows, transition, *, initial):
+        self.calls.append(('transition', initial))
+
+    def admit_cell(self, *args):
+        self.calls.append('sealed-admit-cell')
+        target = self.HERE / 'ORIGINAL-SYNTHETIC-ADMISSION.json'
+        target.write_text(json.dumps({'schema': 'SYNTHETIC-only', 'observer_code_sha256': h.OBSERVER_SHA,
+            'evidence_refs': [h.ref(self.args.policy), h.ref(self.args.routes), h.ref(self.args.reader_identities), h.ref(self.state)]}))
+        if self.mutate_state:
+            self.state.write_bytes(b'{"SYNTHETIC-state":2}')
+        return target
+
+
+def flow(tmp_path, monkeypatch, *, mutate_state=False):
+    monkeypatch.setattr(h, 'HERE', tmp_path)
+    args = SimpleNamespace(model='gpt-6.1-sol', admit_cell='roots', helper_review_sha256=None)
+    for key in ('policy', 'routes', 'transition', 'reader_identities'):
+        path = tmp_path / (key + '.json'); path.write_bytes(b'{"SYNTHETIC":true}')
+        setattr(args, key, path)
+    review = tmp_path / 'revue-independante-r1'; review.mkdir()
+    args.helper_review = review / 'SYNTHETIC-REVIEW.json'; args.helper_review.write_bytes(b'{"SYNTHETIC":true}')
+    args.helper_review_sha256 = h.digest(args.helper_review)
+    refs = {'policy': h.ref(args.policy), 'transition': h.ref(args.transition)}
+    monkeypatch.setattr(h, 'read_startup', lambda _: (refs, {}))
+    monkeypatch.setattr(h, 'validate_startup', lambda *args: [{'SYNTHETIC-complete-pair-already-validated': True}])
+    obs = FakeObserver(tmp_path, args, mutate_state=mutate_state)
+    output = tmp_path / 'execution-SYNTHETIC'; output.mkdir()
+    return obs, args, output
+
+
+def test_same_observer_admission_function_and_byte_equal_cold_state(tmp_path, monkeypatch):
+    obs, args, output = flow(tmp_path, monkeypatch)
+    target = h.admission_once(obs, args, output, clock=lambda: 1000)
+    result = json.loads(target.read_text())
+    original = json.loads((obs.HERE / 'ORIGINAL-SYNTHETIC-ADMISSION.json').read_text())
+    assert ('guard', False) in obs.calls and ('transition', False) in obs.calls
+    assert obs.calls.index('fresh-census') < obs.calls.index('sealed-admit-cell')
+    assert result['observer_code_sha256'] == original['observer_code_sha256'] == h.OBSERVER_SHA
+    assert original['evidence_refs'][-1]['path'] == str(obs.state)
+    assert Path(result['evidence_refs'][-2]['path']).read_bytes() == obs.state.read_bytes()
+    assert result['evidence_refs'][-1] == h.ref(args.helper_review)
+    assert result['validated_live_state_origin']['live_file_promised_immutable'] is False
+    saved_cim = json.loads((output / 'CIM-PRIVE-ADMISSION.json').read_text())
+    assert datetime.fromisoformat(saved_cim['captured_at_utc']).utcoffset().total_seconds() == 0
+
+
+def test_state_change_retains_original_without_stable_admission(tmp_path, monkeypatch):
+    obs, args, output = flow(tmp_path, monkeypatch, mutate_state=True)
+    with pytest.raises(ValueError, match='Live state changed'):
+        h.admission_once(obs, args, output, clock=lambda: 1000)
+    assert (obs.HERE / 'ORIGINAL-SYNTHETIC-ADMISSION.json').is_file()
+    assert not (output / 'ADMISSION-STABLE-CELLULE.json').exists()
+
+
+def test_expired_fresh_census_never_calls_admit(tmp_path, monkeypatch):
+    obs, args, output = flow(tmp_path, monkeypatch)
+    ticks = iter([1000, 1121])
+    with pytest.raises(ValueError, match='CIM expired'):
+        h.admission_once(obs, args, output, clock=lambda: next(ticks))
+    assert 'sealed-admit-cell' not in obs.calls
+
+
+def test_expiry_after_original_call_never_publishes_stable(tmp_path, monkeypatch):
+    obs, args, output = flow(tmp_path, monkeypatch)
+    ticks = iter([1000, 1001, 1122])
+    with pytest.raises(ValueError, match='changed before stable'):
+        h.admission_once(obs, args, output, clock=lambda: next(ticks))
+    assert (obs.HERE / 'ORIGINAL-SYNTHETIC-ADMISSION.json').exists()
+    assert not (output / 'ADMISSION-STABLE-CELLULE.json').exists()
+
+
+def test_helper_review_outside_scope_is_refused_before_read(tmp_path, monkeypatch):
+    obs, args, output = flow(tmp_path, monkeypatch)
+    args.helper_review = tmp_path / 'FOREIGN-never-read.json'
+    obs.bound = lambda _: pytest.fail('Foreign review read')
+    with pytest.raises(ValueError, match='ordinary local review artifact'):
+        h.admission_once(obs, args, output, clock=lambda: 1000)
+
+
+def test_watch_first_start_flags_and_passive_code_are_untouched():
+    assert h.digest(h.OBSERVER) == h.OBSERVER_SHA
+    tree = ast.parse(h.OBSERVER.read_text())
+    watch = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == 'watch')
+    calls = [node for node in ast.walk(watch) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in {'guard', 'transition_state'}]
+    initial = [node for node in calls if any(keyword.arg == 'initial' and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True for keyword in node.keywords)]
+    assert {node.func.id for node in initial} == {'guard', 'transition_state'}
+    wrapper = ast.parse((HERE / 'admettre-cellule-externe.py').read_text())
+    assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {'watch', 'main', 'run', 'Popen', 'kill', 'terminate'} for node in ast.walk(wrapper))

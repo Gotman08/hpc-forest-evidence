@@ -1,0 +1,94 @@
+"""Read-only reconciliation of the single already-started source-only group."""
+import hashlib
+import json
+import re
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+WORKSPACE = ROOT.parent.parent
+
+
+def read(p):
+    return json.loads(Path(p).read_text(encoding="utf-8-sig"))
+
+
+def sha(p):
+    with Path(p).open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def link(p):
+    return {"path": str(Path(p).resolve()), "sha256": sha(p)}
+
+
+def main():
+    state = read(ROOT / "coordinator-state.json")
+    assert state["research_jobs_submitted"] == 1
+    group = next(g for g in state["queue"] if g["key"] == state["current_key"])
+    assert group["key"] == "source-only-gpt-6-luna-max" and group["job_id"] == "749843"
+    assert group["session_id"] == "bb7a58941e74486ba24267f2f526de8f"
+    run = ROOT / "runs" / group["key"]
+    deployment = read(run / "deployment-received.json")
+    assert deployment["source_files_verified"] == 94 and deployment["original_preparation_files_verified"] == 609
+    assert deployment["all_copied_bytes_verified"] and not deployment["old_candidates_imported"]
+    assert not deployment["model_calls"] and not deployment["candidate_compilations_or_executions"]
+    assert deployment["input_manifest_sha256"] == "9b54f8dc1d745f4af6389871265923d1a96f8d7ea14da6552ed045f2973b9bd9"
+    launch = read(run / "worker-lancement.json")
+    assert launch["session_id"] == group["session_id"]
+    assert (run / "deployment-received.json").stat().st_mtime < (run / "worker-launch-started.json").stat().st_mtime
+    assert sha(launch["cli"]["executable"]["path"]) == launch["cli"]["executable"]["sha256"]
+    census = read(HERE / "cim-controle-activation.json")
+    processes = {p["ProcessId"]: p for p in census}
+    # The two native relay pairs are separate from their coordinators/observers.
+    r1 = [processes[i] for i in (22244, 1520)]
+    assert all("reprendre-relais-r1.py" in p["CommandLine"] and "--resume" in p["CommandLine"] for p in r1)
+    assert processes[1520]["ParentProcessId"] == 22244
+    assert all(p["CreatedUTC"].startswith("2026-10-16T22:45:13.") for p in r1)
+    source_pair = [p for p in census if "-m hpc_forest.ablation_worker" in (p["CommandLine"] or "")
+                   and group["session_id"] in p["CommandLine"] and p["ExecutablePath"].lower().endswith("python.exe")]
+    assert len(source_pair) == 2
+    assert any(p["ProcessId"] == 39288 and p["ParentProcessId"] == 11168 for p in source_pair)
+    actual = next(p for p in source_pair if p["ParentProcessId"] == 39288)
+    assert all(p["CreatedUTC"].startswith("2026-10-17T02:20:43.") for p in source_pair)
+    assert processes[11168]["ParentProcessId"] == 27336 and processes[27336]["CreatedUTC"].startswith("2026-10-17T02:14:34.")
+    assert all(i not in processes for i in (16204, 53492))
+    known_relays = {p["ProcessId"] for p in r1 + source_pair}
+    possible = [p for p in census if p["ExecutablePath"] and p["ExecutablePath"].lower().endswith("python.exe")
+                and re.search(r"(?:-m hpc_forest\.(?:ablation|reference96)_worker|reprendre-relais-r1\.py)", p["CommandLine"] or "")]
+    assert {p["ProcessId"] for p in possible} == known_relays
+    for p in source_pair:
+        assert group["session_id"] in p["CommandLine"] and "--resume" in p["CommandLine"]
+    archive = ROOT / "HPC-Forest-Harnais-Comparaison-r1.zip"
+    assert sha(archive) == "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb"
+    project = WORKSPACE / "work/hpc-forest-harnais-comparaison-r1/project"
+    with zipfile.ZipFile(archive) as z:
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        assert len(names) == 94
+        for name in names:
+            assert (project / name).read_bytes() == z.read(name), name
+    authority = read(run / "autorisation.json")
+    assert authority["native_lane_release_received_and_verified"] and not authority["operator_algorithm_advice"]
+    authority_files = [link(run / n) for n in ("deployment-received.json", "autorisation.json", "submission.json", "worker-lancement.json")]
+    out = {"schema": "hpc-forest-source-only-first-activation-verified-v1", "verified": True,
+           "observed_utc": datetime.now(UTC).isoformat(), "job_id": group["job_id"], "session_id": group["session_id"],
+           "group": group["key"], "source_files_unchanged": 94, "prepared_official_files_verified": 609,
+           "deployment_received_before_worker_launch": True, "single_coordinator": [processes[27336], processes[11168]],
+           "source_only_worker_pair": source_pair, "source_only_real_python_pid": actual["ProcessId"],
+           "r1_worker_pair_preserved": r1, "native_workers": 2, "gpt96_owned_tree_absent": True,
+           "cli_pin_reverified": launch["cli"], "authority_files": authority_files,
+           "cim_evidence": link(HERE / "cim-controle-activation.json"),
+           "lane_release": link(ROOT / "voies-liberees.json"), "final_source_only_reception_received": False,
+           "native_codex_admitted": False, "no_source_only_final_gain_claim": True,
+           "initial_powershell_receipt_failure_reconciled_without_duplicate_launch": True}
+    target = HERE / "activation-verifiee.json"
+    assert not target.exists()
+    target.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"verified": True, "job_id": group["job_id"], "native_workers": 2,
+                      "source_worker_launcher": 39288, "source_worker_python": actual["ProcessId"]}))
+
+
+if __name__ == "__main__":
+    main()

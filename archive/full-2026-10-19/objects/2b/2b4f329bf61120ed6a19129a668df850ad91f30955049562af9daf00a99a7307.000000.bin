@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n#define PAIR_TILE 32\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\n/* Allocation-free fallback with the original accumulation order. */\nstatic void body_force_direct(Body *p, float dt, int n) {\n  for (int i = 0; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/* Diagonal tiles retain the complete directed source loop, including self. */\nstatic inline void accumulate_diagonal_tile(\n    const float * restrict x,\n    const float * restrict y,\n    const float * restrict z,\n    float * restrict fx,\n    float * restrict fy,\n    float * restrict fz,\n    int first, int end) {\n  for (int i = first; i < end; ++i) {\n    const float tx = x[i];\n    const float ty = y[i];\n    const float tz = z[i];\n    float ax = fx[i];\n    float ay = fy[i];\n    float az = fz[i];\n\n    for (int j = first; j < end; ++j) {\n      float dx = x[j] - tx;\n      float dy = y[j] - ty;\n      float dz = z[j] - tz;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      ax += dx * inv_dist3;\n      ay += dy * inv_dist3;\n      az += dz * inv_dist3;\n    }\n\n    fx[i] = ax;\n    fy[i] = ay;\n    fz[i] = az;\n  }\n}\n\n/*\n * Both tiles stay cache-resident. Rows accumulate ascending j values,\n * while columns receive ascending i values. Reverse displacements are\n * evaluated explicitly to preserve their signed-zero behavior.\n */\nstatic inline void accumulate_pair_tile(\n    const float * restrict x,\n    const float * restrict y,\n    const float * restrict z,\n    float * restrict fx,\n    float * restrict fy,\n    float * restrict fz,\n    int first_i, int end_i, int first_j, int end_j) {\n  for (int i = first_i; i < end_i; ++i) {\n    const float tx = x[i];\n    const float ty = y[i];\n    const float tz = z[i];\n    float ax = fx[i];\n    float ay = fy[i];\n    float az = fz[i];\n\n    for (int j = first_j; j < end_j; ++j) {\n      const float sx = x[j];\n      const float sy = y[j];\n      const float sz = z[j];\n      float dx = sx - tx;\n      float dy = sy - ty;\n      float dz = sz - tz;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      ax += dx * inv_dist3;\n      ay += dy * inv_dist3;\n      az += dz * inv_dist3;\n\n      float reverse_dx = tx - sx;\n      float reverse_dy = ty - sy;\n      float reverse_dz = tz - sz;\n      fx[j] += reverse_dx * inv_dist3;\n      fy[j] += reverse_dy * inv_dist3;\n      fz[j] += reverse_dz * inv_dist3;\n    }\n\n    fx[i] = ax;\n    fy[i] = ay;\n    fz[i] = az;\n  }\n}\n\nvoid body_force(Body *p, float dt, int n) {\n  if (n <= 0) {\n    return;\n  }\n\n  if ((size_t)n > (size_t)-1 / (6 * sizeof(float))) {\n    body_force_direct(p, dt, n);\n    return;\n  }\n\n  float *workspace = (float *)malloc((size_t)n * 6 * sizeof(float));\n  if (workspace == NULL) {\n    body_force_direct(p, dt, n);\n    return;\n  }\n\n  float * restrict x = workspace;\n  float * restrict y = workspace + (size_t)n;\n  float * restrict z = workspace + 2 * (size_t)n;\n  float * restrict fx = workspace + 3 * (size_t)n;\n  float * restrict fy = workspace + 4 * (size_t)n;\n  float * restrict fz = workspace + 5 * (size_t)n;\n\n  for (int i = 0; i < n; ++i) {\n    x[i] = p[i].x;\n    y[i] = p[i].y;\n    z[i] = p[i].z;\n    if (!isfinite(x[i]) || !isfinite(y[i]) || !isfinite(z[i])) {\n      free(workspace);\n      body_force_direct(p, dt, n);\n      return;\n    }\n    fx[i] = 0.0f;\n    fy[i] = 0.0f;\n    fz[i] = 0.0f;\n  }\n\n  const int blocks = n / PAIR_TILE + (n % PAIR_TILE != 0);\n\n#ifdef _OPENMP\n#pragma omp parallel if (blocks > 2)\n#endif\n  {\n    /*\n     * Pairs with the same block-index sum have disjoint bodies.\n     * Increasing that sum visits every body's source blocks in order.\n     * The implicit worksharing barrier separates successive waves.\n     */\n    for (int wave = 0; wave < 2 * blocks - 1; ++wave) {\n      const int first_block = wave < blocks ? 0 : wave - blocks + 1;\n      const int last_block = wave / 2;\n\n#ifdef _OPENMP\n#pragma omp for schedule(static)\n#endif\n      for (int block = first_block; block <= last_block; ++block) {\n        const int other = wave - block;\n        const int first_i = block * PAIR_TILE;\n        const int first_j = other * PAIR_TILE;\n        int count_i = n - first_i;\n        int count_j = n - first_j;\n        if (count_i > PAIR_TILE) {\n          count_i = PAIR_TILE;\n        }\n        if (count_j > PAIR_TILE) {\n          count_j = PAIR_TILE;\n        }\n        const int end_i = first_i + count_i;\n        const int end_j = first_j + count_j;\n\n        if (block == other) {\n          accumulate_diagonal_tile(x, y, z, fx, fy, fz, first_i, end_i);\n        } else {\n          accumulate_pair_tile(x, y, z, fx, fy, fz,\n                               first_i, end_i, first_j, end_j);\n        }\n      }\n    }\n\n#ifdef _OPENMP\n#pragma omp for schedule(static)\n#endif\n    for (int i = 0; i < n; ++i) {\n      p[i].vx += dt*fx[i];\n      p[i].vy += dt*fy[i];\n      p[i].vz += dt*fz[i];\n    }\n  }\n\n  free(workspace);\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n\n  /*\n   * At each simulation iteration, interbody forces are computed,\n   * and bodies' positions are integrated.\n   */\n  for (int iter = 0; iter < N_ITER; iter++) {\n    body_force(bodies, DT, nbodies);\n\n    for (int i = 0; i < nbodies; i++) {\n      bodies[i].x += bodies[i].vx * DT;\n      bodies[i].y += bodies[i].vy * DT;\n      bodies[i].z += bodies[i].vz * DT;\n    }\n  }\n\n  write_dataset(nbodies, bodies);\n\n  free(bodies);\n\n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "Wavefront-ordered, cache-resident body-pair tiles should reduce redundant distance evaluations while preserving each body's ascending-source accumulation order.",
+    "notes": "Retains the original sqrt expression and direct fallback for non-finite positions or unavailable scratch storage. No commands or measurements were performed.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Replace eight-target full scans with 32-body pair tiles over compact SoA position and force storage.",
+      "Parallelize disjoint tile pairs within barrier-separated anti-diagonal waves, preserving source-block order for every body.",
+      "Share inverse distances across opposite interactions, explicitly recompute reverse displacements, and retain directed diagonal-tile calculations."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "b406d7cf71ab4a7eb88ee6f47183257e",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "0a5410e4ea2ad042dc64f6db208aade01abbb0d5eddbe56a9e9b3b61b4904ffd",
+  "session_id": "e102a585de23492ca9019858dac5af4d",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "114736f7811251d9aa811b5d150299229fe5e155fb24433e37f65bbce7ace95e",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 17523,
+        "output_tokens": 16562,
+        "reasoning_output_tokens": 13900
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 34085,
+    "tool_events": []
+  }
+}

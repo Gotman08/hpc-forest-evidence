@@ -1,0 +1,176 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+class FastInput {
+    unsigned char buffer_[1 << 16];
+    std::size_t position_;
+    std::size_t size_;
+
+    int getChar() {
+        if (position_ == size_) {
+            size_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (size_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    FastInput() : position_(0), size_(0) {}
+
+    bool readInt(int& result) {
+        int c;
+        do {
+            c = getChar();
+            if (c == EOF) return false;
+        } while (c <= ' ');
+
+        int sign = 1;
+        if (c == '-' || c == '+') {
+            sign = c == '-' ? -1 : 1;
+            c = getChar();
+        }
+        long long value = 0;
+        while (c >= '0' && c <= '9') {
+            value = value * 10 + (c - '0');
+            c = getChar();
+        }
+        result = static_cast<int>(sign * value);
+        return true;
+    }
+};
+
+struct PrefixEvent {
+    int row;
+    int band;
+    bool finish;
+};
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.readInt(n) || !input.readInt(s)) return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t cells = static_cast<std::size_t>(n) * n;
+    std::unique_ptr<int[]> matrix(new int[cells]);
+    for (std::size_t i = 0; i < cells; ++i) {
+        if (!input.readInt(matrix[i])) return 0;
+    }
+    const int* data = matrix.get();
+    const int windows = n - s + 1;
+
+    int requested = 1;
+#ifdef _OPENMP
+    requested = std::min(omp_get_max_threads(), windows);
+#endif
+    if (static_cast<long long>(n) * n < 65536) requested = 1;
+
+    std::vector<long long> initial(static_cast<std::size_t>(requested) * n, 0);
+    long long maximum = std::numeric_limits<long long>::min();
+
+#pragma omp parallel num_threads(requested) reduction(max:maximum)
+    {
+        int id = 0;
+        int threads = 1;
+#ifdef _OPENMP
+        id = omp_get_thread_num();
+        threads = omp_get_num_threads();
+#endif
+        const int first = static_cast<int>(static_cast<long long>(windows) * id / threads);
+        const int last = static_cast<int>(static_cast<long long>(windows) * (id + 1) / threads);
+        long long* columns = initial.data() + static_cast<std::size_t>(id) * n;
+        const long long prefixRows = s + static_cast<long long>(windows) * (threads - 1) / threads;
+
+        if (prefixRows < static_cast<long long>(threads) * s) {
+            const int columnFirst = static_cast<int>(static_cast<long long>(n) * id / threads);
+            const int columnLast = static_cast<int>(static_cast<long long>(n) * (id + 1) / threads);
+            const int width = columnLast - columnFirst;
+            std::vector<long long> prefix(width, 0);
+            std::vector<PrefixEvent> events;
+            events.reserve(2 * threads);
+            for (int band = 0; band < threads; ++band) {
+                const int start = static_cast<int>(static_cast<long long>(windows) * band / threads);
+                events.push_back(PrefixEvent{start, band, false});
+                events.push_back(PrefixEvent{start + s, band, true});
+            }
+            std::sort(events.begin(), events.end(),
+                      [](const PrefixEvent& a, const PrefixEvent& b) {
+                          return a.row < b.row;
+                      });
+
+            int row = 0;
+            for (std::size_t e = 0; e < events.size(); ++e) {
+                const PrefixEvent& event = events[e];
+                for (; row < event.row; ++row) {
+                    const int* source = data + static_cast<std::size_t>(row) * n + columnFirst;
+#pragma omp simd
+                    for (int c = 0; c < width; ++c) {
+                        prefix[c] += source[c];
+                    }
+                }
+                long long* destination = initial.data()
+                    + static_cast<std::size_t>(event.band) * n + columnFirst;
+                if (event.finish) {
+#pragma omp simd
+                    for (int c = 0; c < width; ++c) {
+                        destination[c] += prefix[c];
+                    }
+                } else {
+#pragma omp simd
+                    for (int c = 0; c < width; ++c) {
+                        destination[c] = -prefix[c];
+                    }
+                }
+            }
+        } else {
+            for (int row = first; row < first + s; ++row) {
+                const int* source = data + static_cast<std::size_t>(row) * n;
+#pragma omp simd
+                for (int c = 0; c < n; ++c) {
+                    columns[c] += source[c];
+                }
+            }
+        }
+
+#pragma omp barrier
+        long long localMaximum = std::numeric_limits<long long>::min();
+        for (int row = first; row < last; ++row) {
+            long long sum = 0;
+#pragma omp simd reduction(+:sum)
+            for (int c = 0; c < s; ++c) {
+                sum += columns[c];
+            }
+            localMaximum = std::max(localMaximum, sum);
+            for (int c = s; c < n; ++c) {
+                sum += columns[c] - columns[c - s];
+                localMaximum = std::max(localMaximum, sum);
+            }
+
+            if (row + 1 < last) {
+                const int* exiting = data + static_cast<std::size_t>(row) * n;
+                const int* entering = data + static_cast<std::size_t>(row + s) * n;
+#pragma omp simd
+                for (int c = 0; c < n; ++c) {
+                    columns[c] += static_cast<long long>(entering[c]) - exiting[c];
+                }
+            }
+        }
+        maximum = localMaximum;
+    }
+
+    std::printf("%lld\n", maximum);
+    return 0;
+}

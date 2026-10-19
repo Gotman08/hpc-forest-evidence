@@ -1,0 +1,215 @@
+"""Read-only completion of one naturally exited --once technical worker snapshot."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+AUDIT_SHA256 = '996fdaf826faa5695a008e2c5f126999ebef59153f31eab18dc5bf8c747bc994'
+if hashlib.sha256((HERE / "receipt_native.py").read_bytes()).hexdigest() != AUDIT_SHA256:
+    raise RuntimeError("Changed isolated phase auditor")
+spec = importlib.util.spec_from_file_location("r4b_phase_audit", HERE / "receipt_native.py")
+audit = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(audit)
+TOP = {"OWNER.json", "worker-ready.json", "CLI-IDENTITY-VERIFIED.json", "CELL-BINDING.json", "worker.lock"}
+NONCE_FILES = {"downloaded-request.json", "download-receipt.json", "generation-claimed.json", "instructions.txt",
+               "output-schema.json", "invocation.json", "request.json", "codex.jsonl", "process.json",
+               "response.json", "response-ready.json", "delivered.json", "agent-result.json", "codex.jsonl.json",
+               "cli-diagnostics.json", "invocation.json.arm-projection.json", "codex.jsonl.json.arm-projection.json"}
+
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def inventory(root):
+    value = {}
+    for path in sorted(root.rglob("*")):
+        require(not path.is_symlink() and not (hasattr(path, "is_junction") and path.is_junction()), "Snapshot symbolic alias refused")
+        if path.is_file():
+            value[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            require(path.is_dir(), "Snapshot special file refused")
+    return value
+
+
+def receive(refs, expected, snapshot, natural_exit, *, private_cli):
+    """Snapshot only, after parent observed natural process exit; no live controller/lock."""
+    require(natural_exit.get("schema") == "hpc-forest-dynamic-r4b-once-worker-natural-exit-v1"
+            and natural_exit.get("verified") is True and natural_exit.get("natural_exit_observed") is True
+            and natural_exit.get("no_stop_or_replay") is True and type(natural_exit.get("worker_exit_code")) is int
+            and natural_exit["worker_exit_code"] == 0
+            and natural_exit.get("all_owned_full_identities_absent") is True,
+            "Actual natural --once exit/absence receipt required before reading a complete snapshot")
+    for key in ("scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "phase", "session_id", "job_id"):
+        require(natural_exit.get(key) == expected["scope" if key == "scope_id" else key], "Exit belongs to another exact phase cell")
+    require(natural_exit.get("owned_full_identities") and natural_exit.get("evidence_refs"), "Full identities and real exit evidence required")
+    for ref in natural_exit["evidence_refs"]:
+        audit._hash_ref(ref, "natural exit evidence")
+    census_raw = audit._hash_ref(natural_exit["fresh_full_cim"], "fresh full CIM after natural exit")
+    census = audit._decode(census_raw.read_bytes(), "natural-exit census")
+    require(census.get("schema") == "hpc-forest-dynamic-r4b-full-cim-v1"
+            and census.get("complete_census") is True and census.get("strict_utf8_decoding") is True,
+            "Complete private UTF8 process observation required")
+    rows = census["rows"]
+    fields = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+    require(isinstance(rows, list) and rows and type(census["rows_count"]) is int and len(rows) == census["rows_count"] and len({r["ProcessId"] for r in rows}) == len(rows)
+            and all(all(k in r for k in fields) and type(r["ProcessId"]) is int
+                    and type(r["ParentProcessId"]) is int for r in rows), "Incomplete census")
+    captured = datetime.fromisoformat(census["captured_at_utc"])
+    require(captured.tzinfo is not None and captured.utcoffset().total_seconds() == 0
+            and audit._number(natural_exit["observed_at"], positive=True), "Explicit UTC census/reception timestamps required")
+    observed = captured.timestamp()
+    require(0 <= natural_exit["observed_at"] - observed <= 120, "Natural exit census was not fresh at reception")
+    def identity_fields(row):
+        require(isinstance(row, dict) and all(k in row for k in fields) and type(row["ProcessId"]) is int and row["ProcessId"] > 0
+                and type(row["ParentProcessId"]) is int and row["ParentProcessId"] >= 0
+                and all(isinstance(row[k], str) and row[k] for k in fields[2:]),
+                "Owned full identity field is unreadable")
+        require(Path(row["ExecutablePath"]).is_absolute()
+                and not any(c in row[key] for key in ("ExecutablePath", "CommandLine") for c in ("\0", "\r", "\n")),
+                "Owned executable/command must be complete ordinary metadata")
+        require(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z", row["CreationDate"]),
+                "Owned process UTC creation time required")
+        datetime.fromisoformat(row["CreationDate"])  # Reject calendar-invalid dates as well as malformed strings.
+        result = {k: row[k] for k in fields}
+        if "." in result["CreationDate"]:
+            result["CreationDate"] = result["CreationDate"][:-1].rstrip("0").rstrip(".") + "Z"
+        return result
+
+    owned = natural_exit["owned_full_identities"]
+    require(isinstance(owned, list) and len(owned) == 2, "Exact owned launcher/Python pair required")
+    # Validate EVERY value before any PID-filtered lookup. Absent PIDs cannot bypass
+    # this normalization. This closes the independently reproduced r3 defect.
+    normalized_owned = []
+    for identity in owned:
+        require(isinstance(identity, dict) and set(identity) == set(fields), "Exactly five owned identity fields required")
+        normalized_owned.append(identity_fields(identity))
+    require(len({row["ProcessId"] for row in normalized_owned}) == 2
+            and len({tuple(row[key] for key in fields) for row in normalized_owned}) == 2,
+            "Duplicate owned PID/full identity refused")
+    a, b = normalized_owned
+    require(a["CommandLine"] == b["CommandLine"]
+            and sum((a["ParentProcessId"] == b["ProcessId"], b["ParentProcessId"] == a["ProcessId"])) == 1,
+            "Exact noncyclic launcher/Python parent relationship required")
+    for normalized in normalized_owned:
+        require(expected["session_id"] in normalized["CommandLine"]
+                and expected["source_cache"] in normalized["CommandLine"],
+                "Exit identity lacks full fields or exact session")
+
+    # A dead numeric PID plus self-declared strings is not evidence of prior
+    # existence. Require the actual parent-received earlier full census under SHA.
+    prior_ref = natural_exit.get("prior_full_cim")
+    require(prior_ref in natural_exit["evidence_refs"] and natural_exit["fresh_full_cim"] in natural_exit["evidence_refs"],
+            "Prior presence and fresh exit census must both be linked evidence")
+    prior = audit._decode(audit._read_ref(prior_ref, "actual earlier full CIM"), "actual earlier full CIM")
+    prior_rows = prior.get("rows")
+    require(prior.get("schema") == "hpc-forest-dynamic-r4b-full-cim-v1" and prior.get("complete_census") is True
+            and prior.get("strict_utf8_decoding") is True and isinstance(prior_rows, list) and prior_rows
+            and type(prior.get("rows_count")) is int and prior["rows_count"] == len(prior_rows)
+            and all(isinstance(row, dict) and all(key in row for key in fields)
+                    and type(row["ProcessId"]) is int and type(row["ParentProcessId"]) is int for row in prior_rows)
+            and len({row["ProcessId"] for row in prior_rows}) == len(prior_rows), "Complete actual prior census required")
+    prior_captured = datetime.fromisoformat(prior["captured_at_utc"])
+    require(prior_captured.tzinfo is not None and prior_captured.utcoffset().total_seconds() == 0
+            and prior_captured.timestamp() <= observed, "Actual earlier census must precede the UTC exit census")
+    for normalized in normalized_owned:
+        require(datetime.fromisoformat(normalized["CreationDate"]).timestamp() <= prior_captured.timestamp()
+                and any(identity_fields(row) == normalized for row in prior_rows if row["ProcessId"] == normalized["ProcessId"]),
+                "Owned full identity was not observed in the actual prior census")
+        require(not any(identity_fields(row) == normalized for row in rows if row["ProcessId"] == normalized["ProcessId"]),
+                "Owned worker identity remains live")
+    snapshot = Path(snapshot)
+    require(snapshot.is_absolute() and ".." not in snapshot.parts
+            and not any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()) for p in (snapshot, *snapshot.parents)), "Ordinary cold snapshot root required")
+    snapshot = snapshot.resolve(strict=True)
+    original_cache = audit.WORKER_CACHE_PARENT / ("worker-" + expected["session_id"])
+    require(expected["source_cache"] == str(original_cache), "Wrong explicit factory source cache")
+    require(snapshot != original_cache and natural_exit.get("source_cache") == str(original_cache)
+            and natural_exit.get("snapshot_root") == str(snapshot), "Fresh received snapshot required; never read the original worker cache")
+    before = inventory(snapshot)
+    request = audit._decode(audit._read_ref(refs["request_native"], "received request"), "received request")
+    nonce = request["nonce"]
+    require(re.fullmatch("[0-9a-f]{32}", nonce), "Invalid nonce directory")
+    children = {path.name for path in snapshot.iterdir()}
+    require(children == TOP | {nonce} and (snapshot / nonce).is_dir(), "Unexpected top-level cache artifact or orphan invocation")
+    require({p.name for p in (snapshot / nonce).iterdir()} == NONCE_FILES
+            and all(p.is_file() and not p.is_symlink() for p in (snapshot / nonce).iterdir()),
+            "Incomplete nonce evidence, unknown directory, or orphan invocation")
+    require((snapshot / "worker.lock").read_bytes() == b"0", "Closed cold worker lock must remain the historical byte zero")
+    locations = {"request_downloaded": nonce + "/downloaded-request.json", "request_native": nonce + "/request.json",
+        "claim": nonce + "/generation-claimed.json", "invocation": nonce + "/invocation.json", "process": nonce + "/process.json",
+        "jsonl": nonce + "/codex.jsonl", "response": nonce + "/response.json", "ready": nonce + "/response-ready.json",
+        "delivered": nonce + "/delivered.json", "agent_result": nonce + "/agent-result.json",
+        "cli_identity": "CLI-IDENTITY-VERIFIED.json", "worker_ready": "worker-ready.json", "cell_binding": "CELL-BINDING.json",
+        "execution_sidecar": nonce + "/codex.jsonl.json"}
+    for name, relative in locations.items():
+        require(Path(refs[name]["path"]).resolve(strict=True) == snapshot / relative
+                and refs[name]["sha256"] == before[relative], "Reference differs from exhaustive received cache snapshot")
+    owner = audit._decode((snapshot / "OWNER.json").read_bytes(), "received OWNER")
+    require(set(owner) == {"protocol", "session_id", "model", "reasoning_effort", "job_id", "owner"}
+            and owner == {"protocol": audit.PROTOCOL, "session_id": expected["session_id"], "model": expected["model"],
+                          "reasoning_effort": "max", "job_id": expected["job_id"], "owner":expected["job_id"]}, "Received OWNER identity differs")
+    download = audit._decode((snapshot / nonce / "download-receipt.json").read_bytes(), "download receipt")
+    remote = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + expected["session_id"]
+    remote_request = remote + "/results-" + expected["job_id"] + "/mailbox/requests/" + nonce + ".request.json"
+    require(set(download) == {"ok", "downloaded", "to", "bytes", "transport", "remote_sha256", "empreinte_locale", "empreinte_distante", "verifie"}
+            and download["ok"] is True and download["verifie"] is True and download["transport"] == "scp"
+            and download["downloaded"] in {remote_request, remote_request.replace("/scratch_p/", "/gpfs/scratch/", 1)}
+            and download["to"] == str(original_cache / nonce / "downloaded-request.json")
+            and type(download["bytes"]) is int and download["bytes"] == len(audit._read_ref(refs["request_downloaded"], "downloaded request"))
+            and all(download[key] == expected["request_sha256"] for key in ("remote_sha256", "empreinte_locale", "empreinte_distante")),
+            "Actual request download metadata differs")
+    require(audit._same(audit._decode((snapshot / nonce / "output-schema.json").read_bytes(), "actual schema"), request["schema"]),
+            "Actual output-schema bytes differ semantically from request")
+    worker = audit._decode(audit._read_ref(refs["worker_ready"], "received worker-ready"), "received worker-ready")
+    worker_pid = worker.get("pid")
+    require(type(worker_pid) is int and worker_pid > 0, "Actual worker-ready PID must be an integer")
+    matches = [row for row in normalized_owned if row["ProcessId"] == worker_pid]
+    require(len(matches) == 1 and any(row["ProcessId"] == matches[0]["ParentProcessId"] for row in normalized_owned),
+            "Actual worker-ready must identify the previously observed Python child")
+    require(audit._number(worker.get("started_at"), positive=True)
+            and datetime.fromisoformat(matches[0]["CreationDate"]).timestamp() <= worker["started_at"] <= prior_captured.timestamp(),
+            "Worker-ready time must be inside the observed historical worker lifetime")
+    receipt = audit.audit_phase(refs, expected, snapshot_inventory=before, snapshot=snapshot, private_cli=private_cli)
+    require((snapshot / nonce / "instructions.txt").read_bytes() == request["messages"][0]["content"].encode("utf8"),
+            "Actual CLI instruction bytes differ from the exact staged request")
+    require(inventory(snapshot) == before, "Complete snapshot changed during audit")
+    return {**receipt, "schema": "hpc-forest-dynamic-r4b-reconciled-phase-receipt-v1",
+            "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + expected["session_id"],
+            "all_started_calls_reconciled": True, "unknown_invocations": 0, "unresolved_invocations": [],
+            "native_invocation_count": 1, "complete_cache_inventory": before,
+            "cache_snapshot": str(snapshot), "cache_inventory_before_after_identical": True,
+            "worker_natural_exit": natural_exit, "complete_snapshot_after_natural_exit_only": True,
+            "receiver_revision": "external-native-receiver-r4-lane-r2", "prior_presence_census": dict(prior_ref),
+            "owned_identities_validated_before_pid_lookup": True, "worker_ready_bound_to_actual_prior_identity": True,
+            "evidence_refs": [dict(ref) for ref in refs.values()] + natural_exit["evidence_refs"],
+            "global_admission_verified": False, "independent_performance_audit_verified": False,
+            "first_normal_candidate_delivery_and_evaluation_verified": False}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--input-sha256", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    raw = args.input.read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == args.input_sha256, "Receiving input changed")
+    value = audit._decode(raw, "receiving input")
+    require(set(value)=={"refs","expected","snapshot","natural_exit","private_cli"}, "Closed receiving input with private context required")
+    result = receive(value["refs"], value["expected"], value["snapshot"], value["natural_exit"], private_cli=value["private_cli"])
+    with args.output.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    print(json.dumps({"output": str(args.output.resolve()), "phase": result["phase"], "tokens": result["tokens"],
+                      "global_admission_verified": False, "candidate_first_start_verified": False}))
+
+
+if __name__ == "__main__":
+    main()

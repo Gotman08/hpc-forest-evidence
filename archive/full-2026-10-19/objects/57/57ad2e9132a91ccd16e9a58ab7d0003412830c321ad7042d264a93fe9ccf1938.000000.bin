@@ -1,0 +1,176 @@
+"""Synthetic read-only boundary tests. Fixtures are never production admissions."""
+import copy
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('r2d_receiver_tests', HERE / 'controler-reception-bornee.py')
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+m = c.m
+
+
+def make_boundary(tmp_path):
+    paths = {}
+    def put(name, data):
+        path = tmp_path / name
+        path.write_bytes(data if isinstance(data, bytes) else json.dumps(data).encode('utf8'))
+        remote = '/SYNTHETIC-NOT-AN-ADMISSION/' + name
+        paths[remote] = path
+        return {'path': remote, 'sha256': m.sha(path)}
+    model, job, nonce, trial = 'gpt-6-astra', '90001', 'a' * 32, 'SYNTHETIC-trial'
+    cli = put('cli.json', {'executable_path': 'SYNTHETIC-NOT-EXECUTED', 'executable_sha256': m.CLI, 'source_execution_allowed': False})
+    request = put('request.json', {'kind': 'source-proposal', 'nonce': nonce, 'model': model,
+        'reasoning_effort': 'max', 'session_id': m.CELLS[model], 'mission_id': trial, 'meta_role': None})
+    events = [{'type': 'thread.started'}, {'type': 'turn.started'},
+        {'type': 'item.completed', 'item': {'type': 'agent_message'}},
+        {'type': 'turn.completed', 'usage': {'input_tokens': 7, 'output_tokens': 5}}]
+    raw = b''.join(json.dumps(event).encode() + b'\n' for event in events)
+    log = put('codex.jsonl', raw)
+    response = put('response.json', {'model': model, 'reasoning_effort': 'max', 'session_id': m.CELLS[model],
+        'nonce': nonce, 'request_sha256': request['sha256'], 'infrastructure_error': False,
+        'usage': {'token_accounting': 'exact', 'tokens': 12, 'llm_calls': 1, 'tool_events': [],
+            'events': [events[-1]['usage']], 'codex_jsonl_sha256': log['sha256']}})
+    ready = put('ready.json', {'sha256': response['sha256'], 'bytes': paths[response['path']].stat().st_size})
+    argv = ['SYNTHETIC-NOT-EXECUTED', 'exec', '--model', model, '-c', 'model_reasoning_effort="max"',
+        '-c', 'forced_login_method="chatgpt"']
+    invocation = put('invocation.json', {'argv': argv, 'source_execution_allowed': False,
+        'request_sha256': request['sha256'], 'model': model, 'reasoning_effort': 'max'})
+    process = put('process.json', {'argv': argv, 'returncode': 0, 'timed_out': False})
+    delivered = put('delivered.json', {**m.identity(model, job), 'request_sha256': request['sha256'], 'response_sha256': response['sha256']})
+    call = {'normal_delivered': True, 'usage_exact': True, 'mother_call': False, 'mission_id': trial,
+        'request': request, 'response': response, 'ready': ready, 'invocation': invocation,
+        'delivered': delivered, 'process': process, 'error_and_usage_log': log}
+    first = {'model': model, 'job_id': job, 'verified': True, 'admission_artifacts': {'cli_identity': cli},
+        'all_started_calls_reconciled': [call], 'first_normal_delivered_call': copy.deepcopy(call),
+        'first_real_evaluation': {'experiment_id': trial}}
+    def resolve(item):
+        path = paths[item['path']]
+        m.need(m.sha(path) == item['sha256'], 'Synthetic changed bytes')
+        return path
+    return first, resolve, paths, put
+
+
+def test_exact_named_normal_boundary_reconciles_without_model_execution(tmp_path):
+    first, resolve, _paths, _put = make_boundary(tmp_path)
+    result = m.call_boundary(first, resolve)
+    assert result['exact_tokens_at_this_boundary'] == 12
+    assert result['unknown_invocations_in_named_frozen_boundary'] == 0
+    assert result['all_current_live_calls_or_total_session_cost_claimed'] is False
+    assert result['calls'][0]['diagnostics'] == []
+
+
+@pytest.mark.parametrize('diagnostic', [b'WARN malformed role (preserved)\n',
+    b'{"type":"error"}\n', b'{"type":"turn.failed"}\n',
+    b'{"type":"item.completed","item":{"type":"error","message":"Code Mode is unavailable"}}\n',
+    b'{"type":"item.completed","item":{}}\n'])
+def test_diagnostics_do_not_become_normal_even_with_success_exit_and_exact_usage(tmp_path, diagnostic):
+    first, resolve, paths, put = make_boundary(tmp_path)
+    call = first['all_started_calls_reconciled'][0]
+    old = paths[call['error_and_usage_log']['path']].read_bytes()
+    call['error_and_usage_log'] = put('diagnostic.jsonl', diagnostic + old)
+    with pytest.raises(m.Refusal, match='diagnostics retained') as error:
+        m.call_boundary(first, resolve)
+    assert error.value.diagnostics and 'message' not in error.value.diagnostics[0]
+
+
+@pytest.mark.parametrize('field,value', [('returncode', 1), ('returncode', False), ('timed_out', True)])
+def test_process_failure_or_noninteger_zero_refuses(tmp_path, field, value):
+    first, resolve, paths, put = make_boundary(tmp_path)
+    call = first['all_started_calls_reconciled'][0]
+    process = json.loads(paths[call['process']['path']].read_bytes())
+    process[field] = value
+    call['process'] = put('changed-process.json', process)
+    with pytest.raises(m.Refusal, match='Invocation'):
+        m.call_boundary(first, resolve)
+
+
+def test_mother_cannot_stand_in_for_normal_child(tmp_path):
+    first, resolve, _paths, _put = make_boundary(tmp_path)
+    first['all_started_calls_reconciled'][0]['mother_call'] = True
+    with pytest.raises(m.Refusal):
+        m.call_boundary(first, resolve)
+
+
+def installed_fixture():
+    model, job = 'gpt-6-astra', '90001'
+    ident = m.identity(model, job)
+    binding = {**ident, 'remote_root': '/scratch_p/nimarano/' + m.SCOPE + '-' + m.CELLS[model]}
+    owner = {'protocol': 'hpc-forest-codex-mailbox-v1', 'owner': job, 'reasoning_effort': 'max', **binding}
+    worker = {**owner, 'mode': 'codex', 'authentication': 'existing-local-ChatGPT',
+        'codex_executable_sha256': m.CLI, 'codex_cli_version': 'codex-cli 0.163.0-alpha.10.2',
+        'model_weights_on_romeo': False, 'weight_digest_available': False}
+    refs = {key: {'path': 'SYNTHETIC-' + key, 'sha256': 'a' * 64}
+        for key in ('local_authorization', 'remote_authorization', 'initial_worker_ready', 'source_bindings')}
+    installation = {**ident, 'schema': 'hpc-forest-r2d-initial-installation-received-v1',
+        'initial_fresh_gate_completed_before_ready': True,
+        'authorization_local': refs['local_authorization'], 'authorization_remote': refs['remote_authorization'],
+        'worker_ready': refs['initial_worker_ready'], 'source_bindings': refs['source_bindings'],
+        'new_worker_authorized_by_this_receipt': False, 'calls_replayed': 0, 'evidence_refs': [refs['source_bindings']]}
+    return ident, binding, worker, {'CELL-BINDING.json': binding, 'OWNER.json': owner}, installation, refs
+
+
+def test_same_frozen_installation_only_produces_binding_not_new_worker_right():
+    first, binding, worker, roots, install, refs = installed_fixture()
+    assert c.check_frozen_identity(first, binding, worker, roots, install, refs) == binding
+    assert install['new_worker_authorized_by_this_receipt'] is False
+
+
+@pytest.mark.parametrize('which', ['no_install', 'other_auth', 'other_ready', 'source_changed', 'new_worker', 'missing_launch_evidence', 'cache_session'])
+def test_initial_lane_false_is_not_available_without_frozen_installation(which):
+    first, binding, worker, roots, install, refs = installed_fixture()
+    if which == 'no_install':
+        install = {}
+    elif which == 'other_auth':
+        install['authorization_local'] = {'path': 'OTHER', 'sha256': 'b' * 64}
+    elif which == 'other_ready':
+        install['worker_ready'] = {'path': 'OTHER', 'sha256': 'b' * 64}
+    elif which == 'source_changed':
+        install['source_bindings'] = {'path': 'OTHER', 'sha256': 'b' * 64}
+    elif which == 'new_worker':
+        install['new_worker_authorized_by_this_receipt'] = True
+    elif which == 'missing_launch_evidence':
+        install['evidence_refs'] = []
+    else:
+        roots['CELL-BINDING.json'] = {**binding, 'session_id': 'b' * 32}
+    with pytest.raises(m.Refusal):
+        c.check_frozen_identity(first, binding, worker, roots, install, refs)
+
+
+def test_received_inputs_changed_after_read_are_rejected(tmp_path):
+    path = tmp_path / 'record.json'
+    path.write_text('{}', encoding='utf8')
+    inputs = c.Inputs()
+    inputs.read(m.ref(path))
+    path.write_text('{"changed":true}', encoding='utf8')
+    with pytest.raises(m.Refusal, match='changed during audit'):
+        inputs.after()
+
+
+@pytest.mark.parametrize('name', ['worker.lock', 'live.sqlite', 'live.sqlite3', 'live.db'])
+def test_no_live_lock_or_database_opened(tmp_path, name):
+    path = tmp_path / name
+    path.write_bytes(b'SYNTHETIC-PROTECTED')
+    with pytest.raises(m.Refusal, match='Live lock/database'):
+        c.Inputs().path(m.ref(path))
+
+
+def test_received_snapshot_cannot_escape_explicit_root(tmp_path):
+    with pytest.raises(m.Refusal, match='below the explicit'):
+        c.contained(tmp_path / 'elsewhere' / 'record.json', tmp_path / 'received')
+
+
+def test_incomplete_future_input_is_refused_without_factory_or_model(tmp_path):
+    path = tmp_path / 'not-a-production-input.json'
+    path.write_text('{"schema":"hpc-forest-r2d-first-start-reception-input-v1"}', encoding='utf8')
+    with pytest.raises(m.Refusal, match='Closed R2d input schema'):
+        c.audit(m.ref(path))
+
+
+def test_revision3_locates_the_original_pinned_factory_without_copy_or_execution():
+    assert c.FACTORY == HERE.parent / 'revision-r3-attempt2'
+    assert m.sha(c.FACTORY / 'preparer-cellule-max.py') == c.FACTORY_SHA
+    assert m.sha(c.FACTORY / 'publication-locale.py') == c.PUBLICATION_SHA

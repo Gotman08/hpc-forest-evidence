@@ -1,0 +1,265 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <string.h>
+#include <stdint.h>
+
+typedef struct {
+    long int *data;
+    int length;
+    long int total;
+} bucket;
+
+typedef struct {
+    uint64_t prefix;
+    long int index;
+} sort_entry;
+
+enum { SORT_RUN = 32 };
+
+static uint64_t prefix_key(const char *s) {
+    uint64_t key = 0;
+    for (unsigned int i = 0; i < 8; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0)
+            break;
+        key |= (uint64_t)c << (56 - 8 * i);
+    }
+    return key;
+}
+
+static inline int entry_leq(const sort_entry *left,
+                            const sort_entry *right,
+                            const char *strings, size_t stride) {
+    if (left->prefix != right->prefix)
+        return left->prefix < right->prefix;
+
+    /* A zero final byte means the equal prefixes contain a terminator. */
+    if ((left->prefix & UINT64_C(255)) == 0)
+        return 1;
+
+    return strcmp(strings + (size_t)left->index * stride + 8,
+                  strings + (size_t)right->index * stride + 8) <= 0;
+}
+
+static void merge_entries(const sort_entry *restrict source,
+                          sort_entry *restrict destination,
+                          size_t begin, size_t middle, size_t end,
+                          const char *strings, size_t stride) {
+    if (middle == end ||
+        entry_leq(&source[middle - 1], &source[middle], strings, stride)) {
+        memcpy(destination + begin, source + begin,
+               (end - begin) * sizeof(*destination));
+        return;
+    }
+
+    size_t left = begin;
+    size_t right = middle;
+    size_t out = begin;
+    while (left < middle && right < end) {
+        size_t count = middle - left;
+        if (end - right < count)
+            count = end - right;
+        size_t stop = out + count;
+
+        /* Both heads remain valid before every step in this batch.
+           Cursor updates are genuinely dependent, so this is not a
+           SIMD-independent loop. Record transfers remain contiguous. */
+        do {
+            size_t take_left = (size_t)entry_leq(&source[left],
+                                                &source[right],
+                                                strings, stride);
+            const sort_entry *selected = take_left ? source + left
+                                                   : source + right;
+            destination[out++] = *selected;
+            left += take_left;
+            right += (size_t)1 - take_left;
+        } while (out < stop);
+    }
+
+    if (left < middle)
+        memcpy(destination + out, source + left,
+               (middle - left) * sizeof(*destination));
+    else if (right < end)
+        memcpy(destination + out, source + right,
+               (end - right) * sizeof(*destination));
+}
+
+static long int *comparison_sort_indices(const char *strings, int length,
+                                          long int size,
+                                          const long int *initial) {
+    if (size <= 0)
+        return NULL;
+    if ((uintmax_t)size > SIZE_MAX / sizeof(sort_entry))
+        exit(EXIT_FAILURE);
+
+    size_t n = (size_t)size;
+    size_t stride = (size_t)length;
+    sort_entry *records = malloc(n * sizeof(*records));
+    if (records == NULL)
+        exit(EXIT_FAILURE);
+
+#if defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+    for (size_t i = 0; i < n; ++i) {
+        long int index = initial != NULL ? initial[i] : (long int)i;
+        records[i].prefix = prefix_key(strings + (size_t)index * stride);
+        records[i].index = index;
+    }
+
+    int ordered = 1;
+    for (size_t i = 1; i < n; ++i) {
+        if (!entry_leq(&records[i - 1], &records[i], strings, stride)) {
+            ordered = 0;
+            break;
+        }
+    }
+
+    sort_entry *source = records;
+    sort_entry *destination = NULL;
+    if (!ordered) {
+        if (n > SORT_RUN) {
+            destination = malloc(n * sizeof(*destination));
+            if (destination == NULL) {
+                free(records);
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        /* Keep the dependent insertion work bounded to short base runs. */
+        for (size_t begin = 0; begin < n;) {
+            size_t count = n - begin;
+            if (count > SORT_RUN)
+                count = SORT_RUN;
+            size_t end = begin + count;
+            for (size_t i = begin + 1; i < end; ++i) {
+                sort_entry key = source[i];
+                size_t j = i;
+                while (j > begin &&
+                       !entry_leq(&source[j - 1], &key, strings, stride)) {
+                    source[j] = source[j - 1];
+                    --j;
+                }
+                source[j] = key;
+            }
+            begin = end;
+        }
+
+        for (size_t width = SORT_RUN; width < n;) {
+            for (size_t begin = 0; begin < n;) {
+                size_t middle = begin +
+                    (n - begin < width ? n - begin : width);
+                size_t end = middle +
+                    (n - middle < width ? n - middle : width);
+                merge_entries(source, destination, begin, middle, end,
+                              strings, stride);
+                begin = end;
+            }
+            sort_entry *temporary = source;
+            source = destination;
+            destination = temporary;
+
+            if (width >= n - width)
+                break;
+            width += width;
+        }
+    }
+
+    free(destination);
+    long int *result = malloc(n * sizeof(*result));
+    if (result == NULL) {
+        free(source);
+        exit(EXIT_FAILURE);
+    }
+#if defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+    for (size_t i = 0; i < n; ++i)
+        result[i] = source[i].index;
+    free(source);
+    return result;
+}
+
+void sort(char *a, bucket *b) {
+    if (b->total < 2)
+        return;
+    long int *result = comparison_sort_indices(a, b->length, b->total,
+                                               b->data);
+    memcpy(b->data, result, (size_t)b->total * sizeof(*result));
+    free(result);
+}
+
+long int *bucket_sort(char *a, int length, long int size,
+                      int offset, int nbuckets) {
+    (void)offset;
+    (void)nbuckets;
+    return comparison_sort_indices(a, length, size, NULL);
+}
+
+void load(char **vString, long int *N, int *l, int *os, int *nb) {
+    char *strings = NULL;
+    int len, offset, nbucket;
+    long int n;
+
+    if (!fscanf(stdin, "%d", &len)) {
+        printf("ERROR len\n");
+        exit(1);
+    }
+    if (!fscanf(stdin, "%ld", &n)) {
+        printf("ERROR n\n");
+        exit(1);
+    }
+    if (!fscanf(stdin, "%d", &offset)) {
+        printf("ERROR offset\n");
+        exit(1);
+    }
+    if (!fscanf(stdin, "%d", &nbucket)) {
+        printf("ERROR nbucket\n");
+        exit(1);
+    }
+
+    nbucket = nbucket + 1;
+    len = len + 1;
+    strings = (char *)malloc(n * len);
+
+    for (long int i = 0; i < n; i++) {
+        if (!fscanf(stdin, "%s", strings + (i * len))) {
+            printf("ERROR %ld\n", i);
+            exit(1);
+        }
+    }
+
+    *vString = strings;
+    *N = n;
+    *l = len;
+    *os = offset;
+    *nb = nbucket;
+}
+
+void print(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; i++)
+        printf("%ld -> %s\n", i, strings + (index[i] * len));
+}
+
+void save(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; i++)
+        printf("%s\n", strings + (index[i] * len));
+}
+
+int main(int ac, char **av) {
+    char *strings = NULL;
+    long int N = 0;
+    long int *index = NULL;
+    int len = 0, save2File = 0, offset, nbuckets;
+
+    load(&strings, &N, &len, &offset, &nbuckets);
+    index = bucket_sort(strings, len, N, offset, nbuckets);
+    save(strings, index, N, len);
+
+    if (strings != NULL)
+        free(strings);
+    if (index != NULL)
+        free(index);
+    return EXIT_SUCCESS;
+}

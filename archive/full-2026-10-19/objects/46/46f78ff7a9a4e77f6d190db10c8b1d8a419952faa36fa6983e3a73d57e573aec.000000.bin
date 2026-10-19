@@ -1,0 +1,187 @@
+"""Neutral MAX4 route/policy/RPC tests; no process, model or remote action."""
+import copy
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("max4_neutral", HERE / "observer-max4-r5.py")
+d = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(d)
+
+
+def write(path, value):
+    path.write_text(json.dumps(value), encoding="utf8")
+    return {"path": str(path), "sha256": d.digest(path)}
+
+
+def pair(session, pid):
+    command = "python.exe -m hpc_forest.r2max_worker --session-id " + session
+    return [{"ProcessId": pid, "ParentProcessId": 0, "ExecutablePath": "C:/python.exe",
+             "CommandLine": command, "CreationDate": "2026-10-17T21:00:00Z"},
+            {"ProcessId": pid + 1, "ParentProcessId": pid, "ExecutablePath": "C:/python.exe",
+             "CommandLine": command, "CreationDate": "2026-10-17T21:00:00Z"}]
+
+
+class MaxFour(unittest.TestCase):
+    def test_four_full_pairs_counted_without_old_max2_guard(self):
+        sessions = [d.SESSION, *d.R2_CELLS.values()]
+        rows = [r for n, s in enumerate(sessions, 1) for r in pair(s, n * 10)]
+        self.assertEqual(set(d.native_sessions(rows)), set(sessions))
+
+    def test_fifth_session_refused(self):
+        sessions = [d.SESSION, *d.R2_CELLS.values(), "f" * 32]
+        rows = [r for n, s in enumerate(sessions, 1) for r in pair(s, n * 10)]
+        with self.assertRaises(RuntimeError):
+            d.native_sessions(rows)
+
+    def test_third_process_in_same_session_refused(self):
+        rows = pair(d.SESSION, 10) + [pair(d.SESSION, 30)[0]]
+        with self.assertRaises(RuntimeError):
+            d.native_sessions(rows)
+
+    def test_worker_without_exact_session_refused(self):
+        rows = pair(d.SESSION, 10)
+        rows[0]["CommandLine"] = "python.exe -m hpc_forest.r2max_worker --session-id unknown"
+        with self.assertRaises(RuntimeError):
+            d.native_sessions(rows)
+
+    def test_foreign_python_not_counted(self):
+        rows = pair(d.SESSION, 10)
+        rows[0]["CommandLine"] = "python.exe harmless.py"
+        self.assertEqual(len(d.native_sessions(rows)[d.SESSION]), 1)
+
+    def test_bound_four_jobs_status_accounting_only(self):
+        jobs = {d.JOB, "800001", "800002", "800003"}
+        for job in jobs:
+            for tool in ("job_status", "job_efficiency"):
+                d.check_rpc(tool, {"job_id": job}, jobs)
+        for tool in ("job_prepare", "job_submit", "job_logs", "cancel_job", "read_remote_file", "upload_to_romeo"):
+            with self.subTest(tool=tool), self.assertRaises(RuntimeError):
+                d.check_rpc(tool, {"job_id": "800001"}, jobs)
+
+    def test_unbound_rpc_or_fifth_job_refused(self):
+        for jobs, request in [({d.JOB, "800001"}, "800002"),
+                              ({d.JOB, "800001", "800002", "800003", "800004"}, d.JOB),
+                              ({"800001"}, "800001")]:
+            with self.subTest(jobs=jobs), self.assertRaises(RuntimeError):
+                d.check_rpc("job_status", {"job_id": request}, jobs)
+
+    def test_rpc_extra_fields_refused_for_r2(self):
+        with self.assertRaises(RuntimeError):
+            d.check_rpc("job_status", {"job_id": "800001", "force": True}, {d.JOB, "800001"})
+
+    def fixture(self, root, count=3):
+        routes, sessions, rows, values = [], {d.SESSION: []}, [], []
+        for index, (model, session) in enumerate(list(d.R2_CELLS.items())[:count], 1):
+            workers = pair(session, index * 10)
+            item = {"model": model, "session_id": session, "job_id": str(800000 + index),
+                    "relay_identities": workers, "route_sha256": "neutral"}
+            route = write(root / (session + ".json"), item)
+            routes.append(route); sessions[session] = workers; rows.extend(workers); values.append(item)
+        path = root / "routes.json"
+        write(path, {"schema": "hpc-forest-max-secondary-lanes-route-v2", "maximum_total_workers": 4,
+                     "maximum_r2_workers": 3, "routes": routes})
+        return path, sessions, rows, values
+
+    def evaluate(self, path, sessions, rows, values):
+        with patch.object(d, "verify_policy", return_value={"policy_sha256": "NEUTRAL"}), \
+             patch.object(d, "verify_r2_route", side_effect=values):
+            return d.verify_secondary_route(path, sessions, rows, {"NEUTRAL_ONLY": True})
+
+    def test_three_distinct_real_route_refs_match_four_lanes(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            args = self.fixture(Path(folder))
+            result = self.evaluate(*args)
+            self.assertEqual(len(result["routes"]), 3)
+
+    def test_duplicate_route_session_job_model_each_refused(self):
+        for key in ("session_id", "job_id", "model"):
+            with tempfile.TemporaryDirectory(dir=HERE) as folder:
+                path, sessions, rows, values = self.fixture(Path(folder))
+                values[1][key] = values[0][key]
+                with self.subTest(key=key), self.assertRaises(RuntimeError):
+                    self.evaluate(path, sessions, rows, values)
+
+    def test_routes_must_cover_exact_actual_sessions(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            path, sessions, rows, values = self.fixture(Path(folder), 2)
+            sessions[next(reversed(d.R2_CELLS.values()))] = []
+            with self.assertRaises(RuntimeError):
+                self.evaluate(path, sessions, rows, values)
+
+    def test_more_than_three_route_refs_refused(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            path, sessions, rows, values = self.fixture(Path(folder))
+            data = json.loads(path.read_text()); data["routes"].append(data["routes"][0]); write(path, data)
+            with self.assertRaises(RuntimeError):
+                self.evaluate(path, sessions, rows, values)
+
+    def test_positive_route_without_actual_workers_refused(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            path, _, rows, values = self.fixture(Path(folder), 1)
+            with self.assertRaises(RuntimeError):
+                self.evaluate(path, {d.SESSION: []}, rows, values)
+
+    def test_shared_r2_process_ids_refused(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            path, sessions, rows, values = self.fixture(Path(folder), 2)
+            values[1]["relay_identities"] = copy.deepcopy(values[0]["relay_identities"])
+            with self.assertRaises(RuntimeError):
+                self.evaluate(path, sessions, rows, values)
+
+    def test_nonempty_routes_without_bound_policy_refused(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            path, sessions, rows, _ = self.fixture(Path(folder), 1)
+            with self.assertRaises(RuntimeError):
+                d.verify_secondary_route(path, sessions, rows)
+
+    def test_empty_route_bundle_does_not_create_policy_or_admission(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            root = Path(folder); path, _, _, _ = self.fixture(root, 0)
+            self.assertFalse(d.verify_secondary_route(path, {d.SESSION: []}, [])["secondary_lane_occupied"])
+            self.assertEqual([p.name for p in root.iterdir()], ["routes.json"])
+
+    def test_historical_single_route_schema_refused(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            path = Path(folder) / "old.json"; write(path, {"schema": "hpc-forest-max-secondary-lane-route-v1"})
+            with self.assertRaises(RuntimeError):
+                d.verify_secondary_route(path, {d.SESSION: []}, [])
+
+    def test_max2_bundle_not_treated_as_max4(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            path, sessions, rows, values = self.fixture(Path(folder), 0)
+            data = json.loads(path.read_text()); data["maximum_total_workers"] = 2; write(path, data)
+            with self.assertRaises(RuntimeError):
+                self.evaluate(path, sessions, rows, values)
+
+    def test_flags_preserve_windows_quotes_and_refuse_duplicates(self):
+        command = 'python --output "C:/Has space/cache" --session-id abc'
+        self.assertEqual(d.flag(command, "--output"), "C:/Has space/cache")
+        self.assertEqual(d.flag(command, "--session-id"), "abc")
+        for value in ("python --output one --output two", "python"):
+            with self.assertRaises(RuntimeError):
+                d.flag(value, "--output")
+
+    def test_old_reader_owned_stop_requires_actual_bound_evidence(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            root=Path(folder); evidence=write(root/"evidence.json", {"NEUTRAL_ONLY": True})
+            old=pair("a"*32, 90)
+            stop={"schema":"hpc-forest-passive-observer-owned-stop-v1", "verified":True,
+                  "owned_observer_stop_verified":True,"previous_observer_identities":old,
+                  "source_only_relay_preserved":True,"model_workers_stopped":False,"recursive_stop":False,
+                  "evidence_refs":[evidence]}
+            reference=write(root/"stop.json",stop)
+            admission={"previous_observer_identities":old,"previous_observer_owned_stop_receipt":reference}
+            d.verify_old_observer_absent(admission,[])
+            for key,value in (("model_workers_stopped",True),("recursive_stop",True),("source_only_relay_preserved",False)):
+                changed={**stop,key:value};admission["previous_observer_owned_stop_receipt"]=write(root/"stop.json",changed)
+                with self.subTest(key=key),self.assertRaises(RuntimeError):
+                    d.verify_old_observer_absent(admission,[])
+
+
+if __name__ == "__main__":
+    unittest.main()

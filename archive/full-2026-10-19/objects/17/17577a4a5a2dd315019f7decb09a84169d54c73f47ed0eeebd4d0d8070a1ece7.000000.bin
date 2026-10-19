@@ -1,0 +1,232 @@
+"""Problem-independent execution/oracle adapter; contains no contest algorithm."""
+from __future__ import annotations
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path, PurePosixPath
+
+FLAGS={"-O0","-O1","-O2","-O3","-std=c99","-std=c11","-std=gnu99","-std=gnu11","-std=c++11","-std=c++14","-std=c++17","-std=gnu++17","-fopenmp","-lm","-pthread"}
+
+
+def safe_relative(name):
+    if not isinstance(name,str) or not name or "\\" in name:
+        raise ValueError("Invalid relative name")
+    path=PurePosixPath(name)
+    if path.is_absolute() or any(p in {"..","."} for p in path.parts) or ":" in name:
+        raise ValueError("Path outside the case/source directory")
+    return path.as_posix()
+
+
+def validate_contract(c,official):
+    if c["language"] not in {"c","c++"}:
+        raise ValueError("Only the available C/C++ toolchain is configured")
+    if not 1<=len(c["source_files"])<=20:
+        raise ValueError("Expected one to twenty compilation units")
+    for name in c["source_files"]:
+        name=safe_relative(name)
+        if not (official/name).is_file() or Path(name).suffix.lower() not in {".c",".cpp",".cc",".cxx"}:
+            raise ValueError("Compilation unit is not a supplied source file: "+name)
+    if any(flag not in FLAGS for flag in c["compiler_flags"]):
+        raise ValueError("Compiler option outside the fixed toolchain contract")
+    for key in ["abs_tol","rel_tol"]:
+        value=c["comparison"][key]
+        if type(value) not in {int,float} or not math.isfinite(value) or not 0<=value<=0.0001:
+            raise ValueError("Comparison tolerance must be finite and between zero and 1e-4")
+    if not 2<=len(c["search_cases"])<=8 or not 2<=len(c["confirmation_cases"])<=8:
+        raise ValueError("Provide at least two distinct cases per evaluation phase")
+    names=set()
+    for case in [*c["search_cases"],*c["confirmation_cases"],c["benchmark_case"]]:
+        name=safe_relative(case["name"])
+        if name in names:
+            raise ValueError("Case names must be distinct")
+        names.add(name)
+        if len(case["argv"])>30 or any(not isinstance(x,str) or "\0" in x for x in case["argv"]):
+            raise ValueError("Invalid data arguments")
+        for name in case["capture_files"]:
+            safe_relative(name)
+        if len(case["stdin_python"])+len(case["stdin_text"])>24000:
+            raise ValueError("Fixture generator is too large")
+        if case["stdin_file"]:
+            source=official/safe_relative(case["stdin_file"])
+            if not source.is_file():
+                raise ValueError("Requested official input is absent")
+        modes=sum(bool(case[k]) for k in ["stdin_file","stdin_text","stdin_python"])
+        if modes>1:
+            raise ValueError("Choose at most one stdin source")
+        for item in case["files"]:
+            if not (official/safe_relative(item["source"])).is_file():
+                raise ValueError("Requested data file is absent")
+            safe_relative(item["target"])
+
+
+def build_source(src,build,c):
+    build.mkdir(parents=True,exist_ok=True)
+    compiler=shutil.which("g++" if c["language"]=="c++" else "gcc")
+    if not compiler:
+        raise RuntimeError("Configured compiler is unavailable")
+    command=[compiler,"-I",str(src),*map(lambda name:str(src/safe_relative(name)),c["source_files"]),*c["compiler_flags"],"-o",str(build/"solution")]
+    result=subprocess.run(command,capture_output=True,text=True,timeout=90)
+    if result.returncode:
+        raise ValueError("Official/candidate compilation failed:\n"+(result.stderr+result.stdout)[-12000:])
+    return result
+
+
+def materialize(case,official,root,resources):
+    root.mkdir(parents=True,exist_ok=True)
+    stdin=root/"stdin.data"
+    if case["stdin_file"]:
+        shutil.copyfile(official/safe_relative(case["stdin_file"]),stdin)
+    elif case["stdin_python"]:
+        generator=root/"fixture.py"
+        generator.write_text(case["stdin_python"],encoding="utf-8")
+        with stdin.open("wb") as stream:
+            run=subprocess.run([sys.executable,"-I","-S",str(generator)],cwd=root,stdout=stream,stderr=subprocess.PIPE,timeout=20)
+        if run.returncode:
+            raise ValueError("Fixture generator failed: "+run.stderr.decode(errors="replace")[-6000:])
+    else:
+        stdin.write_text(case["stdin_text"],encoding="utf-8")
+    if stdin.stat().st_size>128*1024*1024:
+        raise ValueError("Generated stdin exceeds the fixed 128 MiB limit")
+    assets=[]
+    for item in case["files"]:
+        source=official/safe_relative(item["source"])
+        target=root/"assets"/safe_relative(item["target"])
+        target.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copyfile(source,target)
+        assets.append({"source":target.relative_to(resources).as_posix(),"target":item["target"]})
+    return {"name":case["name"],"argv":case["argv"],"stdin":stdin.relative_to(resources).as_posix(),"files":assets,"capture_files":case["capture_files"]}
+
+
+def execute(binary,case,timeout=45,resources=None):
+    resources=resources or Path(__file__).parent
+    with tempfile.TemporaryDirectory(prefix="hpc-forest-case-") as tmp:
+        cwd=Path(tmp)
+        for item in case["files"]:
+            target=cwd/safe_relative(item["target"])
+            target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(resources/item["source"],target)
+        with open(resources/case["stdin"],"rb") as stream:
+            p=subprocess.run([str(binary),*case["argv"]],cwd=cwd,stdin=stream,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,env={**os.environ,"OMP_NUM_THREADS":"4","OMP_DYNAMIC":"FALSE","CUDA_VISIBLE_DEVICES":""})
+        if p.returncode:
+            raise ValueError(f"Execution failed ({p.returncode}): "+p.stderr.decode(errors="replace")[-6000:])
+        output={"stdout":p.stdout.decode("utf-8",errors="strict")}
+        for name in case["capture_files"]:
+            target=cwd/safe_relative(name)
+            if not target.is_file() or target.stat().st_size>32*1024*1024:
+                raise ValueError("Missing/oversized contracted output: "+name)
+            output[name]=target.read_text(encoding="utf-8")
+        if sum(len(v) for v in output.values())>32*1024*1024:
+            raise ValueError("Excessive program output")
+        return output
+
+
+def equal_output(expected,actual,comparison):
+    if expected.keys()!=actual.keys():
+        return False
+    for name in expected:
+        left,right=expected[name].split(),actual[name].split()
+        if len(left)!=len(right):
+            return False
+        for a,b in zip(left,right):
+            if a==b:
+                continue
+            try:
+                x,y=float(a),float(b)
+            except ValueError:
+                return False
+            if not math.isfinite(x) or not math.isfinite(y) or not math.isclose(x,y,abs_tol=comparison["abs_tol"],rel_tol=comparison["rel_tol"]):
+                return False
+    return True
+
+
+def prepare(contract,official,root):
+    validate_contract(contract,official)
+    root.mkdir(parents=True,exist_ok=False)
+    source=root/"source"
+    (source/"src").mkdir(parents=True)
+    for p in official.rglob("*"):
+        if p.is_file() and p.suffix.lower() in {".c",".cpp",".cc",".cxx",".h",".hpp",".inc"}:
+            target=source/"src"/p.relative_to(official)
+            target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(p,target)
+    cc="g++" if contract["language"]=="c++" else "gcc"
+    command=[cc,"-I","src",*["src/"+p for p in contract["source_files"]],*contract["compiler_flags"],"-o","solution"]
+    (source/"Makefile").write_text("all: solution\nsolution: "+" ".join("src/"+p for p in contract["source_files"])+"\n\t"+" ".join(shlex.quote(p) for p in command)+"\n",encoding="utf-8")
+    (source/"run.sh").write_text('#!/bin/sh\ncd -- "$(dirname "$0")"\nexec ./solution "$@"\n',encoding="utf-8")
+    reference=root/"reference-build"
+    build_source(source/"src",reference,contract)
+    trusted=root/"validation"
+    trusted.mkdir()
+    shutil.copyfile(Path(__file__),trusted/"contract_tool.py")
+    resolved={"language":contract["language"],"source_files":contract["source_files"],"compiler_flags":contract["compiler_flags"],"comparison":contract["comparison"],"search":[],"confirmation":[]}
+    fingerprints=set()
+    for phase,key in [("search","search_cases"),("confirmation","confirmation_cases")]:
+        for case in contract[key]:
+            actual=materialize(case,official,trusted/"fixtures"/phase/case["name"],trusted)
+            fingerprint=hashlib.sha256((trusted/actual["stdin"]).read_bytes()+json.dumps(actual["argv"]).encode()).hexdigest()
+            if fingerprint in fingerprints:
+                raise ValueError("Duplicate fixtures across evaluation phases")
+            fingerprints.add(fingerprint)
+            expected=execute(reference/"solution",actual,resources=trusted)
+            repeat=execute(reference/"solution",actual,resources=trusted)
+            if not any(v.strip() for v in expected.values()):
+                raise ValueError("Oracle produced no observable result; declare its output files")
+            if not equal_output(expected,repeat,contract["comparison"]):
+                raise ValueError("Reference output is not reproducible under this contract")
+            if equal_output(expected,{k:"WRONG_OUTPUT" for k in expected},contract["comparison"]):
+                raise ValueError("Negative output control was incorrectly admitted")
+            actual["expected"]=expected
+            resolved[phase].append(actual)
+    bench=materialize(contract["benchmark_case"],official,trusted/"fixtures/benchmark",trusted)
+    bench["expected"]=execute(reference/"solution",bench,resources=trusted)
+    if not equal_output(bench["expected"],execute(reference/"solution",bench,resources=trusted),contract["comparison"]):
+        raise ValueError("Benchmark reference output is not reproducible")
+    resolved["benchmark"]=bench
+    (trusted/"contract.json").write_text(json.dumps(resolved,ensure_ascii=False),encoding="utf-8")
+    script=['#!/bin/sh','set -eu','binary="$1"','resources="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"','cd "$(dirname "$binary")"']
+    for item in bench["files"]:
+        parent=str(PurePosixPath(item["target"]).parent)
+        script.append("mkdir -p "+shlex.quote(parent))
+        script.append('cp -- "$resources/"'+shlex.quote(item["source"])+" "+shlex.quote(item["target"]))
+    script.append('exec "$binary" '+" ".join(shlex.quote(a) for a in bench["argv"])+ ' < "$resources/"'+shlex.quote(bench["stdin"]))
+    (trusted/"benchmark.sh").write_text("\n".join(script)+"\n",encoding="utf-8")
+    (root/"model-contract.json").write_text(json.dumps(contract,ensure_ascii=False,indent=2),encoding="utf-8")
+    return {"ready":True,"source":str(source),"validation":str(trusted),"reference_binary_sha256":hashlib.sha256((reference/"solution").read_bytes()).hexdigest(),"search_cases":len(resolved["search"]),"confirmation_cases":len(resolved["confirmation"])}
+
+
+def main():
+    action=sys.argv[1]
+    if action=="build":
+        trusted=Path(__file__).parent
+        c=json.loads((trusted/"contract.json").read_text())
+        build_source(Path(sys.argv[2])/"src",Path(sys.argv[3]),c)
+    elif action=="check":
+        c=json.loads((Path(__file__).parent/"contract.json").read_text())
+        cases=[*c[sys.argv[3]],c["benchmark"]]
+        for case in cases:
+            actual=execute(Path(sys.argv[2]),case)
+            if not equal_output(case["expected"],actual,c["comparison"]):
+                print(json.dumps({"correct":False,"case":case["name"],"reason":"Oracle output mismatch"}))
+                return 1
+        print(json.dumps({"correct":True,"cases":len(cases)}))
+    else:
+        raise ValueError("Unknown harness operation")
+    return 0
+
+
+if __name__=="__main__":
+    try:
+        raise SystemExit(main())
+    except (FileNotFoundError,PermissionError,RuntimeError) as exc:
+        print(type(exc).__name__+": "+str(exc),file=sys.stderr)
+        raise SystemExit(70)
+    except Exception as exc:
+        print(type(exc).__name__+": "+str(exc),file=sys.stderr)
+        raise SystemExit(1)

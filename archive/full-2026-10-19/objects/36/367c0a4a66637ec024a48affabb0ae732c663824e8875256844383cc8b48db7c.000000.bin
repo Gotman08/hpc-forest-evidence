@@ -1,0 +1,96 @@
+"""Individually stop the seven reviewed relay identities after read-only audit."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import subprocess
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+INCIDENT = STUDY / "reprises/incident-double-liaison-20261017T1345"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+OWNED = {7712, 13268, 13600, 23228, 23584, 56476, 59560}
+ORDER = [23584, 56476, 59560, 23228, 7712, 13600, 13268]
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf8") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=True)
+        stream.write("\n")
+
+
+def same(saved, rows):
+    current = next((row for row in rows if row["ProcessId"] == saved["ProcessId"]), None)
+    return current is not None and all(current.get(k) == saved.get(k) for k in FIELDS)
+
+
+def main():
+    assert not (HERE / "owned-worker-stopped.json").exists()
+    spec = importlib.util.spec_from_file_location("r1_stop_identity_reader", INCIDENT / "reprendre-deux-relais.py")
+    identity = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(identity)
+    spec = importlib.util.spec_from_file_location("r1_stop_reconciliation", HERE / "reconcilier-r1-interruption.py")
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+    extra = load(HERE / "audit-complementaire.json")
+    assert extra["all_final_confirmations_verified"] and extra["all_restored_bytes_unchanged"]
+    group = {"job_id": "750205", "session_id": "2bd8b683b45b41c8b48ec38708f46bab", "model": "gpt-6-astra", "effort": "xhigh"}
+    fresh = reader.reconcile(HERE / "restauration-neuve/results-750205", STUDY / "runs/coverage-gpt-6-astra-xhigh/worker", group)
+    assert fresh == load(HERE / "reconciliation-livraisons.json")
+    assert fresh["all_published_requests_delivered"] and fresh["published_requests"] == 118
+    terminal = load(HERE / "efficiency.json")
+    assert terminal["state"] == "COMPLETED" and terminal["exit_code"] == "0:0"
+    expected = load(HERE / "arbre-identites-a-revoir.json")
+    assert {row["ProcessId"] for row in expected} == OWNED
+    assert all(all(row.get(k) is not None for k in FIELDS) for row in expected)
+    assert not any("codex.exe" in row["ExecutablePath"].lower() for row in expected)
+    roots = load(INCIDENT / "relais-attendu-r1.json")
+    assert all(row in expected for row in roots)
+    preserved = load(INCIDENT / "relais-attendu-source_only.json")
+    preserved.append(load(INCIDENT / "identites-observateur-source_only.json")["observer"])
+    first, second = identity.census(), identity.census()
+    for rows in (first, second):
+        assert all(same(row, rows) for row in expected)
+        assert all(same(row, rows) for row in preserved)
+        assert not any("codex.exe" in (row.get("ExecutablePath") or "").lower()
+                       and group["session_id"] in (row.get("CommandLine") or "") for row in rows)
+    save("cim-avant-arret.json", {"first": first, "second": second, "reviewed_owned": expected, "preserved": preserved})
+    results = []
+    for pid in ORDER:
+        saved = next(row for row in expected if row["ProcessId"] == pid)
+        rows = identity.census()
+        if any(row["ProcessId"] == pid for row in rows):
+            assert same(saved, rows), "Identity changed before individual stop"
+            argv = ["taskkill.exe", "/PID", str(pid), "/F"]
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                                    check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+            results.append({"identity": saved, "argv": argv, "returncode": result.returncode,
+                            "stdout": result.stdout, "stderr": result.stderr, "recursive": False})
+        else:
+            results.append({"identity": saved, "already_exited_after_owned_parent_stop": True, "recursive": False})
+    after = identity.census()
+    assert not any(same(row, after) for row in expected)
+    assert all(same(row, after) for row in preserved)
+    save("commande-arret-resultat.json", results)
+    save("cim-apres-arret.json", after)
+    save("owned-worker-stopped.json", {"schema": "hpc-forest-owned-relay-stop-v3", **group,
+         "observed_at": time.time(), "after_audit": True, "after_deliveries": True,
+         "native_audit_sha256": reader.sha(HERE / "audit-initial.json"),
+         "supplemental_audit_sha256": reader.sha(HERE / "audit-complementaire.json"),
+         "reconciliation_sha256": reader.sha(HERE / "reconciliation-livraisons.json"),
+         "all_owned_process_identities_absent_after_stop": True, "reviewed_owned_identities": expected,
+         "complete_identity_rechecked_before_each_individual_stop": True,
+         "recursive_pid_tree_stop_used": False, "source_only_relay_and_observer_preserved": True,
+         "foreign_processes_targeted": False})
+    print(json.dumps({"reviewed_owned_identities_absent": len(expected), "after_audit_and_reconciliation": True,
+                      "recursive_stop": False, "source_only_preserved": True}))
+
+
+if __name__ == "__main__":
+    main()

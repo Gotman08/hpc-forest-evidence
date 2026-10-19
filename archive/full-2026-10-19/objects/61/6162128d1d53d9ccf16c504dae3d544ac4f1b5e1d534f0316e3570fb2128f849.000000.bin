@@ -1,0 +1,171 @@
+"""Portable closed evidence checks; no Windows or service observation is claimed."""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from pathlib import Path
+
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE = "60db53fb69e014133a9c77ebaea9ae09ae7891c1433070a9af4eae30b0d05e6d"
+PLAN = "b1b39b999cb89374a17191c5b3aef2b4eee255287a4cdbb80ed9c8b5d2ac1e1c"
+BASE_IDENTITY = {"scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN}
+Q_REVISION = "lane-r2-integration"
+QUALIFIED_COMPONENTS_SHA = "d18259c0017f0273522a54c638aaf14da9f5db8c32b12618852157f879323977"
+LOCAL_DELTA_REVISION = "r5-so-clos-delta-local"
+LOCAL_MODIFIED = {"chain_contract.py", "reader_bridge.py", "lane_projection.py", "observer/ABI.json"}
+LOCAL_ADDED = {"observer/validation-locale.json", "observer/test_obs4_neutre.py", "test_local_delta.py"}
+
+
+def need(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def artifact(ref):
+    need(isinstance(ref, dict) and set(ref) == {"path", "sha256"}, "Closed path/SHA reference required")
+    path = Path(ref["path"])
+    need(path.is_absolute() and ".." not in path.parts and path.is_file()
+         and not any(p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents))
+         and isinstance(ref["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"])
+         and sha(path) == ref["sha256"], "Missing, aliased or changed evidence")
+    return path
+
+
+def read(ref):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, "Duplicate JSON member")
+            result[key] = value
+        return result
+    value = json.loads(artifact(ref).read_text(encoding="utf8"), object_pairs_hook=pairs,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+    need(isinstance(value, dict), "JSON object required")
+    return value
+
+
+def bind(value, identity=BASE_IDENTITY):
+    need(all(type(value.get(k)) is type(v) and value.get(k) == v for k, v in identity.items()),
+         "Exact source/plan/cell identity differs")
+
+
+def check_local_delta(base_pins, active_pins, delta):
+    """Closed local-only byte delta; never relabel new bytes as allocated tests."""
+    bind(delta)
+    need(set(delta) == {"schema", "revision", *BASE_IDENTITY, "qualified_base_components_sha256",
+                       "unchanged_files", "changed_files", "added_files", "source105_changed",
+                       "ARM_executable_components_changed", "Q_reexecuted", "native_generation_admitted"}
+         and delta["schema"] == "hpc-forest-lane-r2-local-only-closed-delta-v1"
+         and delta["revision"] == LOCAL_DELTA_REVISION
+         and delta["qualified_base_components_sha256"] == QUALIFIED_COMPONENTS_SHA
+         and all(delta[k] is False for k in ("source105_changed", "ARM_executable_components_changed",
+                                             "Q_reexecuted", "native_generation_admitted")),
+         "Explicit qualified-base/local-delta scope required")
+    need(set(active_pins) == set(base_pins) | LOCAL_ADDED
+         and set(delta["changed_files"]) == LOCAL_MODIFIED
+         and set(delta["added_files"]) == LOCAL_ADDED
+         and set(delta["unchanged_files"]) == set(base_pins) - LOCAL_MODIFIED,
+         "Only the closed local adapter delta may differ")
+    for name in set(base_pins) - LOCAL_MODIFIED:
+        need(active_pins[name] == base_pins[name] == delta["unchanged_files"][name],
+             "Qualified ARM/exported or unchanged component differs")
+    for name in LOCAL_MODIFIED:
+        need(delta["changed_files"][name] == {"before": base_pins[name], "after": active_pins[name]},
+             "Modified local component digest differs")
+    need(delta["added_files"] == {name: active_pins[name] for name in LOCAL_ADDED},
+         "New local runtime/test dependency differs")
+
+
+def local_delta(root):
+    """Prove original allocated bytes AND the separately reviewed local graph."""
+    root = Path(root)
+    manifest = json.loads((root / "COMPONENTS.json").read_text(encoding="utf8"))
+    expected = root.parent / "revision-r4-observer-binding/COMPONENTS.json"
+    qualified_ref = manifest.get("qualified_base_components")
+    need(qualified_ref == {"path": str(expected.resolve()), "sha256": QUALIFIED_COMPONENTS_SHA},
+         "Exact immutable qualified base reference required")
+    qualified = read(qualified_ref)
+    bind(qualified)
+    delta_ref = manifest.get("local_only_delta")
+    need(artifact(delta_ref) == root.resolve() / "DELTA-LOCAL-FERME.json", "Exact local delta file required")
+    delta = read(delta_ref)
+    check_local_delta(qualified["code_pins"], manifest["code_pins"], delta)
+    for directory, pins in ((expected.parent, qualified["code_pins"]), (root, manifest["code_pins"])):
+        for name, checksum in pins.items():
+            path = Path(name)
+            need(not path.is_absolute() and ".." not in path.parts
+                 and artifact({"path": str((directory / path).absolute()), "sha256": checksum}),
+                 "Changed local or qualified component")
+    return {"qualified_components_sha256": QUALIFIED_COMPONENTS_SHA,
+            "active_components_sha256": sha(root / "COMPONENTS.json"), "delta": delta_ref}
+
+
+def qualification(ref, *, components_manifest_sha256):
+    """Check actual received Q bytes; no old job or positive template is accepted."""
+    q = read(ref)
+    bind(q)
+    need(q.get("schema") == "hpc-forest-dynamic-r4b-mechanical-reception-v1" and q.get("verified") is True
+         and type(q.get("native_model_calls")) is int and q["native_model_calls"] == 0
+         and all(q.get(k) is True for k in ("source_files_exact", "privacy_neutral_tests_passed",
+                                           "target_profile_verified", "reference_contracts_reviewed")),
+         "Actual exact-source allocated qualification reception required")
+    archive = artifact(q["archive"])
+    actual = read(q["qualification"])
+    audit = read(q["independent_audit"])
+    bind(actual)
+    bind(audit)
+    need(actual.get("verified") is True and type(actual.get("native_model_calls")) is int
+         and actual["native_model_calls"] == 0 and actual.get("adapter_revision") == Q_REVISION
+         and actual.get("source_file_count") == 105 and type(actual["source_file_count"]) is int
+         and actual.get("allocated_contract_tests_returncode") == 0
+         and type(actual["allocated_contract_tests_returncode"]) is int
+         and actual.get("adapter_components_manifest_sha256") == components_manifest_sha256,
+         "Actual allocated derivative and integration qualification required")
+    source_tests, adapter_tests = actual.get("source_lane_contract_tests"), actual.get("adapter_portable_tests")
+    need(isinstance(source_tests, dict) and set(source_tests) == {"passed", "failed"}
+         and type(source_tests["passed"]) is int and source_tests["passed"] == 26
+         and type(source_tests["failed"]) is int and source_tests["failed"] == 0,
+         "All 26 exact-source neutral lane tests required")
+    need(isinstance(adapter_tests, dict) and set(adapter_tests) == {"passed", "failed"}
+         and type(adapter_tests["passed"]) is int and adapter_tests["passed"] > 0
+         and type(adapter_tests["failed"]) is int and adapter_tests["failed"] == 0,
+         "Actual portable integration tests required")
+    allocation = actual.get("allocation", {})
+    target = {"architecture": "ARM64", "cpu_cores": 4, "tasks": 1, "nodes": 1,
+              "allocated_memory_mib": 16384, "allocated_gpus": 0}
+    need(all(type(allocation.get(k)) is type(v) and allocation[k] == v for k, v in target.items())
+         and isinstance(allocation.get("slurm_job_id"), str) and allocation["slurm_job_id"].isdigit(),
+         "Actual ARM64 four CPU, 16GiB, zero GPU allocation required")
+    need(audit.get("schema") == "hpc-forest-dynamic-r4b-independent-mechanical-audit-v1"
+         and audit.get("verified") is True and audit.get("qualification_sha256") == q["qualification"]["sha256"]
+         and audit.get("archive_sha256") == sha(archive)
+         and audit.get("adapter_components_manifest_sha256") == components_manifest_sha256
+         and type(audit.get("native_model_calls")) is int and audit["native_model_calls"] == 0
+         and audit.get("native_generation_admitted") is False and audit.get("normal_first_start_verified") is False,
+         "Independent exact-Q audit required; mechanical tests never admit generation")
+    return q
+
+
+def integration_review(ref, root):
+    """Bind every concrete chain component to the actual independent review."""
+    root = Path(root)
+    manifest_path = root / "COMPONENTS.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf8"))
+    value = read(ref)
+    bind(value)
+    need(value.get("schema") == "hpc-forest-dynamic-r4b-integration-review-v1"
+         and value.get("verified") is True and value.get("blocking_findings") == []
+         and value.get("neutral_tests_passed") is True
+         and value.get("adapter_revision") == Q_REVISION
+         and value.get("adapter_components_manifest_sha256") == sha(manifest_path)
+         and value.get("reviewed_files") == manifest["code_pins"], "Actual review of this complete integration required")
+    for name, checksum in manifest["code_pins"].items():
+        path = root / name
+        need(not Path(name).is_absolute() and ".." not in Path(name).parts and sha(path) == checksum,
+             "Reviewed integration component changed")
+    return value

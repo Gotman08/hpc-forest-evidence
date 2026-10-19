@@ -1,0 +1,51 @@
+"""Read-only process metadata for the two observed neutral-test PIDs. No stop."""
+import ctypes
+from ctypes import wintypes
+from datetime import datetime, UTC
+import json
+
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel.OpenProcess.restype = wintypes.HANDLE
+kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel.CloseHandle.restype = wintypes.BOOL
+kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel.WaitForSingleObject.restype = wintypes.DWORD
+kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel.GetExitCodeProcess.restype = wintypes.BOOL
+kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+kernel.GetProcessTimes.restype = wintypes.BOOL
+
+rows = []
+for pid in (46668, 52488):
+    item = {"pid_observed_in_prior_census": pid}
+    handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)
+    if not handle:
+        item["query_open_error"] = ctypes.get_last_error()
+        rows.append(item)
+        continue
+    try:
+        item["wait_zero_result"] = int(kernel.WaitForSingleObject(handle, 0))
+        status = wintypes.DWORD()
+        if kernel.GetExitCodeProcess(handle, ctypes.byref(status)):
+            item["exit_code_raw"] = int(status.value)
+        else:
+            item["exit_query_error"] = ctypes.get_last_error()
+        size = wintypes.DWORD(32768)
+        image = ctypes.create_unicode_buffer(size.value)
+        if kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size)):
+            item["image_path"] = image.value
+        else:
+            item["image_query_error"] = ctypes.get_last_error()
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            for label, point in zip(("creation", "exit", "kernel", "user"), times):
+                item[label + "_FILETIME_100ns"] = (point.dwHighDateTime << 32) | point.dwLowDateTime
+        else:
+            item["times_query_error"] = ctypes.get_last_error()
+    finally:
+        kernel.CloseHandle(handle)
+    rows.append(item)
+print(json.dumps({"schema": "hpc-forest-root-test-process-exit-readonly-v1", "at_utc": datetime.now(UTC).isoformat(), "process_intervention": False, "memory_or_payload_read": False, "rows": rows}))

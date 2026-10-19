@@ -1,0 +1,126 @@
+"""Render a bound R2d official-only qualification; execute no proposed command."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+import tarfile
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parents[3]
+SOURCE = BASE / "outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2d"
+OLD = BASE / "outputs/HPC-Forest-Primes-Natif-Qualification-r2c"
+OUT = BASE / "outputs/HPC-Forest-Primes-Natif-Qualification-r2d"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def save(path, value):
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-review", type=Path, required=True)
+    parser.add_argument("--source-review-sha256", required=True)
+    args = parser.parse_args()
+    assert sha(args.source_review) == args.source_review_sha256
+    review = json.loads(args.source_review.read_text(encoding="utf-8"))
+    delivery_path = SOURCE / "LIVRAISON-LOCALE-FINALE.json"
+    delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+    for key in ("source_zip", "plan", "bundle", "bundle_manifest", "runtime_manifest"):
+        assert sha(Path(delivery[key]["path"])) == delivery[key]["sha256"]
+    assert review["verified"] is True and review["blocking_findings"] == []
+    assert review["native_research_admitted"] is False
+    for key, expected in {"source_zip_sha256": delivery["source_zip"]["sha256"],
+                          "plan_sha256": delivery["plan"]["sha256"],
+                          "bundle_sha256": delivery["bundle"]["sha256"],
+                          "delivery_sha256": sha(delivery_path)}.items():
+        assert review[key] == expected
+    bundle = Path(delivery["bundle"]["path"])
+    with tarfile.open(bundle, "r:gz") as archive:
+        members = archive.getmembers()
+        assert all(m.isfile() and not m.issym() and not m.islnk() for m in members)
+        count = len(members)
+    pin = {"source_zip_sha256": delivery["source_zip"]["sha256"],
+           "plan_sha256": delivery["plan"]["sha256"],
+           "payload_sha256": delivery["bundle"]["sha256"],
+           "bundle_manifest_sha256": delivery["bundle_manifest"]["sha256"],
+           "runtime_manifest_sha256": delivery["runtime_manifest"]["sha256"],
+           "delivery_sha256": sha(delivery_path),
+           "integration_review_sha256": args.source_review_sha256,
+           "payload_bytes": bundle.stat().st_size, "payload_member_count": count,
+           "source_member_count": delivery["source_files"],
+           "remote_root": "/scratch_p/nimarano/hpc-forest-primes-native-contract-qualification-20261018-r2d-" + delivery["bundle"]["sha256"][:12],
+           "payload_path": "/scratch_p/nimarano/hpc-forest-primes-native-max-r2d-" + delivery["bundle"]["sha256"][:16] + ".tar.gz"}
+    assert pin["source_member_count"] == 105 and count == 211
+    text = (OLD / "qualification-wrapper.py").read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PINNED" for t in n.targets))
+    lines = text.splitlines(keepends=True)
+    lines[assignment.lineno - 1:assignment.end_lineno] = ["PINNED = " + repr(pin) + "\n"]
+    text = "".join(lines).replace("r2c", "r2d").replace("R2C", "R2D")
+    text = text.replace("len(manifest) == 103", "len(manifest) == 105").replace("Exact 103 source bytes", "Exact 105 source bytes")
+    # Pytest fixture links remain metadata. Never follow them while delivering results.
+    old_archive_guard = '''    paths = [p for p in sorted(root.rglob("*")) if p.is_file()]
+    require(all(not p.is_symlink() for p in paths), "Refusing linked result in envelope")'''
+    new_archive_guard = '''    links = [{"relative_path": p.relative_to(root).as_posix(), "target": os.readlink(p),
+              "followed": False} for p in sorted(root.rglob("*")) if p.is_symlink()]
+    save(root / "fixture-links-metadata.json", {"links": links, "links_followed": False})
+    paths = [p for p in sorted(root.rglob("*")) if not p.is_symlink() and p.is_file()]
+    require(all(p.stat().st_nlink == 1 for p in paths), "Refusing hard-linked result in envelope")'''
+    assert old_archive_guard in text
+    text = text.replace(old_archive_guard, new_archive_guard)
+    marker = "\ndef main(bindings):"
+    assert text.count(marker) == 1
+    delta = '''
+def run_lane_delta_tests(root, extraction):
+    allocation_guard()
+    deadline_guard()
+    test = extraction / "HPC-Forest/tests/test_r2max_r2d_lane.py"
+    script = "import sys;sys.path.insert(0,sys.argv[1]);import pytest;raise SystemExit(pytest.main(sys.argv[2:]))"
+    argv = [PYTHON, "-I", "-B", "-c", script, str(extraction / "HPC-Forest/src"),
+            "--noconftest", "-p", "no:cacheprovider", "-q", str(test),
+            "--basetemp", str(root / "lane-delta-fixtures"), "--junitxml=" + str(root / "lane-delta.xml")]
+    save(root / "lane-delta-intent.json", {"argv": argv, "launch_count": 1, "native_model_calls": 0, "no_retry": True})
+    process = subprocess.run(argv, capture_output=True, check=False, timeout=120,
+                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    (root / "lane-delta.stdout").write_bytes(process.stdout)
+    (root / "lane-delta.stderr").write_bytes(process.stderr)
+    import xml.etree.ElementTree as ET
+    suites = ET.fromstring((root / "lane-delta.xml").read_bytes()).findall(".//testsuite")
+    cases = sum(int(s.get("tests", "0")) for s in suites)
+    require(process.returncode == 0 and cases == 36 and all(int(s.get(k, "0")) == 0 for s in suites for k in ("failures", "errors", "skipped")), "Exact 36 neutral R2d lane tests required")
+    return {"returncode": process.returncode, "passed": cases, "executions": 1, "native_model_calls": 0,
+            "junit_sha256": file_sha(root / "lane-delta.xml")}
+
+'''
+    text = text.replace(marker, "\n" + delta + marker)
+    trigger = '        save(root / "input-inventory-before.json", before)'
+    assert text.count(trigger) == 1
+    text = text.replace(trigger, trigger + '\n        receipt["lane_delta_tests"] = run_lane_delta_tests(root, extraction)')
+    OUT.mkdir(exist_ok=False)
+    (OUT / "qualification-wrapper.py").write_text(text, encoding="utf-8", newline="\n")
+    test_text = (OLD / "test_qualification_wrapper.py").read_text(encoding="utf-8").replace("r2c", "r2d").replace("R2C", "R2D")
+    (OUT / "test_qualification_wrapper.py").write_text(test_text, encoding="utf-8", newline="\n")
+    render = (OLD / "preparer-commande.py").read_text(encoding="utf-8").replace("r2c", "r2d").replace("R2C", "R2D")
+    (OUT / "preparer-commande.py").write_text(render, encoding="utf-8", newline="\n")
+    save(OUT / "REVUE-SOURCE-REFERENCE.json", {"path": str(args.source_review.resolve()), "sha256": args.source_review_sha256})
+    save(OUT / "DELTA-ENVELOPPE.json", {"source_wrapper": {"path": str(OLD / "qualification-wrapper.py"), "sha256": sha(OLD / "qualification-wrapper.py")},
+        "new_wrapper": {"path": str(OUT / "qualification-wrapper.py"), "sha256": sha(OUT / "qualification-wrapper.py")},
+        "changes": ["Exact R2d source/plan/bundle/review/scope/count pins", "36 delta lane tests once under allocation before official-only qualification", "Fixture symlinks recorded as metadata, not followed; hard links refused"],
+        "native_model_calls": 0, "job_submitted": False, "separate_wrapper_review_required": True})
+    spec = importlib.util.spec_from_file_location("r2d_render_local", OUT / "preparer-commande.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.main()
+    print(json.dumps({"output": str(OUT), "remote_root": pin["remote_root"], "payload_path": pin["payload_path"], "wrapper_sha256": sha(OUT / "qualification-wrapper.py")}))
+
+
+if __name__ == "__main__":
+    main()

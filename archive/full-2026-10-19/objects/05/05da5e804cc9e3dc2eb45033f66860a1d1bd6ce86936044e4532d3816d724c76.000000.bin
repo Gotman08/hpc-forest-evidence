@@ -1,0 +1,119 @@
+#include <cassert>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+int main() {
+    int n, s;
+    if (std::scanf("%d %d", &n, &s) != 2) return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t row_width = static_cast<std::size_t>(n);
+    std::vector<int> matrix(row_width * row_width);
+    for (int r = 0; r < n; ++r) {
+        int* row = matrix.data() + static_cast<std::size_t>(r) * row_width;
+        for (int c = 0; c < n; ++c) {
+            if (std::scanf("%d", &row[c]) != 1) return 0;
+        }
+    }
+
+    const int window_count = n - s + 1;
+    long long max_sum = LLONG_MIN;
+
+    #pragma omp parallel reduction(max:max_sum)
+    {
+        int team_size = 1;
+#ifdef _OPENMP
+        team_size = omp_get_num_threads();
+#endif
+
+        // Each statically assigned block owns a contiguous range of top rows.
+        #pragma omp for schedule(static, 1)
+        for (int block = 0; block < team_size; ++block) {
+            const int first = static_cast<int>(
+                static_cast<long long>(window_count) * block / team_size);
+            const int last = static_cast<int>(
+                static_cast<long long>(window_count) * (block + 1) / team_size);
+
+            if (first < last) {
+                std::vector<std::int64_t> vertical(row_width, 0);
+
+                // Initialize the vertical sums for this block's first top row.
+                for (int r = first; r < first + s; ++r) {
+                    const int* row = matrix.data() +
+                                     static_cast<std::size_t>(r) * row_width;
+                    for (int c = 0; c < n; ++c) {
+                        vertical[static_cast<std::size_t>(c)] += row[c];
+                    }
+                }
+
+                for (int top = first; top < last; ++top) {
+                    if (top > first) {
+                        const int* leaving = matrix.data() +
+                            static_cast<std::size_t>(top - 1) * row_width;
+                        const int* entering = matrix.data() +
+                            static_cast<std::size_t>(top + s - 1) * row_width;
+                        int c = 0;
+#if defined(__aarch64__)
+                        for (; c + 4 <= n; c += 4) {
+                            const int32x4_t entering_values = vld1q_s32(entering + c);
+                            const int32x4_t leaving_values = vld1q_s32(leaving + c);
+
+                            const int64x2_t entering_low =
+                                vmovl_s32(vget_low_s32(entering_values));
+                            const int64x2_t leaving_low =
+                                vmovl_s32(vget_low_s32(leaving_values));
+                            const int64x2_t entering_high =
+                                vmovl_s32(vget_high_s32(entering_values));
+                            const int64x2_t leaving_high =
+                                vmovl_s32(vget_high_s32(leaving_values));
+
+                            int64x2_t sums_low = vld1q_s64(vertical.data() + c);
+                            int64x2_t sums_high = vld1q_s64(vertical.data() + c + 2);
+                            sums_low = vaddq_s64(
+                                sums_low, vsubq_s64(entering_low, leaving_low));
+                            sums_high = vaddq_s64(
+                                sums_high, vsubq_s64(entering_high, leaving_high));
+                            vst1q_s64(vertical.data() + c, sums_low);
+                            vst1q_s64(vertical.data() + c + 2, sums_high);
+                        }
+#endif
+                        for (; c < n; ++c) {
+                            vertical[static_cast<std::size_t>(c)] +=
+                                static_cast<std::int64_t>(entering[c]) - leaving[c];
+                        }
+                    }
+
+                    long long sum = 0;
+                    for (int c = 0; c < s; ++c) {
+                        sum += vertical[static_cast<std::size_t>(c)];
+                    }
+                    if (sum > max_sum) max_sum = sum;
+
+                    for (int left = 1; left < window_count; ++left) {
+                        sum += vertical[static_cast<std::size_t>(left + s - 1)] -
+                               vertical[static_cast<std::size_t>(left - 1)];
+                        if (sum > max_sum) max_sum = sum;
+                    }
+                }
+            }
+        }
+    }
+
+    std::printf("%lld\n", max_sum);
+    return 0;
+}

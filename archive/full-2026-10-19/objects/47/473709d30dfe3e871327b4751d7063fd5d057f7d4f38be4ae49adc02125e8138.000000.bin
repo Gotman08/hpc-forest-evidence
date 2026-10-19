@@ -1,0 +1,156 @@
+"""Render three LOCAL source-reviewed commands, without admitting missing qualification."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import zipfile
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('commands_cap4_r6', OUT / 'preparer-cellule-max.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+SEALED = m.BASE / 'outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2c'
+PROJECT = m.BASE / 'work/hpc-forest-primes-native-max-r2c/project'
+QUAL_ROOT = '/scratch_p/nimarano/hpc-forest-primes-native-contract-qualification-20261018-r2c-b64b297c0d15'
+EXTRACTION = QUAL_ROOT + '/extraction'
+SCOPE = 'hpc-forest-primes-native-max-r2c'
+SOURCE = 'ade344bfec4322e8aaecc99cfbf7bd502e6d39b55c62180e8f552a3d6391e680'
+PLAN = 'bac579fdb44850c636a6522c014175f95d4ce867bab502d86dd15c1bff31032e'
+RUNTIME = '20802c1855c983954c2af5d21d336cc14e7b8964a1ab5d40aec38c6ba1c37c5d'
+REVIEW = '22ba707765abdc4764b771c4c620ae2648ff15f3052a55e8dcde17066f0a728d'
+SOURCE_ZIP = SEALED / 'HPC-Forest-Primes-Natif-MAX-r2c.zip'
+MODELS = [('astra-max', 'gpt-6-astra'), ('terra-max', 'gpt-5.6-terra'), ('sol-max', 'gpt-6.1-sol')]
+
+
+def verify_static_source():
+    for p, expected in ((SOURCE_ZIP, SOURCE), (SEALED / 'native-max-plan.json', PLAN),
+                        (SEALED / 'runtime-manifest-r2max.json', RUNTIME), (SEALED / 'REVUE-INDEPENDANTE-CAP4.json', REVIEW)):
+        m.require(m.sha(p) == expected, 'Actual reviewed source artifact changed')
+    plan, review = m.read(SEALED / 'native-max-plan.json'), m.read(SEALED / 'REVUE-INDEPENDANTE-CAP4.json')
+    m.require(review.get('verified') is True and review.get('blocking_findings') == []
+              and review.get('source_zip_sha256') == SOURCE and review.get('plan_sha256') == PLAN
+              and review.get('native_research_admitted') is False and review.get('arm64_qualification_admitted') is False,
+              'Actual static source review required; never substitute mechanical admission')
+    m.require(plan.get('scope_id') == SCOPE and plan.get('cells') == m.CELLS
+              and plan.get('maximum_native_workers_total') == 4 and plan.get('maximum_cells_per_authorization') == 1
+              and plan.get('efforts') == ['max'] and plan.get('automatic_extension') is False,
+              'Exact cap4/three-cell/single-authorization plan required')
+    expected = m.read(SEALED / 'runtime-manifest-r2max.json')
+    actual = {p.relative_to(PROJECT).as_posix(): p for p in PROJECT.rglob('*') if p.is_file()
+              and not any(x in {'__pycache__', '.ruff_cache', '.pytest_cache'} for x in p.relative_to(PROJECT).parts)}
+    m.require(len(expected) == 103 and set(actual) == set(expected)
+              and all(not p.is_symlink() and m.sha(p) == expected[n] for n, p in actual.items()), 'Actual103 source bytes required')
+    with zipfile.ZipFile(SOURCE_ZIP) as archive:
+        names = archive.namelist()
+        m.require(len(names) == len(set(names)) == 103 and all(n.startswith('HPC-Forest/')
+            and n.removeprefix('HPC-Forest/') in actual
+            and archive.read(n) == actual[n.removeprefix('HPC-Forest/')].read_bytes() for n in names), 'Actual source ZIP mismatch')
+
+
+def payload(model):
+    model, session = m.selected_cell(model)
+    return {'scope_id': SCOPE, 'model': model, 'effort': 'max', 'session_id': session,
+        'source_sha256': SOURCE, 'plan_sha256': PLAN, 'runtime_sha256': RUNTIME, 'source_members': 103,
+        'remote_extraction': EXTRACTION, 'remote_root': '/scratch_p/nimarano/' + SCOPE + '-' + session,
+        'admission_root': '/scratch_p/nimarano/' + SCOPE + '-admission-' + session,
+        'source_zip_name': SOURCE_ZIP.name, 'cells': m.CELLS, 'maximum_native_workers': 4}
+
+
+def make_command(model):
+    # Qualification SHA/job is deliberately absent: the sealed wait enforces the future real authorization.
+    return m.command_from_preflight(m.render_payload(payload(model)))
+
+
+def main():
+    verify_static_source()
+    common = OUT / 'commun-non-admis'
+    common.mkdir(exist_ok=False)
+    binding = {'schema': 'hpc-forest-max-cap4-source-bindings-v1', 'verified': False, 'scope_id': SCOPE,
+        'source_zip': m.ref(SOURCE_ZIP), 'plan': m.ref(SEALED / 'native-max-plan.json'),
+        'runtime_manifest': m.ref(SEALED / 'runtime-manifest-r2max.json'), 'project_path': str(PROJECT),
+        'source_member_count': 103, 'remote_extraction': EXTRACTION, 'remote_qualification_root': QUAL_ROOT,
+        'qualification': None, 'qualification_reception': None, 'source_review': m.ref(SEALED / 'REVUE-INDEPENDANTE-CAP4.json'),
+        'maximum_native_workers': 4, 'cells': m.CELLS}
+    binding_ref = m.save(common, 'source-bindings-non-admis.json', binding)
+    refs, hashes = {}, {}
+    # Local file rendering only. No job/worker/model/transport function is called by this loop.
+    for short, model in MODELS:
+        directory = OUT / short
+        directory.mkdir(exist_ok=False)
+        cell = payload(model)
+        command = make_command(model)
+        with (directory / 'commande-allouee-proposee.sh').open('x', encoding='utf8', newline='\n') as stream:
+            stream.write(command)
+        command_ref = m.ref(directory / 'commande-allouee-proposee.sh')
+        hashes[model] = command_ref['sha256']
+        request = {'arch': 'armgpu', 'partition': 'short', 'nodes': 1, 'ntasks_per_node': 1,
+            'cpus_per_task': 4, 'mem_gb': 16, 'gpus_per_node': 0, 'time_limit': '03:00:00', 'cpu_bind': 'cores',
+            'spack_packages': [], 'name': 'forest-primes-' + short + '-r2c', 'workdir': '/scratch_p/nimarano', 'command': command}
+        m.save(directory, 'job-prepare-arguments-proposes.json', request)
+        m.save(directory, 'cellule-source-revue-non-admise.json', {**cell, 'verified': False,
+            'native_research_admitted': False, 'arm64_qualification_admitted': False,
+            'source_review': m.ref(SEALED / 'REVUE-INDEPENDANTE-CAP4.json'), 'command': command_ref,
+            'qualification_sha256': None, 'job_id': None, 'normal_first_call_proved': False,
+            'native_calls': 0, 'executed': False, 'source_files_verified': 103,
+            'allocation_seconds': 10800, 'tokens_ceiling': 1500000, 'search_seconds_ceiling': 1800,
+            'maximum_program_missions': 8, 'maximum_mother_calls': 2, 'inference_cpu_count_inferred': False})
+        intent = {'schema': 'hpc-forest-max-cell-submit-intent-v1', 'verified': False,
+            'scope_id': SCOPE, 'model': model, 'effort': 'max', 'session_id': cell['session_id'],
+            'source_zip_sha256': SOURCE, 'research_plan_sha256': PLAN, 'plan_id': None, 'plan_sha256': None,
+            'command': command_ref, 'job_script': None, 'full_script_reviewed': False, 'one_submit_only': False,
+            'no_resubmit_if_unknown': False, 'normal_first_call_proved': False, 'allocation_max_seconds': 10800,
+            'maximum_native_workers': 4, 'source_only_preserved': False, 'evidence_refs': []}
+        intent_ref = m.save(directory, 'submission-intent-non-admise.json', intent)
+        template_common = {'verified': False, 'scope_id': SCOPE, 'model': model, 'effort': 'max',
+            'session_id': cell['session_id'], 'job_id': 'NONSOUMIS', 'source_zip_sha256': SOURCE,
+            'plan_sha256': PLAN, 'observed_at': None, 'evidence_refs': []}
+        remote_ref = m.save(directory, 'remote-freshness-non-admise.json', {**template_common,
+            'schema': 'hpc-forest-max-cell-remote-freshness-observation-v1', 'remote_root': cell['remote_root'],
+            'admission_root': cell['admission_root'], 'native_root_absent': False, 'registry_absent': False,
+            'channel_absent': False, 'prior_session_claims_absent': False, 'parent_actual_observation_reviewed': False})
+        transport_ref = m.save(directory, 'transport-non-admis.json', {**template_common,
+            'schema': 'hpc-forest-max-cell-existing-transport-observation-v1', 'configuration_path': str(m.CONFIG),
+            'configuration_sha256': m.sha(m.CONFIG), 'transport_name': 'romeo-mcp', 'existing_transport_only': False,
+            'no_new_authentication': False, 'cli_tools_disabled': False, 'neutral_controls_passed': False,
+            'parent_actual_observation_reviewed': False})
+        obs_ref = m.save(directory, 'parent-observations-non-admises.json', {**template_common,
+            'schema': 'hpc-forest-max-cell-parent-observations-v1', 'complete_utf8_cim': None,
+            'allocation_ready': None, 'remote_freshness': remote_ref, 'transport': transport_ref, 'running_cells': []})
+        human_ref = m.save(directory, 'human-scope-non-admis.json', {**template_common,
+            'schema': 'hpc-forest-max-cell-human-scope-attestation-v1', 'max_only': False,
+            'one_cell_only': False, 'automatic_extension': False, 'user_messages': []})
+        refs[model] = {'directory': directory, 'intent': intent_ref, 'observations': obs_ref, 'human': human_ref}
+    review_ref = m.save(common, 'factory-review-non-admise.json', {
+        'schema': 'hpc-forest-max-cell-launch-factory-independent-review-v1', 'verified': False,
+        'source_zip_sha256': SOURCE, 'plan_sha256': PLAN, 'blocking_findings': ['LAUNCH_FACTORY_REVIEW_NOT_RECEIVED'],
+        'reviewer': None, 'reviewed_files': {n: m.sha(OUT / n) for n in
+            ('preparer-cellule-max.py', 'allocated-preflight-template.py', 'assembler-admissions-cellule.py', 'publication-locale.py')},
+        'command_sha256_by_model': hashes})
+    cohort_ref = m.save(common, 'cohort-reservation-non-admise.json', {
+        'schema': 'hpc-forest-max-cell-cap4-cohort-reservation-v1', 'verified': False, 'scope_id': SCOPE,
+        'source_zip_sha256': SOURCE, 'plan_sha256': PLAN, 'maximum_native_workers': 4,
+        'source_only_preserved': False, 'luna_not_replayed': True, 'one_submit_per_cell': False,
+        'cells': {model: {'session_id': m.CELLS[model], 'effort': 'max', 'job_id': 'NONSOUMIS',
+            'submission_intent': refs[model]['intent'], 'submission_observed': None, 'allocation_ready': None} for _, model in MODELS},
+        'evidence_refs': []})
+    for short, model in MODELS:
+        directory = refs[model]['directory']
+        m.save(directory, 'factory-input-non-admis.json', {'schema': 'hpc-forest-max-cell-factory-input-v1',
+            'job_id': 'NONSOUMIS', 'submission_intent': refs[model]['intent'], 'submission_observed': None,
+            'observations': refs[model]['observations'], 'factory_review': review_ref,
+            'human_scope': refs[model]['human'], 'cohort_reservation': cohort_ref})
+        m.save(directory, 'commandes-locales-futures-arguments.json', {'verified': False, 'performed': False,
+            'source_bindings': binding_ref, 'model': model,
+            'factory_argv_template': [str(m.PYTHON_LOCAL), '-B', str(OUT / 'assembler-admissions-cellule.py'),
+                '--bindings', 'BINDINGS_REELS', '--bindings-sha256', 'SHA_BINDINGS_REELS', '--model', model,
+                '--input', 'FACTORY_INPUT_REEL', '--input-sha256', 'SHA_INPUT_REEL', '--output-name', 'admissions-' + short],
+            'remote_allocation_marker_to_receive': payload(model)['admission_root'] + '/allocation-ready.json',
+            'new_local_cache_expected_absent': str(m.LAUNCH / ('worker-' + m.CELLS[model])),
+            'after_submit_channel_template': payload(model)['remote_root'] + '/results-<JOB_REEL>/mailbox'})
+    print(json.dumps({'status': 'three_local_command_folders_only_not_admitted', 'command_sha256_by_model': hashes}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

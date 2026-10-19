@@ -1,0 +1,50 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cassert>\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <cstring>\n#include <limits>\n#include <memory>\n\n#if defined(__aarch64__)\n#include <arm_neon.h>\n#endif\n#ifdef _OPENMP\n#include <omp.h>\n#endif\n\nusing Word = std::uint32_t;\nusing Sum = std::int32_t;\n\nclass FastInput {\n    static constexpr std::size_t capacity = 1u << 16;\n    unsigned char buffer_[capacity + 1];\n    std::size_t position_ = 0;\n    std::size_t available_ = 0;\n\n    void refill() {\n        available_ = std::fread(buffer_, 1, capacity, stdin);\n        position_ = 0;\n        buffer_[available_] = 0;\n    }\n\n    int next_byte() {\n        if (position_ == available_) {\n            refill();\n            if (available_ == 0) return EOF;\n        }\n        return buffer_[position_++];\n    }\n\npublic:\n    bool read_int(int& value) {\n        int c = next_byte();\n        while (c != EOF && c <= ' ') c = next_byte();\n        if (c == EOF) return false;\n        const bool negative = c == '-';\n        if (c == '-' || c == '+') c = next_byte();\n        Word magnitude = 0;\n        while (c >= '0' && c <= '9') {\n            magnitude = magnitude * 10u + static_cast<Word>(c - '0');\n            c = next_byte();\n        }\n        const std::int64_t wide = static_cast<std::int64_t>(magnitude);\n        value = static_cast<int>(negative ? -wide : wide);\n        return true;\n    }\n\n    bool read_words(Word* __restrict__ destination, std::size_t count) {\n        unsigned char* cursor = buffer_ + position_;\n        unsigned char* end = buffer_ + available_;\n        for (std::size_t i = 0; i < count; ++i) {\n            for (;;) {\n                while (cursor != end && *cursor <= ' ') ++cursor;\n                if (cursor != end) break;\n                refill();\n                cursor = buffer_;\n                end = buffer_ + available_;\n                if (available_ == 0) return false;\n            }\n\n            const bool negative = *cursor == '-';\n            if (*cursor == '-' || *cursor == '+') ++cursor;\n            Word magnitude = 0;\n            for (;;) {\n                unsigned digit = static_cast<unsigned>(*cursor)\n                               - static_cast<unsigned>('0');\n                while (digit < 10u) {\n                    magnitude = magnitude * 10u + digit;\n                    ++cursor;\n                    digit = static_cast<unsigned>(*cursor)\n                          - static_cast<unsigned>('0');\n                }\n                if (cursor != end) {\n                    ++cursor;\n                    break;\n                }\n                refill();\n                cursor = buffer_;\n                end = buffer_ + available_;\n                if (available_ == 0) break;\n            }\n            destination[i] = negative ? Word(0) - magnitude : magnitude;\n        }\n        position_ = static_cast<std::size_t>(cursor - buffer_);\n        return true;\n    }\n};\n\nstatic inline Sum signed_sum(Word bits) {\n    Sum value;\n    std::memcpy(&value, &bits, sizeof(value));\n    return value;\n}\n\n#if defined(__aarch64__)\nstatic inline uint32x4_t prefix_four(uint32x4_t values) {\n    const uint32x4_t zero = vdupq_n_u32(0);\n    values = vaddq_u32(values, vextq_u32(zero, values, 3));\n    return vaddq_u32(values, vextq_u32(zero, values, 2));\n}\n#endif\n\nstatic inline void horizontal_sums(Word* row, int n, int s) {\n    const int windows = n - s + 1;\n    Word total = 0;\n    #pragma omp simd reduction(+:total)\n    for (int c = 0; c < s; ++c) total += row[c];\n\n    int c = 0;\n#if defined(__aarch64__)\n    uint32x4_t carry = vdupq_n_u32(total);\n    for (; c + 8 < windows; c += 8) {\n        // Load both source ranges before overwriting any overlapping input.\n        const uint32x4_t leaving0 = vld1q_u32(row + c);\n        const uint32x4_t leaving1 = vld1q_u32(row + c + 4);\n        const uint32x4_t entering0 = vld1q_u32(row + c + s);\n        const uint32x4_t entering1 = vld1q_u32(row + c + s + 4);\n\n        const uint32x4_t prefix0 = prefix_four(vsubq_u32(entering0, leaving0));\n        uint32x4_t prefix1 = prefix_four(vsubq_u32(entering1, leaving1));\n        prefix1 = vaddq_u32(prefix1,\n                           vdupq_n_u32(vgetq_lane_u32(prefix0, 3)));\n        const uint32x4_t values0 = vaddq_u32(carry, prefix0);\n        const uint32x4_t values1 = vaddq_u32(carry, prefix1);\n\n        vst1q_u32(row + c, vextq_u32(carry, values0, 3));\n        vst1q_u32(row + c + 4, vextq_u32(values0, values1, 3));\n        carry = vdupq_n_u32(vgetq_lane_u32(values1, 3));\n    }\n    total = vgetq_lane_u32(carry, 0);\n#endif\n    for (; c < windows - 1; ++c) {\n        const Word leaving = row[c];\n        const Word entering = row[c + s];\n        row[c] = total;\n        total += entering - leaving;\n    }\n    row[windows - 1] = total;\n}\n\nint main() {\n    FastInput input;\n    int n, s;\n    if (!input.read_int(n) || !input.read_int(s)) return 0;\n    assert(s < n);\n    assert(n < 8000);\n    assert(s > 0);\n    assert(n > 0);\n\n    const std::size_t elements = static_cast<std::size_t>(n) * n;\n    std::unique_ptr<Word[]> matrix(new Word[elements]);\n    Word* const data = matrix.get();\n    constexpr std::size_t input_tile = 1u << 14;\n    for (std::size_t offset = 0; offset < elements;) {\n        const std::size_t count = std::min(input_tile, elements - offset);\n        if (!input.read_words(data + offset, count)) return 0;\n        offset += count;\n    }\n\n    const int windows = n - s + 1;\n    constexpr int max_stripe_width = 256;\n    int workers = 1;\n#ifdef _OPENMP\n    workers = omp_get_max_threads();\n#endif\n    const int stripe_width = std::min(max_stripe_width,\n        std::max(1, (windows + workers - 1) / workers));\n    const int stripes = (windows + stripe_width - 1) / stripe_width;\n    Sum maximum = std::numeric_limits<Sum>::lowest();\n\n    #pragma omp parallel if(elements >= 65536) reduction(max:maximum)\n    {\n        #pragma omp for schedule(static)\n        for (int r = 0; r < n; ++r) {\n            horizontal_sums(data + static_cast<std::size_t>(r) * n, n, s);\n        }\n\n        alignas(64) Word column_sums[max_stripe_width];\n        alignas(64) Sum column_maxima[max_stripe_width];\n\n        #pragma omp for schedule(static) nowait\n        for (int block = 0; block < stripes; ++block) {\n            const int first = block * stripe_width;\n            const int width = std::min(stripe_width, windows - first);\n            #pragma omp simd\n            for (int c = 0; c < width; ++c) column_sums[c] = 0;\n\n            for (int r = 0; r < s; ++r) {\n                const Word* const row = data + static_cast<std::size_t>(r) * n + first;\n                #pragma omp simd\n                for (int c = 0; c < width; ++c) column_sums[c] += row[c];\n            }\n            #pragma omp simd\n            for (int c = 0; c < width; ++c) {\n                column_maxima[c] = signed_sum(column_sums[c]);\n            }\n\n            for (int r = s; r < n; ++r) {\n                const Word* const entering = data + static_cast<std::size_t>(r) * n + first;\n                const Word* const leaving = data + static_cast<std::size_t>(r - s) * n + first;\n                #pragma omp simd\n                for (int c = 0; c < width; ++c) {\n                    const Word total = column_sums[c] + entering[c] - leaving[c];\n                    column_sums[c] = total;\n                    column_maxima[c] = std::max(column_maxima[c], signed_sum(total));\n                }\n            }\n\n            Sum block_maximum = std::numeric_limits<Sum>::lowest();\n            #pragma omp simd reduction(max:block_maximum)\n            for (int c = 0; c < width; ++c) {\n                block_maximum = std::max(block_maximum, column_maxima[c]);\n            }\n            maximum = std::max(maximum, block_maximum);\n        }\n    }\n\n    std::printf(\"%d\\n\", static_cast<int>(maximum));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Bulk tile parsing combined with parallel separable sums and an eight-output NEON horizontal prefix tree should reduce parsing overhead and scan latency while preserving reference wraparound comparisons.",
+    "notes": "Retains B's prefix-tree idea, not its 64-bit accumulation. No commands or measurements executed.",
+    "sources_kept": [
+      "b214fa6cacb441f0",
+      "09862ad695cf4a97",
+      "78a7c73c1c804332"
+    ],
+    "transformations": [
+      "Integrate A's sentinel-backed input buffer and tile-local bulk signed-integer parsing.",
+      "Adapt B's eight-output NEON prefix tree to in-place horizontal sums, loading overlapping inputs before stores and preserving a scalar fallback.",
+      "Retain C's unsigned 32-bit recurrences with signed bit interpretation for maximum comparisons.",
+      "Retain C's persistent OpenMP region, static work sharing, inter-phase barrier, cache-bounded vertical stripes, and small-input serialization."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "baee98ad62954e4baa1d03df91d2030e",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "7482157f26c0b9cfa3b5ffa4f0aac27fdc6edde009e1d89574bebb23fba8bd70",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "03a70073b75f8eac18c332b1bfda7478294ffc5ed412ab70056d95b78a5380f4",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 17670,
+        "output_tokens": 9787,
+        "reasoning_output_tokens": 7190
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 27457,
+    "tool_events": []
+  }
+}

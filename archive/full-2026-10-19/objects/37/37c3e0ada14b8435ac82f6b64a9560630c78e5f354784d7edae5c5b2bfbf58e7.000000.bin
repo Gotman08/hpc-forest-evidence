@@ -1,0 +1,81 @@
+"""Restore and baseline-audit only the completed SO Terra archive, without a worker."""
+import hashlib
+import json
+import os
+import runpy
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+COMPARE = HERE.parents[1]
+STUDY = COMPARE.parent / "HPC-Forest-Etude-2020-2024-r1"
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        assert not path.is_symlink(), "Linked restored evidence"
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = {"bytes": path.stat().st_size, "sha256": sha(path)}
+    return result
+
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def main():
+    assert __debug__
+    assert not (HERE / "restauration-neuve").exists()
+    archive = HERE / "archive/results-750831.tar.gz"
+    source = COMPARE / "HPC-Forest-Harnais-Comparaison-r1.zip"
+    assert sha(archive) == "83265ee01e92d9ca5b917816a9a417721fbbe38b90e1138e4e57ee66e57e4c13"
+    assert sha(source) == "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb"
+    group = json.loads((HERE / "groupe-exact.json").read_text(encoding="utf8"))
+    assert group["job_id"] == "750831" and group["session_id"] == "15219a6fd62b4dcb91b395dcd4ae03d5"
+    assert group["model"] == "gpt-5.6-terra" and group["effort"] == "max" and group["arm"] == "source-only"
+    restorer = STUDY.parent / "Marathon22-DeepSeek-v11/cadre-execution/restaurer-preuves.py"
+    restore = runpy.run_path(str(restorer))["restore"]
+    restored = HERE / "restauration-neuve"
+    save("restauration-verifiee.json", restore(archive, STUDY / "sources-officielles-restauration", restored))
+    before = inventory(restored)
+    save("inventaire-avant-audit.json", before)
+    command = [sys.executable, "-B", str(COMPARE / "auditer-source-only.py"),
+               str(restored / "results-750831"), str(HERE / "audit-initial.json"),
+               "--archive", str(archive), "--group", str(HERE / "groupe-exact.json"),
+               "--source-zip", str(source), "--references", str(COMPARE / "contrats-reference.json")]
+    assert "--worker" not in command
+    with (HERE / "audit-initial.log").open("xb") as log:
+        completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=600,
+                                   env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"), check=False)
+    after = inventory(restored)
+    save("inventaire-apres-audit.json", after)
+    assert before == after
+    assert completed.returncode == 0, "Baseline refused; preserve audit-initial.log"
+    audit = json.loads((HERE / "audit-initial.json").read_text(encoding="utf8"))
+    assert audit["coverage_and_final_confirmations_verified"] and audit["read_only_file_verification_before_and_after"]
+    assert audit["job_id"] == group["job_id"] and audit["session_id"] == group["session_id"]
+    assert audit["model"] == group["model"] and audit["effort"] == group["effort"]
+    assert len(audit["subjects"]) == len(group["subjects"])
+    assert audit["deliveries_reconciled"] is False and audit["local_delivery_reconciliation"] is None
+    save("verification-reception-initiale.json", {
+        "verified": True, "observed_utc": datetime.now(UTC).isoformat(), "job_id": group["job_id"],
+        "archive_sha256": sha(archive), "source_zip_sha256": sha(source),
+        "restored_files_including_manifest_unchanged": len(before), "baseline_audit_sha256": sha(HERE / "audit-initial.json"),
+        "subjects": len(audit["subjects"]), "baseline_without_worker": True, "deliveries_reconciliation_pending": True,
+        "model_calls": 0, "candidate_executions_or_compilations": 0})
+    print(json.dumps({"verified": True, "subjects": len(audit["subjects"]), "restored_files": len(before),
+                      "baseline_without_worker": True, "reconciliation_pending": True}))
+
+
+if __name__ == "__main__":
+    main()

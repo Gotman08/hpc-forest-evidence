@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include \"knn.h\"\n#include <limits.h>\n#include <stdint.h>\n#include <string.h>\n\nstatic char winning_label(const size_t counts[UCHAR_MAX + 1]) {\n    char winner = (char)CHAR_MIN;\n    size_t best_count = 0;\n\n    for (int label = CHAR_MIN; label <= CHAR_MAX; ++label) {\n        size_t count = counts[(unsigned char)label];\n        if (count > best_count) {\n            best_count = count;\n            winner = (char)label;\n        }\n    }\n    return winner;\n}\n\nstatic char knn_insertion(int n_groups, Group *groups, int k,\n                          Point to_evaluate) {\n    char *labels = (char *)malloc(sizeof(char) * (size_t)k);\n    float *distances = (float *)malloc(sizeof(float) * (size_t)k);\n    size_t counts[UCHAR_MAX + 1] = {0};\n\n    for (int i = 0; i < k; ++i) {\n        labels[i] = -1;\n        distances[i] = -1;\n    }\n\n    for (int i = 0; i < n_groups; ++i) {\n        Group g = groups[i];\n        for (int j = 0; j < g.length; ++j) {\n            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);\n            for (int x = 0; x < k; ++x) {\n                if (d < distances[x] || distances[x] == -1) {\n                    for (int y = k - 1; y > x; --y) {\n                        distances[y] = distances[y - 1];\n                        labels[y] = labels[y - 1];\n                    }\n                    distances[x] = d;\n                    labels[x] = g.label;\n                    break;\n                }\n            }\n        }\n    }\n\n    for (int i = 0; i < k; ++i) {\n        ++counts[(unsigned char)labels[i]];\n    }\n    free(distances);\n    free(labels);\n    return winning_label(counts);\n}\n\nstatic uint32_t histogram_bucket(const size_t *histogram,\n                                 uint32_t bucket_count, size_t *rank) {\n    for (uint32_t bucket = 0; bucket < bucket_count; ++bucket) {\n        if (*rank < histogram[bucket]) {\n            return bucket;\n        }\n        *rank -= histogram[bucket];\n    }\n    return bucket_count - 1;\n}\n\nstatic uint32_t select_distance_threshold(const uint32_t *distances,\n                                          size_t count, size_t keep,\n                                          size_t histogram[2048],\n                                          size_t *equal_to_keep) {\n    size_t rank = keep - 1;\n    uint32_t high = histogram_bucket(histogram, 2048, &rank);\n\n    /* Refine only the selected prefix; distances remain in group order. */\n    memset(histogram, 0, 1024 * sizeof(*histogram));\n    for (size_t i = 0; i < count; ++i) {\n        uint32_t bits = distances[i];\n        if ((bits >> 20) == high) {\n            ++histogram[(bits >> 10) & UINT32_C(1023)];\n        }\n    }\n    uint32_t middle = histogram_bucket(histogram, 1024, &rank);\n    uint32_t prefix = (high << 10) | middle;\n\n    memset(histogram, 0, 1024 * sizeof(*histogram));\n    for (size_t i = 0; i < count; ++i) {\n        uint32_t bits = distances[i];\n        if ((bits >> 10) == prefix) {\n            ++histogram[bits & UINT32_C(1023)];\n        }\n    }\n    uint32_t low = histogram_bucket(histogram, 1024, &rank);\n    *equal_to_keep = rank + 1;\n    return (prefix << 10) | low;\n}\n\nchar knn(int n_groups, Group *groups, int k, Point to_evaluate) {\n    if (k <= 0) {\n        return (char)-1;\n    }\n\n    size_t total = 0;\n    for (int i = 0; i < n_groups; ++i) {\n        if (groups[i].length > 0) {\n            size_t length = (size_t)groups[i].length;\n            if (length > SIZE_MAX - total) {\n                return knn_insertion(n_groups, groups, k, to_evaluate);\n            }\n            total += length;\n        }\n    }\n\n    size_t counts[UCHAR_MAX + 1] = {0};\n    if ((size_t)k >= total) {\n        for (int i = 0; i < n_groups; ++i) {\n            if (groups[i].length > 0) {\n                counts[(unsigned char)groups[i].label] +=\n                    (size_t)groups[i].length;\n            }\n        }\n        counts[(unsigned char)-1] += (size_t)k - total;\n        return winning_label(counts);\n    }\n\n    if (sizeof(float) != sizeof(uint32_t) ||\n        total > SIZE_MAX / sizeof(uint32_t)) {\n        return knn_insertion(n_groups, groups, k, to_evaluate);\n    }\n\n    uint32_t *distances = (uint32_t *)malloc(total * sizeof(*distances));\n    if (distances == NULL) {\n        return knn_insertion(n_groups, groups, k, to_evaluate);\n    }\n\n    size_t histogram[2048] = {0};\n    size_t position = 0;\n    for (int i = 0; i < n_groups; ++i) {\n        Group g = groups[i];\n        for (int j = 0; j < g.length; ++j) {\n            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);\n            uint32_t bits;\n            memcpy(&bits, &d, sizeof(bits));\n            bits &= UINT32_C(0x7fffffff);\n            if (bits > UINT32_C(0x7f800000)) {\n                free(distances);\n                return knn_insertion(n_groups, groups, k, to_evaluate);\n            }\n\n            distances[position++] = bits;\n            ++histogram[bits >> 20];\n        }\n    }\n\n    size_t equal_to_keep;\n    uint32_t threshold = select_distance_threshold(\n        distances, total, (size_t)k, histogram, &equal_to_keep);\n\n    position = 0;\n    for (int i = 0; i < n_groups; ++i) {\n        size_t below = 0;\n        size_t equal = 0;\n        for (int j = 0; j < groups[i].length; ++j) {\n            uint32_t bits = distances[position++];\n            below += (size_t)(bits < threshold);\n            equal += (size_t)(bits == threshold);\n        }\n\n        /* Equal-distance ties favor earlier groups, as in insertion order. */\n        size_t take_equal = equal < equal_to_keep ? equal : equal_to_keep;\n        counts[(unsigned char)groups[i].label] += below + take_equal;\n        equal_to_keep -= take_equal;\n    }\n\n    free(distances);\n    return winning_label(counts);\n}\n\nint main() {\n    int n_groups = parse_number_of_groups();\n    \n    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);\n\n    for (int i = 0; i < n_groups; i++) {\n        groups[i] = parse_next_group();\n    }\n\n    int k = parse_k();\n\n    Point to_evaluate = parse_point();\n\n    printf(\"%c\", knn(n_groups, groups, k, to_evaluate));\n}\n",
+        "path": "src/knn.c"
+      }
+    ],
+    "hypothesis": "Keeping 32-bit distances in group order and selecting through cache-resident histogram refinement should reduce scratch traffic and branch-heavy partitioning.",
+    "notes": "Unmeasured. Parsing, public interfaces, tie priority, and existing fallback behavior are preserved. All scratch storage is per call.",
+    "sources_kept": [],
+    "transformations": [
+      "Replace packed 64-bit keys with contiguous 32-bit distance bits; group membership remains implicit in group boundaries.",
+      "Fuse the initial histogram with distance generation, then refine the selected prefix using sequential scans without scattering.",
+      "Count below-threshold and equal-threshold points per group, consuming boundary ties in original group order."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "382406c6d34a495da5323b7ecbcdf41f",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "021530121f8534d6761deedbb54f4b0e937df429323fa54f50dd118396e274a3",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "8988673247ef776b464d8e9c961065c774f9d80e7e28656245b5a304855b4582",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 18603,
+        "output_tokens": 8265,
+        "reasoning_output_tokens": 6214
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 26868,
+    "tool_events": []
+  }
+}

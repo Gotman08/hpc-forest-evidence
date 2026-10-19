@@ -1,0 +1,314 @@
+#include "knn.h"
+#include <float.h>
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+static char knn_insertion_fallback(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *) malloc(sizeof(char) * k);
+    float * distances = (float *) malloc(sizeof(float) * k);
+
+    int i, j;
+    int used = 0;
+    int ordered = 1;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            /* Preserve the original insertion behavior for unordered distances. */
+            if (!ordered || d != d) {
+                for (int x = 0; x < k; x++) {
+                    if (d < distances[x] || distances[x] == -1) {
+                        for (int y = k - 1; y > x; y--) {
+                            distances[y] = distances[y - 1];
+                            labels[y] = labels[y - 1];
+                        }
+
+                        distances[x] = d;
+                        labels[x] = g.label;
+                        if (used < k) used++;
+                        if (d != d) ordered = 0;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            int end;
+            if (used < k) {
+                end = used++;
+            } else {
+                /* Equal distances retain the earlier point. */
+                if (!(d < distances[k - 1])) continue;
+                end = k - 1;
+            }
+
+            /* Upper bound preserves the original stable distance ordering. */
+            int lo = 0;
+            int hi = end;
+            while (lo < hi) {
+                int mid = lo + (hi - lo) / 2;
+                if (d < distances[mid]) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+
+            size_t moved = (size_t) (end - lo);
+            if (moved != 0) {
+                memmove(distances + lo + 1, distances + lo,
+                        moved * sizeof(*distances));
+                memmove(labels + lo + 1, labels + lo,
+                        moved * sizeof(*labels));
+            }
+            distances[lo] = d;
+            labels[lo] = g.label;
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+static void knn_sift_keys(uint64_t * keys, size_t root, size_t count) {
+    uint64_t value = keys[root];
+    while (root < count / 2) {
+        size_t child = root * 2 + 1;
+        if (child + 1 < count && keys[child] < keys[child + 1]) child++;
+        if (value >= keys[child]) break;
+        keys[root] = keys[child];
+        root = child;
+    }
+    keys[root] = value;
+}
+
+static void knn_sort_keys(uint64_t * keys, size_t count) {
+    if (count < 2) return;
+    for (size_t root = count / 2; root > 0;) {
+        --root;
+        knn_sift_keys(keys, root, count);
+    }
+    for (size_t end = count; end > 1;) {
+        --end;
+        uint64_t value = keys[0];
+        keys[0] = keys[end];
+        keys[end] = value;
+        knn_sift_keys(keys, 0, end);
+    }
+}
+
+static uint64_t knn_median_key(uint64_t a, uint64_t b, uint64_t c) {
+    if (a > b) {
+        uint64_t value = a;
+        a = b;
+        b = value;
+    }
+    if (b > c) {
+        uint64_t value = b;
+        b = c;
+        c = value;
+    }
+    return a > b ? a : b;
+}
+
+/* Leave the smallest keep keys in the contiguous prefix. */
+static void knn_select_keys(uint64_t * keys, size_t count, size_t keep) {
+    if (keep == 0 || keep >= count) return;
+
+    size_t lo = 0;
+    size_t hi = count;
+    unsigned int budget = 0;
+    for (size_t remaining = count; remaining > 1; remaining >>= 1) budget += 2;
+
+    while (hi - lo > 24) {
+        if (budget == 0) {
+            knn_sort_keys(keys + lo, hi - lo);
+            return;
+        }
+        --budget;
+
+        uint64_t pivot = knn_median_key(keys[lo], keys[lo + (hi - lo) / 2],
+                                        keys[hi - 1]);
+        size_t left = lo;
+        size_t scan = lo;
+        size_t right = hi;
+        while (scan < right) {
+            uint64_t value = keys[scan];
+            if (value < pivot) {
+                keys[scan] = keys[left];
+                keys[left] = value;
+                ++left;
+                ++scan;
+            } else if (value > pivot) {
+                --right;
+                keys[scan] = keys[right];
+                keys[right] = value;
+            } else {
+                ++scan;
+            }
+        }
+
+        if (keep < left) {
+            hi = left;
+        } else if (keep > right) {
+            lo = right;
+        } else {
+            return;
+        }
+    }
+
+    for (size_t i = lo + 1; i < hi; i++) {
+        uint64_t value = keys[i];
+        size_t j = i;
+        while (j > lo && value < keys[j - 1]) {
+            keys[j] = keys[j - 1];
+            --j;
+        }
+        keys[j] = value;
+    }
+}
+
+static char knn_vote(const size_t * counts) {
+    char winner = (char) -1;
+    size_t best_count = 0;
+    for (int value = 0; value <= UCHAR_MAX; value++) {
+        char label = (char) (unsigned char) value;
+        if (counts[value] > best_count ||
+            (counts[value] == best_count && counts[value] != 0 && label < winner)) {
+            winner = label;
+            best_count = counts[value];
+        }
+    }
+    return winner;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    if (k <= 0 || sizeof(float) != sizeof(uint32_t) || FLT_RADIX != 2 ||
+        FLT_MANT_DIG != 24 || FLT_MAX_EXP != 128) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t) groups[i].length;
+            if (length > SIZE_MAX - total) {
+                return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+            }
+            total += length;
+        }
+    }
+
+    size_t counts[UCHAR_MAX + 1] = {0};
+    size_t keep = (size_t) k;
+    if (total <= keep) {
+        counts[(unsigned char) (char) -1] = keep - total;
+        for (int i = 0; i < n_groups; i++) {
+            if (groups[i].length > 0) {
+                counts[(unsigned char) groups[i].label] += (size_t) groups[i].length;
+            }
+        }
+        return knn_vote(counts);
+    }
+
+    size_t extra = keep < 1024 ? 1024 : keep;
+    size_t capacity = extra > total - keep ? total : keep + extra;
+    if (capacity > SIZE_MAX / sizeof(uint64_t)) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+    uint64_t * keys = (uint64_t *) malloc(capacity * sizeof(*keys));
+    if (keys == NULL) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t used = 0;
+    uint64_t cutoff = UINT64_MAX;
+    int have_cutoff = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            float distance = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            uint32_t bits;
+            memcpy(&bits, &distance, sizeof(bits));
+            bits &= UINT32_C(0x7fffffff);
+            if (bits > UINT32_C(0x7f800000)) {
+                free(keys);
+                return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+            }
+
+            /* Nonnegative float bits sort numerically. Group order breaks ties;
+               tied points within one group have identical voting effects. */
+            uint64_t key = ((uint64_t) bits << 32) | (uint32_t) i;
+            if (have_cutoff && key >= cutoff) continue;
+            keys[used++] = key;
+
+            if (used == capacity) {
+                knn_select_keys(keys, used, keep);
+                used = keep;
+                cutoff = keys[0];
+                for (size_t x = 1; x < keep; x++) {
+                    if (keys[x] > cutoff) cutoff = keys[x];
+                }
+                have_cutoff = 1;
+            }
+        }
+    }
+
+    knn_select_keys(keys, used, keep);
+    for (size_t i = 0; i < keep; i++) {
+        size_t group = (size_t) (uint32_t) keys[i];
+        counts[(unsigned char) groups[group].label]++;
+    }
+    free(keys);
+    return knn_vote(counts);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

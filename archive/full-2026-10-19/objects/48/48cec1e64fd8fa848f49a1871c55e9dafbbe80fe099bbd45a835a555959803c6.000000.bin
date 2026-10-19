@@ -1,0 +1,128 @@
+#include "knn.h"
+#include <omp.h>
+
+typedef struct {
+    float dist;
+    char label;
+} Candidate;
+
+int compare_candidates(const void *a, const void *b) {
+    float diff = ((Candidate*)a)->dist - ((Candidate*)b)->dist;
+    if (diff < 0) return -1;
+    else if (diff > 0) return 1;
+    else return 0;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *) malloc(sizeof(char) * k);
+    float * distances = (float *) malloc(sizeof(float) * k);
+
+    for (int i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    int nthreads;
+    Candidate **all_cands = NULL;
+
+    #pragma omp parallel shared(n_groups, groups, k, to_evaluate, all_cands, nthreads)
+    {
+        int tid = omp_get_thread_num();
+        #pragma omp single
+        {
+            nthreads = omp_get_num_threads();
+            all_cands = (Candidate**) malloc(nthreads * sizeof(Candidate*));
+            for (int t = 0; t < nthreads; t++) {
+                all_cands[t] = (Candidate*) malloc(k * sizeof(Candidate));
+                for (int i = 0; i < k; i++) {
+                    all_cands[t][i].dist = -1.0f;
+                    all_cands[t][i].label = -1;
+                }
+            }
+        }
+
+        Candidate *local = all_cands[tid];
+        int count = 0;
+
+        #pragma omp for schedule(dynamic)
+        for (int i = 0; i < n_groups; i++) {
+            Group g = groups[i];
+            for (int j = 0; j < g.length; j++) {
+                float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+                int pos;
+                for (pos = 0; pos < count && pos < k; pos++) {
+                    if (d < local[pos].dist) break;
+                }
+                if (pos < k) {
+                    for (int y = (count < k ? count : k-1); y > pos; y--) {
+                        local[y] = local[y-1];
+                    }
+                    local[pos].dist = d;
+                    local[pos].label = g.label;
+                    if (count < k) count++;
+                }
+            }
+        }
+    }
+
+    int total_valid = 0;
+    for (int t = 0; t < nthreads; t++) {
+        Candidate *cand = all_cands[t];
+        for (int i = 0; i < k && cand[i].dist != -1.0f; i++) {
+            total_valid++;
+        }
+    }
+
+    if (total_valid > 0) {
+        Candidate *merged = (Candidate*) malloc(total_valid * sizeof(Candidate));
+        int idx = 0;
+        for (int t = 0; t < nthreads; t++) {
+            Candidate *cand = all_cands[t];
+            for (int i = 0; i < k && cand[i].dist != -1.0f; i++) {
+                merged[idx++] = cand[i];
+            }
+        }
+        qsort(merged, total_valid, sizeof(Candidate), compare_candidates);
+
+        int limit = (total_valid < k) ? total_valid : k;
+        for (int i = 0; i < limit; i++) {
+            distances[i] = merged[i].dist;
+            labels[i] = merged[i].label;
+        }
+        free(merged);
+    }
+
+    for (int t = 0; t < nthreads; t++) {
+        free(all_cands[t]);
+    }
+    free(all_cands);
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(labels);
+    free(distances);
+
+    return most_frequent;
+}

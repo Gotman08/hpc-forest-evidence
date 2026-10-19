@@ -1,0 +1,77 @@
+"""Record observed missing interfaces and CLI pin barrier; never launch or stop."""
+import contextlib
+import importlib.util
+import json
+import os
+import sys
+import time
+from pathlib import Path
+BASE = Path("C:/Users/nicol/Documents/Codex/2026-10-15/cr")
+STUDY = BASE / "outputs/HPC-Forest-Etude-2020-2024-r1"
+COMPARE = BASE / "outputs/HPC-Forest-Harnais-Comparaison-r1"
+HERE = STUDY / "reprises/incident-double-liaison-20261017T2012"
+OBSERVATIONS = {"r1":{"ok":True,"job_id":"750909","finished":True,"scheduler_completed":True,"scheduler_success_observed":True,"result_validated":False,"name":"forest-matrix-coverage-gpt-5.6-terra-xhigh","partition":"short","state":"COMPLETED","elapsed":"06:17:18","exit_code":"0:0","start":"2026-10-17T15:59:41","end":"2026-10-17T22:16:59","next_step":"Consulte job_log_tail puis job_efficiency.","observation":{"observed_at":1792268368.167626,"target":{"host":"romeo1","user":"nimarano","account":"r250127"},"source":"slurm","current_state_observed":True}},"source_only":{"ok":True,"job_id":"750831","allocation_id":"750831","scope":"job","finished":False,"scheduler_completed":False,"result_validated":False,"name":"forest-compare-source-only-gpt-5.6-terra-max","partition":"short","state":"RUNNING","elapsed":"6:52:08","remaining":"2:07:52","nodes":"1","reason_or_nodelist":"romeo-a041","dependencies_remaining":"","estimated_start":None,"observation":{"observed_at":1792268368.0501735,"target":{"host":"romeo1","user":"nimarano","account":"r250127"},"source":"slurm","current_state_observed":True}}}
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+def save_new(path, value):
+    with path.open("x", encoding="utf8") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+spec = importlib.util.spec_from_file_location("observer_incident_readonly",
+    STUDY / "reprises/incident-liaison-terra-xhigh-20261017T1726/observer-strict.py")
+observer = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = observer
+spec.loader.exec_module(observer)
+rows = observer.census()
+save_new(HERE / "cim-avant-consignation.json", rows)
+old_pids = {70620,25440,62748,61252,51504,53396,64976,56756}
+assert not old_pids & {r["ProcessId"] for r in rows}
+pin = load(COMPARE / "cli-figee.json")
+assert not Path(pin["executable"]["path"]).exists()
+sys.path.insert(0, str(BASE / "work/marathon-archive-mother-r1/project/src"))
+from hpc_forest.core import FileLock
+with contextlib.ExitStack() as stack:
+    for root, lock in [(STUDY, "coordinator.lock"), (COMPARE, "comparison-coordinator.lock")]:
+        previous_lock = root / lock
+        if previous_lock.exists():
+            (HERE / (lock + ".before")).write_bytes(previous_lock.read_bytes())
+        stack.enter_context(FileLock(previous_lock))
+    for lane, root, key in [("r1", STUDY, "coverage-gpt-5.6-terra-xhigh"),
+                             ("source_only", COMPARE, "source-only-gpt-5.6-terra-max")]:
+        state_path = root / "coordinator-state.json"
+        state = load(state_path)
+        assert state["current_key"] == key
+        cell = next(c for c in state["queue"] if c["key"] == key)
+        state.update(stage=("awaiting_audited_r1_reception_after_interface_loss" if lane == "r1" else "attention_required"),
+            error="Pinned CLI 0.162.0-alpha.17.2 missing; CLI 0.163.0-alpha.10.2 not admitted",
+            updated_at=time.time(), strict_observer_running=False,
+            recovery_incident={"path": str(HERE), "local_interfaces_absent": True,
+                "pinned_cli_missing": True, "new_cli_admission": "pending_human_decision",
+                "generation_replayed": False, "submission_replayed": False,
+                "next_action": ("Strict audited reception of completed job" if lane == "r1"
+                                else "CLI pin restoration or explicit reviewed migration before relay resume")})
+        cell["scheduler"] = OBSERVATIONS[lane]
+        temp = state_path.with_suffix(".incident2012.tmp")
+        with temp.open("x", encoding="utf8") as stream:
+            json.dump(state, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, state_path)
+save_new(HERE / "observation-cli-et-application.json", {
+    "observed_at": time.time(),
+    "application": {"package": "OpenAI.Codex_26.1013.4894.0_x64__2p2nqsd0c76g0",
+                    "root_pid": 29832, "root_created_utc": "2026-10-17T20:00:40.8508110Z",
+                    "app_server_pid": 29280, "app_server_created_utc": "2026-10-17T20:00:47.4444360Z"},
+    "pinned_cli": pin, "pinned_cli_present": False,
+    "current_cli": {"path": "C:/Users/nicol/AppData/Local/OpenAI/Codex/bin/896a0166b774037a/codex.exe",
+        "sha256": "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312",
+        "version": "codex-cli 0.163.0-alpha.10.2", "model_calls": 0, "admitted_for_research": False},
+    "checked_locations": ["workspace work/ and outputs/ for codex executables/CLI archives",
+                          "AppData/Local/OpenAI/Codex/bin; directories 896a... and ce475..."],
+    "exact_pinned_copy_found": False, "processes_stopped": 0,
+    "application_restart_performed_by_this_turn": False,
+    "low_level_causality_established": False, "mcp_update_performed": False,
+    "native_workers_observed": 0, "observations": OBSERVATIONS})
+print(json.dumps({"recorded": True, "r1": OBSERVATIONS["r1"]["state"], "source_only": OBSERVATIONS["source_only"]["state"],
+                  "local_interfaces": "absent", "new_cli_admission": "pending_human_decision"}))

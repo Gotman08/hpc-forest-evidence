@@ -1,0 +1,50 @@
+"""Launch only the admitted observer, preserving uncertain launches."""
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+
+
+def read_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def main():
+    legacy = read_module("observer_launch_legacy", ROOT / "coordonner-matrice.py")
+    observer = read_module("observer_launch_admitted", HERE / "observer-courant.py")
+    assert not (HERE / "lancement-intention.json").exists(), "Reconcile any launch before retrying"
+    state = json.loads((ROOT / "coordinator-state.json").read_text())
+    assert state["stage"] == "attention_required"
+    assert not legacy.same_process(state["strict_coordinator_identity"]), "Existing coordinator still lives"
+    expected = json.loads((HERE / "relais-attendu.json").read_text())
+    observer.verify_relay_pair(expected, legacy.process_identity)
+    observer.verify_cell(state, legacy.process_identity(expected[0]["ProcessId"]))
+    with legacy.FileLock(ROOT / "coordinator.lock"):
+        pass
+    argv = [sys.executable, "-B", "-u", str(HERE / "observer-courant.py")]
+    legacy.atomic_json(HERE / "lancement-intention.json", {"argv": argv, "observed_at": time.time(),
+        "observer_only": True, "submission_replayed": False, "worker_restarted": False,
+        "retry_without_reconciliation_forbidden": True})
+    with (HERE / "stdout.log").open("xb") as stdout, (HERE / "stderr.log").open("xb") as stderr:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+    identity = legacy.process_identity(process.pid)
+    assert identity and str(HERE / "observer-courant.py") in identity["CommandLine"]
+    legacy.atomic_json(HERE / "lancement.json", {"identity": identity, "argv": argv,
+        "observer_only": True, "worker_restarted": False, "submission_replayed": False})
+    print(json.dumps({"observer_launcher_pid": process.pid, "observer_only": True}))
+
+
+if __name__ == "__main__":
+    main()

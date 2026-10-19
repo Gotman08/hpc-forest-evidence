@@ -1,0 +1,95 @@
+"""Data-binding delta only. No existing suite or operational entrypoint rerun."""
+import hashlib
+import importlib.util
+import io
+import json
+import tarfile
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+OLD = HERE / 'revision-r4-facades-cloture-observer'
+NEW = HERE / 'revision-r5-G-recu-avant-Q'
+Q = HERE / 'qualification-complete110-r4-G-bound'
+OLDQ = HERE / 'qualification-complete110-r3-facades'
+BASE = HERE.parents[2]
+CANONICAL = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2g/RECEPTION-FINALE-ET-CLOTURE-VERIFIEE.json'
+CANONICAL_SHA = 'd4c74352d28555ba3a476273af51b1d7791c328fa37addcee580318aedbc6df4'
+G_REF = {'path': str(CANONICAL), 'sha256': CANONICAL_SHA}
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def bridge():
+    spec = importlib.util.spec_from_file_location('G_bound_r5_bridge', NEW / 'reader_bridge.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_two_real_bindings_only_before_Q():
+    for name in ('launcher/pins-source-plan.json', 'reader/pins-source-plan.json'):
+        old, new = (json.loads((root / name).read_bytes()) for root in (OLD, NEW))
+        assert old['latest_native_generation_closure'] is None
+        assert new['latest_native_generation_closure'] == G_REF
+        new['latest_native_generation_closure'] = None
+        assert new == old
+
+
+def test_other60_components_and_all_prior_r4_bytes_preserved():
+    old = json.loads((OLD / 'COMPONENTS.json').read_bytes())
+    new = json.loads((NEW / 'COMPONENTS.json').read_bytes())
+    assert sha(OLD / 'COMPONENTS.json') == '17fa505a5f8bfa03aaa3f28d6cf14423ad89e2cf29fd2852ca909b9a8debe946'
+    assert set(old['code_pins']) == set(new['code_pins']) and len(new['code_pins']) == 62
+    changed = {name for name in old['code_pins'] if sha(NEW / name) != old['code_pins'][name]}
+    assert changed == {'launcher/pins-source-plan.json', 'reader/pins-source-plan.json'}
+    assert all(sha(OLD / name) == expected for name, expected in old['code_pins'].items())
+    assert all(sha(NEW / name) == expected for name, expected in new['code_pins'].items())
+
+
+def test_real_G_contract_and_external_independent_post_review_bound():
+    reader = bridge()
+    reader.verify_dependencies()
+    value = reader.latest_g_closure(G_REF, G_REF)
+    assert value['native_research_admitted'] is False and value['five_confirmations_verified'] is False
+    admission = json.loads((HERE / 'ADMISSION-LOCALE-G-POST-CLOTURE-R5.json').read_bytes())
+    proof = admission['independent_post_closure_review']
+    assert proof['sha256'] == '12d72682ca473cae60ec8133185c634420d2ea01c8ed6e13f35d4578be488ccb'
+    assert sha(Path(proof['path'])) == proof['sha256']
+    post = json.loads(Path(proof['path']).read_bytes())
+    assert post['verified'] is True and post['blocking_findings'] == [] and post['canonical_receipt'] == G_REF
+    assert admission['new_fresh_current_CIM_still_required'] is True
+    assert admission['R3_native_generation_or_scientific_admission'] is False
+
+
+@pytest.mark.parametrize('kind', ['missing', 'wrong_digest', 'different_pin'])
+def test_missing_or_changed_G_pin_stays_closed(kind):
+    reader = bridge()
+    value, pinned = dict(G_REF), dict(G_REF)
+    if kind == 'missing':
+        value = None
+    elif kind == 'wrong_digest':
+        value['sha256'] = pinned['sha256'] = 'a' * 64
+    else:
+        pinned['sha256'] = 'a' * 64
+    with pytest.raises(ValueError):
+        reader.latest_g_closure(value, pinned)
+
+
+def test_packet_refs_only_no_G_private_receipt_or_CIM_bytes():
+    with tarfile.open(Q / 'complete-source110-neutral-packet.tar.gz', 'r:gz') as archive:
+        packet = {m.name: archive.extractfile(m).read() for m in archive.getmembers()}
+    with tarfile.open(fileobj=io.BytesIO(packet['adapter-bundle.tar.gz']), mode='r:gz') as archive:
+        files = {m.name: archive.extractfile(m).read() for m in archive.getmembers()}
+    assert len(files) == 63
+    assert 'ADMISSION-LOCALE-G-POST-CLOTURE-R5.json' not in files
+    assert all(Path(name).name not in {'auth.json', 'config.toml', 'invocation.json', 'codex.jsonl.json',
+        'RECEPTION-FINALE-ET-CLOTURE-VERIFIEE.json', 'REVUE-POST-CLOTURE-REELLE-G.json'} for name in files)
+    assert all(CANONICAL.read_bytes() != raw for raw in files.values())
+    for name in ('launcher/pins-source-plan.json', 'reader/pins-source-plan.json'):
+        assert json.loads(files[name])['latest_native_generation_closure'] == G_REF
+    assert packet['qualification-wrapper.py'] == (OLDQ / 'qualification-wrapper.py').read_bytes()
+    assert packet['source-bundle.tar.gz'] == (OLDQ / 'source-bundle.tar.gz').read_bytes()

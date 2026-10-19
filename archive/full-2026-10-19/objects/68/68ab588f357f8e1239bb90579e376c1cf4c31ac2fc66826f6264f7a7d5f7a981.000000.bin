@@ -1,0 +1,532 @@
+"""ROOT-only cold G collection. No process, model, transport or SQLite API.
+
+The author never runs this main. ROOT must supply a fresh complete pinned CIM.
+Only three literal caches can be observed; worker.lock is always STAT ONLY.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import tarfile
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[2]
+REL = HERE.parent
+LAUNCH = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2g'
+FACTORY = LAUNCH / 'revision-r1'
+SCOPE = 'hpc-forest-primes-native-max-r2g'
+SOURCE = 'f8c2104bad52e3c298de596fd365415fbdfbbb12fbdc41b47b06a94ad68273fe'
+PLAN = '5af07859f99192e169f2475fb2c863c9d4a05a4a8dba07845b3fcc54451e7dba'
+PREPARATION = 'd260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd'
+LAUNCH_SHA = '26e9c4cc5936f7e5a5a49b260f3310af9a2aeae1b003a38dcb59bf3347bb10e5'
+FROZEN_INPUTS_SHA = 'f86889d0ea04152fd1c3d93e611efdbc495c202c05249216ecea9aa3be897ab1'
+LAUNCH_RECEIPT = FACTORY / 'helper-lancement-possedes/lancement_reel_01/LANCEMENTS-POSSEDES-RECUS.json'
+FIELDS = ('ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate')
+CELLS = (
+    ('astra', 'gpt-6-astra', '753498', '110cefccf16b439eb226e475c875c8df', 27596, 61176, 4),
+    ('terra', 'gpt-5.6-terra', '753497', '5d8811082a1842f5836a2bdda982500f', 50984, 45916, 3),
+    ('sol', 'gpt-6.1-sol', '753499', '13eaca4e39cf4147a3f677a32fb5a52d', 44728, 50420, 3),
+)
+ARTIFACTS = {'allocated_contract_qualification', 'allocated_contract_reception', 'cli_identity',
+    'extension_admission', 'integration_review', 'luna_closure', 'luna_first_start', 'plan',
+    'preparation_manifest', 'preparation_review', 'session_freshness', 'source_zip',
+    'transport_admission', 'worker_lane_admission'}
+ROOT_REQUIRED = {'OWNER.json', 'worker-ready.json', 'CELL-BINDING.json', 'worker.lock'}
+ROOT_OPTIONAL = {'cli-technical-hold.json'}
+NONCE_REQUIRED = {'downloaded-request.json', 'download-receipt.json', 'generation-claimed.json', 'request.json',
+    'invocation.json', 'codex.jsonl', 'codex.jsonl.json', 'response.json', 'response-ready.json', 'delivered.json',
+    'instructions.txt', 'output-schema.json', 'cli-diagnostics.json',
+    'invocation.json.arm-projection.json', 'codex.jsonl.json.arm-projection.json'}
+NONCE_OPTIONAL = {'agent-result.json'}
+MAX_FILE = 128 * 1024 * 1024
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def safe(path, boundary=BASE):
+    path, boundary = Path(path).absolute(), Path(boundary).absolute()
+    need(path.is_relative_to(boundary) and path.resolve().is_relative_to(boundary.resolve()), 'Path escapes owned boundary')
+    need(not path.anchor.startswith('\\\\') and all(':' not in part for part in path.parts[1:]), 'UNC/ADS refused')
+    for part in (path, *path.parents):
+        if part.exists() or part.is_symlink():
+            info = part.lstat()
+            need(not stat.S_ISLNK(info.st_mode) and not
+                (getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 1024)),
+                'Symlink/junction/reparse point refused')
+    return path
+
+
+def file_meta(info):
+    return {'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns, 'mode': info.st_mode,
+            'device': info.st_dev, 'inode': info.st_ino, 'links': info.st_nlink,
+            'attributes': getattr(info, 'st_file_attributes', None)}
+
+
+def readable_name(path, allow_cold_database=False):
+    name = Path(path).name.rstrip(' .').casefold()
+    need(name != 'worker.lock', 'worker.lock content must NEVER be opened/hashed')
+    need(allow_cold_database or not re.search(r'\.(?:sqlite3?|db)(?:-(?:wal|shm|journal))?$', name),
+         'SQLite/database cache file refused before read')
+
+
+def stable_bytes(path, boundary=BASE, allow_cold_database=False):
+    path = safe(path, boundary)
+    readable_name(path, allow_cold_database)
+    before = path.lstat()
+    need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= MAX_FILE,
+         'Missing/nonregular/hardlinked/oversized named evidence')
+    with path.open('rb') as stream:
+        need(file_meta(os.fstat(stream.fileno())) == file_meta(before), 'File replaced before open')
+        raw = stream.read(MAX_FILE + 1)
+        need(file_meta(os.fstat(stream.fileno())) == file_meta(before), 'File changed during read')
+    after = path.lstat()
+    need(file_meta(before) == file_meta(after) and len(raw) == after.st_size, 'File replaced/changed after read')
+    return raw, {**file_meta(after), 'sha256': digest(raw)}
+
+
+def ref(path):
+    raw, metadata = stable_bytes(path)
+    return {'path': str(Path(path).absolute()), 'sha256': metadata['sha256']}
+
+
+def item(value):
+    need(isinstance(value, dict) and set(value) == {'path', 'sha256'}
+         and isinstance(value['path'], str) and re.fullmatch('[0-9a-f]{64}', value.get('sha256', '')), 'Closed original reference required')
+    path = safe(value['path'])
+    need(ref(path) == value, 'Frozen original reference changed')
+    return path
+
+
+def read(path):
+    raw, _ = stable_bytes(path)
+    def pairs(values):
+        result = {}
+        for key, value in values:
+            need(key not in result, 'Duplicate JSON key')
+            result[key] = value
+        return result
+    return json.loads(raw.decode('utf-8-sig'), object_pairs_hook=pairs,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+
+
+def read_ref(value):
+    return read(item(value))
+
+
+def recheck_frozen_references(value):
+    if isinstance(value, dict):
+        if set(value) == {'path', 'sha256'}:
+            item(value)
+        else:
+            for child in value.values(): recheck_frozen_references(child)
+    elif isinstance(value, list):
+        for child in value: recheck_frozen_references(child)
+
+
+def save(path, value, boundary=HERE):
+    path = safe(path, boundary)
+    raw = (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode('utf8')
+    with path.open('xb') as stream:
+        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+    return ref(path)
+
+
+def identity(cell):
+    slug, model, job, session, pid, launcher, count = cell
+    return {'scope_id': SCOPE, 'model': model, 'effort': 'max', 'job_id': job, 'session_id': session,
+        'source_zip_sha256': SOURCE, 'plan_sha256': PLAN}
+
+
+def full_identity(row):
+    need(isinstance(row, dict) and all(k in row for k in FIELDS)
+         and type(row['ProcessId']) is int and type(row['ParentProcessId']) is int
+         and all(isinstance(row[k], str) and row[k] for k in FIELDS[2:])
+         and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z', row['CreationDate']), 'Five-field complete process identity required')
+    return {key: row[key] for key in FIELDS}
+
+
+def fresh_identities(census, launch, now):
+    need(census.get('complete_census') is True and type(census.get('rows_count')) is int
+         and census['rows_count'] == len(census['rows']), 'Complete parent-supplied CIM required')
+    age = (now - datetime.fromisoformat(census['captured_at_utc'])).total_seconds()
+    need(0 <= age <= 45, 'Parent-supplied CIM stale/future')
+    rows = {r['ProcessId']: r for r in census['rows']}
+    need(len(rows) == len(census['rows']) and all(type(r.get('ProcessId')) is int
+         and type(r.get('ParentProcessId')) is int for r in rows.values()), 'Duplicate/untyped CIM graph')
+    need(launch.get('verified') is True and len(launch.get('workers', [])) == 3, 'Real three-worker launch receipt required')
+    result = {}
+    for cell in CELLS:
+        slug, model, job, session, pid, parent, count = cell
+        original = next(w for w in launch['workers'] if w['session_id'] == session)
+        need(original['model'] == model and original['job_id'] == job
+             and {r['ProcessId'] for r in original['full_identities']} == {pid, parent}, 'Historical launch pair differs')
+        pair = {r['ProcessId']: full_identity(r) for r in original['full_identities']}
+        for target in (pid, parent):
+            need(target in rows and full_identity(rows[target]) == pair[target], 'Current main/parent missing, opaque or PID reused')
+        need(pair[pid]['ParentProcessId'] == parent and 'hpc_forest.r2max_worker' in pair[pid]['CommandLine']
+             and session in pair[pid]['CommandLine'], 'Owned main scope differs')
+        # A complete current direct-child graph is sufficient: all unexpected first hops refuse.
+        for row in rows.values():
+            if row['ParentProcessId'] not in {pid, parent} or row['ProcessId'] == pid:
+                continue
+            actual = full_identity(row)
+            owner = pair[actual['ParentProcessId']]
+            if actual['CreationDate'] < owner['CreationDate']:
+                continue
+            raise ValueError('Live/foreign descendant preserved; collection refuses ambiguity')
+        result[session] = {'main': pair[pid], 'parent': pair[parent]}
+    return result
+
+
+def safe_member(name, job):
+    path = PurePosixPath(name)
+    need(isinstance(name, str) and name and not path.is_absolute() and str(path) == name
+         and '\\' not in name and ':' not in name and '..' not in path.parts and '.' not in path.parts
+         and path.parts[0] in {'results-' + job, 'runtime-preparation-private-audit'}, 'Unsafe archive member/root')
+    return name
+
+
+def cold_tree(root):
+    root = safe(root)
+    need(root.is_dir(), 'Real restored root missing')
+    output = {}
+    for folder, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs:
+            safe(Path(folder) / name, root)
+        for name in files:
+            path = safe(Path(folder) / name, root)
+            raw, metadata = stable_bytes(path, root, allow_cold_database=True)
+            output[path.relative_to(root).as_posix()] = {'sha256': metadata['sha256'], 'bytes': len(raw)}
+            need(len(output) <= 100000, 'Restored member bound exceeded')
+    return output
+
+
+def verify_cold_archive(archive, root, job):
+    expected, names, total = {}, set(), 0
+    with tarfile.open(safe(archive), 'r:gz') as stream:
+        for member in stream:
+            name = safe_member(member.name.rstrip('/'), job)
+            need(name not in names and len(names) < 100000, 'Duplicate/too many archive members')
+            names.add(name)
+            need(member.isfile() or member.isdir(), 'Archive symlink/hardlink/device refused')
+            if member.isdir():
+                continue
+            total += member.size
+            need(0 <= member.size <= MAX_FILE and total <= 2 * 1024**3, 'Oversized archive')
+            with stream.extractfile(member) as source:
+                raw = source.read(MAX_FILE + 1)
+            need(len(raw) == member.size, 'Archive size differs')
+            expected[name] = {'sha256': digest(raw), 'bytes': len(raw)}
+    need(expected and cold_tree(root) == expected, 'Archive bytes and complete fresh restoration differ')
+    return expected
+
+
+def archive_nonces(root, cell):
+    slug, model, job, session, pid, launcher, count = cell
+    folder = safe(Path(root) / ('results-' + job) / 'mailbox/requests')
+    paths = list(folder.iterdir())
+    nonces = {}
+    for path in paths:
+        safe(path, folder)
+        need(path.is_file() and re.fullmatch('[0-9a-f]{32}\\.request\\.json', path.name), 'Unknown restored request member')
+        value = read(path)
+        nonce = path.name.removesuffix('.request.json')
+        need(value.get('nonce') == nonce and value.get('session_id') == session and value.get('model') == model
+             and value.get('reasoning_effort') == 'max', 'Restored request cell differs')
+        nonces[nonce] = ref(path)
+    need(len(nonces) == count, 'Final archive nonce count differs from actual 4/3/3 boundary')
+    return nonces
+
+
+def discover_cache(cache, nonces):
+    """No file contents read: reject every unknown name/link/database first."""
+    cache = safe(cache)
+    top = list(cache.iterdir())
+    files, folders = {}, {}
+    for path in top:
+        safe(path, cache)
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            need(path.name in nonces, 'Extra/unreviewed cache nonce refused')
+            folders[path.name] = path
+        else:
+            need(stat.S_ISREG(info.st_mode) and path.name in ROOT_REQUIRED | ROOT_OPTIONAL, 'Unknown/nonregular root cache file')
+            files[path.name] = path
+    need(set(folders) == set(nonces) and ROOT_REQUIRED <= set(files), 'Missing exact nonce/root cache files')
+    for nonce, folder in folders.items():
+        children = list(folder.iterdir())
+        need(all(safe(path, cache).is_file() for path in children), 'Nonce subdirectory/link refused')
+        names = {path.name for path in children}
+        need(NONCE_REQUIRED <= names <= NONCE_REQUIRED | NONCE_OPTIONAL, 'Missing/unknown final nonce file')
+        for path in children:
+            readable_name(path)
+            files[nonce + '/' + path.name] = path
+    return files
+
+
+def reconcile_copy_delivery(snapshot, restored, cell, nonces):
+    """Byte/identity binding only. Never interpret proposals, correctness or tool output."""
+    slug, model, job, session, pid, launcher, count = cell
+    mailbox = Path(restored) / ('results-' + job) / 'mailbox'
+    expected_sets = {
+        'requests': {n + '.request.json' for n in nonces},
+        'responses': {n + suffix for n in nonces for suffix in ('.response.json', '.ready.json')},
+        'logs': {n + suffix for n in nonces for suffix in ('.invocation.json', '.codex.jsonl', '.codex.jsonl.json', '.delivered.json')}}
+    for directory, names in expected_sets.items():
+        actual = list((mailbox / directory).iterdir())
+        need(all(safe(p, mailbox).is_file() for p in actual) and {p.name for p in actual} == names,
+             'Missing/orphan/unrecognized archive request/response/invocation/delivery artifact')
+    rows = []
+    pairs = {'downloaded-request.json': ('requests', '.request.json'),
+        'response.json': ('responses', '.response.json'), 'response-ready.json': ('responses', '.ready.json'),
+        'delivered.json': ('logs', '.delivered.json'), 'codex.jsonl': ('logs', '.codex.jsonl'),
+        'invocation.json.arm-projection.json': ('logs', '.invocation.json'),
+        'codex.jsonl.json.arm-projection.json': ('logs', '.codex.jsonl.json')}
+    for nonce, request_ref in sorted(nonces.items()):
+        folder = snapshot / nonce
+        for local, (kind, suffix) in pairs.items():
+            need(stable_bytes(folder / local)[0] == stable_bytes(mailbox / kind / (nonce + suffix))[0],
+                 'Actual private snapshot and archive delivery/projection bytes differ: ' + local)
+        response = read(folder / 'response.json')
+        ready = read(folder / 'response-ready.json')
+        delivered = read(folder / 'delivered.json')
+        response_ref = ref(folder / 'response.json')
+        need(read(folder / 'generation-claimed.json').get('request_sha256') == request_ref['sha256']
+             and response.get('nonce') == nonce and response.get('request_sha256') == request_ref['sha256']
+             and response.get('session_id') == session and response.get('model') == model
+             and response.get('reasoning_effort') == 'max'
+             and ready.get('sha256') == response_ref['sha256'] and ready.get('bytes') == (folder / 'response.json').stat().st_size
+             and delivered.get('request_sha256') == request_ref['sha256']
+             and delivered.get('response_sha256') == response_ref['sha256']
+             and all(delivered.get(k) == v for k, v in identity(cell).items()),
+             'Actual delivered request/response/ready/claim full identity differs')
+        rows.append({'nonce': nonce, 'request': request_ref, 'response': response_ref,
+            'delivered': ref(folder / 'delivered.json'), 'archive_bytes_equal': True})
+    return rows
+
+
+def inventory_readable(cache, nonces):
+    paths = discover_cache(cache, nonces)
+    inventory, metadata = {}, {}
+    for name, path in sorted(paths.items()):
+        if name == 'worker.lock':
+            info = path.lstat()
+            need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size == 1, 'Exact one-byte lock metadata required')
+            metadata[name] = {'path': str(path), **file_meta(info), 'sha256': None,
+                'bytes_read': False, 'read_attempted': False, 'read_errno': None}
+        else:
+            raw, info = stable_bytes(path, cache)
+            inventory[name] = {'sha256': info['sha256'], 'bytes': len(raw)}
+            metadata[name] = {'path': str(path), **info, 'bytes_read': True}
+    return inventory, metadata
+
+
+def copy_exact(source, destination, expected=None, boundary=HERE):
+    raw, before = stable_bytes(source)
+    need(expected is None or before['sha256'] == expected, 'Exact copy source hash differs')
+    destination = safe(destination, boundary)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open('xb') as target:
+        target.write(raw); target.flush(); os.fsync(target.fileno())
+    os.chmod(destination, stat.S_IMODE(before['mode']))
+    os.utime(destination, ns=(Path(source).stat().st_atime_ns, before['mtime_ns']))
+    copied, after = stable_bytes(destination, boundary)
+    _, source_after = stable_bytes(source)
+    need(before == source_after and copied == raw
+         and all(after[k] == before[k] for k in ('sha256', 'bytes', 'mtime_ns', 'mode')),
+         'Source before/after hash+metadata or copied hash+portable metadata differ')
+    return ref(destination)
+
+
+def collect_cell(cell, frozen, pair, census_ref, output):
+    slug, model, job, session, pid, launcher, count = cell
+    common = {**identity(cell), 'preparation_manifest_sha256': PREPARATION}
+    cache = LAUNCH / ('worker-' + session)  # Literal actual launch --output, never revision-r1.
+    terminal = REL / ('reception-terminal-' + job)
+    restored = terminal / 'restauration-neuve-parent-r1'
+    archive = item(frozen['archive'])
+    need(read_ref(frozen['restore_receipt']).get('announced_remote_local_sha_equal') is True,
+         'Actual parent triple-SHA restoration missing')
+    announced = read_ref(frozen['archive_announcement'])
+    announcement_transfer = read_ref(frozen['archive_announcement_transfer'])
+    announcement_transfer = announcement_transfer.get('structuredContent', announcement_transfer)
+    transfer = read_ref(frozen['archive_transfer']); transfer = transfer.get('structuredContent', transfer)
+    remote_root = '/scratch_p/nimarano/' + SCOPE + '-' + session
+    aliases = {remote_root + '/results-' + job + '.tar.gz',
+               '/gpfs/scratch/nimarano/' + SCOPE + '-' + session + '/results-' + job + '.tar.gz'}
+    need(announced.get('path') in aliases and transfer.get('downloaded') == remote_root + '/results-' + job + '.tar.gz'
+         and transfer.get('ok') is True and transfer.get('verifie') is True and transfer.get('to') == str(archive)
+         and transfer.get('transport') == 'scp' and transfer.get('bytes') == archive.stat().st_size
+         and transfer.get('remote_sha256') == transfer.get('empreinte_locale') == transfer.get('empreinte_distante')
+         == frozen['archive']['sha256'] == announced.get('sha256'), 'Actual announced/remote/local archive transfer differs')
+    need(announcement_transfer.get('ok') is True and announcement_transfer.get('verifie') is True
+         and announcement_transfer.get('transport') == 'scp'
+         and announcement_transfer.get('downloaded') == remote_root + '/archive.json'
+         and announcement_transfer.get('to') == frozen['archive_announcement']['path']
+         and announcement_transfer.get('bytes') == item(frozen['archive_announcement']).stat().st_size
+         and announcement_transfer.get('remote_sha256') == announcement_transfer.get('empreinte_locale')
+         == announcement_transfer.get('empreinte_distante') == frozen['archive_announcement']['sha256'],
+         'Actual announcement transfer size/source/destination/triple-SHA differs')
+    restored_files = verify_cold_archive(archive, restored, job)
+    need(read_ref(frozen['restored_inventory']) == restored_files, 'Frozen parent restored inventory changed')
+    nonces = archive_nonces(restored, cell)
+    need(nonces == frozen['archive_request_refs'], 'Restored authoritative request refs changed')
+    folder = output / (slug + '-' + job)
+    folder.mkdir(exist_ok=False)
+    snapshot = folder / 'cache-snapshot'; snapshot.mkdir(exist_ok=False)
+    before, meta_before = inventory_readable(cache, nonces)
+    for name, value in before.items():
+        copy_exact(cache / Path(name), snapshot / Path(name), value['sha256'])
+    after, meta_after = inventory_readable(cache, nonces)
+    need(before == after and meta_before == meta_after, 'Source cache changed during complete named collection')
+    snap_files = cold_tree(snapshot)
+    need(before == snap_files, 'Snapshot does not cover all actual readable source cache bytes')
+    deliveries = reconcile_copy_delivery(snapshot, restored, cell, nonces)
+    portable_fields = ('bytes', 'mtime_ns', 'mode')
+    snapshot_metadata = {name: {k: file_meta((snapshot / Path(name)).lstat())[k] for k in portable_fields}
+        for name in before}
+    need(snapshot_metadata == {name: {k: meta_before[name][k] for k in portable_fields} for name in before},
+         'Source/snapshot portable metadata differs after complete collection')
+    owner = read(snapshot / 'OWNER.json')
+    archived_owner = read(restored / ('results-' + job) / 'mailbox/OWNER.json')
+    binding_cell = {**identity(cell), 'remote_root': remote_root}
+    need(owner == archived_owner and all(owner.get(k) == v for k, v in binding_cell.items()), 'Cache/archive OWNER exact cell differs')
+    need(read(snapshot / 'CELL-BINDING.json') == binding_cell, 'Exact snapshot CELL-BINDING differs')
+    ready = read(snapshot / 'worker-ready.json')
+    need(ready.get('pid') == pid and all(ready.get(k) == v for k, v in identity(cell).items()), 'Snapshot worker-ready identity differs')
+    before_ref = save(folder / 'source-readable-before.json', before)
+    after_ref = save(folder / 'source-readable-after.json', after)
+    metadata_before = save(folder / 'source-full-metadata-before.json', meta_before)
+    metadata_after = save(folder / 'source-full-metadata-after.json', meta_after)
+    copy_metadata_ref = save(folder / 'copied-portable-metadata.json', {
+        'portable_metadata_fields_compared': list(portable_fields), 'source_before_after_full_metadata_equal': True,
+        'source_snapshot_hash_and_portable_metadata_equal': True, 'snapshot_metadata': snapshot_metadata,
+        'inode_device_and_creation_time_are_source_identity_not_copy_claims': True})
+    deliveries_ref = save(folder / 'delivered-byte-bindings.json', {
+        'scope': 'byte-identical requests/responses/deliveries and ARM projections only',
+        'all_received_responses_delivered': True, 'native_invocations_at_archive_boundary': len(deliveries),
+        'nonces': deliveries, 'algorithmic_or_scientific_admission': False})
+    owner_ref = save(folder / 'owned-process-census-identity.json', {**common,
+        'schema': 'hpc-forest-r2g-owned-cache-process-census-identity-v1', 'verified': True,
+        'verified_scope': 'exact five-field main and parent at parent-supplied census only',
+        'pid': pid, 'executable': pair['main']['ExecutablePath'], 'command_line': pair['main']['CommandLine'],
+        'creation_time_utc': pair['main']['CreationDate'], 'parent_pid': launcher,
+        'full_identity': pair['main'], 'parent_full_identity': pair['parent'],
+        'fresh_cim_ref': census_ref, 'real_launch_ref': ref(LAUNCH_RECEIPT), 'cache_source_root': str(cache)})
+    stat_ref = save(folder / 'owned-lock-stat-only.json', {'path': str(cache / 'worker.lock'),
+        'st_size': meta_before['worker.lock']['bytes'], **meta_before['worker.lock'],
+        'source_before_after_metadata_equal': True})
+    source_ref = frozen['controller_admission_copies']['source_zip']
+    with zipfile.ZipFile(item(source_ref)) as source:
+        core = source.read('HPC-Forest/src/hpc_forest/core.py')
+    need(b'msvcrt.locking' in core, 'Pinned source110 one-byte locking mechanism absent')
+    exception_ref = save(folder / 'owned-lock-unread-exception.json', {**common,
+        'schema': 'hpc-forest-primes-r2g-owned-unread-operational-lock-v1', 'verified': True,
+        'verified_scope': 'owned one-byte lock metadata and source mechanism only; contents never read',
+        'relative_path': 'worker.lock', 'source_path': str(cache / 'worker.lock'), 'bytes': 1,
+        'bytes_read': False, 'read_attempted': False, 'read_errno': None, 'sha256': None, 'sha256_before': None,
+        'stat_ref': stat_ref, 'owner_identity_ref': owner_ref, 'source_zip_ref': source_ref,
+        'lock_source_member': 'HPC-Forest/src/hpc_forest/core.py', 'lock_source_member_sha256': digest(core)})
+    cache_receipt = save(folder / 'CACHE-PRESERVATION-PRE-STOP.json', {**common,
+        'schema': 'hpc-forest-primes-r2max-cache-preservation-for-audit-v1',
+        'preservation_phase': 'pre_stop_owned_lock_pending', 'verified': False, 'source_cache_complete': False,
+        'readable_data_preservation_verified': True, 'source_cache_stable': True, 'snapshot_is_live': False,
+        'snapshot_root': str(snapshot), 'files': snap_files, 'source_inventory_before': before_ref,
+        'source_inventory_after': after_ref, 'source_full_metadata_before': metadata_before,
+        'source_full_metadata_after': metadata_after, 'source_files_observed': len(before) + 1,
+        'copy_metadata_comparison_ref': copy_metadata_ref,
+        'owned_operational_lock_exception': exception_ref, 'post_stop_lock_preservation': None})
+    reception = save(folder / 'RECEPTION-RESTAURATION-POUR-AUDIT.json', {**common,
+        'schema': 'hpc-forest-primes-r2max-reception-for-audit-v1', 'verified': True,
+        'verified_scope': 'actual archive triple-SHA and complete byte-identical cold fresh restoration only',
+        'fresh_restore': True, 'live_controller': False, 'restored_root': str(restored),
+        'archive': frozen['archive'], 'files': restored_files,
+        'archive_announcement': frozen['archive_announcement'],
+        'archive_announcement_transfer': frozen['archive_announcement_transfer'],
+        'archive_transfer': frozen['archive_transfer'],
+        'transfer_receipts': [frozen['archive_announcement_transfer'], frozen['archive_transfer'], frozen['restore_receipt']]})
+    policy = copy_exact(item(frozen['private_cli_policy_original']), folder / 'private-cli-policy.json')
+    for side in ('controller', 'worker'):
+        auth = read_ref(frozen[side + '_authorization'])
+        copies = frozen[side + '_admission_copies']
+        need(set(auth['artifacts']) == set(copies) == ARTIFACTS, 'All fourteen original admissions required')
+        for key, original in auth['artifacts'].items():
+            need(original['sha256'] == copies[key]['sha256'], 'Original/copy admission SHA differs')
+            item(copies[key])
+    cli = read_ref(frozen['worker_admission_copies']['cli_identity'])
+    need(policy['sha256'] == cli.get('task_cli_policy_sha256'), 'Adjacent private policy differs from original CLI identity')
+    expectation = save(folder / 'BINDING-AUDIT-FINAL.json', {**identity(cell),
+        'schema': 'hpc-forest-primes-r2g-native-cell-audit-expectation-v1', 'remote_root': remote_root,
+        'cache_source_root': str(cache), 'scheduler_observation': frozen['scheduler_observation'],
+        'controller_authorization': frozen['controller_authorization'], 'worker_authorization': frozen['worker_authorization'],
+        'controller_admission_copies': frozen['controller_admission_copies'], 'worker_admission_copies': frozen['worker_admission_copies'],
+        'admission_namespace_aliases': frozen['admission_namespace_aliases'], 'private_cli_policy': policy})
+    return {'model': model, 'job_id': job, 'session_id': session, 'binding': expectation,
+        'root': str(restored), 'cache': str(snapshot), 'reception': reception, 'cache_receipt': cache_receipt,
+        'source_zip': frozen['controller_admission_copies']['source_zip']['path'],
+        'plan': frozen['controller_admission_copies']['plan']['path'], 'certified': frozen['certified'],
+        'authoritative_archive_request_count': len(nonces), 'live_lock_read': False,
+        'delivery_byte_bindings': deliveries_ref,
+        'preservation_complete': False, 'scientific_or_performance_admission': False}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root-only-collect', action='store_true', required=True)
+    parser.add_argument('--fresh-cim', type=Path, required=True)
+    parser.add_argument('--fresh-cim-sha256', required=True)
+    parser.add_argument('--output-name', required=True)
+    args = parser.parse_args()
+    need(re.fullmatch('[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.output_name), 'Fresh simple output name required')
+    frozen_path = HERE / 'INPUTS-FROIDS-EPINGLES-r2.json'
+    frozen_ref = {'path': str(frozen_path), 'sha256': FROZEN_INPUTS_SHA}
+    frozen = read_ref(frozen_ref)
+    need(frozen.get('schema') == 'hpc-forest-r2g-root-collection-frozen-inputs-v1'
+         and set(frozen['cells']) == {c[3] for c in CELLS}, 'Exact frozen three-cell inputs required')
+    recheck_frozen_references(frozen)
+    launch = read_ref({'path': str(LAUNCH_RECEIPT), 'sha256': LAUNCH_SHA})
+    census_ref = {'path': str(safe(args.fresh_cim)), 'sha256': args.fresh_cim_sha256}
+    census = read_ref(census_ref)
+    pairs = fresh_identities(census, launch, datetime.now(UTC))
+    output = HERE / args.output_name
+    output.mkdir(exist_ok=False)
+    save(output / 'INTENTION-COLLECTE-ROOT.json', {'scope_id': SCOPE, 'source_cache_roots':
+        [str(LAUNCH / ('worker-' + c[3])) for c in CELLS], 'fresh_cim': census_ref,
+        'real_launch_receipt': ref(LAUNCH_RECEIPT), 'frozen_inputs': ref(frozen_path),
+        'cache_lock_contents_will_never_be_opened': True, 'stop_or_launch_authorized': False})
+    cells = []
+    try:
+        for cell in CELLS:
+            fresh_identities(census, launch, datetime.now(UTC))
+            cells.append(collect_cell(cell, frozen['cells'][cell[3]], pairs[cell[3]], census_ref, output))
+        need(sum(c['authoritative_archive_request_count'] for c in cells) == 10, 'Actual final 10 archive requests required')
+        need(ref(frozen_path) == frozen_ref, 'Frozen input changed')
+        recheck_frozen_references(frozen)
+        fresh_identities(census, launch, datetime.now(UTC))
+        result = save(output / 'COLLECTE-PRE-STOP-POUR-AUDIT.json', {
+            'schema': 'hpc-forest-r2g-root-cold-collection-pre-stop-v1', 'verified': False,
+            'readable_data_collection_completed': True, 'cells': cells, 'fresh_cim': census_ref,
+            'real_launch_receipt': ref(LAUNCH_RECEIPT), 'final_audits_or_reconciliation_executed': False,
+            'stop_or_launch_executed': False, 'complete_cache_including_lock': False,
+            'scientific_or_performance_admission': False, 'source_or_worker_modified': False})
+        print(json.dumps({'collection': result, 'admission': False, 'stop_or_launch_executed': False}))
+    except BaseException as exc:
+        save(output / 'COLLECTE-REFUSEE.json', {'verified': False, 'cells_already_collected': cells,
+            'error': str(exc), 'partial_files_retained': True, 'stop_or_launch_executed': False})
+        raise
+
+
+if __name__ == '__main__':
+    main()

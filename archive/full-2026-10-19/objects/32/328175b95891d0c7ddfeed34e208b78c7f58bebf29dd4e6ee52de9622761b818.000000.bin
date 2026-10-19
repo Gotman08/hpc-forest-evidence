@@ -1,0 +1,91 @@
+"""Preserve qualification data without materializing or following symbolic aliases."""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import stat
+import tarfile
+from pathlib import Path, PurePosixPath
+
+
+def _relative(name: str) -> PurePosixPath:
+    value = PurePosixPath(name)
+    if (not name or value.is_absolute() or ".." in value.parts or "\\" in name
+            or ":" in name or name != value.as_posix()):
+        raise ValueError("Unsafe archive member name")
+    return value
+
+
+def _add_bytes(archive: tarfile.TarFile, name: str, data: bytes, mode: int = 0o600) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = mode
+    info.mtime = 0
+    archive.addfile(info, io.BytesIO(data))
+
+
+def create_archive(root: Path, archive_path: Path, names: list[str]) -> dict:
+    """All selected regular bytes are copied; link literals are recorded, never read."""
+    root = root.resolve(strict=True)
+    aliases: list[dict] = []
+    members: dict[str, str] = {}
+    seen: set[str] = set()
+
+    def visit(archive: tarfile.TarFile, relative: str) -> None:
+        _relative(relative)
+        if relative in seen:
+            raise ValueError("Duplicate archive member")
+        seen.add(relative)
+        path = root / relative
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            aliases.append({"archive_path": relative, "type": "symbolic_link",
+                            "readlink_literal": os.readlink(path), "lstat_mode": info.st_mode,
+                            "lstat_size": info.st_size, "materialized_or_followed": False})
+        elif stat.S_ISDIR(info.st_mode):
+            entry = tarfile.TarInfo(relative + "/")
+            entry.type = tarfile.DIRTYPE
+            entry.mode = stat.S_IMODE(info.st_mode)
+            entry.mtime = 0
+            archive.addfile(entry)
+            with os.scandir(path) as children:
+                child_names = sorted(child.name for child in children)
+            for child in child_names:
+                visit(archive, relative + "/" + child)
+        elif stat.S_ISREG(info.st_mode):
+            # Explicit regular TarInfo prevents tarfile's inode/hardlink shortcut.
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                                 | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode) or (opened.st_ino, opened.st_size) != (
+                        info.st_ino, info.st_size):
+                    raise ValueError("Qualification member changed before reading")
+                data = stream.read()
+            after = path.lstat()
+            if (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino) != (
+                    after.st_mode, after.st_size, after.st_mtime_ns, after.st_ino):
+                raise ValueError("Qualification member changed while archiving")
+            _add_bytes(archive, relative, data, stat.S_IMODE(info.st_mode))
+            members[relative] = hashlib.sha256(data).hexdigest()
+        else:
+            raise ValueError("Unexpected special file in qualification archive: " + relative)
+
+    if "archive-aliases.json" in names or "archive-members.json" in names:
+        raise ValueError("Reserved archive metadata name")
+    with tarfile.open(archive_path, "x:gz") as archive:
+        for name in names:
+            _relative(name)
+            try:
+                (root / name).lstat()
+            except FileNotFoundError:
+                continue
+            visit(archive, name)
+        evidence = {"schema": "hpc-forest-r4b-qualified-archive-aliases-v1",
+                    "symbolic_aliases": aliases, "all_symlinks_materialized_or_followed": False,
+                    "special_files_accepted": False, "performance_effect_claimed": False}
+        _add_bytes(archive, "archive-aliases.json", (json.dumps(evidence, indent=2) + "\n").encode())
+        _add_bytes(archive, "archive-members.json", (json.dumps(members, indent=2) + "\n").encode())
+    return {"regular_files": len(members), "aliases": len(aliases), "alias_metadata": evidence}

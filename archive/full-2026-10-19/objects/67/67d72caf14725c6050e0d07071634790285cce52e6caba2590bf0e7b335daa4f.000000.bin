@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cstddef>\n#include <cstdio>\n#include <limits>\n#include <memory>\n\n#ifdef _OPENMP\n#define OMP_PRAGMA_IMPL(x) _Pragma(#x)\n#define OMP_PRAGMA(x) OMP_PRAGMA_IMPL(omp x)\n#else\n#define OMP_PRAGMA(x)\n#endif\n\nclass FastInput {\n    char buffer_[1 << 16];\n    std::size_t position_;\n    std::size_t size_;\n\n    int next() {\n        if (position_ == size_) {\n            size_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);\n            position_ = 0;\n            if (size_ == 0) {\n                return EOF;\n            }\n        }\n        return static_cast<unsigned char>(buffer_[position_++]);\n    }\n\npublic:\n    FastInput() : position_(0), size_(0) {}\n\n    bool readInt(int& output) {\n        int character;\n        do {\n            character = next();\n            if (character == EOF) {\n                return false;\n            }\n        } while (character <= ' ');\n\n        bool negative = false;\n        if (character == '-' || character == '+') {\n            negative = character == '-';\n            character = next();\n        }\n\n        long long value = 0;\n        while (character >= '0' && character <= '9') {\n            value = value * 10 + (character - '0');\n            character = next();\n        }\n        output = static_cast<int>(negative ? -value : value);\n        return true;\n    }\n};\n\nint main() {\n    FastInput input;\n    int n;\n    int s;\n    if (!input.readInt(n) || !input.readInt(s) || n <= 0 || s <= 0 || s >= n) {\n        return 0;\n    }\n\n    const int width = n - s + 1;\n    const int rowBlock = 64;\n    const int columnTile = 64;\n\n    std::unique_ptr<int[]> inputRows(\n        new int[static_cast<std::size_t>(rowBlock) * static_cast<std::size_t>(n)]);\n    std::unique_ptr<long long[]> rowWindows(\n        new long long[static_cast<std::size_t>(rowBlock) * static_cast<std::size_t>(width)]);\n    std::unique_ptr<long long[]> vertical(\n        new long long[static_cast<std::size_t>(width)]());\n    std::unique_ptr<long long[]> history(\n        new long long[static_cast<std::size_t>(s) * static_cast<std::size_t>(width)]);\n\n    int* const raw = inputRows.get();\n    long long* const horizontal = rowWindows.get();\n    long long* const verticalSums = vertical.get();\n    long long* const previousRows = history.get();\n    long long maximum = std::numeric_limits<long long>::lowest();\n\n    OMP_PRAGMA(parallel)\n    {\n        for (int blockStart = 0; blockStart < n; blockStart += rowBlock) {\n            const int rows = std::min(rowBlock, n - blockStart);\n\n            OMP_PRAGMA(single)\n            {\n                for (int row = 0; row < rows; ++row) {\n                    int* destination = raw + static_cast<std::size_t>(row) * static_cast<std::size_t>(n);\n                    for (int column = 0; column < n; ++column) {\n                        input.readInt(destination[column]);\n                    }\n                }\n            }\n\n            OMP_PRAGMA(for schedule(static))\n            for (int row = 0; row < rows; ++row) {\n                const int* __restrict__ source = raw + static_cast<std::size_t>(row) * static_cast<std::size_t>(n);\n                long long* __restrict__ destination = horizontal + static_cast<std::size_t>(row) * static_cast<std::size_t>(width);\n\n                long long sum = 0;\n                for (int column = 0; column < s; ++column) {\n                    sum += source[column];\n                }\n                destination[0] = sum;\n                for (int column = 1; column < width; ++column) {\n                    sum += static_cast<long long>(source[column + s - 1]) - source[column - 1];\n                    destination[column] = sum;\n                }\n            }\n\n            const int tiles = (width + columnTile - 1) / columnTile;\n            OMP_PRAGMA(for schedule(static) reduction(max : maximum))\n            for (int tile = 0; tile < tiles; ++tile) {\n                const int first = tile * columnTile;\n                const int count = std::min(columnTile, width - first);\n                long long* __restrict__ totals = verticalSums + first;\n                long long tileMaximum = std::numeric_limits<long long>::lowest();\n\n                for (int row = 0; row < rows; ++row) {\n                    const int absoluteRow = blockStart + row;\n                    const long long* __restrict__ values = horizontal + static_cast<std::size_t>(row) * static_cast<std::size_t>(width) + static_cast<std::size_t>(first);\n                    long long* __restrict__ prior = previousRows + static_cast<std::size_t>(absoluteRow % s) * static_cast<std::size_t>(width) + static_cast<std::size_t>(first);\n\n                    if (absoluteRow < s - 1) {\n                        OMP_PRAGMA(simd)\n                        for (int column = 0; column < count; ++column) {\n                            totals[column] += values[column];\n                            prior[column] = values[column];\n                        }\n                    } else if (absoluteRow < s) {\n                        OMP_PRAGMA(simd reduction(max : tileMaximum))\n                        for (int column = 0; column < count; ++column) {\n                            const long long total = totals[column] + values[column];\n                            totals[column] = total;\n                            prior[column] = values[column];\n                            tileMaximum = total > tileMaximum ? total : tileMaximum;\n                        }\n                    } else {\n                        OMP_PRAGMA(simd reduction(max : tileMaximum))\n                        for (int column = 0; column < count; ++column) {\n                            const long long total = totals[column] + values[column] - prior[column];\n                            totals[column] = total;\n                            prior[column] = values[column];\n                            tileMaximum = total > tileMaximum ? total : tileMaximum;\n                        }\n                    }\n                }\n\n                maximum = tileMaximum > maximum ? tileMaximum : maximum;\n            }\n        }\n    }\n\n    std::printf(\"%lld\\n\", maximum);\n    return 0;\n}\n\n#undef OMP_PRAGMA\n#ifdef _OPENMP\n#undef OMP_PRAGMA_IMPL\n#endif\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "A persistent OpenMP region with static row and column-tile work sharing can amortize synchronization while parallelizing independent rolling-window work and max reduction.",
+    "notes": "Uses bounded 64-row batches and an S-row ring buffer; OpenMP directives compile to a serial fallback when OpenMP is unavailable.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Replace the S-wide snake traversal with O(N^2) horizontal rolling sums plus vertical ring-buffer updates.",
+      "Statically share batched horizontal rows and column tiles, with OpenMP SIMD and max reductions.",
+      "Use buffered signed-integer input and 64-bit intermediate sums."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-5.6-terra",
+  "nonce": "8582b0f0055247b7af1790934922db85",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "297b991ea338fffcc14e771e37a3c59eb41e8ccfe03c2bb4aa6f8722e2d0c132",
+  "session_id": "16cc609c0eae4b378c00819505095c0f",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "1ef033ca4ebce6cb2098aae9ea00011cccb188c374698071790fc34f440d8ea1",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 10446,
+        "output_tokens": 24528,
+        "reasoning_output_tokens": 22772
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-5.6-terra",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 34974,
+    "tool_events": []
+  }
+}

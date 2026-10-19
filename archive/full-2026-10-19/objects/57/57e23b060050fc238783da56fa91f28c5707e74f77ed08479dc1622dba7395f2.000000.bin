@@ -1,0 +1,78 @@
+"""Admission boundary tests only; never submit or start a worker."""
+import copy
+import importlib.util
+import unittest
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("r1_continue", Path(__file__).with_name("continuer-courant.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class ContinuationTests(unittest.TestCase):
+    def setUp(self):
+        self.state = {"source_zip_sha256": module.SOURCE, "queue": [
+            {"key": "received", "state": "received_and_audited", "phase": "coverage"},
+            {"key": "next", "state": "not_started", "phase": "coverage"},
+            {"key": "later", "state": "not_started", "phase": "coverage"}]}
+        self.parent = {"ProcessId": 10, "ParentProcessId": 1, "ExecutablePath": "C:/python.exe",
+                       "CommandLine": "python -m hpc_forest.reference96_worker --resume", "CreationDate": "birth"}
+        self.child = {**self.parent, "ProcessId": 11, "ParentProcessId": 10}
+
+    def test_same_queue_next_group_selected(self):
+        self.assertEqual(module.choose_next(self.state)["key"], "next")
+
+    def test_unknown_submission_is_not_replayed(self):
+        self.state["queue"][1]["state"] = "submitting"
+        with self.assertRaises(ValueError):
+            module.choose_next(self.state)
+
+    def test_existing_worker_is_not_duplicated(self):
+        self.state["queue"][1]["state"] = "working"
+        with self.assertRaises(ValueError):
+            module.choose_next(self.state)
+
+    def test_wrong_frozen_source_refused(self):
+        self.state["source_zip_sha256"] = "changed"
+        with self.assertRaises(ValueError):
+            module.choose_next(self.state)
+
+    def test_reordered_received_group_refused(self):
+        self.state["queue"] = [self.state["queue"][1], self.state["queue"][0], self.state["queue"][2]]
+        with self.assertRaises(ValueError):
+            module.choose_next(self.state)
+
+    def test_finished_queue_has_no_new_submission(self):
+        for cell in self.state["queue"]:
+            cell["state"] = "received_and_audited"
+        with self.assertRaises(ValueError):
+            module.choose_next(self.state)
+
+    def test_exclusive_deadline_reserves_three_hours(self):
+        cell = {"phase": "coverage"}
+        with self.assertRaises(ValueError):
+            module.deadline_check(cell, module.DEADLINE - 39600 - 10800)
+        module.deadline_check(cell, module.DEADLINE - 39600 - 10800 - 1)
+
+    def test_two_python_processes_are_one_other_worker(self):
+        module.check_census([self.parent, self.child], [self.parent, self.child])
+
+    def test_unknown_native_worker_refused(self):
+        another = {**self.parent, "ProcessId": 20, "CommandLine": "python -m hpc_forest.matrix_worker"}
+        with self.assertRaises(ValueError):
+            module.check_census([self.parent, self.child, another], [self.parent, self.child])
+
+    def test_reused_pid_identity_refused(self):
+        current = copy.deepcopy(self.parent)
+        current["CreationDate"] = "another-birth"
+        with self.assertRaises(ValueError):
+            module.check_census([current], [self.parent])
+
+    def test_two_other_worker_roots_refused(self):
+        other = {**self.parent, "ProcessId": 20, "ParentProcessId": 2}
+        with self.assertRaises(ValueError):
+            module.check_census([self.parent, other], [self.parent, other])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

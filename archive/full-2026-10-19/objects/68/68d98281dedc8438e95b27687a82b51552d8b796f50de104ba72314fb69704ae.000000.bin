@@ -1,0 +1,129 @@
+"""Hash/read/AST/XML only. No candidate imports, Q, tests or operational calls."""
+import ast
+import hashlib
+import io
+import json
+from pathlib import Path, PurePosixPath
+import tarfile
+import xml.etree.ElementTree as ET
+import zipfile
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+CANDIDATE = ROOT/'revision-r4-facades-cloture-observer'
+PREVIOUS = ROOT/'revision-r3-integration-negative-closed'
+Q = ROOT/'qualification-complete110-r3-facades'
+BASE = ROOT.parents[2]
+def require(ok, why):
+    if not ok: raise ValueError(why)
+def sha(raw): return hashlib.sha256(raw).hexdigest()
+def read(path): return json.loads(path.read_text(encoding='utf8'))
+def ref(path):
+    require(path.name.casefold()!='worker.lock','No lock bytes inspected')
+    return {'path':str(path),'sha256':sha(path.read_bytes())}
+def members(raw):
+    output={}
+    with tarfile.open(fileobj=io.BytesIO(raw),mode='r:gz') as archive:
+        for member in archive:
+            path=PurePosixPath(member.name)
+            require(member.isfile() and not path.is_absolute() and '..' not in path.parts
+                and '\\' not in member.name and str(path)==member.name and member.name not in output
+                and 0<=member.size<=64*1024*1024,'Unsafe frozen archive member')
+            data=archive.extractfile(member).read(64*1024*1024+1)
+            require(len(data)==member.size,'Short frozen archive member')
+            output[member.name]=data
+    return output
+def cases(path, expected_sha, expected_count):
+    require(ref(path)['sha256']==expected_sha,'JUnit changed')
+    values=list(ET.parse(path).iter('testcase'))
+    require(len(values)==expected_count and len({(v.get('classname'),v.get('name')) for v in values})==expected_count
+        and all(all(v.find(k) is None for k in ('failure','error','skipped')) for v in values),'Received case counts/failures differ')
+    return values
+
+delivery_path=ROOT/'LIVRAISON-CORRECTION-FACADES-R4-POUR-REVUE.json'
+require(ref(delivery_path)['sha256']=='31bfd1fd2e0c96eaee7b4b625389897338274d3e7539fb1f47ddcf9bb217035a','Delivery changed')
+delivery=read(delivery_path)
+manifest_path=Path(delivery['manifest']['path'])
+require(ref(manifest_path)['sha256']=='8aad11924f0e63633b7a0656b26aece9e15f0589936a8c35a799ae9a8df688be','Manifest changed')
+manifest=read(manifest_path)
+for name,checksum in manifest['files'].items(): require(ref(ROOT/name)['sha256']==checksum,'Manifest member changed')
+raw_components=(CANDIDATE/'COMPONENTS.json').read_bytes()
+components=json.loads(raw_components)
+require(sha(raw_components)=='17fa505a5f8bfa03aaa3f28d6cf14423ad89e2cf29fd2852ca909b9a8debe946','Components changed')
+pins=components['code_pins']; old=read(PREVIOUS/'COMPONENTS.json')['code_pins']
+paths=list(CANDIDATE.rglob('*'))
+require(all(not p.is_symlink() and not getattr(p,'is_junction',lambda:False)() for p in paths),'Filesystem alias')
+require(len(pins)==62 and {p.relative_to(CANDIDATE).as_posix() for p in paths if p.is_file()}==set(pins)|{'COMPONENTS.json'},'Exact63candidate files required')
+for name,checksum in pins.items(): require(ref(CANDIDATE/name)['sha256']==checksum,'Component changed')
+for name,checksum in old.items(): require(ref(PREVIOUS/name)['sha256']==checksum,'Historical component changed')
+require(ref(ROOT/'LIVRAISON-PORT-CONCRET-110-POUR-REVUE.json')['sha256']=='75461cb33820769c077f82d0e0a47b41a04d4a803a947378d1adfa0381cf8e69','Historical delivery changed')
+changed=[n for n in old if pins[n]!=old[n]]; added=sorted(set(pins)-set(old))
+require(len(changed)==6 and len(added)==7 and sum(pins[n]==old[n] for n in old)==49,'Closed6changed7added49same delta required')
+expected_functions={'chain_contract.py':['qualification'],'contrat_source110.py':[], 'lane_projection.py':[],
+    'observer/observer-mixte.py':['main'],'reader/receive_phase.py':['main'],'reader_bridge.py':['latest_g_closure']}
+ast_delta={}
+for name,wanted in expected_functions.items():
+    prior=ast.parse((PREVIOUS/name).read_text()); current=ast.parse((CANDIDATE/name).read_text())
+    a={x.name:ast.dump(x,include_attributes=False) for x in prior.body if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef))}
+    b={x.name:ast.dump(x,include_attributes=False) for x in current.body if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef))}
+    diff=sorted(n for n in a if a[n]!=b.get(n)); new=sorted(set(b)-set(a))
+    require(diff==wanted and new==(['verify_local_validation'] if name.startswith('observer/') else []),'Unexpected function delta')
+    ast_delta[name]={'changed_old_functions':diff,'new_functions':new}
+for path in CANDIDATE.rglob('*.py'): ast.parse(path.read_text(encoding='utf8'))
+packet_raw=Path(delivery['Q_packet']['path']).read_bytes()
+require(sha(packet_raw)=='03251fe482275b7ac4179be5a826ae6c556015574724780c269b64d15a94d075','Qpacket changed')
+packet=members(packet_raw)
+require(set(packet)=={'qualification-wrapper.py','bindings.json','source-bundle.tar.gz','adapter-bundle.tar.gz','packet-manifest.json'},'Exact five packet members')
+require(json.loads(packet['packet-manifest.json'])=={n:sha(v) for n,v in packet.items() if n!='packet-manifest.json'},'Packet hashes differ')
+require(all((Q/name).read_bytes()==value for name,value in packet.items()),'Qdisk/packet differs')
+bindings=json.loads(packet['bindings.json']); source=members(packet['source-bundle.tar.gz']); adapters=members(packet['adapter-bundle.tar.gz'])
+require(len(source)==116 and len(adapters)==63 and adapters['COMPONENTS.json']==raw_components,'Source116/adapters63 required')
+require(set(adapters)==set(pins)|{'COMPONENTS.json'} and all(sha(adapters[n])==h for n,h in pins.items()),'Exact62Qcomponent pins required')
+runtime=json.loads(source['runtime-manifest.json'])
+require(len(runtime)==110 and set(source)=={'project/'+n for n in runtime}|{'project.zip','dynamic-plan.json','runtime-manifest.json','DESIGN-INTERFACE.json','predecessor/project.zip','predecessor/plan.json'},'Exact110source inventory')
+require(all(sha(source['project/'+n])==h for n,h in runtime.items()),'Source runtime changed')
+with zipfile.ZipFile(io.BytesIO(source['project.zip'])) as archive:
+    require(len(archive.infolist())==110 and {m.filename.removeprefix('HPC-Forest/'):sha(archive.read(m)) for m in archive.infolist()}==runtime,'Source ZIP110 differs')
+require(sha(source['project.zip'])==delivery['source_zip_sha256'] and sha(source['dynamic-plan.json'])==delivery['plan_sha256'],'Source/plan changed')
+require(sha(packet['source-bundle.tar.gz'])==bindings['source_bundle_sha256'] and sha(packet['adapter-bundle.tar.gz'])==bindings['adapter_bundle_sha256'],'Bundle binding changed')
+native=members(adapters['launcher/native-interface-models-max-r3.tar.gz'])
+require(not any(PurePosixPath(n).name.startswith('cli-policy-') or PurePosixPath(n).name in {'auth.json','config.toml','invocation.json','codex.jsonl.json'} for group in (packet,source,adapters,native) for n in group),'Private runtime payload in Q')
+validation=read(Path(delivery['validation']['path']))
+counts={}
+for label,key,count in [('adapters_facades','adapter_facade_junit',73),('OBS4','observer_local_junit',5),('Qguards','Q_guard_junit',10)]:
+    item=validation[key]; rows=cases(Path(item['path']),item['sha256'],count)
+    counts[label]={'received_unique_cases':count,'failures_or_skips':0,'sha256':item['sha256'],'reexecuted':False}
+original_path=CANDIDATE/'observer/TESTS-FACADES-ET-OBS4-ORIGINAL.xml'
+provenance=read(CANDIDATE/'observer/PROVENANCE-EXTRACTION-CINQ-CAS.json')
+original=cases(original_path,provenance['actual_original_sha256'],29)
+subset=cases(CANDIDATE/'observer/TESTS-OBS4-NEUTRES.xml',provenance['subset_sha256'],5)
+selected=[v for v in original if v.get('classname','').endswith('PassiveRuntimeTests')]
+require([v.attrib for v in selected]==[v.attrib for v in subset] and len(selected)==5,'Actual5case subset differs from original29')
+local=read(CANDIDATE/'observer/validation-locale.json')
+require(local['observer_sha256']==pins['observer/observer-mixte.py'] and local['test_sha256']==pins['observer/test_obs4_neutre.py']
+    and local['junit_sha256']==pins['observer/TESTS-OBS4-NEUTRES.xml'] and local['new_allocated_Q_required'] is True,'Actual OBSvalidation linkage differs')
+for name in ('launcher/pins-source-plan.json','reader/pins-source-plan.json'):
+    require(read(CANDIDATE/name)['latest_native_generation_closure'] is None,'Runtime Gpin must remain unbound')
+canonical_path=BASE/'outputs/HPC-Forest-Primes-Natif-Relance-r2g/RECEPTION-FINALE-ET-CLOTURE-VERIFIEE.json'
+require(ref(canonical_path)['sha256']=='d4c74352d28555ba3a476273af51b1d7791c328fa37addcee580318aedbc6df4','Actual canonical G changed')
+canonical=read(canonical_path); bridge_ast=ast.parse((CANDIDATE/'reader_bridge.py').read_text())
+literal_sets={t.id:ast.literal_eval(n.value) for n in bridge_ast.body if isinstance(n,ast.Assign) for t in n.targets
+              if isinstance(t,ast.Name) and t.id in {'G_POST_KEYS','G_POST_PROOFS'}}
+require(set(canonical)==literal_sets['G_POST_KEYS'] and len(canonical)==32,'Actual canonical32keys differ from consumer')
+for name in literal_sets['G_POST_PROOFS']|({'stop_intent'} if canonical['stop_intent'] is not None else set()):
+    proof=canonical[name];require(ref(Path(proof['path']))['sha256']==proof['sha256'],'Actual top-level metadata ref changed')
+post_review=BASE/'outputs/HPC-Forest-Primes-Natif-Relance-r2g/operations-parent/post-cloture-r1/execution-root-01/revue-independante-r1/REVUE-POST-CLOTURE-REELLE-G.json'
+require(ref(post_review)['sha256']=='12d72682ca473cae60ec8133185c634420d2ea01c8ed6e13f35d4578be488ccb','Actual independent Gpost review changed')
+value={'schema':'hpc-forest-r4b-independent-corrected-port-frozen-inspection-v1','delivery':ref(delivery_path),
+    'manifest':ref(manifest_path),'components_sha256':sha(raw_components),'component_pins':62,'candidate_files':63,
+    'all_component_and_manifest_hashes_match':True,'delta':{'changed':changed,'added':added,'old_identical':49,'function_AST_delta':ast_delta},
+    'Q_packet_sha256':sha(packet_raw),'Q_wrapper_sha256':sha(packet['qualification-wrapper.py']),
+    'source_members':116,'source_exact_files':110,'adapter_members':63,'source_zip_sha256':sha(source['project.zip']),
+    'plan_sha256':sha(source['dynamic-plan.json']),'received_reports':counts,'actual_OBS5_subset_of29_confirmed':True,
+    'actual_G_canonical':ref(canonical_path),'actual_G_post_independent_review':ref(post_review),
+    'G32key_contract_matches_data_without_candidate_call':True,'runtime_Gpins_still_null':True,
+    'source187_or_any_received_tests_reexecuted':False,'candidate_modules_imported':False,
+    'Q_or_operational_main_executed':False,'live_CIM_cache_lock_private_auth_or_model_data_read':False,
+    'native_generation_Q_runtime_or_scientific_admission':False}
+with (HERE/'INTEGRITE-CORRECTION-FROIDE-R4.json').open('x',encoding='utf8') as stream:stream.write(json.dumps(value,indent=2)+'\n')
+print(json.dumps({'frozen_data_inspection_only':True,'component_pins':62,'source_exact_files':110,'adapter_members':63,'received_reports':counts}))

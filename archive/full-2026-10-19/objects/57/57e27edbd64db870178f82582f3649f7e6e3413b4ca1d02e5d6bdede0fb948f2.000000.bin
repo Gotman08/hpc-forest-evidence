@@ -1,0 +1,166 @@
+#include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <limits>
+#include <memory>
+
+#ifdef _OPENMP
+#define OMP_PRAGMA_IMPL(x) _Pragma(#x)
+#define OMP_PRAGMA(x) OMP_PRAGMA_IMPL(omp x)
+#else
+#define OMP_PRAGMA(x)
+#endif
+
+class FastInput {
+    char buffer_[1 << 16];
+    std::size_t position_;
+    std::size_t size_;
+
+    int next() {
+        if (position_ == size_) {
+            size_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (size_ == 0) {
+                return EOF;
+            }
+        }
+        return static_cast<unsigned char>(buffer_[position_++]);
+    }
+
+public:
+    FastInput() : position_(0), size_(0) {}
+
+    bool readInt(int& output) {
+        int character;
+        do {
+            character = next();
+            if (character == EOF) {
+                return false;
+            }
+        } while (character <= ' ');
+
+        bool negative = false;
+        if (character == '-' || character == '+') {
+            negative = character == '-';
+            character = next();
+        }
+
+        long long value = 0;
+        while (character >= '0' && character <= '9') {
+            value = value * 10 + (character - '0');
+            character = next();
+        }
+        output = static_cast<int>(negative ? -value : value);
+        return true;
+    }
+};
+
+int main() {
+    FastInput input;
+    int n;
+    int s;
+    if (!input.readInt(n) || !input.readInt(s) || n <= 0 || s <= 0 || s >= n) {
+        return 0;
+    }
+
+    const int width = n - s + 1;
+    const int rowBlock = 64;
+    const int columnTile = 64;
+
+    std::unique_ptr<int[]> inputRows(
+        new int[static_cast<std::size_t>(rowBlock) * static_cast<std::size_t>(n)]);
+    std::unique_ptr<long long[]> rowWindows(
+        new long long[static_cast<std::size_t>(rowBlock) * static_cast<std::size_t>(width)]);
+    std::unique_ptr<long long[]> vertical(
+        new long long[static_cast<std::size_t>(width)]());
+    std::unique_ptr<long long[]> history(
+        new long long[static_cast<std::size_t>(s) * static_cast<std::size_t>(width)]);
+
+    int* const raw = inputRows.get();
+    long long* const horizontal = rowWindows.get();
+    long long* const verticalSums = vertical.get();
+    long long* const previousRows = history.get();
+    long long maximum = std::numeric_limits<long long>::lowest();
+
+    OMP_PRAGMA(parallel)
+    {
+        for (int blockStart = 0; blockStart < n; blockStart += rowBlock) {
+            const int rows = std::min(rowBlock, n - blockStart);
+
+            OMP_PRAGMA(single)
+            {
+                for (int row = 0; row < rows; ++row) {
+                    int* destination = raw + static_cast<std::size_t>(row) * static_cast<std::size_t>(n);
+                    for (int column = 0; column < n; ++column) {
+                        input.readInt(destination[column]);
+                    }
+                }
+            }
+
+            OMP_PRAGMA(for schedule(static))
+            for (int row = 0; row < rows; ++row) {
+                const int* __restrict__ source = raw + static_cast<std::size_t>(row) * static_cast<std::size_t>(n);
+                long long* __restrict__ destination = horizontal + static_cast<std::size_t>(row) * static_cast<std::size_t>(width);
+
+                long long sum = 0;
+                for (int column = 0; column < s; ++column) {
+                    sum += source[column];
+                }
+                destination[0] = sum;
+                for (int column = 1; column < width; ++column) {
+                    sum += static_cast<long long>(source[column + s - 1]) - source[column - 1];
+                    destination[column] = sum;
+                }
+            }
+
+            const int tiles = (width + columnTile - 1) / columnTile;
+            OMP_PRAGMA(for schedule(static) reduction(max : maximum))
+            for (int tile = 0; tile < tiles; ++tile) {
+                const int first = tile * columnTile;
+                const int count = std::min(columnTile, width - first);
+                long long* __restrict__ totals = verticalSums + first;
+                long long tileMaximum = std::numeric_limits<long long>::lowest();
+
+                for (int row = 0; row < rows; ++row) {
+                    const int absoluteRow = blockStart + row;
+                    const long long* __restrict__ values = horizontal + static_cast<std::size_t>(row) * static_cast<std::size_t>(width) + static_cast<std::size_t>(first);
+                    long long* __restrict__ prior = previousRows + static_cast<std::size_t>(absoluteRow % s) * static_cast<std::size_t>(width) + static_cast<std::size_t>(first);
+
+                    if (absoluteRow < s - 1) {
+                        OMP_PRAGMA(simd)
+                        for (int column = 0; column < count; ++column) {
+                            totals[column] += values[column];
+                            prior[column] = values[column];
+                        }
+                    } else if (absoluteRow < s) {
+                        OMP_PRAGMA(simd reduction(max : tileMaximum))
+                        for (int column = 0; column < count; ++column) {
+                            const long long total = totals[column] + values[column];
+                            totals[column] = total;
+                            prior[column] = values[column];
+                            tileMaximum = total > tileMaximum ? total : tileMaximum;
+                        }
+                    } else {
+                        OMP_PRAGMA(simd reduction(max : tileMaximum))
+                        for (int column = 0; column < count; ++column) {
+                            const long long total = totals[column] + values[column] - prior[column];
+                            totals[column] = total;
+                            prior[column] = values[column];
+                            tileMaximum = total > tileMaximum ? total : tileMaximum;
+                        }
+                    }
+                }
+
+                maximum = tileMaximum > maximum ? tileMaximum : maximum;
+            }
+        }
+    }
+
+    std::printf("%lld\n", maximum);
+    return 0;
+}
+
+#undef OMP_PRAGMA
+#ifdef _OPENMP
+#undef OMP_PRAGMA_IMPL
+#endif

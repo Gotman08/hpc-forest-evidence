@@ -1,0 +1,430 @@
+"""R2e received first-start boundary. Local files only; no CLI, process, C, model or transport execution."""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.util
+import json
+import math
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+RECEIVED_HERE = HERE
+HELPER_SHA = 'ded2fdc49f14186df714b3dc11f74f4c99abe801701a55cf59508e7ea04a7ab4'
+if hashlib.sha256((HERE / 'reception_bornee.py').read_bytes()).hexdigest() != HELPER_SHA:
+    raise ValueError('Changed immutable scientific helper before import')
+FACTORY = HERE.parents[1] / 'HPC-Forest-Primes-Natif-Lancement-r2g/revision-r1'
+FACTORY_SHA = '2e3b38c7b262f289ed27cbafb7b8741d6e01ea452f666cdaf12316ad9316985a'
+PUBLICATION_SHA = '2054e0e6964408919aa06e117fb380275407a1b778601cb342c87eed0641df26'
+PRIVATE_SHA = '147f28242753c81065048613fd9e1c79e00f3d4aadb9e8deec4bab8398be0b1c'
+SPEC = importlib.util.spec_from_file_location('r2e_received_boundary', HERE / 'reception_bornee.py')
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+INPUT_FIELDS = {'schema', 'model', 'job_id', 'source_bindings', 'first_start_transfer',
+    'local_authorization', 'remote_authorization', 'upload_manifest', 'publication_readbacks',
+    'ready_uploads', 'allocation_ready', 'initial_worker_ready', 'initial_installation',
+    'parent_oauth', 'received_root', 'received_files', 'directory_transfers', 'received_cache',
+    'cli_policy', 'paused_snapshot_transfer'}
+ROOT_FILES = {'CELL-BINDING.json', 'OWNER.json', 'worker-ready.json'}
+NONCE_FILES = {'downloaded-request.json', 'download-receipt.json', 'generation-claimed.json',
+    'request.json', 'invocation.json', 'codex.jsonl', 'codex.jsonl.json', 'response.json',
+    'response-ready.json', 'delivered.json', 'instructions.txt', 'output-schema.json', 'agent-result.json', 'cli-diagnostics.json'}
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def save(path, value):
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+    return m.ref(path)
+
+
+def wire_schema(value):
+    value = copy.deepcopy(value)
+    def visit(node):
+        if isinstance(node, dict):
+            node.pop('uniqueItems', None)
+            node.pop('maxItems', None)
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+    visit(value)
+    return value
+
+
+class Inputs:
+    """All explicitly referenced inputs are hashed before reading and rehashed at completion."""
+    def __init__(self):
+        self.paths = {}
+
+    def path(self, value):
+        path = m.checked_local(value)
+        before = {'sha256': value['sha256'], 'bytes': path.stat().st_size}
+        previous = self.paths.setdefault(str(path), before)
+        m.need(previous == before, 'Conflicting immutable input reference')
+        return path
+
+    def read(self, value):
+        path = self.path(value)
+        m.need(path.stat().st_size < 16 * 1024 * 1024, 'Oversized metadata JSON')
+        value = json.loads(path.read_text(encoding='utf8'))
+        m.need(isinstance(value, dict), 'Metadata JSON object required')
+        return value
+
+    def after(self):
+        after = {name: {'sha256': m.sha(name), 'bytes': Path(name).stat().st_size} for name in self.paths}
+        m.need(after == self.paths, 'Received inputs changed during audit')
+        return after
+
+
+def contained(path, root):
+    m.need(path.is_relative_to(root) and path != root, 'Received snapshot must be below the explicit received root')
+    return path
+
+
+def admissible_directory_path(path, model, job, exact_canonical_root):
+    # A real directory transfer root has no file suffix. Never widen the file guard.
+    m.identity(model, job)
+    native = '/scratch_p/nimarano/' + m.SCOPE + '-' + m.CELLS[model]
+    canonical = '/gpfs/scratch/nimarano/' + m.SCOPE + '-' + m.CELLS[model]
+    m.need(exact_canonical_root == canonical and isinstance(path, str), 'Exact selected canonical directory root required')
+    pure = PurePosixPath(path)
+    m.need(pure.is_absolute() and str(pure) == path and '..' not in pure.parts and '\\' not in path,
+           'Malformed exact received directory namespace')
+    allowed = {native, canonical, native + '/results-' + job, canonical + '/results-' + job}
+    m.need(path in allowed, 'Directory outside exact selected native/results roots')
+    return path
+
+
+def check_frozen_identity(first, auth, worker, cache_root, install, inputs):
+    """Permit the repeated read-only gate only after immutable initial installation links match."""
+    model, job = first['model'], first['job_id']
+    binding = {**m.identity(model, job), 'remote_root': '/scratch_p/nimarano/' + m.SCOPE + '-' + m.CELLS[model]}
+    m.need(cache_root['CELL-BINDING.json'] == binding and all(worker.get(k) == v for k, v in binding.items()),
+           'Frozen initial cache/ready cell binding differs')
+    owner = cache_root['OWNER.json']
+    expected_owner = {'protocol': 'hpc-forest-codex-mailbox-v1', 'owner': job,
+        'reasoning_effort': 'max', **binding}
+    m.need(all(owner.get(k) == v for k, v in expected_owner.items())
+        and all(worker.get(k) == v for k, v in expected_owner.items()), 'Initial OWNER/ready identity differs')
+    m.need(worker.get('mode') == 'codex' and worker.get('authentication') == 'existing-local-ChatGPT'
+        and worker.get('codex_executable_sha256') == m.CLI
+        and worker.get('codex_cli_version') == 'codex-cli 0.163.0-alpha.10.2'
+        and worker.get('model_weights_on_romeo') is False and worker.get('weight_digest_available') is False,
+        'Initial ready lacks exact existing ChatGPT CLI identity')
+    m.need(install.get('schema') == 'hpc-forest-r2e-initial-installation-received-v1'
+        and all(install.get(k) == v for k, v in m.identity(model, job).items())
+        and install.get('initial_fresh_gate_completed_before_ready') is True
+        and install.get('authorization_local') == inputs['local_authorization']
+        and install.get('authorization_remote') == inputs['remote_authorization']
+        and install.get('worker_ready') == inputs['initial_worker_ready']
+        and install.get('source_bindings') == inputs['source_bindings']
+        and install.get('new_worker_authorized_by_this_receipt') is False
+        and install.get('calls_replayed') == 0 and type(install.get('calls_replayed')) is int,
+        'Actual initial installation receipt with frozen auth/ready/source links required')
+    m.need(isinstance(install.get('evidence_refs'), list) and install['evidence_refs'], 'Initial installation requires real launch/CIM evidence')
+    m.need(auth.get('model') == model and auth.get('job_id') == job
+        and auth.get('session_id') == m.CELLS[model] and auth.get('remote_root') == binding['remote_root'],
+        'Actual authorization not bound to this ready')
+    return binding
+
+
+def verify_frozen_authorizations(module, local_path, remote_path, resolver):
+    # No install_identity, allocation_guard, process, or fresh worker path is called.
+    local = module.validate_receipt(local_path, {m.SCOPE}, runtime=False, prepared=False, initial_lane=False)
+    original = module.artifact
+    module.artifact = resolver
+    try:
+        remote = module.validate_receipt(remote_path, {m.SCOPE}, runtime=False, prepared=False, initial_lane=False)
+    finally:
+        module.artifact = original
+    m.need({k: v for k, v in local.items() if k != 'artifacts'} ==
+           {k: v for k, v in remote.items() if k != 'artifacts'}, 'Initial local/POSIX authorization identity or limits differ')
+    for key in ('source_zip', 'plan', 'preparation_manifest', 'preparation_review'):
+        m.need(local['artifacts'][key]['sha256'] == remote['artifacts'][key]['sha256'], 'Immutable cross-environment pin differs')
+    return local, remote
+
+
+def audit(input_ref):
+    tracked = Inputs()
+    value = tracked.read(input_ref)
+    m.need(set(value) == INPUT_FIELDS and value['schema'] == 'hpc-forest-r2e-first-start-reception-input-v1', 'Closed R2e input schema required')
+    model, job = value['model'], value['job_id']
+    m.identity(model, job)
+    root = Path(value['received_root'])
+    m.need(root.is_absolute() and root.is_dir() and not root.is_symlink()
+        and root.resolve().is_relative_to(RECEIVED_HERE) and root.resolve() != RECEIVED_HERE, 'Explicit immutable received root must remain under the original owned reader directory')
+    root = root.resolve()
+    first_path = contained(m.transfer_bytes(value['first_start_transfer']), root)
+    tracked.path(m.ref(first_path))
+    tracked.path(value['first_start_transfer']['transfer_result'])
+    first = tracked.read(m.ref(first_path))
+    m.validate_header(first, model, job)
+    # Pending receipts never become evaluated or admissible merely by running this reader.
+    m.need(first.get('verified') is True, 'PENDING_FIRST_REAL_EVALUATION: await received native evaluation; never replay')
+    canonical = '/gpfs/scratch/nimarano/' + m.SCOPE + '-' + m.CELLS[model]
+    m.admissible_call_path(value['first_start_transfer']['remote_path'], model, job, canonical)
+    m.need(m.sha(FACTORY / 'preparer-cellule-max.py') == FACTORY_SHA
+        and m.sha(FACTORY / 'publication-locale.py') == PUBLICATION_SHA, 'Reviewed local factory changed')
+    factory = load(FACTORY / 'preparer-cellule-max.py', 'r2e_first_factory')
+    factory.configure(value['source_bindings'], model)
+    m.need((factory.SCOPE, factory.SOURCE, factory.PLAN, factory.SOURCE_MEMBERS) == (m.SCOPE, m.SOURCE, m.PLAN, 110), 'Unrelated source/Q binding')
+    tracked.path(value['source_bindings'])
+    for field in ('source_zip', 'plan', 'runtime_manifest', 'qualification', 'qualification_reception', 'source_review'):
+        tracked.path(factory.BINDING[field])
+    publication = load(FACTORY / 'publication-locale.py', 'r2e_first_publication')
+    readbacks = tracked.read(value['publication_readbacks'])
+    m.need(readbacks.get('schema') == 'hpc-forest-max-cap4-cohort-readbacks-reconciled-v1'
+        and readbacks.get('directory_readback_bytes_reconciled') is True and readbacks.get('verified') is False
+        and readbacks.get('source_zip_sha256') == m.SOURCE and readbacks.get('plan_sha256') == m.PLAN
+        and len(readbacks.get('evidence', [])) == 3, 'All three actual full readbacks required')
+    publications = [publication.verify_one(item)[0] for item in readbacks['evidence']]
+    m.need({p['model'] for p in publications} == set(m.CELLS)
+        and len({p['job_id'] for p in publications}) == 3, 'Three distinct R2e publications required')
+    for row, pub_row in zip(readbacks['evidence'], publications, strict=True):
+        for item in row.values():
+            tracked.path(item)
+        tracked.path(pub_row['allocation_marker'])
+        tracked.path(pub_row['ready']['local'])
+        for group in (Path(pub_row['staged_directory']), Path(pub_row['directory_readback']['arguments']['local_path'])):
+            for name in publication.inventory(group):
+                tracked.path(m.ref(group / name))
+    m.need(set(value['ready_uploads']) == set(m.CELLS), 'Three actual ready uploads required after cohort readbacks')
+    for pub in publications:
+        result = tracked.read(value['ready_uploads'][pub['model']])
+        result = result.get('structuredContent', result)
+        ready = pub['ready']
+        m.need(result.get('ok') is True and result.get('verifie') is True
+            and result.get('sent') == ready['local']['path'] and result.get('to') == ready['remote_path']
+            and result.get('empreinte_locale') == result.get('empreinte_distante') == ready['local']['sha256'], 'Actual exact ready upload/hash missing')
+    pub = next(p for p in publications if p['model'] == model)
+    m.need(pub['job_id'] == job, 'Selected first start job differs from the actual published cohort')
+    upload = tracked.read(value['upload_manifest'])
+    m.need(upload.get('schema') == 'hpc-forest-max-cell-explicit-upload-proposal-v1'
+        and upload.get('verified') is False and upload.get('performed') is False
+        and upload.get('job_id') == job and len(upload.get('dependencies', [])) == 23, 'Upload graph belongs to another job or factory')
+    m.need(pub['allocation_marker'] == value['allocation_ready']
+        and pub['inventory']['authorization.json']['sha256'] == value['remote_authorization']['sha256'], 'Initial marker/auth is not the one actually read back')
+    for row in upload['dependencies']:
+        name = PurePosixPath(row['remote_path']).name
+        m.need(str(PurePosixPath(row['remote_path']).parent) == pub['remote_root']
+            and name in pub['inventory'] and pub['inventory'][name]['sha256'] == row['local']['sha256'], 'Uploaded dependency differs from actual complete readback')
+    factory.remote_resolver([*upload['dependencies'], *upload['existing_qualified_files']])
+    mirrors = {}
+    for row in [*upload['dependencies'], *upload['existing_qualified_files']]:
+        m.need(set(row) == {'remote_path', 'local'} and row['remote_path'] not in mirrors, 'Closed unique upload graph row required')
+        mirrors[row['remote_path']] = row['local']
+        tracked.path(row['local'])
+    m.need(upload['authorization_publish_after_dependencies']['local'] == value['remote_authorization'], 'Published authorization differs from frozen remote bytes')
+    for row in value['received_files']:
+        m.need(set(row) == {'remote_path', 'local'} and row['remote_path'] not in mirrors, 'Closed unique received file map required')
+        m.admissible_call_path(row['remote_path'], model, job, canonical)
+        contained(tracked.path(row['local']), root)
+        mirrors[row['remote_path']] = row['local']
+    directories = []
+    for row in value['directory_transfers']:
+        m.need(set(row) == {'remote_path', 'local_directory', 'transfer_result'}, 'Closed received directory transfer required')
+        admissible_directory_path(row['remote_path'], model, job, canonical)
+        local = Path(row['local_directory'])
+        contained(local, root)
+        result = tracked.read(row['transfer_result'])
+        result = result.get('structuredContent', result)
+        m.need(result.get('ok') is True and result.get('downloaded') == row['remote_path']
+            and result.get('to') == str(local) and local.is_dir() and not local.is_symlink(), 'Exact actual directory snapshot receipt missing')
+        directories.append((row['remote_path'].rstrip('/') + '/', local))
+    resolved = {}
+    def resolve(item):
+        m.need(isinstance(item, dict) and set(item) == {'path', 'sha256'} and item['path'] in mirrors, 'Every original reference requires an explicit received mirror')
+        local_ref = mirrors[item['path']]
+        m.need(local_ref['sha256'] == item['sha256'], 'Remote reference/local bytes SHA differs')
+        path = tracked.path(local_ref)
+        if path.is_relative_to(root):
+            matches = [(prefix, directory) for prefix, directory in directories if item['path'].startswith(prefix)
+                and directory / PurePosixPath(item['path'][len(prefix):]) == path]
+            m.need(len(matches) == 1, 'Received file lacks its exact actual directory transfer provenance')
+        resolved[item['path']] = {'original': item, 'received': local_ref, 'bytes': path.stat().st_size}
+        return path
+    local_auth = tracked.read(value['local_authorization'])
+    auth = tracked.read(value['remote_authorization'])
+    m.need(auth.get('artifacts') == first.get('admission_artifacts') and len(auth.get('artifacts', {})) == 14,
+           'First start must bind the exact initial fourteen admission artifacts')
+    cache = value['received_cache']
+    m.need(set(cache) == {'root', 'nonces'} and set(cache['root']) == ROOT_FILES, 'Only explicit root/nonce snapshots are accepted')
+    root_cache = {}
+    for name, item in cache['root'].items():
+        contained(tracked.path(item), root)
+        root_cache[name] = tracked.read(item)
+    worker = tracked.read(value['initial_worker_ready'])
+    m.need(tracked.path(value['initial_worker_ready']).read_bytes() == tracked.path(cache['root']['worker-ready.json']).read_bytes()
+        == resolve(first['worker_identity']).read_bytes(), 'Initial/local/remote frozen worker ready bytes differ')
+    install = tracked.read(value['initial_installation'])
+    binding = check_frozen_identity(first, local_auth, worker, root_cache, install, value)
+    for item in install['evidence_refs']:
+        tracked.path(item)
+    module = factory.native()
+    local_auth, auth = verify_frozen_authorizations(module, tracked.path(value['local_authorization']), tracked.path(value['remote_authorization']), resolve)
+    cli = tracked.read(local_auth['artifacts']['cli_identity'])
+    m.need(cli.get('executable_path') == str(factory.CLI)
+        and worker.get('codex_executable') == str(factory.CLI)
+        and cli.get('executable_sha256') == m.CLI and m.sha(factory.CLI) == m.CLI
+        and cli.get('version') == 'codex-cli 0.163.0-alpha.10.2', 'Exact initial copied CLI identity changed')
+    tracked.path(m.ref(factory.CLI))
+    lane = tracked.read(local_auth['artifacts']['worker_lane_admission'])
+    nested = lane['lane_v2']
+    m.need(lane['schema'] == 'hpc-forest-primes-r2max-worker-lane-admission-v2'
+        and nested.get('source_only_state') == 'received_absent'
+        and type(nested.get('source_only_active_workers')) is int and nested['source_only_active_workers'] == 0
+        and nested.get('source_only_preserved') is False, 'Exact source-only absent/zero/false lane-v2 required')
+    start = worker.get('started_at')
+    m.need(type(start) in {int, float} and math.isfinite(start)
+        and 0 <= start - nested['observed_at'] <= 600, 'Initial actual ready must follow its fresh lane observation within600seconds')
+    marker = tracked.read(value['allocation_ready'])
+    origin = tracked.read(m.ref(resolve(first['runtime_reference_origin'])))
+    m.need(marker.get('verified') is True and marker.get('native_model_calls') == 0
+        and all(marker.get(k) == v for k, v in m.identity(model, job).items())
+        and origin.get('verified') is True and origin.get('job_id') == job
+        and origin.get('allocation') == first['allocation'] == marker['allocation']
+        and origin.get('reference_origin_is_current_allocation') is True
+        and origin.get('qualification_timings_imported') is False and origin.get('native_model_calls') == 0
+        and origin.get('source_zip_sha256') == m.SOURCE and origin.get('plan_sha256') == m.PLAN,
+        'Reference/allocation must be from the same actual4CPU job')
+    oauth = tracked.read(value['parent_oauth'])
+    m.need(oauth.get('schema') == 'hpc-forest-three-native-workers-oauth-observation-v1'
+        and oauth.get('verified') is True and oauth.get('cli_login_status') == 'Logged in using ChatGPT'
+        and oauth.get('auth_mode') == 'chatgpt' and oauth.get('same_copied_cli') is True
+        and all(oauth.get(k) is False for k in ('api_key_in_auth_present', 'OPENAI_API_KEY_environment_present', 'CODEX_API_KEY_environment_present', 'secrets_exported')),
+        'Actual existing ChatGPT OAuth/no-API metadata required')
+    rows = [row for row in oauth.get('workers', []) if row.get('model') == model and row.get('job_id') == job]
+    m.need(len(rows) == 1 and rows[0].get('authentication') == 'existing-local-ChatGPT'
+        and rows[0].get('worker_ready', {}).get('sha256') == value['initial_worker_ready']['sha256']
+        and rows[0].get('codex_executable_sha256') == m.CLI, 'OAuth observation does not bind this actual ready/job')
+    m.need(first.get('private_cli_review_required') is True and first.get('private_cli_argv_verified') is False,
+        'Actual first receipt must preserve the pending private argv boundary')
+    m.need(m.sha(HERE / 'audit_prive.py') == PRIVATE_SHA, 'Private auditor changed before import')
+    private_module = load(HERE / 'audit_prive.py', 'r2e_private_argv_auditor')
+    private_cli = private_module.inspect_private(first, resolve, cache, value['cli_policy'], factory, tracked, m)
+    m.need(worker.get('task_cli_policy_sha256') == value['cli_policy']['sha256']
+        and type(worker.get('task_cli_policy_candidate_count')) is int
+        and worker['task_cli_policy_candidate_count'] == private_cli['private_skill_path_count']
+        and worker.get('local_skill_paths_exported') is False, 'Initial ready/policy digest or count differs')
+    calls = private_cli['transport']
+    private = m.private_evaluation(first, resolve)
+    paused_path = contained(m.transfer_bytes(value['paused_snapshot_transfer']), root)
+    tracked.path(value['paused_snapshot_transfer']['transfer_result'])
+    snapshot = tracked.read(m.ref(paused_path))
+    snapshot_ref = {'path': value['paused_snapshot_transfer']['remote_path'], 'sha256': m.sha(paused_path)}
+    m.admissible_call_path(snapshot_ref['path'], model, job, canonical)
+    first_ref = {'path': value['first_start_transfer']['remote_path'], 'sha256': m.sha(first_path)}
+    paused_binding = private_module.validate_snapshot(snapshot, snapshot_ref, first, first_ref, m)
+    m.need(paused_binding == binding, 'First-batch paused binding differs from initial immutable installation')
+    nonces = {}
+    for call in first['all_started_calls_reconciled']:
+        request = tracked.read(m.ref(resolve(call['request'])))
+        nonce = request['nonce']
+        m.need(nonce in cache['nonces'], 'Named nonce was not explicitly received')
+        files = cache['nonces'][nonce]
+        required = NONCE_FILES - {'agent-result.json'}
+        m.need(required <= set(files) <= NONCE_FILES, 'Missing or unknown explicit named nonce snapshot')
+        for item in files.values():
+            contained(tracked.path(item), root)
+        compare = {'downloaded-request.json': 'request', 'response.json': 'response', 'response-ready.json': 'ready',
+            'invocation.json': 'invocation', 'codex.jsonl': 'error_and_usage_log', 'codex.jsonl.json': 'process', 'delivered.json': 'delivered'}
+        for local_name, field in compare.items():
+            if local_name in {'invocation.json', 'codex.jsonl.json'}:
+                private_key = 'invocation_sha256' if local_name == 'invocation.json' else 'process_sha256'
+                m.need(files[local_name]['sha256'] == call['private_cli_records'][private_key], 'Private named raw SHA differs')
+            else:
+                m.need(tracked.path(files[local_name]).read_bytes() == resolve(call[field]).read_bytes(), 'Received cache/remote named call bytes differ')
+        m.need(tracked.read(files['request.json']) == request, 'Actual CLI request differs from the downloaded original request')
+        claim = tracked.read(files['generation-claimed.json'])
+        m.need(claim.get('request_sha256') == call['request']['sha256'], 'Immutable started claim/request differs')
+        m.need(tracked.path(files['instructions.txt']).read_text(encoding='utf8') == request['messages'][0]['content']
+            and tracked.read(files['output-schema.json']) == wire_schema(request['schema']), 'Actual CLI instructions/schema differs')
+        response = tracked.read(m.ref(resolve(call['response'])))
+        if response.get('error') is None:
+            m.need('agent-result.json' in files and tracked.read(files['agent-result.json']) == response.get('data'), 'Typed agent result/delivery differs')
+        nonces[nonce] = files
+    m.need(set(nonces) == set(cache['nonces']), 'Unreferenced nonce snapshots cannot extend the frozen boundary')
+    after = tracked.after()
+    return {'schema': 'hpc-forest-r2e-first-start-bounded-reception-v1', 'reader_revision': 'r2g-first-batch-private-projection-r1', 'verified': False, **m.identity(model, job),
+        'preparation_manifest_sha256': m.PREP, 'received_first_normal_delivery_and_real_evaluation_with_private_bytes': True,
+        'source_native_first_start_verified': True, 'native_first_receipt': m.ref(first_path),
+        'first_real_evaluation': first['first_real_evaluation'], 'first_normal_delivered_call': first['first_normal_delivered_call'],
+        'named_first_boundary_transport': calls, 'private_first_evaluation': private, 'allocation': first['allocation'],
+        'private_cli_audit': private_cli, 'task_cli_policy': value['cli_policy'],
+        'first_start_original': first_ref, 'evaluation_snapshot_original': first['evaluation_snapshot'],
+        'paused_snapshot_original': snapshot_ref, 'first_batch_paused_binding': paused_binding,
+        'first_batch_waiting_snapshot_received': True,
+        'initial_installation': value['initial_installation'], 'frozen_cell_binding': binding,
+        'lane_v2_revalidated_for_same_already_installed_worker_only': True, 'initial_lane_false_grants_new_worker': False,
+        'source_only_state': 'received_absent', 'source_only_active_workers': 0, 'source_only_preserved': False,
+        'parent_oauth_evidence': value['parent_oauth'], 'exact_admission_artifacts': first['admission_artifacts'],
+        'reference_files_checked': list(resolved.values()), 'received_input_inventory': after,
+        'received_input_inventory_before_after_identical': True, 'diagnostics': [],
+        'cache_lock_read': False, 'live_cache_opened': False, 'live_sqlite_opened': False,
+        'native_research_admitted_by_receiver': False, 'extension_to_other_models_allowed_by_receiver': False,
+        'independent_candidate_sources_git_lineage_audit': False, 'independent_performance_verified': False,
+        'hardware_or_process_isolation_proved': False, 'native_calls_by_receiver': 0,
+        'limits': ['Named received boundary only; no claim about later calls or whole-session cost',
+            'Directory transfer verifie=false is not upgraded: individually recorded reference SHA/bytes checked locally',
+            'Private logs/context/case records match typed candidate commit/tree; no C or model rerun',
+            'Any CLI diagnostic remains a refusal for clean NORMAL admission; raw files are retained',
+            'Full final cohort, Git, oracle, performance and isolation audits remain separate']}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', type=Path, required=True)
+    parser.add_argument('--input-sha256', required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    output = args.output.resolve()
+    m.need(output.is_relative_to(HERE) and output != HERE and not output.exists(), 'New owned result directory required')
+    output.mkdir(parents=False, exist_ok=False)
+    try:
+        result = audit({'path': str(args.input.resolve()), 'sha256': args.input_sha256})
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError, StopIteration, ImportError, AssertionError) as exc:
+        # The refusal stores only the reason/diagnostic hashes; never model response or foreign role bodies.
+        receipt = save(output / 'RECEPTION-PREMIER-REFUS.json', {
+            'schema': 'hpc-forest-r2e-first-start-reception-refusal-v1', 'verified': False,
+            'received_first_normal_delivery_and_real_evaluation_with_private_bytes': False,
+            'input': {'path': str(args.input.resolve()), 'sha256': args.input_sha256},
+            'error_type': type(exc).__name__, 'error': str(exc), 'diagnostics': getattr(exc, 'diagnostics', []),
+            'no_replay_or_stop_performed': True, 'native_calls_by_receiver': 0})
+        print(json.dumps({'refused': receipt, 'global_verified': False}))
+        return 1
+    receipt = save(output / 'RECEPTION-PREMIER-DEMARRAGE-BORNEE.json', result)
+    private_receipt = save(output / 'AUDIT-CLI-PRIVE-LOCAL.json', {
+        'schema': 'hpc-forest-r2e-local-private-cli-review-v1', 'verified': True,
+        **result['first_batch_paused_binding'], 'bounded_reception': receipt,
+        **result['private_cli_audit'], 'no_native_calls': True, 'no_remote_publication': True,
+        'no_model_or_instruction_bodies_exported': True})
+    m.need(m.sha(HERE / 'audit_prive.py') == PRIVATE_SHA, 'Private auditor changed before release rendering')
+    private_module = load(HERE / 'audit_prive.py', 'r2e_private_release_render')
+    projection, release = private_module.release_proposals(result['first_batch_paused_binding'],
+        result['first_start_original'], result['evaluation_snapshot_original'], result['paused_snapshot_original'],
+        private_receipt, result['private_cli_audit'])
+    projection_ref = save(output / 'audit-cli-prive-digest.json', projection)
+    m.need(projection_ref['sha256'] == release['private_cli_audit']['sha256'], 'Release projection SHA differs')
+    release_ref = save(output / 'PROPOSITION-autorisation-apres-premier-batch.json', release)
+    proposal = save(output / 'PUBLICATION-PROPOSEE-NON-EFFECTUEE.json', {
+        'schema': 'hpc-forest-r2e-first-batch-release-publication-proposal-v1', 'verified': False,
+        'performed': False, 'root_actual_publication_required': True,
+        'private_audit_projection': {'local': projection_ref, 'remote_path': release['private_cli_audit']['path']},
+        'release': {'local': release_ref, 'remote_path': release['paused_snapshot']['path'].rsplit('/', 1)[0] + '/autorisation-apres-premier-batch.json'},
+        'order': ['audit-digest-upload-readback', 'exact-release-last'], 'no_budget_reset': True})
+    print(json.dumps({'bounded_reception': receipt, 'private_audit': private_receipt,
+        'publication_proposal': proposal, 'global_verified': False}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

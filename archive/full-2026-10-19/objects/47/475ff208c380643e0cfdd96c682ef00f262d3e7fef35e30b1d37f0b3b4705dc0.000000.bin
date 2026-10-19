@@ -1,0 +1,404 @@
+"""ROOT-only passive OBS4 closure gate. No capture, transport, launch or stop here."""
+from __future__ import annotations
+import argparse
+import ast
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+CODE = Path(__file__).resolve().parent
+HERE = CODE.parent
+OP = HERE.parent
+PREP = OP.parent
+BASE = PREP.parents[1]
+CHAIN = PREP / 'adaptateurs-source110-r1/revision-r5-G-recu-avant-Q'
+RAW_SOURCE = PREP / 'qualification-allouee-source110-G-recu-r1/revue-resultats-Q753709-r1/lecteur-r4b/auditer-restauration-existante-r4b.py'
+RAW_SHA = '5c1e1784574566a585e2d9cc50f85b52337d10d3109e449a4112581eae68f8d5'
+CAPACITY = OP / 'capacite-preracines-r1/verifier-capacite-preracines.py'
+CAPACITY_SHA = '581403d134951fbde8c7b815c9d2c6d3281b09c3c847dc62386d7ea62be8d107'
+COMPONENTS_SHA = '1e60da6d5b51afaf3c857b1ba215927e7e1201c297241afd6390212a89d5e449'
+FIELDS = ('ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate')
+MAIN, LAUNCHER = 28416, 57452
+SESSIONS = ('3b1de5658e4641149b15a3bea4850239', '7b6c29c0e329400bb2be145b0e2dbe0a', 'bd2b3153a7544c909afbc19fe69902b4')
+_raw = _decode = None
+
+
+def need(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def initialize_io():
+    global _raw, _decode
+    code = RAW_SOURCE.read_bytes()
+    need(digest(code) == RAW_SHA, 'Pinned held/no-follow reader changed')
+    names = {'need', 'ordinary', 'metadata', 'open_nofollow_read', 'cross_identity',
+             'validate_windows_mode_views', 'native_basic_info', 'raw', 'decode'}
+    nodes = [n for n in ast.parse(code).body if isinstance(n, ast.FunctionDef) and n.name in names]
+    need({n.name for n in nodes} == names, 'Exact held-read definitions required')
+    ns = {'Path': Path, 'os': os, 'stat': stat, 'Q': BASE, 'json': json}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(RAW_SOURCE), 'exec'), ns)
+    _raw, _decode = ns['raw'], ns['decode']
+
+
+def lock_name(path):
+    return Path(path).name.rstrip(' .').casefold() in {'observer.lock', 'worker.lock'}
+
+
+def raw(path):
+    need(_raw is not None, 'Held IO must be initialized')
+    path = Path(path)
+    need(path.is_absolute() and path.is_relative_to(PREP), 'Only exact local PREP evidence')
+    need(not lock_name(path), 'Operational lock bytes never read, including Windows case/trailing aliases')
+    return _raw(path)
+
+
+def reference(path):
+    return {'path': str(path), 'sha256': digest(raw(path))}
+
+
+def read(reference_value):
+    need(isinstance(reference_value, dict) and set(reference_value) == {'path', 'sha256'}
+         and re.fullmatch('[0-9a-f]{64}', reference_value['sha256']), 'Exact SHA reference')
+    data = raw(reference_value['path'])
+    need(digest(data) == reference_value['sha256'], 'Pinned evidence changed')
+    return _decode(data)
+
+
+def ordinary_output(path, *, new=False):
+    original = Path(path)
+    need(original.is_absolute() and '..' not in original.parts, 'Literal absolute output; no traversal')
+    p = Path(os.path.abspath(original))
+    need(p.is_relative_to(HERE) and not p.anchor.startswith('\\\\')
+         and all(':' not in part for part in p.parts[1:]), 'Only local owned output')
+    for q in (p, *p.parents):
+        if q.exists() or q.is_symlink():
+            s = q.lstat()
+            need(not stat.S_ISLNK(s.st_mode) and not getattr(s, 'st_file_attributes', 0) & 1024, 'Output reparse refused')
+    need(p.resolve(strict=False) == p, 'Output canonical boundary')
+    if new:
+        need(not p.exists(), 'Never overwrite prior output or intent')
+    return p
+
+
+def save(path, value):
+    p = ordinary_output(path, new=True)
+    data = (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
+    with p.open('xb') as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return reference(p)
+
+
+def identity(row):
+    need(isinstance(row, dict) and set(row) == set(FIELDS), 'Exact five-field identity')
+    need(all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+         and all(isinstance(row[k], str) and row[k] for k in FIELDS[2:]), 'Complete identity required')
+    return tuple(row[k] for k in FIELDS)
+
+
+def creation(row):
+    text = row['CreationDate']
+    need(isinstance(text, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z', text), 'Exact seven-digit UTC creation required')
+    return datetime.fromisoformat(text).timestamp()
+
+
+def cim_birth_ticks(row):
+    creation(row)
+    need(row['CreationDate'][-2] == '0', 'CIM CreationDate must have its exact observed microsecond quantum')
+    delta = datetime.fromisoformat(row['CreationDate']) - datetime(1, 1, 1, tzinfo=UTC)
+    return ((delta.days * 86400 + delta.seconds) * 1000000 + delta.microseconds) * 10
+
+
+def checked_anchors():
+    anchors = _decode(raw(HERE / 'ANCRAGES-FROIDS-EXACTS.json'))
+    need(anchors['schema'] == 'hpc-forest-obs4-main-only-closure-cold-anchors-v1'
+         and anchors['effect_targets'] == [MAIN] and anchors['context_never_stop_targets'] is True, 'Closed cold scope')
+    for r in anchors['evidence'].values():
+        read(r)
+    pair = read(anchors['evidence']['pair'])
+    start = read(anchors['evidence']['start'])
+    context = anchors['contextual_identities']
+    need(len(context) == 7 and {r['ProcessId'] for r in context} == {57452,28416,35952,37264,49132,60168,48996}, 'Seven exact historical context identities')
+    need([r for r in context if r['ProcessId'] in (LAUNCHER, MAIN)] == pair
+         and pair == [r for r in start['five_fields'] if r['ProcessId'] in (LAUNCHER, MAIN)], 'Historical pair/start bytes')
+    for row in context:
+        identity(row); creation(row)
+    closed = read(anchors['evidence']['technical_closure'])
+    need(closed['verified_metadata_only'] is True and closed['native_invocations'] == 0
+         and closed['unknown_invocations'] == 0 and closed['all_started_calls_reconciled'] is True
+         and closed['job_ids'] == ['754295','754296','754299'], 'Actual three zero-call terminals required')
+    example = anchors['historical_native_tick_precision_example']
+    received_example = read(example['byte_equal_copy'])
+    native_ticks = received_example['native_birth_ticks']
+    need(example['original']['sha256'] == example['byte_equal_copy']['sha256']
+         and native_ticks == example['exact_native_ticks']
+         and native_ticks - native_ticks % 10 == cim_birth_ticks(received_example['identity']),
+         'Actual historical native/CIM precision example, never present observer authority')
+    return anchors
+
+
+def reviewed_code(review_ref):
+    review = read(review_ref)
+    need(review.get('schema') == 'hpc-forest-obs4-main-only-closure-preparation-review-v1'
+         and review.get('verified_source_preparation_only') is True and review.get('blocking_findings') == []
+         and review.get('permitted_effect_ids') == [MAIN]
+         and review.get('no_services_or_foreign_stop') is True, 'Independent reviewed preparation is NON_ADMIS/missing')
+    paths = {'garder-fermeture-observateur-r2.py': CODE / 'garder-fermeture-observateur-r2.py',
+             'fermer-main-observateur-r2.ps1': CODE / 'fermer-main-observateur-r2.ps1',
+             'ANCRAGES-FROIDS-EXACTS.json': HERE / 'ANCRAGES-FROIDS-EXACTS.json'}
+    need(set(review.get('reviewed_files', {})) == set(paths), 'Exact independently reviewed helper set')
+    for name, expected in review['reviewed_files'].items():
+        need(digest(raw(paths[name])) == expected, 'Reviewed helper bytes changed')
+    return review
+
+
+def pure_capacity():
+    code = raw(CAPACITY)
+    need(digest(code) == CAPACITY_SHA, 'Qualified pure zero-worker gate changed')
+    names = {'need','metadata','timestamp_z','complete_cim','native_definitions','classify_zero','digest','ordinary_absence'}
+    nodes = [n for n in ast.parse(code).body if isinstance(n, ast.FunctionDef) and n.name in names]
+    need({n.name for n in nodes} == names, 'Closed pure capacity definitions')
+    observer = CHAIN / 'observer/observer-mixte.py'
+    detector = CHAIN / 'launcher/native_worker_detection.py'
+    ns = {'Path': Path, 'os': os, 'stat': stat, 'time': time, 're': re, 'math': math, 'ast': ast,
+          'datetime': datetime, 'UTC': UTC, 'hashlib': hashlib, 'FIELDS': FIELDS,
+          'OBSERVER': observer, 'DETECTOR': detector,
+          'OBSERVER_SHA': 'db24bef9282b510642dbc23d527c32f1a5515df9791d255f920d7e326db32180',
+          'DETECTOR_SHA': '07fb437746064f20d0be33fcef748d1f9b0f0028214f02a042540d97e4c51766',
+          'LOCAL_CACHES': [PREP / ('lancement-modeles-max-r3/worker-' + s) for s in SESSIONS]}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(CAPACITY), 'exec'), ns)
+    api = ns['native_definitions'](raw(observer), raw(detector))
+    return ns, api
+
+
+def complete_current(census_ref):
+    census = read(census_ref)
+    now = time.time()
+    ns, api = pure_capacity()
+    rows = ns['complete_cim'](census, now)
+    need(0 <= now - census['observed_at'] <= 45, 'Closure requires full census age <=45 seconds, never increased')
+    ns['classify_zero'](rows, api)
+    caches = [ns['ordinary_absence'](PREP / ('lancement-modeles-max-r3/worker-' + s)) for s in SESSIONS]
+    return census, rows, caches
+
+
+def graph_state(rows, anchors, *, final=False):
+    old = {r['ProcessId']: r for r in anchors['contextual_identities']}
+    by_pid = {r['ProcessId']: r for r in rows}
+    present, absent, reused = [], [], []
+    for pid, expected in old.items():
+        actual = by_pid.get(pid)
+        if actual is None:
+            absent.append(pid)
+        elif actual == expected:
+            identity(actual); creation(actual)
+            present.append(pid)
+        else:
+            reused.append(actual)
+    # Full command identity also prevents an equivalent renamed/restarted observer from
+    # being certified absent. Opaque Python rows already refused by both capacity gates.
+    observer_script = str(CHAIN / 'observer/observer-mixte.py').replace('/', '\\').casefold()
+    equivalent = [r for r in rows if r['ProcessId'] not in old
+                  and observer_script in (r.get('CommandLine') or '').replace('/', '\\').casefold()
+                  and Path(r.get('ExecutablePath') or '').name.casefold() in {'python.exe','pythonw.exe'}]
+    unknown = []
+    for row in rows:
+        if row['ParentProcessId'] in old and row['ProcessId'] not in old:
+            unknown.append(row)
+    for pid in present:
+        row = old[pid]
+        if pid != LAUNCHER:
+            parent = old.get(row['ParentProcessId'])
+            need(parent is not None and creation(parent) <= creation(row), 'Frozen parent/child chronology')
+            if not final:
+                need(parent['ProcessId'] in present, 'Live descendant without exact live historical parent; no attribution by PPID alone')
+    if not final:
+        need(not reused and not unknown and not equivalent, 'PID reuse/new or foreign descendant/equivalent observer preserved; effect refused')
+        need(MAIN not in present or LAUNCHER in present, 'Main requires exact launcher parent identity')
+    return {'exact_present_ids': present, 'exact_absent_ids': absent,
+            'reused_or_foreign_rows_preserved': reused, 'new_unattributed_descendants_preserved': unknown,
+            'equivalent_observer_rows_preserved': equivalent,
+            'pair_absent': MAIN not in present and LAUNCHER not in present,
+            'all_seven_original_identities_absent': not present,
+            'unresolved_context': bool(reused or unknown or equivalent),
+            'contextual_graph_not_stop_authority': True}
+
+
+def code62():
+    registry_ref = {'path': str(CHAIN / 'COMPONENTS.json'), 'sha256': COMPONENTS_SHA}
+    registry = read(registry_ref)
+    need(len(registry['code_pins']) == 62, 'Frozen62 count')
+    for name, expected in registry['code_pins'].items():
+        need('..' not in Path(name).parts and digest(raw(CHAIN / name)) == expected, 'Frozen62 bytes changed')
+    return registry_ref
+
+
+def stat_lock(path):
+    # Deliberately never call raw/open/access/read on a lock, even after termination.
+    path = Path(path)
+    for parent in path.parents:
+        if parent.exists():
+            s = parent.lstat()
+            need(not stat.S_ISLNK(s.st_mode) and not getattr(s, 'st_file_attributes', 0) & 1024, 'Lock parent reparse')
+    try:
+        s = path.lstat()
+    except FileNotFoundError:
+        return {'path':str(path), 'exists':False, 'bytes_read':False, 'read_attempted':False, 'read_errno':None, 'sha256':None}
+    need(stat.S_ISREG(s.st_mode) and not getattr(s, 'st_file_attributes', 0) & 1024, 'Operational lock must be ordinary or absent')
+    return {'path':str(path), 'exists':True, 'bytes':s.st_size, 'mode':s.st_mode,
+            'dev':s.st_dev, 'ino':s.st_ino, 'mtime_ns':s.st_mtime_ns, 'ctime_ns':s.st_ctime_ns,
+            'bytes_read':False, 'read_attempted':False, 'read_errno':None, 'sha256':None}
+
+
+def validate_passive_state(state):
+    need(isinstance(state, dict) and state.get('schema') == 'hpc-forest-r4b-passive-state-v1'
+         and state.get('passive_only') is True and state.get('active_native_workers') == 0
+         and state.get('scientific_admission') is False and 'science_admitted' not in state,
+         'Exact frozen OBS4 state schema/scientific_admission=false; wrong alias never accepted')
+
+
+def snapshot(output, phase):
+    target = ordinary_output(output / ('preservation-' + phase), new=True)
+    target.mkdir()
+    observer_dir = CHAIN / 'observer'
+    entries = list(observer_dir.iterdir())  # ROOT only: exact owned observer metadata directory.
+    named = [OP / 'preparation-observation-source110-r1/politique-fraiche-parent-02/POLICY-OBS4.json',
+             OP / 'preparation-observation-source110-r1/politique-fraiche-parent-02/ROUTES-OBS4.json',
+             OP / 'preparation-observation-source110-r1/absence-fraiche-parent-02/TRANSITION-OBS3-OBS4.json',
+             OP / 'lancement-observateur-reel-01/stdout.log', OP / 'lancement-observateur-reel-01/stderr.log']
+    paths = [p for p in entries if not lock_name(p)] + named
+    locks = [stat_lock(p) for p in entries if lock_name(p)]
+    if not any(p.name.rstrip(' .').casefold() == 'observer.lock' for p in entries):
+        locks.append(stat_lock(observer_dir / 'observer.lock'))
+    inventory = []
+    for index, path in enumerate(paths):
+        s = path.lstat()
+        need(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and not getattr(s, 'st_file_attributes', 0) & 1024,
+             'Observer metadata subtree/special/reparse/alias refused; no recursive copy')
+        data = raw(path)
+        copied = target / ('opaque-%03d.bin' % index)
+        with ordinary_output(copied, new=True).open('xb') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        need(raw(path) == data == raw(copied), 'Metadata changed during named opaque copy')
+        inventory.append({'source':str(path), 'received':str(copied), 'bytes':len(data), 'sha256':digest(data)})
+    for item in inventory:
+        need(digest(raw(item['source'])) == item['sha256'] == digest(raw(item['received'])), 'Metadata changed within complete snapshot')
+    need({p.name for p in observer_dir.iterdir()} == {p.name for p in entries}, 'Observer metadata directory changed during snapshot')
+    # State/cache contents are preserved; they confer no terminal/lifecycle permission.
+    state = _decode(raw(observer_dir / 'observer-state.json'))
+    validate_passive_state(state)
+    return {'schema':'hpc-forest-obs4-named-ordinary-metadata-preservation-v1', 'phase':phase,
+            'files':inventory, 'ordinary_files':len(inventory), 'locks_stat_only':locks,
+            'stable_source_and_copy_within_this_snapshot':True,
+            'cross_snapshot_state_bytes_claimed_equal':False,
+            'lock_bytes_preserved_or_read_claimed':False,
+            'state_terminal_route_or_lifecycle_admission':False}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--mode', required=True, choices=['review-check','prepare','recheck','finalize'])
+    parser.add_argument('--review', type=Path, required=True)
+    parser.add_argument('--review-sha256', required=True)
+    parser.add_argument('--cim', type=Path)
+    parser.add_argument('--cim-sha256')
+    parser.add_argument('--output-directory', type=Path)
+    parser.add_argument('--plan', type=Path)
+    parser.add_argument('--plan-sha256')
+    parser.add_argument('--action', type=Path)
+    parser.add_argument('--action-sha256')
+    args = parser.parse_args()
+    initialize_io()
+    review_ref = {'path':str(args.review), 'sha256':args.review_sha256}
+    reviewed_code(review_ref)
+    anchors = checked_anchors()
+    if args.mode == 'review-check':
+        print(json.dumps({'verified_preparation_review':True,'permitted_effect_ids':[MAIN]})); return
+    need(args.cim is not None and args.cim_sha256 is not None and args.output_directory is not None, 'Actual future ROOT input required')
+    output = ordinary_output(args.output_directory)
+    need(output.parent == HERE and output.is_dir(), 'Exact new execution direct child must be created by ROOT PS')
+    census_ref = {'path':str(args.cim),'sha256':args.cim_sha256}
+    census, rows, cache_absence = complete_current(census_ref)
+    frozen62 = code62()
+    state = graph_state(rows, anchors, final=args.mode == 'finalize')
+    if args.mode == 'prepare':
+        preserved = snapshot(output, 'avant')
+        # Verify freshness again after copying metadata; never extend the45s limit.
+        complete_current(census_ref)
+        plan = {'schema':'hpc-forest-obs4-main-only-actual-closure-plan-v1', 'verified_metadata_only':True,
+                'review':review_ref, 'cold_anchors':reference(HERE / 'ANCRAGES-FROIDS-EXACTS.json'),
+                'frozen62':frozen62, 'fresh_full_cim':census_ref, 'graph_state':state,
+                'main_identity':next(r for r in anchors['contextual_identities'] if r['ProcessId'] == MAIN),
+                'effect_targets':[MAIN], 'cache_absence':cache_absence, 'metadata_preservation':preserved,
+                'recursive_or_name_stop':False, 'services_or_foreign_stop_permitted':False,
+                'actual_effect_or_absence21_or_native_admission_claimed':False,
+                'created_at_utc':datetime.now(UTC).isoformat()}
+        print(json.dumps(save(output / 'PLAN-ACTUEL-MAIN-SEUL.json', plan))); return
+    need(args.plan is not None and args.plan_sha256 is not None, 'Actual ROOT prepared plan required')
+    plan_ref = {'path':str(args.plan),'sha256':args.plan_sha256}
+    plan = read(plan_ref)
+    need(Path(args.plan).parent == output and plan['schema'] == 'hpc-forest-obs4-main-only-actual-closure-plan-v1'
+         and plan['review'] == review_ref and plan['cold_anchors'] == reference(HERE / 'ANCRAGES-FROIDS-EXACTS.json')
+         and plan['frozen62'] == frozen62 and plan['effect_targets'] == [MAIN], 'Actual reviewed plan binding')
+    for item in plan['metadata_preservation']['files']:
+        need(digest(raw(item['received'])) == item['sha256'], 'Pre-stop copy changed; source state may legitimately have advanced')
+    if args.mode == 'recheck':
+        complete_current(census_ref)
+        value = {'schema':'hpc-forest-obs4-main-only-fresh-pre-effect-gate-v1','verified_metadata_only':True,
+                 'plan':plan_ref,'fresh_full_cim':census_ref,'graph_state':state,'cache_absence':cache_absence,
+                 'created_at_utc':datetime.now(UTC).isoformat(),'effects_executed':False}
+        print(json.dumps(save(output / ('PREVOL-' + str(time.time_ns()) + '.json'), value))); return
+    need(args.action is not None and args.action_sha256 is not None, 'Known actual stop/natural outcome required')
+    action_ref = {'path':str(args.action),'sha256':args.action_sha256}
+    action = read(action_ref)
+    need(Path(args.action).parent == output and action['schema'] == 'hpc-forest-obs4-main-only-action-v1'
+         and action['plan'] == plan_ref and action['identity'] == plan['main_identity']
+         and action['outcome'] in ('natural_exit_observed','single_held_handle_termination_returned_and_exit_observed')
+         and action['automatic_retry_allowed'] is False, 'No UNKNOWN outcome may finalize; preserve and reconcile manually')
+    if action['outcome'] == 'single_held_handle_termination_returned_and_exit_observed':
+        intent = read(action['intent'])
+        need(Path(action['intent']['path']) == HERE / 'INTENTION-UNIQUE-OBS4-28416.json'
+             and intent['schema'] == 'hpc-forest-obs4-main-only-durable-effect-intent-v1'
+             and intent['plan'] == plan_ref and intent['identity'] == plan['main_identity']
+             and intent['effect_targets'] == [MAIN] and action['termination_issued'] is True
+             and action['native_call_count'] == 1 and action['held_handle_identity_verified'] is True,
+             'One exclusive durable ROOT intent and one held native effect required')
+        native_ticks = intent['native_birth_ticks']
+        need(type(native_ticks) is int and native_ticks - native_ticks % 10 == cim_birth_ticks(plan['main_identity'])
+             and intent['cim_creation_quantum_100ns_ticks'] == 10 and action['native_birth_ticks'] == native_ticks,
+             'Exact held native birth and deterministic CIM microsecond projection; never an absolute tolerance')
+    else:
+        need(action['termination_issued'] is False and action['native_call_count'] == 0,
+             'Natural exit must never be reported as caused by a termination')
+    preserved = snapshot(output, 'apres')
+    complete_current(census_ref)
+    closed = state['pair_absent'] and state['all_seven_original_identities_absent'] and not state['unresolved_context']
+    final = {'schema':'hpc-forest-obs4-main-only-owned-passive-closure-v1','verified_metadata_only':closed,
+             'verified_owned_observer_absence':closed,'plan':plan_ref,'review':review_ref,'action':action_ref,
+             'final_full_cim':census_ref,'graph_state':state,'cache_absence':cache_absence,
+             'metadata_preservation_before':plan['metadata_preservation'],'metadata_preservation_after':preserved,
+             'frozen62':frozen62,'only_main28416_ever_permitted_as_effect':True,
+             'services_naturally_absent':state['all_seven_original_identities_absent'],
+             'foreign_and_unresolved_preserved_no_effect':True,
+             'observer_lock_bytes_before_unknown_retained':True,'observer_lock_read':False,
+             'new_watcher_started':False,'native_or_model_or_R7_or_scientific_or_performance_admission':False,
+             'OBS4_terminal_routes_promoted_or_modified':False,'automatic_retry_or_followup_effect_allowed':False,
+             'current_state_after_observation_promised':False,'observed_at_utc':datetime.now(UTC).isoformat()}
+    filename = 'FERMETURE-OBSERVATEUR-PASSIF-VERIFIEE.json' if closed else 'PAIRE-OU-CONTEXTE-RESTANT-PRESERVE.json'
+    print(json.dumps(save(output / filename, final)))
+
+
+if __name__ == '__main__':
+    main()

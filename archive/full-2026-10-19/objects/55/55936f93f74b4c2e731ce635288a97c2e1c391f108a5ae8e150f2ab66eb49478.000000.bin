@@ -1,0 +1,189 @@
+#include <iostream>
+#include <vector>
+#include <utility>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+struct adjacency_matrix {
+    size_t vertices;
+    size_t stride;
+    vector<unsigned char> entries;
+
+    explicit adjacency_matrix(size_t count)
+        : vertices(count), stride(((count + 15) / 16) * 16),
+          entries(count * stride, 0) {}
+
+    size_t size() const { return vertices; }
+
+    unsigned char *row(size_t index) {
+        return entries.data() + index * stride;
+    }
+
+    const unsigned char *row(size_t index) const {
+        return entries.data() + index * stride;
+    }
+};
+
+struct permutation_witness {
+    size_t first;
+    size_t second;
+    bool valid;
+
+    permutation_witness() : first(0), second(0), valid(false) {}
+
+    void record(size_t a, size_t b) {
+        first = a < b ? a : b;
+        second = a < b ? b : a;
+        valid = true;
+    }
+
+    bool affected_by_swap(size_t low, size_t high) const {
+        if (!valid) return true;
+        // Every Heap swap supplies low < high.
+        if (high < first) return false;
+        return low == first || low == second ||
+               high == first || high == second;
+    }
+};
+
+adjacency_matrix readGraph();
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2);
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2,
+                       const vector<unsigned char> &equivalence,
+                       permutation_witness &witness);
+inline void printPermutation(const vector<unsigned char> &equivalence, size_t vertices);
+
+int main() {
+    adjacency_matrix g1 = readGraph();
+    adjacency_matrix g2 = readGraph();
+
+    if (!testIsomorphism(g1, g2))
+        cout << "The graphs are not isomorphic" << endl;
+
+    return 0;
+}
+
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2) {
+    // Valid vertex indices fit in a byte. Padding supplies inactive SIMD lanes.
+    vector<unsigned char> equivalence(g1.size() + 16, 255);
+    vector<int> exchange_counter(g1.size(), 0);
+    permutation_witness witness;
+    int exchange_index = 1;
+    bool isomorphism_found = false;
+
+    if (g1.size() != g2.size()) return false;
+
+    for (size_t i = 0; i < g1.size(); ++i)
+        equivalence[i] = static_cast<unsigned char>(i);
+
+    if (verifyPermutation(g1, g2, equivalence, witness)) {
+        printPermutation(equivalence, g1.size());
+        return true;
+    }
+
+    /*
+     * Permutations are based on Heap's algorithm, which generates all possible
+     * permutations for a given set of elements.
+     */
+    while (exchange_index < g1.size()) {
+        if (exchange_counter[exchange_index] < exchange_index) {
+            const size_t exchange_partner = exchange_index % 2 == 0
+                ? 0 : static_cast<size_t>(exchange_counter[exchange_index]);
+            swap(equivalence[exchange_partner], equivalence[exchange_index]);
+
+            // An untouched counterexample remains a counterexample after the swap.
+            if (witness.affected_by_swap(exchange_partner,
+                                         static_cast<size_t>(exchange_index)) &&
+                verifyPermutation(g1, g2, equivalence, witness)) {
+                printPermutation(equivalence, g1.size());
+                isomorphism_found = true;
+            }
+
+            exchange_counter[exchange_index]++;
+            exchange_index = 1;
+        } else {
+            exchange_counter[exchange_index] = 0;
+            exchange_index++;
+        }
+    }
+    return isomorphism_found;
+}
+
+adjacency_matrix readGraph() {
+    int vertices, edges, source, destination;
+
+    cin >> vertices;
+    adjacency_matrix graph(static_cast<size_t>(vertices));
+
+    cin >> edges;
+    for (int i = 0; i < edges; ++i) {
+        cin >> source >> destination;
+        graph.row(source)[destination] = 1;
+        graph.row(destination)[source] = 1;
+    }
+
+    return graph;
+}
+
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2,
+                       const vector<unsigned char> &equivalence,
+                       permutation_witness &witness) {
+    const size_t vertices = g1.size();
+
+    if (witness.valid) {
+        if (g1.row(witness.first)[witness.second] !=
+            g2.row(equivalence[witness.first])[equivalence[witness.second]])
+            return false;
+        // Repairing one pair never establishes acceptance.
+        witness.valid = false;
+    }
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    if (vertices <= 16) {
+        const uint8x16_t permutation = vld1q_u8(equivalence.data());
+        const uint8x16_t column_numbers = {
+            1, 2, 3, 4, 5, 6, 7, 8,
+            9, 10, 11, 12, 13, 14, 15, 16
+        };
+        for (size_t remaining = vertices; remaining != 0; --remaining) {
+            const size_t i = remaining - 1;
+            const uint8x16_t expected = vld1q_u8(g1.row(i));
+            const uint8x16_t source = vld1q_u8(g2.row(equivalence[i]));
+            const uint8x16_t actual = vqtbl1q_u8(source, permutation);
+            // Adjacency XOR bytes are 0 or 1. Weighted maximum identifies
+            // the highest mismatching column plus one; padded bytes stay zero.
+            const unsigned int mismatch_column = vmaxvq_u8(
+                vmulq_u8(veorq_u8(expected, actual), column_numbers));
+            if (mismatch_column != 0) {
+                witness.record(i, static_cast<size_t>(mismatch_column - 1));
+                return false;
+            }
+        }
+        return true;
+    }
+#endif
+
+    for (size_t remaining = vertices; remaining != 0; --remaining) {
+        const size_t i = remaining - 1;
+        const unsigned char *row1 = g1.row(i);
+        const unsigned char *row2 = g2.row(equivalence[i]);
+        for (size_t columns = i + 1; columns != 0; --columns) {
+            const size_t j = columns - 1;
+            if (row1[j] != row2[equivalence[j]]) {
+                witness.record(i, j);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+inline void printPermutation(const vector<unsigned char> &equivalence, size_t vertices) {
+    for (size_t i = 0; i < vertices; ++i)
+        cout << static_cast<unsigned int>(equivalence[i]) << " ";
+    cout << endl;
+}

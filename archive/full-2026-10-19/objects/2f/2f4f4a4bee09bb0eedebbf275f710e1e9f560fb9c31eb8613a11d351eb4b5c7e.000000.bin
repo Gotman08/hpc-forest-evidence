@@ -1,0 +1,648 @@
+"""Data-only Q15 to native bridge. Never imports or executes received source."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import io
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
+import stat
+import tarfile
+import tempfile
+import zipfile
+
+SCHEMA = "hpc-forest-Q15-native-bridge-input-v1"
+QSCOPE = "hpc-forest-matrix15-baseline-qualification-r1"
+NSCOPE = "hpc-forest-matrix15-native-max-r2"
+SUBJECTS = ("2023-count", "2020-tropical", "2020-quicksort", "2020-permutations", "2020-graph",
+            "2021-graph", "2021-metrics", "2021-sokoban", "2021-jacobi", "2022-knn", "2022-sum",
+            "2022-nbody", "2022-bucketsort", "2023-sum", "2023-npbonacci")
+MODELS = ("gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "gpt-5.6-terra")
+PINS = {"PROTOCOL_SHA256": "ae2ccbb8d10f54d022bb95248412d0fba8751b8f1c97196336e6e6b9f1fb08b2",
+        "R1_CONTRACTS_SHA256": "fd36a6c9bdd35845834053d92b83fa58c688c02f0b6443b7a2edfded96956bdf",
+        "HARNESS_SHA256": "c9a9e1f25fd6c1ae603b7b29d52f9e4c505a2c5df49fbb0eb1362a5691c4aa1b"}
+SOURCE_PINS = {"src/hpc_forest/native_matrix15.py": "7cd89d37dec6da660d4c5942054444fa789cb944c69fa9b34dad02b70a426e32",
+               "src/hpc_forest/matrix15_contract.py": "aef3c33b4123330a411b426b1ede766c33f95e784d94344df56c66f7e698928c"}
+Q_DELTA = {"src/hpc_forest/matrix15_provenance.py": {
+               "q": "c5d1b7f45dd126899b48b547b245e5d8da4e8088cdf88e73094687af56639e9b",
+               "native": "7d38449b45e3ebe755d438a6a97681478b44f817deba0fd296cc4c578b4ee818"},
+           "src/hpc_forest/matrix15_qualification.py": {
+               "q": "5dcc79a2e76c6bad956b29581e1b45abfabce1b8694c352759e0d2598bbd6a13", "native": None}}
+COMMON = {"scope_id", "subject_id", "source_zip_sha256", "plan_sha256", "preparation_manifest_sha256", "r1_contract_sha256"}
+QFIELDS = COMMON | {"schema", "verified", "observation_mode", "allocation", "native_model_calls",
+    "r1_paired_contract_verified", "execution_semantics_changed", "independent_raw_stdout_per_candidate_verified",
+    "independent_performance_audit_verified", "prepared_contract", "prepared_root", "prepared_files", "evidence_refs"}
+LIMITS = ("execution_semantics_changed", "independent_raw_stdout_per_candidate_verified", "independent_performance_audit_verified")
+RESOURCES = {"nodes": 1, "tasks": 1, "cpus_per_task": 4, "memory_mib": 16384, "gpus": 0}
+REF_NAMES = {"source_archive", "source_manifest", "source_plan", "source_preparation", "output_archive",
+             "archive_announcement", "archive_transfer", "announcement_transfer", "status", "efficiency"}
+SHA = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class Refusal(ValueError):
+    pass
+
+
+def need(ok, why):
+    if not ok:
+        raise Refusal(why)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+
+
+def data(value):
+    return canonical(value) + b"\n"
+
+
+def parse(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, "Duplicate JSON key")
+            result[key] = value
+        return result
+    def forbidden(_):
+        raise Refusal("Nonfinite JSON constant")
+    def floating(value):
+        number = float(value)
+        need(math.isfinite(number), "Nonfinite JSON number")
+        return number
+    try:
+        value = json.loads(raw.decode("utf8"), object_pairs_hook=pairs,
+                           parse_constant=forbidden, parse_float=floating)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise Refusal("Malformed UTF8 JSON") from exc
+    need(type(value) is dict, "JSON object required")
+    return value
+
+
+def relative(name):
+    need(type(name) is str and bool(name), "Relative member name required")
+    pure = PurePosixPath(name)
+    need(not pure.is_absolute() and pure.as_posix() == name and ".." not in pure.parts
+         and not any(c in name for c in ("\\", ":", "\x00", "\r", "\n")), "Unsafe member name")
+    return pure
+
+
+def local_path(value, *, exists=True, directory=False):
+    need(type(value) is str and bool(value), "Explicit local path required")
+    path = Path(value)
+    need(path.is_absolute() and ".." not in path.parts, "Absolute local path required")
+    need(not any(p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents)), "Linked path refused")
+    if exists:
+        need(path.is_dir() if directory else path.is_file(), "Missing concrete local artifact")
+        if not directory:
+            need(stat.S_ISREG(path.stat().st_mode), "Nonregular local artifact")
+    return path
+
+
+def reference(value, *, sizes=False):
+    fields = {"path", "sha256", "bytes"} if sizes else {"path", "sha256"}
+    return (type(value) is dict and set(value) == fields and type(value["path"]) is str and bool(value["path"])
+            and type(value["sha256"]) is str and SHA.fullmatch(value["sha256"]) is not None
+            and (not sizes or (type(value["bytes"]) is int and value["bytes"] >= 0)))
+
+
+def ref2(value):
+    need(reference(value) or reference(value, sizes=True), "Exact reference required")
+    return {key: value[key] for key in ("path", "sha256")}
+
+
+class Snapshots:
+    def __init__(self):
+        self.files = {}
+        self.directories = {}
+
+    def read(self, ref, *, sizes=False):
+        need(reference(ref, sizes=sizes), "Exact SHA-bound reference required")
+        path = local_path(ref["path"])
+        need(path.stat().st_size <= 128 * 1024 * 1024, "Oversized local artifact")
+        raw = path.read_bytes()
+        need(sha(raw) == ref["sha256"] and (not sizes or len(raw) == ref["bytes"]), "Changed artifact bytes/digest")
+        prior = self.files.setdefault(str(path), raw)
+        need(prior == raw, "Artifact changed between reads")
+        return raw
+
+    def json(self, ref, *, sizes=False):
+        return parse(self.read(ref, sizes=sizes))
+
+    def inventory(self, root):
+        root = local_path(str(root), directory=True)
+        result = {}
+        for path in sorted(root.rglob("*")):
+            local_path(str(path), directory=path.is_dir())
+            if path.is_file():
+                relative(path.relative_to(root).as_posix())
+                need(path.stat().st_size <= 128 * 1024 * 1024, "Oversized inventory member")
+                raw = path.read_bytes()
+                self.files.setdefault(str(path), raw)
+                need(self.files[str(path)] == raw, "Inventory member changed")
+                result[path.relative_to(root).as_posix()] = sha(raw)
+        need(len(result) <= 10000, "Unbounded inventory")
+        previous = self.directories.setdefault(str(root), result)
+        need(previous == result, "Inventory changed during bridge")
+        return result
+
+    def stable(self):
+        for name, raw in list(self.files.items()):
+            need(local_path(name).read_bytes() == raw, "Input changed before bridge seal")
+        for root, expected in list(self.directories.items()):
+            need(self.inventory(root) == expected, "Directory changed before bridge seal")
+
+
+def tar_members(raw, prefix=None):
+    need(len(raw) <= 128 * 1024 * 1024, "Archive compressed bound exceeded")
+    result, total, folded, parents = {}, 0, set(), {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+        for member in archive:
+            name = member.name.rstrip("/") if member.isdir() else member.name
+            pure = relative(name)
+            need(member.type in {tarfile.REGTYPE, tarfile.AREGTYPE} and not member.sparse
+                 and not archive.pax_headers, "Archive special member or global PAX refused")
+            for key, value in member.pax_headers.items():
+                if key == "path":
+                    need(value == member.name, "PAX path override differs")
+                elif key in {"mtime", "atime", "ctime"}:
+                    try:
+                        need(math.isfinite(float(value)), "Nonfinite PAX time")
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        raise Refusal("Malformed PAX time") from exc
+                else:
+                    raise Refusal("Unsafe PAX metadata")
+            if prefix is not None:
+                need(pure.parts[0] == prefix, "Archive prefix differs")
+                name = "/".join(pure.parts[1:])
+                if not name:
+                    need(member.isdir(), "Archive prefix root must be directory")
+                    continue
+                relative(name)
+            lower = name.casefold()
+            need(lower not in folded and lower not in parents, "Archive duplicate/case collision")
+            for parent in PurePosixPath(name).parents:
+                if str(parent) == ".":
+                    continue
+                p = str(parent)
+                need(p.casefold() not in folded and parents.get(p.casefold(), p) == p, "Archive parent/case collision")
+                parents[p.casefold()] = p
+            folded.add(lower)
+            need(member.isfile() and name not in result and 0 <= member.size <= 128 * 1024 * 1024, "Nonregular/duplicate/oversized archive member")
+            total += member.size
+            need(total <= 512 * 1024 * 1024 and len(result) < 10000, "Archive expanded bound exceeded")
+            payload = archive.extractfile(member).read()
+            need(len(payload) == member.size, "Truncated archive member")
+            result[name] = payload
+    return result
+
+
+def zip_members(raw):
+    result, total = {}, 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        for info in archive.infolist():
+            name = info.filename.rstrip("/") if info.is_dir() else info.filename
+            pure = relative(name)
+            need(pure.parts[0] == "HPC-Forest", "Native ZIP prefix differs")
+            mode = info.external_attr >> 16
+            need(not stat.S_ISLNK(mode) and not (mode & 0o170000 and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))), "Native ZIP special member refused")
+            name = "/".join(pure.parts[1:])
+            if info.is_dir():
+                continue
+            relative(name)
+            need(name not in result and info.file_size <= 128 * 1024 * 1024, "Native ZIP duplicate/oversized member")
+            total += info.file_size
+            need(total <= 512 * 1024 * 1024 and len(result) < 2000, "Native ZIP bounds exceeded")
+            result[name] = archive.read(info)
+    return result
+
+
+def literals(raw):
+    """Read literal assignments as data; no compile/eval/import."""
+    tree = ast.parse(raw.decode("utf8"))
+    result = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            try:
+                result[node.targets[0].id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                pass
+    return result
+
+
+def aliases_valid(aliases, source_sha, preparation_sha):
+    need(set(aliases) == {"schema", "scope_id", "source_zip_sha256", "preparation_manifest_sha256", "entries"}
+         and aliases["schema"] == "hpc-forest-matrix15-artifact-aliases-v2" and aliases["scope_id"] == NSCOPE
+         and aliases["source_zip_sha256"] == source_sha and aliases["preparation_manifest_sha256"] == preparation_sha,
+         "Native aliases source/preparation binding differs")
+    need(type(aliases["entries"]) is list and len(aliases["entries"]) <= 2000, "Bounded aliases required")
+    owners = {}
+    for i, entry in enumerate(aliases["entries"]):
+        need(type(entry) is dict and entry.get("kind") in {"file", "directory"}, "Typed alias required")
+        common = {"kind", "canonical_path", "windows_path", "arm_path"}
+        extra = {"sha256"} if entry["kind"] == "file" else {"subject_id", "role", "inventory_prefix", "inventory_sha256"}
+        need(set(entry) == common | extra, "Exact alias fields required")
+        for field in ("canonical_path", "windows_path", "arm_path"):
+            path = entry[field]
+            need(type(path) is str and path and not any(c in path for c in ("\0", "\r", "\n")), "Malformed alias path")
+            win = PureWindowsPath(path)
+            posix = PurePosixPath(path)
+            is_win = win.is_absolute() and re.match(r"^[A-Za-z]:[/\\]", path) is not None
+            need((is_win and ".." not in win.parts) or
+                 (posix.is_absolute() and ".." not in posix.parts and "\\" not in path and posix.as_posix() == path), "Noncanonical alias path")
+            if field == "windows_path":
+                need(is_win, "Windows alias must be drive-absolute")
+            if field == "arm_path":
+                need(not is_win, "ARM alias must be POSIX-absolute")
+            identity = ("windows", win.as_posix().casefold()) if is_win else ("arm", path)
+            need(identity not in owners or owners[identity] == i, "Ambiguous alias identity")
+            owners[identity] = i
+        if entry["kind"] == "file":
+            need(type(entry["sha256"]) is str and SHA.fullmatch(entry["sha256"]), "Bad alias digest")
+        else:
+            need(entry["subject_id"] in SUBJECTS and entry["role"] in {"official", "source", "validation"}
+                 and type(entry["inventory_sha256"]) is str and SHA.fullmatch(entry["inventory_sha256"]), "Bad directory alias")
+            relative(entry["inventory_prefix"])
+    return aliases
+
+
+def matches(path, entry):
+    win = PureWindowsPath(path)
+    return any(path == entry[key] or (win.is_absolute() and PureWindowsPath(entry[key]).is_absolute()
+        and win.as_posix().casefold() == PureWindowsPath(entry[key]).as_posix().casefold())
+        for key in ("canonical_path", "windows_path", "arm_path"))
+
+
+def file_alias(ref, aliases):
+    need(reference(ref), "Exact artifact reference required")
+    rows = [entry for entry in aliases["entries"] if entry["kind"] == "file" and matches(ref["path"], entry)]
+    need(len(rows) == 1 and rows[0]["sha256"] == ref["sha256"], "Missing exact upstream file alias")
+    return {"path": rows[0]["windows_path"], "sha256": ref["sha256"]}
+
+
+def aliased_json(ref, aliases, snapshots):
+    return snapshots.json(file_alias(ref, aliases))
+
+
+def directory(subject, role, canonical_path, prep, aliases, snapshots):
+    rows = [entry for entry in aliases["entries"] if entry["kind"] == "directory"
+            and entry["subject_id"] == subject and entry["role"] == role and matches(canonical_path, entry)]
+    need(len(rows) == 1, "Missing or ambiguous subject/role directory alias")
+    row = rows[0]
+    prefix = row["inventory_prefix"] + "/"
+    expected = {name[len(prefix):]: digest for name, digest in prep["files"].items() if name.startswith(prefix)}
+    need(expected and sha(canonical(expected)) == row["inventory_sha256"], "Preparation projection digest differs")
+    need(snapshots.inventory(row["windows_path"]) == expected, "Preparation projection bytes differ")
+    expected_dirs = {parent.as_posix() for name in expected for parent in PurePosixPath(name).parents}
+    actual_root = Path(row["windows_path"])
+    need(all(path.relative_to(actual_root).as_posix() in expected_dirs for path in actual_root.rglob("*") if path.is_dir()),
+         "Extra directory outside exact native preparation inventory")
+    return row, expected
+
+
+def native_static(ref, snapshots):
+    statics = snapshots.json(ref)
+    need(set(statics) == {"schema", "artifacts"} and statics["schema"] == "hpc-forest-matrix15-native-static-package-v1", "Native statics schema differs")
+    refs = statics["artifacts"]
+    need(set(refs) == {"artifact_aliases", "harness", "plan", "preparation_manifest", "primes_release", "r1_contracts", "runtime_manifest", "source_zip"}, "Native static references differ")
+    blobs = {key: snapshots.read(value) for key, value in refs.items()}
+    plan, prep, aliases = (parse(blobs[key]) for key in ("plan", "preparation_manifest", "artifact_aliases"))
+    runtime = parse(blobs["runtime_manifest"])
+    zip_files = zip_members(blobs["source_zip"])
+    need({key: sha(value) for key, value in zip_files.items()} == runtime, "Native runtime ZIP differs from exact manifest")
+    need(all(runtime.get(name) == digest for name, digest in SOURCE_PINS.items()), "Reviewed native v2 source pins changed")
+    contract = literals(zip_files["src/hpc_forest/matrix15_contract.py"])
+    need(contract.get("SCOPE") == NSCOPE and contract.get("SUBJECTS") == SUBJECTS and contract.get("MODELS") == MODELS
+         and contract.get("EFFORT") == "max" and all(contract.get(key) == value for key, value in PINS.items()), "Native contract literal invariants changed")
+    need(set(plan) == contract["PLAN_FIELDS"] and plan["schema"] == "hpc-forest-matrix15-native-max-plan-v2"
+         and plan["scope_id"] == NSCOPE and plan["models"] == list(MODELS) and plan["subjects"] == list(SUBJECTS)
+         and plan["efforts"] == ["max"], "Native plan closure differs")
+    need(type(plan["cells"]) is list and len(plan["cells"]) == 60 and
+         {row["cell_key"]: row for row in plan["cells"]} == contract["REGISTERED_CELLS"], "Sixty exact registered native cells required")
+    need(plan["budgets_per_cell"] == contract["BUDGETS"] and plan["target"] == contract["TARGET"]
+         and all(type(plan["budgets_per_cell"][key]) is type(value) for key, value in contract["BUDGETS"].items())
+         and all(type(plan["target"][key]) is type(value) for key, value in contract["TARGET"].items())
+         and plan["maximum_native_workers_total"] == 4 and type(plan["maximum_native_workers_total"]) is int
+         and plan["maximum_cells_per_authorization"] == 1 and type(plan["maximum_cells_per_authorization"]) is int
+         and plan["automatic_extension"] is False and plan["exclusive_deadline_utc"] == "2026-10-31T23:00:00Z"
+         and plan["reception_audit_reserve_seconds"] == 10800, "Native budgets/target/deadline/gates differ")
+    need(plan["scientific_contract"] == "exact-R1-harness-mixed-calibration-only-excluded", "Native scientific contract differs")
+    for key in ("preparation_manifest", "runtime_manifest", "r1_contracts", "harness", "artifact_aliases", "primes_release"):
+        need(plan[key] == refs[key], "Native plan static reference differs: " + key)
+    need(plan["source_zip_sha256"] == refs["source_zip"]["sha256"], "Native plan source differs")
+    aliases_valid(aliases, refs["source_zip"]["sha256"], refs["preparation_manifest"]["sha256"])
+    for forbidden in (refs["plan"], refs["artifact_aliases"]):
+        need(not any(entry["kind"] == "file" and matches(forbidden["path"], entry) for entry in aliases["entries"]), "Plan/aliases cannot alias themselves")
+    for key, digest_key in (("protocol", "PROTOCOL_SHA256"), ("r1_contracts", "R1_CONTRACTS_SHA256"), ("harness", "HARNESS_SHA256")):
+        need(plan[key]["sha256"] == PINS[digest_key], "Registered native immutable reference differs")
+        snapshots.read(file_alias(plan[key], aliases))
+    need(type(prep.get("files")) is dict and len(prep["files"]) == 196 and set(prep.get("records", {})) == set(SUBJECTS), "Original preparation196 required")
+    for name, digest in prep["files"].items():
+        relative(name)
+        need(type(digest) is str and SHA.fullmatch(digest), "Bad preparation digest")
+    need(set(plan["subject_bindings"]) == set(SUBJECTS), "Fifteen native subject bindings required")
+    r1 = parse(blobs["r1_contracts"])
+    projected = {}
+    for subject in SUBJECTS:
+        row, record = plan["subject_bindings"][subject], prep["records"][subject]
+        need(set(row) == contract["SUBJECT_FIELDS"] and row["subject_id"] == subject
+             and row["qualification_ref"] is None and row["reception_ref"] is None, "Native plan must remain upstream of final receipts")
+        need(record.get("status") == "ready" and sha(canonical(record)) == row["preparation_sha256"], "Native subject preparation record differs")
+        need(row["config"].get("codex", {}).get("model") == "{cell.model}" and
+             row["config"].get("codex", {}).get("reasoning_effort") == "max", "Native subject MAX placeholder differs")
+        roles = {}
+        for role, canonical_path in (("official", row["official_preparation_path"]),
+                                     ("source", record["prepared"]["source"]), ("validation", record["prepared"]["validation"])):
+            roles[role] = directory(subject, role, canonical_path, prep, aliases, snapshots)
+        official_root = Path(roles["official"][0]["windows_path"])
+        need(all(Path(roles[role][0]["windows_path"]).is_relative_to(official_root) for role in ("source", "validation")), "Subject role roots are not nested")
+        need(r1.get("subjects", {}).get(subject, {}).get("contract") == row["r1_contract_ref"], "Native R1 contract registry differs")
+        original = aliased_json(row["r1_contract_ref"], aliases, snapshots)
+        prepared_ref = file_alias(row["prepared_contract_ref"], aliases)
+        need(Path(prepared_ref["path"]) == Path(roles["validation"][0]["windows_path"]) / "contract.json", "Prepared contract file projection differs")
+        prepared = snapshots.json(prepared_ref)
+        for value in (original, prepared):
+            if type(value.get("benchmark")) is dict:
+                value["benchmark"].pop("reference_seconds", None)
+        need(original == prepared, "R1 contract semantics differ")
+        snapshots.read(file_alias(row["statement_ref"], aliases))
+        projected[subject] = roles
+    return refs, plan, prep, aliases, runtime, projected
+
+
+def q_baselines(config, snapshots, aliases):
+    audit = snapshots.json(config["q_audit"], sizes=True)
+    need(audit.get("schema") == "hpc-forest-Q15-baseline-cold-audit-v1" and audit.get("scope_id") == QSCOPE
+         and audit.get("verified") is True and audit.get("NEUTRAL") is False
+         and audit.get("neutral_fixture_checks_passed") is False and audit.get("baseline_qualification_only") is True,
+         "Verified real Q cold baseline audit required")
+    need(audit.get("subject_order") == list(SUBJECTS) and audit.get("confirmation_samples") == 75
+         and audit.get("source_package_inventory_unchanged") is True, "Complete immutable Q baseline audit required")
+    for key in ("native_authorization", "native_research_admitted", "scientific_gain_claimed", "individual_case_provenance_verified",
+                "independent_raw_stdout_per_candidate_verified", "independent_performance_audit_verified", "external_executable_bytes_independently_received"):
+        need(audit.get(key) is False, "Q audit overclaims: " + key)
+    for key in ("native_model_calls", "Controller_instances", "Mother_instances", "native_workers_started", "received_programs_or_scripts_executed"):
+        need(type(audit.get(key)) is int and audit[key] == 0, "Q audit contains native/executed activity")
+    need(audit.get("source_reader", {}).get("sha256") == config["reviewed_q_reader_sha256"], "Q reader is not the reviewed reader")
+    snapshots.read(audit["source_reader"], sizes=True)
+    qinput = snapshots.json(audit["reception_input"], sizes=True)
+    need(qinput.get("schema") == "hpc-forest-Q15-baseline-cold-reception-input-v1" and qinput.get("evidence_origin") == "received", "Real Q reception input required")
+    need(audit.get("input_refs") == {key: qinput[key] for key in REF_NAMES}, "Q audit input references differ")
+    inputs = {key: snapshots.read(qinput[key], sizes=True) for key in REF_NAMES}
+    receipt = snapshots.json(config["q_reader_receipt"], sizes=True)
+    need(receipt.get("schema") == "hpc-forest-Q15-cold-reader-receipt-v1" and receipt.get("verified") is True
+         and receipt.get("NEUTRAL") is False and receipt.get("native_authorization") is False
+         and receipt.get("audit") == config["q_audit"] and receipt.get("source_reader") == audit["source_reader"], "Exact real Q cold reader receipt required")
+    need(type(receipt.get("outputs")) is list and len(receipt["outputs"]) == 15, "Fifteen Q subject references required")
+    reception_root = local_path(qinput["reception_directory"], directory=True)
+    need(Path(config["q_audit"]["path"]) == reception_root / "AUDIT-Q15-BASELINES.json"
+         and Path(config["q_reader_receipt"]["path"]) == reception_root / "RECU-LECTEUR-Q15.json", "Q audit/receipt directory identity differs")
+    restored = reception_root / "restauration-neuve"
+    inv = snapshots.inventory(restored)
+    need(len(inv) == audit.get("restoration_files") and
+         sha(data(inv)) == audit.get("restoration_inventory_sha256_before") == audit.get("restoration_inventory_sha256_after"), "Q restoration inventory differs from audited bytes")
+    archive = tar_members(inputs["output_archive"], PurePosixPath(qinput["remote_output_root"]).name)
+    need({name: sha(raw) for name, raw in archive.items()} == inv, "Q archive/restoration bytes differ")
+    result = parse(archive["RESULT-Q15.json"])
+    need(result.get("schema") == "hpc-forest-matrix15-baseline-qualification-result-v1" and result.get("scope_id") == QSCOPE
+         and result.get("allocation") == audit.get("allocation") and result.get("qualified_subjects") == list(SUBJECTS)
+         and result.get("qualification_complete") is True and set(result.get("subjects", {})) == set(SUBJECTS), "Q result differs from audited baseline scope")
+    allocation = audit["allocation"]
+    need(allocation.get("job_id") == qinput["job_id"] == audit.get("job_id") and type(qinput["job_id"]) is str
+         and qinput["job_id"].isdigit() and allocation.get("machine") in {"aarch64", "arm64"}
+         and all(type(allocation.get(key)) is int and allocation[key] == value for key, value in RESOURCES.items()), "Actual Q ARM allocation differs")
+    package = local_path(qinput["package_directory"], directory=True)
+    qinv = snapshots.inventory(package)
+    manifest, qplan = parse(inputs["source_manifest"]), parse(inputs["source_plan"])
+    need(qinv == {**manifest["files"], "PACKAGE-MANIFEST.json": qinput["source_manifest"]["sha256"]}
+         and sha(data(qinv)) == audit.get("source_package_inventory_sha256"), "Q source package inventory differs")
+    need({name: sha(raw) for name, raw in tar_members(inputs["source_archive"]).items()} == qinv, "Q source tar/package bytes differ")
+    need(qplan.get("schema") == "hpc-forest-matrix15-baseline-qualification-plan-v1" and qplan.get("scope_id") == QSCOPE
+         and qplan.get("subject_order") == list(SUBJECTS) and qplan.get("source_bindings") == audit.get("source_bindings"), "Q source plan differs from audit")
+    subjects = {}
+    for ref in receipt["outputs"]:
+        row = snapshots.json(ref, sizes=True)
+        subject = row.get("subject_id")
+        need(subject in SUBJECTS and subject not in subjects and Path(ref["path"]) == reception_root / (subject + "-baseline-reference.json"), "Q subject reference path/identity differs")
+        need(row.get("schema") == "hpc-forest-Q15-baseline-subject-reference-v1" and row.get("scope_id") == QSCOPE
+             and row.get("verified") is True and row.get("NEUTRAL") is False and row.get("baseline_qualification_only") is True
+             and row.get("native_authorization") is False and row.get("native_research_admitted") is False
+             and row.get("source_reader") == audit["source_reader"] and row.get("output_archive") == qinput["output_archive"]
+             and row.get("source_plan_sha256") == qinput["source_plan"]["sha256"], "Q subject is not its real baseline reference")
+        raw_subject = result["subjects"][subject]
+        need(row.get("r1_contract_sha256") == qplan["subjects"][subject]["r1_contract_sha256"] == raw_subject.get("r1_contract_sha256")
+             and row.get("policy") == raw_subject.get("policy") and row.get("confirmation_seconds") == raw_subject.get("confirmation", {}).get("times")
+             and len(row["confirmation_seconds"]) == 5
+             and all(type(v) in {int, float} and math.isfinite(v) and v > 0 for v in row["confirmation_seconds"]),
+             "Q subject baseline/contract binding differs")
+        need(type(row.get("evidence_refs")) is list and row["evidence_refs"], "Q subject command evidence required")
+        for evidence in row["evidence_refs"]:
+            need(reference(evidence, sizes=True), "Exact Q command evidence reference required")
+            remote = PurePosixPath(evidence["path"])
+            remote_output = PurePosixPath(qinput["remote_output_root"])
+            remote_package = PurePosixPath(qinput["remote_package_root"])
+            if remote.is_relative_to(remote_output):
+                local = restored.joinpath(*relative(remote.relative_to(remote_output).as_posix()).parts)
+            elif remote.is_relative_to(remote_package):
+                local = package.joinpath(*relative(remote.relative_to(remote_package).as_posix()).parts)
+            else:
+                raise Refusal("Q command evidence escapes exact received/package roots")
+            snapshots.read({**evidence, "path": str(local)}, sizes=True)
+        file_alias(ref2(ref), aliases)
+        subjects[subject] = (row, ref)
+    need(set(subjects) == set(SUBJECTS), "Missing Q subject reference")
+    for ref in (config["q_audit"], config["q_reader_receipt"], audit["reception_input"], audit["source_reader"], *qinput_refs(qinput)):
+        file_alias(ref2(ref), aliases)
+    return audit, qinput, qplan, package, subjects
+
+
+def qinput_refs(qinput):
+    return [qinput[key] for key in sorted(REF_NAMES)]
+
+
+def target_root(value):
+    need(type(value) is str and value.startswith("/") and "\\" not in value and
+         PurePosixPath(value).as_posix() == value and ".." not in PurePosixPath(value).parts
+         and not any(c in value for c in ("\0", "\r", "\n")), "Explicit canonical ARM target output root required")
+    return PurePosixPath(value)
+
+
+def build_records(subject, native_refs, plan, official_inventory, audit, qinput, qref, evidence):
+    row = plan["subject_bindings"][subject]
+    common = {"scope_id": NSCOPE, "subject_id": subject, "source_zip_sha256": native_refs["source_zip"]["sha256"],
+              "plan_sha256": native_refs["plan"]["sha256"], "preparation_manifest_sha256": native_refs["preparation_manifest"]["sha256"],
+              "r1_contract_sha256": row["r1_contract_ref"]["sha256"]}
+    allocation = {"job_id": audit["allocation"]["job_id"], "architecture": audit["allocation"]["machine"], **RESOURCES}
+    qualification = {**common, "schema": "hpc-forest-matrix15-subject-qualification-v1", "verified": True,
+        "observation_mode": "command-stream-v1", "allocation": allocation, "native_model_calls": 0,
+        "r1_paired_contract_verified": True, **{key: False for key in LIMITS},
+        "prepared_contract": row["prepared_contract_ref"], "prepared_root": row["official_preparation_path"],
+        "prepared_files": official_inventory, "evidence_refs": evidence}
+    need(set(qualification) == QFIELDS and len(qualification) == 19, "Native qualification must have exactly nineteen fields")
+    return common, qualification
+
+
+def subject_output_records(subject, common, qualification, archive_windows, archive_arm, evidence, destination, arm_root):
+    """One immutable qualification/audit; host-specific downstream receptions."""
+    need(subject in SUBJECTS and common["subject_id"] == subject, "Exact known subject required")
+    arm_root = target_root(str(arm_root))
+    need(Path(destination).is_absolute(), "Absolute final Windows output directory required")
+    def refs(name, value):
+        digest = sha(data(value))
+        return ({"path": str(Path(destination) / name), "sha256": digest},
+                {"path": str(arm_root / name), "sha256": digest})
+    need(reference(archive_windows) and reference(archive_arm)
+         and archive_windows["sha256"] == archive_arm["sha256"], "Exact byte-identical archive host projections required")
+    qualification_name = subject + "/qualification.json"
+    audit_name = subject + "/audit.json"
+    arm_name = subject + "/reception.json"
+    windows_name = subject + "/reception-windows.json"
+    qualification_windows, qualification_arm = refs(qualification_name, qualification)
+    reception_audit = {**common, "schema": "hpc-forest-matrix15-subject-reception-audit-v1", "verified": True,
+        "qualification_sha256": qualification_arm["sha256"], "archive_sha256": archive_arm["sha256"],
+        "all_members_regular_unique": True, "restored_files_byte_identical": True,
+        "r1_paired_contract_verified": True, "actual_official_evaluator_trace_verified": True,
+        "independent_raw_stdout_per_candidate_verified": False, "independent_performance_audit_verified": False}
+    audit_windows, audit_arm = refs(audit_name, reception_audit)
+    reception_arm = {**common, "schema": "hpc-forest-matrix15-subject-reception-v1", "verified": True,
+        "qualification": qualification_arm, "archive": archive_arm, "audit": audit_arm, "evidence_refs": evidence}
+    reception_windows = {**reception_arm, "qualification": qualification_windows, "audit": audit_windows, "archive": archive_windows}
+    _, reception_arm_ref = refs(arm_name, reception_arm)
+    reception_windows_ref, _ = refs(windows_name, reception_windows)
+    records = {qualification_name: qualification, audit_name: reception_audit,
+               arm_name: reception_arm, windows_name: reception_windows}
+    windows = {"qualification": qualification_windows, "reception": reception_windows_ref, "audit": audit_windows, "archive": archive_windows}
+    arm = {"qualification": qualification_arm, "reception": reception_arm_ref, "audit": audit_arm, "archive": archive_arm}
+    return records, windows, arm
+
+
+def preserve_rejected_staging(staging, destination, failure, producer_ref):
+    """Keep rejected generated bytes; never publish or recursively delete them."""
+    staging = local_path(str(staging), directory=True)
+    parent = local_path(str(destination.parent), directory=True)
+    need(staging.resolve(strict=True).parent == parent.resolve(strict=True)
+         and staging.name.startswith(".q15-native-bridge-") and staging != destination,
+         "Refusal staging is outside its intended parent")
+    receipt = {"schema": "hpc-forest-Q15-native-bridge-staging-refusal-v1", "prepared": False,
+               "verified": False, "native_authorization": False, "native_research_admitted": False,
+               "destination_published": False, "staging_preserved": True,
+               "staged_records_are_rejected_not_admissible": True,
+               "staging_directory": str(staging), "intended_destination": str(destination),
+               "error_type": type(failure).__name__, "reason": str(failure), "source_producer": producer_ref}
+    with (staging / "BRIDGE-REFUS.json").open("xb") as handle:
+        handle.write(data(receipt))
+    return receipt
+
+
+def produce(input_path, input_sha256):
+    snapshots = Snapshots()
+    producer_path = Path(__file__).resolve()
+    producer_ref = {"path": str(producer_path), "sha256": sha(producer_path.read_bytes())}
+    snapshots.read(producer_ref)
+    config = snapshots.json({"path": str(input_path), "sha256": input_sha256})
+    need(set(config) == {"schema", "prepared", "verified", "native_statics", "q_audit", "q_reader_receipt",
+                         "reviewed_q_reader_sha256", "output_directory", "target_output_root"} and config["schema"] == SCHEMA,
+         "Exact bridge input fields required")
+    need(config["prepared"] is False and config["verified"] is False, "Input is a request, never an existing admission")
+    root = target_root(config["target_output_root"])
+    destination = local_path(config["output_directory"], exists=False)
+    need(not destination.exists() and destination.parent.is_dir(), "New concrete output directory required")
+    refs, plan, prep, aliases, runtime, projections = native_static(config["native_statics"], snapshots)
+    audit, qinput, qplan, package, subjects = q_baselines(config, snapshots, aliases)
+    qruntime = parse((package / "RUNTIME-Q-MANIFEST.json").read_bytes())
+    delta = {name: {"q": qruntime.get(name), "native": runtime.get(name)} for name in sorted(set(qruntime) | set(runtime)) if qruntime.get(name) != runtime.get(name)}
+    need(delta == Q_DELTA, "Q/native runtime source delta differs from reviewed observer-only bridge")
+    need(snapshots.inventory(package / "project-q") == qruntime, "Q runtime source bytes differ")
+    counts = {"source": 0, "validation": 0}
+    for subject in SUBJECTS:
+        qrow, nrow = qplan["subjects"][subject], plan["subject_bindings"][subject]
+        need(qrow["r1_contract_reference"] == nrow["r1_contract_ref"] and qrow["r1_contract_sha256"] == nrow["r1_contract_ref"]["sha256"], "Q/native exact R1 contract reference differs")
+        for role in ("source", "validation"):
+            actual = snapshots.inventory(package / qrow[role])
+            need(actual == projections[subject][role][1], "Q/native official assets or folds differ")
+            counts[role] += len(actual)
+    need(counts == {"source": 46, "validation": 150}, "Q/native196 asset counts differ")
+    staging = Path(tempfile.mkdtemp(prefix=".q15-native-bridge-", dir=destination.parent))
+    def emit_bytes(name, raw):
+        relative(name)
+        path = staging / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as handle:
+            handle.write(raw)
+        return {"path": str(root / name), "sha256": sha(raw)}
+    def emit(name, value):
+        return emit_bytes(name, data(value))
+    try:
+        archive_name = "received-archive/result-Q15.tar.gz"
+        archive_raw = snapshots.read(qinput["output_archive"], sizes=True)
+        archive_arm = emit_bytes(archive_name, archive_raw)
+        archive_windows = {"path": str(destination / archive_name), "sha256": sha(archive_raw)}
+        need(archive_arm["sha256"] == qinput["output_archive"]["sha256"], "Derived archive copy digest differs")
+        need(not any(entry["kind"] == "file" and (matches(archive_arm["path"], entry)
+                     or matches(archive_windows["path"], entry)) for entry in aliases["entries"]),
+             "Downstream archive copy must remain outside immutable aliases")
+        products, arm_products = {}, {}
+        for subject in SUBJECTS:
+            qrow, qref = subjects[subject]
+            evidence = [ref2(config["q_audit"]), ref2(config["q_reader_receipt"]), ref2(qref),
+                        refs["source_zip"], refs["runtime_manifest"], refs["preparation_manifest"]]
+            for ref in evidence:
+                file_alias(ref, aliases)
+            common, qualification = build_records(subject, refs, plan, projections[subject]["official"][1], audit, qinput, qref, evidence)
+            records, products[subject], arm_products[subject] = subject_output_records(
+                subject, common, qualification, archive_windows, archive_arm, evidence, destination, root)
+            for name, value in records.items():
+                emit(name, value)
+        report = {"schema": "hpc-forest-Q15-native-bridge-report-v1", "prepared": True, "verified": True,
+            "native_authorization": False, "native_research_admitted": False, "native_model_calls": 0,
+            "received_programs_or_scripts_executed": 0, "baseline_qualification_only": True,
+            "q_scope_id_preserved": QSCOPE, "native_scope_id": NSCOPE,
+            "q_audit": config["q_audit"], "q_reader_receipt": config["q_reader_receipt"], "native_statics": config["native_statics"],
+            "source_producer": producer_ref,
+            "asset_counts": {**counts, "total": sum(counts.values())}, "reviewed_source_pins": SOURCE_PINS,
+            "source_delta": delta, "subject_order": list(SUBJECTS), "subjects": products, "arm_subjects": arm_products,
+            "host_projection": {"windows_reception": "reception-windows.json", "arm_reception": "reception.json",
+                                "qualification_bytes_identical": True, "audit_bytes_identical": True},
+            "archive_copy": {"source": qinput["output_archive"], "windows": archive_windows, "arm": archive_arm,
+                             "byte_identical": True, "outside_immutable_aliases": True},
+            "arm_transport_verified": False, "arm_runtime_validation_verified": False,
+            "target_output_root": str(root), "qualification_field_count": 19,
+            "limits": ["Q evidence retains its Q schema/scope; native records are separate derived qualifications.",
+                       "Only combined command streams are attributed; no independent per-candidate stdout or performance audit.",
+                       "No source or received program was imported or executed; no model or job was started.",
+                       "Transport, CLI, lane, freshness, review and explicit cell authorization remain separate gates."]}
+        emit("BRIDGE-REPORT.json", report)
+        snapshots.stable()
+        manifest = {path.relative_to(staging).as_posix(): sha(path.read_bytes()) for path in sorted(staging.rglob("*")) if path.is_file()}
+        emit("BRIDGE-FILES.json", {"schema": "hpc-forest-Q15-native-bridge-files-v1", "files": manifest})
+        snapshots.stable()
+        need(not destination.exists(), "Output appeared before final seal")
+        os.rename(staging, destination)
+        return report
+    except BaseException as failure:
+        preserve_rejected_staging(staging, destination, failure, producer_ref)
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--input-sha256", required=True)
+    args = parser.parse_args()
+    try:
+        report = produce(args.input, args.input_sha256)
+    except (ValueError, OSError, KeyError, tarfile.TarError, zipfile.BadZipFile) as exc:
+        print(json.dumps({"verified": False, "native_authorization": False, "error": str(exc)}))
+        raise SystemExit(2)
+    print(json.dumps({"verified": report["verified"], "native_authorization": False, "subjects": len(report["subjects"])}))
+
+
+if __name__ == "__main__":
+    main()

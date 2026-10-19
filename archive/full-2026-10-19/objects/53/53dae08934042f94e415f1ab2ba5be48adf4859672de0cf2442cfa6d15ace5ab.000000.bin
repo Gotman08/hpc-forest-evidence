@@ -1,0 +1,174 @@
+"""Normalize and explicitly admit the first independently audited source-only cohort."""
+from __future__ import annotations
+
+import copy
+import csv
+import hashlib
+import importlib.util
+import json
+import sqlite3
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+COMPARE = HERE.parents[1]
+STUDY = COMPARE.parent / "HPC-Forest-Etude-2020-2024-r1"
+EDITORIAL = STUDY / "edition-professionnelle"
+ROOT = HERE / "restauration-neuve/results-749843"
+VERSION = STUDY / "versions/20261017-avant-source-only-luna-max-professionnelle"
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    preserved = read(VERSION / "PRESERVATION.json")
+    assert preserved["all_copied_bytes_verified"] and preserved["copied_files"] == 3279
+    assert all(sha(VERSION / name) == value == sha(STUDY / name)
+               for name, value in preserved["previous_manifest"]["files"].items())
+    receipt = read(HERE / "reception-verifiee.json")
+    assert receipt["verified"] and receipt["all_150_requests_delivered_and_reconciled"]
+    for key in ("archive", "coordinator_audit", "independent_audit", "owned_stop"):
+        assert sha(Path(receipt[key]["path"])) == receipt[key]["sha256"]
+    audit = read(HERE / "audit-independant.json")
+    reconciliation = audit["local_delivery_reconciliation"]
+    spec = importlib.util.spec_from_file_location("source_only_reporting_helpers", STUDY / "consolider-couverture-luna-comparaison.py")
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+    rows, missions, trees, calls, pairs = [], [], [], [], []
+    request_owner = {}
+    trial_roles = {}
+    for subject in audit["subjects"]:
+        slug = subject["subject"]
+        campaign = ROOT / slug
+        with sqlite3.connect((campaign / "registry.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+            trial_roles[slug] = dict(db.execute("SELECT id,role FROM trials"))
+        for path in [*(campaign / "logs").glob("*/codex-request.json"),
+                     *(campaign / "logs").glob("mother-*/request.json")]:
+            request = read(path)
+            nonce = request["nonce"]
+            assert nonce not in request_owner
+            flat = ROOT / "mailbox/requests" / (nonce + ".request.json")
+            assert sha(path) == sha(flat)
+            request_owner[nonce] = (slug, request, path)
+    assert len(request_owner) == 150
+    for item in reconciliation["records"]:
+        slug, request, path = request_owner[item["nonce"]]
+        assert item["request_sha256"] == sha(path)
+        assert item["session_id"] == request["session_id"] == receipt["session_id"]
+        assert request["model"] == "gpt-6-luna" and request["reasoning_effort"] == "max"
+        role = ("mère" if request.get("meta_role") else "intégration"
+                if trial_roles[slug][request["mission_id"].rsplit("-h", 1)[0]] == "G" else "enfant")
+        assert item["native_invocation_observed"] and item["usage_measured"]
+        calls.append({"session_id": item["session_id"], "nonce": item["nonce"], "subject": slug,
+            "campaign": "comparaison-source-only/luna-max-749843", "kind": role,
+            "native_invocation_observed": True, "usage_measured": True,
+            "exact_total": item["known_exact_tokens"], "state": "exact",
+            "request_sha256": item["request_sha256"], "response_sha256": item["response_sha256"]})
+    for subject in audit["subjects"]:
+        slug = subject["subject"]
+        campaign = ROOT / slug
+        contract = read(campaign / "trusted/contract.json")
+        config = read(campaign / "trusted/config.json")
+        selected = [c for c in calls if c["subject"] == slug]
+        reference = subject["reference_evidence"]["contract"]
+        assert sha(Path(reference["path"])) == reference["sha256"]
+        left, right = copy.deepcopy(contract), read(Path(reference["path"]))
+        for value in (left, right):
+            value["benchmark"].pop("reference_seconds")
+        assert left == right
+        pairs.append({"subject": slug, "source_only_contract_sha256": sha(campaign / "trusted/contract.json"),
+            "r1_reference": reference, "equal_after_only_benchmark_reference_seconds_removed": True,
+            "timings_pooled": False, "causal_harness_advantage_proved": False})
+        rows.append({"subject": slug, "model": "gpt-6-luna", "effort": "max", "arm": "source-only",
+            "job_id": "749843", "campaign_root": str(campaign), "confirmation": subject["best_confirmed"],
+            "gain_fraction": subject["confirmed_gain_fraction"], "statuses": subject["statuses"],
+            "topology": subject["topology"], "native_calls": len(selected),
+            "known_exact_tokens": sum(c["exact_total"] for c in selected), "unmetered_calls": 0,
+            "trials": subject["trials"], "mother_requests": subject["published_mother_requests"],
+            "harness_repaired_proposals": 0, "samples": helpers.confirmation_data(campaign, subject),
+            "contract": contract, "contract_sha256": sha(campaign / "trusted/contract.json"),
+            "budget": config["budget"], "operator_algorithm_hints": 0})
+        trees.append({"subject": slug, "topology": read(ROOT / (slug + "-progress.json")),
+                      "trials": subject["detailed_trials"]})
+        missions.extend({"subject": slug, **trial} for trial in subject["detailed_trials"])
+    assert sum(c["exact_total"] for c in calls) == 3564823
+    role_totals = {role: {"calls": sum(c["kind"] == role for c in calls),
+                         "known_exact_tokens": sum(c["exact_total"] for c in calls if c["kind"] == role),
+                         "unmetered_calls": 0} for role in ("mère", "enfant", "intégration")}
+    statuses = Counter()
+    for row in rows:
+        statuses.update(row["statuses"])
+    cohort = {"schema": "hpc-forest-received-source-only-luna-max-v1", "observed_utc": datetime.now(UTC).isoformat(),
+        "job_id": "749843", "archive_sha256": receipt["archive"]["sha256"], "rows": rows,
+        "received_subjects": 15, "native_calls": 150, "known_exact_tokens": 3564823,
+        "unmetered_calls": 0, "published_requests": 150, "statuses": dict(statuses), "trials": len(missions),
+        "scored_nodes": sum(r["topology"]["scored_nodes"] for r in rows), "retained_baselines": 1,
+        "tokens_by_role": role_totals, "model_input": False, "total_exact_consumption_available": True,
+        "universal_correctness_or_causal_harness_advantage_proved": False}
+    save(STUDY / "resultats-source-only-luna-max.json", cohort)
+    save(STUDY / "details-missions-source-only-luna-max.json", missions)
+    save(STUDY / "arbres-source-only-luna-max.json", trees)
+    save(STUDY / "comparabilite-source-only-luna-max-r1.json", {"rows": pairs})
+    save(HERE / "appels-natifs-figes.json", {"calls": calls, "tokens_by_role": role_totals})
+    with (STUDY / "jetons-par-appel-source-only-luna-max.csv").open("w", encoding="utf-8-sig", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=list(calls[0]))
+        writer.writeheader()
+        writer.writerows(calls)
+    table = helpers.table(["Sujet", "Référence (s)", "Retenu (s)", "Réduction confirmée"],
+        [[r["subject"], f"{r['confirmation']['reference_seconds']:.9f}", f"{r['confirmation']['mean_seconds']:.9f}",
+          f"{100*r['gain_fraction']:.4f} %"] for r in rows])
+    (STUDY / "BILAN-SOURCE-ONLY-LUNA-MAX.md").write_text(
+        "# Première cohorte source-only : Luna MAX\n\n"
+        "Quinze recherches fraîches sont reçues et auditées, soit 15/300 issues source-only. "
+        "Quatorze programmes modifiés sont confirmés sur les contrats finis ; Sokoban conserve sa référence. "
+        "Les deux restaurations indépendantes vérifient les mêmes 7 433 fichiers inchangés. "
+        f"Archive annoncée/distante/locale : `{receipt['archive']['sha256']}`.\n\n" + table + "\n"
+        "Les 120 missions comprennent 112 valides, cinq compilations échouées, deux sorties incorrectes et un doublon. "
+        f"{cohort['scored_nodes']} sommets notés ne désignent pas autant de programmes chronométrés. "
+        "Les 150 requêtes sont livrées et réconciliées : 150 invocations et 3 564 823 jetons exacts, sans compteur manquant dans cette cohorte. "
+        "Cache et raisonnement sont déjà inclus. Les rôles sont détaillés dans les exports.\n\n"
+        "Le harnais interne est désactivé ; la mère, les trois arbres et les deux intégrations, TreeQuest, "
+        "les oracles et les confirmations externes restent présents. Ce générateur structuré n'est pas le véritable agent Codex à outils. "
+        "Les quinze contrats sont égaux aux références R1 après exclusion du seul temps de calibration ; les temps des allocations ne sont pas fusionnés. "
+        "Une seule graine et l'ordre temporel interdisent tout avantage causal général du harnais. "
+        "La conformité algorithmique stricte de quicksort et une couverture universelle ne sont pas établies.\n\n"
+        "Slurm : COMPLETED 0:0, 3 h 48 min 1 s, quatre CPU ARM64, 16 GiB, zéro GPU, 241,2 s CPU et 229,9 MiB RSS. "
+        "Ces compteurs ne mesurent ni l'inférence hébergée ni un nombre exact de threads. Aucun nouveau diagnostic CPU n'est ajouté. "
+        "Le relais possédé a été arrêté après l'audit et la réconciliation ; la même file poursuit Astra MAX sous 750122.\n",
+        encoding="utf-8")
+    admissions = read(EDITORIAL / "admissions.json")
+    assert not any(c["cohort"] == "source_only_luna_max_fifteen_subjects" for c in admissions["reviewed_new_cohorts"])
+    admissions["reviewed_new_cohorts"].append({"cohort": "source_only_luna_max_fifteen_subjects", "job_id": "749843",
+        "independent_reception_sha256": sha(HERE / "reception-verifiee.json"),
+        "audit_sha256": sha(HERE / "audit-independant.json"), "archive_sha256": receipt["archive"]["sha256"],
+        "native_calls_observed": 150, "known_exact_tokens": 3564823, "unmetered_calls": 0,
+        "new_source_only_cells": 15, "contract_comparisons": "comparabilite-source-only-luna-max-r1.json",
+        "new_cpu_cohort_admitted": False, "source_only_300_barrier_passed": False,
+        "review": "Fresh roots, all fifteen contracts, exact identities, parents/sources, every finalist, five confirmations, negatives and all deliveries reviewed; descriptive comparison only."})
+    admissions["received_file_paths"]["source_only"] = [str(HERE / "audit-independant.json")]
+    admissions["expected_registry_count"] = 122
+    admissions["expected_principal_results"] = 106
+    save(EDITORIAL / "admissions.json", admissions)
+    save(EDITORIAL / "admission-source-only-luna-verifiee.json", {
+        "verified": True, "version_preserved": str(VERSION), "preserved_files": 3279,
+        "receipt_sha256": sha(HERE / "reception-verifiee.json"), "new_registry_roots": 15,
+        "native_calls": 150, "known_exact_tokens": 3564823, "no_new_cpu_cohort": True,
+        "preserved_previous_admissions": True, "causal_harness_advantage_proved": False})
+    print(json.dumps({"rows": len(rows), "missions": len(missions), "nodes": cohort["scored_nodes"],
+                      "statuses": dict(statuses), "tokens_by_role": role_totals}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

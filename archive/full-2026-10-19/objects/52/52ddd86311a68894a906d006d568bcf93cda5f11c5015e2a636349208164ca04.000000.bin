@@ -1,0 +1,150 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <immintrin.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+__attribute__((aligned(32)))
+void body_force(Body *p, float dt, int n) {
+  for (int i = 0; i < n; i += 8) {
+    __m256 fx1 = _mm256_setzero_ps();
+    __m256 fy1 = _mm256_setzero_ps();
+    __m256 fz1 = _mm256_setzero_ps();
+    __m256 fx2 = _mm256_setzero_ps();
+    __m256 fy2 = _mm256_setzero_ps();
+    __m256 fz2 = _mm256_setzero_ps();
+
+    for (int j = 0; j < n; j += 8) {
+      __m256 dx1 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].x), _mm256_set1_ps(p[i+0].x));
+      __m256 dy1 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].y), _mm256_set1_ps(p[i+0].y));
+      __m256 dz1 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].z), _mm256_set1_ps(p[i+0].z));
+
+      __m256 sqrd_dist1 = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(dx1, dx1), _mm256_mul_ps(dy1, dy1)), _mm256_add_ps(_mm256_mul_ps(dz1, dz1), _mm256_set1_ps(SOFTENING)));
+      __m256 inv_dist1 = _mm256_rsqrt_ps(sqrd_dist1);
+      __m256 inv_dist3_1 = _mm256_mul_ps(_mm256_mul_ps(inv_dist1, inv_dist1), inv_dist1);
+
+      fx1 = _mm256_add_ps(fx1, _mm256_mul_ps(dx1, inv_dist3_1));
+      fy1 = _mm256_add_ps(fy1, _mm256_mul_ps(dy1, inv_dist3_1));
+      fz1 = _mm256_add_ps(fz1, _mm256_mul_ps(dz1, inv_dist3_1));
+
+      if (i+4 < n) {
+        __m256 dx2 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].x), _mm256_set1_ps(p[i+4].x));
+        __m256 dy2 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].y), _mm256_set1_ps(p[i+4].y));
+        __m256 dz2 = _mm256_sub_ps(_mm256_loadu_ps(&p[j].z), _mm256_set1_ps(p[i+4].z));
+
+        __m256 sqrd_dist2 = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(dx2, dx2), _mm256_mul_ps(dy2, dy2)), _mm256_add_ps(_mm256_mul_ps(dz2, dz2), _mm256_set1_ps(SOFTENING)));
+        __m256 inv_dist2 = _mm256_rsqrt_ps(sqrd_dist2);
+        __m256 inv_dist3_2 = _mm256_mul_ps(_mm256_mul_ps(inv_dist2, inv_dist2), inv_dist2);
+
+        fx2 = _mm256_add_ps(fx2, _mm256_mul_ps(dx2, inv_dist3_2));
+        fy2 = _mm256_add_ps(fy2, _mm256_mul_ps(dy2, inv_dist3_2));
+        fz2 = _mm256_add_ps(fz2, _mm256_mul_ps(dz2, inv_dist3_2));
+      }
+    }
+
+    float fx_sum1[8] __attribute__((aligned(32)));
+    float fy_sum1[8] __attribute__((aligned(32)));
+    float fz_sum1[8] __attribute__((aligned(32)));
+    float fx_sum2[8] __attribute__((aligned(32)));
+    float fy_sum2[8] __attribute__((aligned(32)));
+    float fz_sum2[8] __attribute__((aligned(32)));
+    _mm256_storeu_ps(fx_sum1, fx1);
+    _mm256_storeu_ps(fy_sum1, fy1);
+    _mm256_storeu_ps(fz_sum1, fz1);
+    if (i+4 < n) {
+      _mm256_storeu_ps(fx_sum2, fx2);
+      _mm256_storeu_ps(fy_sum2, fy2);
+      _mm256_storeu_ps(fz_sum2, fz2);
+    }
+
+    float sum_fx1 = 0.0f, sum_fy1 = 0.0f, sum_fz1 = 0.0f;
+    for (int k = 0; k < 8; ++k) {
+      sum_fx1 += fx_sum1[k];
+      sum_fy1 += fy_sum1[k];
+      sum_fz1 += fz_sum1[k];
+    }
+
+    if (i+4 < n) {
+      float sum_fx2 = 0.0f, sum_fy2 = 0.0f, sum_fz2 = 0.0f;
+      for (int k = 0; k < 8; ++k) {
+        sum_fx2 += fx_sum2[k];
+        sum_fy2 += fy_sum2[k];
+        sum_fz2 += fz_sum2[k];
+      }
+
+      p[i+4].vx += dt * sum_fx2;
+      p[i+4].vy += dt * sum_fy2;
+      p[i+4].vz += dt * sum_fz2;
+    }
+
+    p[i+0].vx += dt * sum_fx1;
+    p[i+0].vy += dt * sum_fy1;
+    p[i+0].vz += dt * sum_fz1;
+  }
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+  
+  exit(EXIT_SUCCESS);
+}

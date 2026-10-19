@@ -1,0 +1,204 @@
+#ifndef KNN_H
+#define KNN_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <limits.h>
+#include <ctype.h>
+
+typedef struct {
+    float x;
+    float y;
+} Point;
+
+typedef struct {
+    char label;
+    int length;
+    Point *points;
+} Group;
+
+void on_error() {
+    printf("Invalid input file.\n");
+    exit(1);
+}
+
+static unsigned char knn_input_buffer[65537];
+static size_t knn_input_position;
+static size_t knn_input_size;
+
+static int knn_input_fill(void) {
+    knn_input_size = fread(knn_input_buffer, 1, sizeof(knn_input_buffer) - 1, stdin);
+    knn_input_position = 0;
+    knn_input_buffer[knn_input_size] = '\0';
+    return knn_input_size != 0;
+}
+
+static inline int knn_input_peek(void) {
+    if (knn_input_position == knn_input_size && !knn_input_fill()) return EOF;
+    return knn_input_buffer[knn_input_position];
+}
+
+static inline int knn_input_get(void) {
+    int value = knn_input_peek();
+    if (value != EOF) knn_input_position++;
+    return value;
+}
+
+static void knn_skip_space(void) {
+    int value;
+    while ((value = knn_input_peek()) != EOF && isspace((unsigned char)value))
+        knn_input_get();
+}
+
+static void knn_expect(const char *literal) {
+    while (*literal) {
+        if (knn_input_get() != (unsigned char)*literal++) on_error();
+    }
+}
+
+static int knn_read_integer(void) {
+    knn_skip_space();
+    int negative = 0;
+    int value = knn_input_peek();
+    if (value == '+' || value == '-') {
+        negative = value == '-';
+        knn_input_get();
+        value = knn_input_peek();
+    }
+    if (value < '0' || value > '9') on_error();
+
+    unsigned magnitude = 0;
+    unsigned limit = negative ? (unsigned)INT_MAX + 1u : (unsigned)INT_MAX;
+    do {
+        unsigned digit = (unsigned)(value - '0');
+        if (magnitude > (limit - digit) / 10u) on_error();
+        magnitude = magnitude * 10u + digit;
+        knn_input_get();
+        value = knn_input_peek();
+    } while (value >= '0' && value <= '9');
+
+    if (negative) {
+        if (magnitude == (unsigned)INT_MAX + 1u) return INT_MIN;
+        return -(int)magnitude;
+    }
+    return (int)magnitude;
+}
+
+static float knn_read_coordinate_slow(int delimiter, int allow_space) {
+    char local[128];
+    char *token = local;
+    size_t capacity = sizeof(local);
+    size_t length = 0;
+    size_t depth = 0;
+
+    for (;;) {
+        int value = knn_input_get();
+        if (value == EOF) on_error();
+        if (value == delimiter && depth == 0) break;
+        if (value == '(') {
+            depth++;
+        } else if (value == ')' && depth != 0) {
+            depth--;
+        }
+        if (length + 1 >= capacity) {
+            if (capacity > SIZE_MAX / 2) on_error();
+            size_t next_capacity = capacity * 2;
+            char *next;
+            if (token == local) {
+                next = (char *)malloc(next_capacity);
+                if (next) memcpy(next, local, length);
+            } else {
+                next = (char *)realloc(token, next_capacity);
+            }
+            if (!next) on_error();
+            token = next;
+            capacity = next_capacity;
+        }
+        token[length++] = (char)value;
+    }
+    token[length] = '\0';
+    char *end;
+    float result = strtof(token, &end);
+    if (end == token) on_error();
+    if (allow_space) {
+        while (isspace((unsigned char)*end)) end++;
+    }
+    if (*end != '\0') on_error();
+    if (token != local) free(token);
+    return result;
+}
+
+static float knn_read_coordinate(int delimiter, int allow_space) {
+    knn_skip_space();
+    if (knn_input_peek() == EOF) on_error();
+
+    char *start = (char *)knn_input_buffer + knn_input_position;
+    char *limit = (char *)knn_input_buffer + knn_input_size;
+    char *end;
+    float result = strtof(start, &end);
+    if (end != start) {
+        char *after = end;
+        if (allow_space) {
+            while (after < limit && isspace((unsigned char)*after)) after++;
+        }
+        if (after < limit && *after == delimiter) {
+            knn_input_position = (size_t)(after - (char *)knn_input_buffer) + 1;
+            return result;
+        }
+    }
+    return knn_read_coordinate_slow(delimiter, allow_space);
+}
+
+int parse_number_of_groups() {
+    knn_skip_space();
+    knn_expect("n_groups=");
+    return knn_read_integer();
+}
+
+Point parse_point() {
+    knn_skip_space();
+    knn_expect("(");
+    Point point;
+    point.x = knn_read_coordinate(',', 1);
+    point.y = knn_read_coordinate(')', 0);
+    return point;
+}
+
+Group parse_next_group() {
+    knn_skip_space();
+    knn_expect("label=");
+    int label = knn_input_get();
+    if (label == EOF) on_error();
+    knn_skip_space();
+    knn_expect("length=");
+    int length = knn_read_integer();
+    if (length < 0) on_error();
+
+    Group group;
+    group.label = (char)label;
+    group.length = length;
+    group.points = (Point *)malloc(sizeof(Point) * (size_t)length);
+    if (length > 0 && !group.points) on_error();
+    for (int i = 0; i < length; i++) {
+        group.points[i] = parse_point();
+    }
+    return group;
+}
+
+int parse_k() {
+    knn_skip_space();
+    knn_expect("k=");
+    return knn_read_integer();
+}
+
+float euclidean_distance_no_sqrt(Point a, Point b) {
+    return ((b.x - a.x) * ((b.x - a.x))) + ((b.y - a.y) * (b.y - a.y));
+}
+
+int compare_for_sort(const void *a, const void *b) {
+    return *(char *)a - *(char *)b;
+}
+
+#endif

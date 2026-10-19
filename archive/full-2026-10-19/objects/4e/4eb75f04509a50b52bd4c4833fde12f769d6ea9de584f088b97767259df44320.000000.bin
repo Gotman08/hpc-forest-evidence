@@ -1,0 +1,72 @@
+"""Read only the three explicitly completed invocation metadata files; export no private argv."""
+import hashlib
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[3]
+LAUNCH = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2f'
+SELECTED = [
+    ('gpt-6-astra', '5aeceff56b26452290325ed4274d71bd', 'd75f093'),
+    ('gpt-5.6-terra', 'e7c86715f4d34e9f9efcdcc4ce2a81c8', 'e6d69b'),
+    ('gpt-6.1-sol', '1294453607b34c68ba05872072640120', 'f4a10f'),
+]
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def main():
+    rows = []
+    for model, session, prefix in SELECTED:
+        cache = LAUNCH / ('worker-' + session)
+        directories = [path for path in cache.glob(prefix + '*') if path.is_dir()]
+        assert len(directories) == 1 and not directories[0].is_symlink()
+        path = directories[0] / 'invocation.json'
+        assert path.is_file() and not path.is_symlink() and path.stat().st_size < 262144
+        raw = path.read_bytes()
+        value = json.loads(raw)
+        argv = value['argv']
+        assert isinstance(argv, list) and all(isinstance(item, str) for item in argv)
+        options = []
+        switches = []
+        for index, item in enumerate(argv):
+            if item in ('-c', '--config') and index + 1 < len(argv):
+                key, sep, setting = argv[index + 1].partition('=')
+                assert sep
+                if key.startswith('features.') or key in ('model', 'model_reasoning_effort'):
+                    options.append({'key': key, 'literal_value': setting})
+            if item in ('--enable', '--disable') and index + 1 < len(argv):
+                switches.append([item, argv[index + 1]])
+        assert path.read_bytes() == raw
+        selected = {row['key']: row['literal_value'] for row in options}
+        rows.append({'model': model, 'session_id': session, 'nonce': directories[0].name,
+            'invocation_metadata': {'path': str(path.resolve()), 'sha256': sha(raw)},
+            'actual_cli_executable': argv[0], 'actual_executable_sha256': sha(Path(argv[0]).read_bytes()),
+            'features_and_model_config_literals_only': options, 'enable_disable_switches': switches,
+            'three_code_mode_scalar_flags_exactly_false': all(selected.get('features.' + name) == 'false'
+                for name in ('code_mode', 'code_mode_only', 'code_mode_host')),
+            'whole_argv_read_in_memory_only_not_exported': True, 'instruction_model_or_candidate_body_read': False})
+    cli = Path(rows[0]['actual_cli_executable'])
+    host = cli.parent / 'codex-code-mode-host.exe'
+    assert host.is_file() and not host.is_symlink()
+    host_sha = sha(host.read_bytes())
+    assert host_sha == '3b6a9179a4da17fa5fc6948219cd61486dc3b534c683838076d8c61bd311c68e'
+    target = HERE / 'OPTIONS-REELLES-TROIS-INVOCATIONS.json'
+    with target.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps({
+            'schema': 'hpc-forest-r2f-completed-invocation-code-mode-option-observation-v1',
+            'verified_metadata_only': True, 'calls': rows,
+            'adjacent_code_mode_host': {'path': str(host.resolve()), 'sha256': host_sha},
+            'host_or_CLI_executed_by_this_reader': False,
+            'no_request_response_stdout_body_lock_SQLite_or_global_config_read': True,
+            'diagnostic_source_or_backend_cause_inferred': False,
+            'corrective_runtime_admission_or_new_generation_authorized': False}, ensure_ascii=False, indent=2) + '\n')
+    print(json.dumps({'report': str(target.resolve()), 'sha256': sha(target.read_bytes()),
+                      'three_actual_scalar_flags_false': all(row['three_code_mode_scalar_flags_exactly_false'] for row in rows),
+                      'host_adjacent_sha256': host_sha}))
+
+
+if __name__ == '__main__':
+    main()

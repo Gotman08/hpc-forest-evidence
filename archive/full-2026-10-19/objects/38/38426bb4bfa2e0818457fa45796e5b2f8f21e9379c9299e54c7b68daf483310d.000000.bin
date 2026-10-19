@@ -1,0 +1,388 @@
+#include "knn.h"
+#include <limits.h>
+#include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+typedef struct {
+    size_t order;
+    float distance;
+    char label;
+} KnnNeighbor;
+
+typedef struct {
+    KnnNeighbor *items;
+    size_t count;
+    size_t capacity;
+    size_t begin;
+    size_t length;
+    size_t first_point;
+    int first_group;
+} KnnPartition;
+
+static char knn_vote(const size_t *frequency) {
+    size_t maximum = 0;
+    char answer = (char)-1;
+
+    for (int label = CHAR_MIN; label <= CHAR_MAX; ++label) {
+        size_t count = frequency[(unsigned char)(char)label];
+        if (count > maximum) {
+            maximum = count;
+            answer = (char)label;
+        }
+    }
+    return answer;
+}
+
+static inline int knn_precedes(const KnnNeighbor *a, const KnnNeighbor *b) {
+    if (a->distance < b->distance) return 1;
+    if (a->distance > b->distance) return 0;
+    return a->order < b->order;
+}
+
+static inline void knn_sift_down(KnnNeighbor *heap, size_t count,
+                                 KnnNeighbor value) {
+    size_t position = 0;
+    size_t child = 1;
+
+    while (child < count) {
+        if (child + 1 < count &&
+            knn_precedes(&heap[child], &heap[child + 1])) {
+            ++child;
+        }
+        if (!knn_precedes(&value, &heap[child])) break;
+        heap[position] = heap[child];
+        position = child;
+        child = position * 2 + 1;
+    }
+    heap[position] = value;
+}
+
+static inline void knn_swap(KnnNeighbor *a, KnnNeighbor *b) {
+    KnnNeighbor temporary = *a;
+    *a = *b;
+    *b = temporary;
+}
+
+/* Retain the nearest keep entries without sorting the retained prefix. */
+static void knn_select_prefix(KnnNeighbor *items, size_t count, size_t keep) {
+    if (keep == 0 || keep >= count) return;
+
+    size_t first = 0;
+    size_t last = count;
+    unsigned depth = 0;
+    for (size_t n = count; n > 1; n >>= 1) depth += 2;
+
+    while (last - first > 24 && depth > 0) {
+        --depth;
+        size_t middle = first + (last - first) / 2;
+        if (knn_precedes(&items[middle], &items[first])) {
+            knn_swap(&items[middle], &items[first]);
+        }
+        if (knn_precedes(&items[last - 1], &items[middle])) {
+            knn_swap(&items[last - 1], &items[middle]);
+        }
+        if (knn_precedes(&items[middle], &items[first])) {
+            knn_swap(&items[middle], &items[first]);
+        }
+
+        KnnNeighbor pivot = items[middle];
+        items[middle] = items[last - 1];
+        size_t left = first;
+        size_t right = last - 1;
+
+        for (;;) {
+            while (left < right &&
+                   knn_precedes(&items[left], &pivot)) {
+                ++left;
+            }
+            while (left < right &&
+                   knn_precedes(&pivot, &items[right - 1])) {
+                --right;
+            }
+            if (left == right) break;
+            --right;
+            knn_swap(&items[left], &items[right]);
+            ++left;
+        }
+        items[last - 1] = items[left];
+        items[left] = pivot;
+
+        if (left == keep || left + 1 == keep) return;
+        if (left < keep) {
+            first = left + 1;
+        } else {
+            last = left;
+        }
+    }
+
+    /* Bound adverse pivot sequences with the existing heap selection. */
+    KnnNeighbor *active = items + first;
+    size_t wanted = keep - first;
+    size_t length = last - first;
+    for (size_t i = 1; i < wanted; ++i) {
+        KnnNeighbor value = active[i];
+        size_t position = i;
+        while (position > 0) {
+            size_t parent = (position - 1) / 2;
+            if (!knn_precedes(&active[parent], &value)) break;
+            active[position] = active[parent];
+            position = parent;
+        }
+        active[position] = value;
+    }
+    for (size_t i = wanted; i < length; ++i) {
+        KnnNeighbor value = active[i];
+        if (knn_precedes(&value, &active[0])) {
+            knn_sift_down(active, wanted, value);
+        }
+    }
+}
+
+static char knn_insertion_fallback(int n_groups, Group *groups, int k,
+                                    Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * (size_t)k);
+    float *distances = (float *)malloc(sizeof(float) * (size_t)k);
+    size_t frequency[UCHAR_MAX + 1] = {0};
+
+    if (labels == NULL || distances == NULL) {
+        free(labels);
+        free(distances);
+        on_error();
+        return (char)-1;
+    }
+
+    for (int i = 0; i < k; ++i) {
+        labels[i] = (char)-1;
+        distances[i] = -1;
+    }
+
+    for (int i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ++j) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (int x = 0; x < k; ++x) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (int y = k - 1; y > x; --y) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < k; ++i) {
+        ++frequency[(unsigned char)labels[i]];
+    }
+    free(distances);
+    free(labels);
+    return knn_vote(frequency);
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    size_t total = 0;
+    size_t frequency[UCHAR_MAX + 1] = {0};
+
+    if (k <= 0) return (char)-1;
+
+    for (int i = 0; i < n_groups; ++i) {
+        if (groups[i].length > 0) total += (size_t)groups[i].length;
+    }
+
+    /* If every point is selected, distance order cannot affect the vote. */
+    if ((size_t)k >= total) {
+        for (int i = 0; i < n_groups; ++i) {
+            if (groups[i].length > 0) {
+                frequency[(unsigned char)groups[i].label] +=
+                    (size_t)groups[i].length;
+            }
+        }
+        frequency[(unsigned char)(char)-1] += (size_t)k - total;
+        return knn_vote(frequency);
+    }
+
+    int partitions = 1;
+#ifdef _OPENMP
+    partitions = omp_get_max_threads();
+    if (partitions < 1) partitions = 1;
+#endif
+    size_t useful_partitions = total / 4096;
+    if (useful_partitions == 0) useful_partitions = 1;
+    if ((size_t)partitions > useful_partitions) {
+        partitions = (int)useful_partitions;
+    }
+
+    KnnPartition *parts = (KnnPartition *)calloc((size_t)partitions,
+                                                sizeof(KnnPartition));
+    if (parts == NULL) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t base = total / (size_t)partitions;
+    size_t extra = total % (size_t)partitions;
+    size_t group_begin = 0;
+    size_t workspace_count = 0;
+    int group_index = 0;
+
+    /* Balance by point count, including when one group dominates the input. */
+    for (int p = 0; p < partitions; ++p) {
+        size_t prefix_extra = (size_t)p < extra ? (size_t)p : extra;
+        size_t begin = base * (size_t)p + prefix_extra;
+
+        while (group_index < n_groups) {
+            size_t length = groups[group_index].length > 0
+                                ? (size_t)groups[group_index].length : 0;
+            if (begin - group_begin < length) break;
+            group_begin += length;
+            ++group_index;
+        }
+
+        parts[p].begin = begin;
+        parts[p].length = base + ((size_t)p < extra);
+        parts[p].capacity = parts[p].length < (size_t)k
+                                ? parts[p].length : (size_t)k;
+        parts[p].first_group = group_index;
+        parts[p].first_point = begin - group_begin;
+        workspace_count += parts[p].capacity;
+    }
+
+    if (workspace_count > ((size_t)-1) / sizeof(KnnNeighbor)) {
+        free(parts);
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+    KnnNeighbor *workspace = (KnnNeighbor *)malloc(
+        workspace_count * sizeof(KnnNeighbor));
+    if (workspace == NULL) {
+        free(parts);
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t offset = 0;
+    for (int p = 0; p < partitions; ++p) {
+        parts[p].items = workspace + offset;
+        offset += parts[p].capacity;
+    }
+
+    int unordered_distance = 0;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(partitions) if(partitions > 1) reduction(|:unordered_distance)
+#endif
+    {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int p = 0; p < partitions; ++p) {
+            size_t capacity = parts[p].capacity;
+            KnnNeighbor *heap = parts[p].items;
+            size_t count = 0;
+            size_t remaining = parts[p].length;
+            size_t order = parts[p].begin;
+            size_t point_index = parts[p].first_point;
+            int current_group = parts[p].first_group;
+
+            while (remaining > 0 && current_group < n_groups) {
+                Group *group = &groups[current_group];
+                size_t length = group->length > 0 ? (size_t)group->length : 0;
+                size_t take = length - point_index;
+                if (take > remaining) take = remaining;
+
+                for (size_t j = 0; j < take; ++j) {
+                    float d = euclidean_distance_no_sqrt(
+                        to_evaluate, group->points[point_index + j]);
+                    if (d != d) {
+                        unordered_distance = 1;
+                        continue;
+                    }
+
+                    KnnNeighbor candidate;
+                    candidate.order = order + j;
+                    candidate.distance = d;
+                    candidate.label = group->label;
+
+                    if (count < capacity) {
+                        size_t position = count++;
+                        while (position > 0) {
+                            size_t parent = (position - 1) / 2;
+                            if (!knn_precedes(&heap[parent], &candidate)) break;
+                            heap[position] = heap[parent];
+                            position = parent;
+                        }
+                        heap[position] = candidate;
+                    } else if (knn_precedes(&candidate, &heap[0])) {
+                        knn_sift_down(heap, count, candidate);
+                    }
+                }
+
+                remaining -= take;
+                order += take;
+                ++current_group;
+                point_index = 0;
+            }
+            parts[p].count = count;
+        }
+
+        /* Adjacent subtrees own disjoint workspace ranges at every level. */
+        for (size_t width = 1; width < (size_t)partitions; width *= 2) {
+            size_t step = width * 2;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (size_t p = 0; p < (size_t)partitions; p += step) {
+                size_t right = p + width;
+                if (right >= (size_t)partitions || parts[right].count == 0) {
+                    continue;
+                }
+
+                KnnPartition *destination = &parts[p];
+                KnnPartition *source = &parts[right];
+                size_t combined = destination->count + source->count;
+                memmove(destination->items + destination->count,
+                        source->items, source->count * sizeof(KnnNeighbor));
+                if (combined > (size_t)k) {
+                    knn_select_prefix(destination->items, combined, (size_t)k);
+                    combined = (size_t)k;
+                }
+                destination->count = combined;
+                source->count = 0;
+            }
+        }
+    }
+
+    /* NaNs require the original, non-total-order insertion semantics. */
+    if (unordered_distance) {
+        free(workspace);
+        free(parts);
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t selected = parts[0].count;
+    for (size_t i = 0; i < selected; ++i) {
+        ++frequency[(unsigned char)parts[0].items[i].label];
+    }
+    frequency[(unsigned char)(char)-1] += (size_t)k - selected;
+
+    free(workspace);
+    free(parts);
+    return knn_vote(frequency);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

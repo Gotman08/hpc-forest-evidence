@@ -1,0 +1,153 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+namespace {
+
+using Coeff = std::uint32_t;
+constexpr std::uint64_t kMod = 1000000007ULL;
+
+// Inputs are canonical residues. Sixteen products plus one residue fit
+// in uint64_t: 16 * (kMod - 1)^2 + (kMod - 1) < 2^64.
+inline Coeff dot_mod(const Coeff* lhs, const Coeff* rhs, int count) {
+    std::uint64_t residue = 0;
+    while (count >= 16) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        uint64x2_t low = vdupq_n_u64(0);
+        uint64x2_t high = vdupq_n_u64(0);
+        for (int i = 0; i < 16; i += 4) {
+            const uint32x4_t x = vld1q_u32(lhs + i);
+            const uint32x4_t y = vld1q_u32(rhs + i);
+            low = vmlal_u32(low, vget_low_u32(x), vget_low_u32(y));
+            high = vmlal_high_u32(high, x, y);
+        }
+        const std::uint64_t block_sum = vaddvq_u64(vaddq_u64(low, high));
+#else
+        std::uint64_t block_sum = 0;
+        for (int i = 0; i < 16; ++i) {
+            block_sum += static_cast<std::uint64_t>(lhs[i]) * rhs[i];
+        }
+#endif
+        residue = (residue + block_sum) % kMod;
+        lhs += 16;
+        rhs += 16;
+        count -= 16;
+    }
+    for (int i = 0; i < count; ++i) {
+        residue += static_cast<std::uint64_t>(lhs[i]) * rhs[i];
+    }
+    return static_cast<Coeff>(residue % kMod);
+}
+
+Coeff recurrence_term(const std::vector<Coeff>& initial,
+                      const std::vector<Coeff>& weights,
+                      std::uint64_t index) {
+    const int n = static_cast<int>(initial.size());
+    if (index < initial.size()) {
+        return initial[static_cast<std::size_t>(index)];
+    }
+
+    std::vector<Coeff> q(n + 1), r(n), reflected(n + 1);
+    std::vector<Coeff> next_q(n + 1), next_r(n);
+
+    // The generating function is R(x)/Q(x), with Q(0) = 1 and
+    // R(x) = (initial(x) * Q(x)) modulo x^n.
+    q[0] = 1;
+    for (int i = 0; i < n; ++i) {
+        q[i + 1] = weights[i] == 0
+            ? 0 : static_cast<Coeff>(kMod - weights[i]);
+    }
+    for (int i = 0; i <= n; ++i) {
+        reflected[n - i] = q[i];
+    }
+    for (int i = 0; i < n; ++i) {
+        r[i] = dot_mod(initial.data(), reflected.data() + n - i, i + 1);
+    }
+
+    while (index != 0) {
+        const int degree = static_cast<int>(q.size()) - 1;
+        // Reverse Q(-x), making each convolution dot product contiguous.
+        for (int i = 0; i <= degree; ++i) {
+            Coeff value = q[i];
+            if ((i & 1) != 0 && value != 0) {
+                value = static_cast<Coeff>(kMod - value);
+            }
+            reflected[degree - i] = value;
+        }
+
+        const int parity = static_cast<int>(index & 1ULL);
+        const std::uint64_t half = index >> 1;
+        const std::size_t needed = static_cast<std::size_t>(half + 1);
+        const int r_degree = static_cast<int>(r.size()) - 1;
+
+        // Only the requested parity of R(x)Q(-x) contributes.
+        // Coefficients above the remaining index can also be discarded.
+        next_r.resize(std::min(r.size(), needed));
+        for (int j = 0; j < static_cast<int>(next_r.size()); ++j) {
+            const int product_degree = 2 * j + parity;
+            const int begin = std::max(0, product_degree - degree);
+            const int end = std::min(r_degree, product_degree);
+            next_r[j] = begin <= end
+                ? dot_mod(r.data() + begin,
+                          reflected.data() + degree - product_degree + begin,
+                          end - begin + 1)
+                : 0;
+        }
+        if (half == 0) {
+            return next_r[0];
+        }
+
+        // Q(x)Q(-x) is even. Symmetric terms agree modulo kMod,
+        // so compute one half of each coefficient and its diagonal.
+        next_q.resize(std::min(q.size(), needed));
+        next_q[0] = 1;
+        for (int j = 1; j < static_cast<int>(next_q.size()); ++j) {
+            const int begin = std::max(0, 2 * j - degree);
+            const std::uint64_t pairs = dot_mod(
+                q.data() + begin,
+                reflected.data() + degree - 2 * j + begin,
+                j - begin);
+            const std::uint64_t diagonal =
+                static_cast<std::uint64_t>(q[j]) * reflected[degree - j];
+            next_q[j] = static_cast<Coeff>((diagonal + 2 * pairs) % kMod);
+        }
+
+        r.swap(next_r);
+        q.swap(next_q);
+        index = half;
+    }
+    return r[0];
+}
+
+} // namespace
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n;
+    std::uint64_t h;
+    if (!(std::cin >> n >> h)) {
+        return 0;
+    }
+
+    std::vector<Coeff> initial(n), weights(n);
+    for (int i = 0; i < n; ++i) {
+        std::uint64_t value;
+        std::cin >> value;
+        initial[i] = static_cast<Coeff>(value % kMod);
+    }
+    for (int i = 0; i < n; ++i) {
+        std::uint64_t value;
+        std::cin >> value;
+        weights[i] = static_cast<Coeff>(value % kMod);
+    }
+
+    std::cout << recurrence_term(initial, weights, h - 1) << '\n';
+    return 0;
+}

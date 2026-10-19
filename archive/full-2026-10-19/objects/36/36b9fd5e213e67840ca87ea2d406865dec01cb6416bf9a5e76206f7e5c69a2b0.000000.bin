@@ -1,0 +1,87 @@
+"""Preserve stopped relay and validate existing cache; no remote or model call."""
+import hashlib
+import importlib.util
+import json
+import shutil
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+BASE = STUDY.parent.parent
+PREVIOUS = STUDY / 'reprises/incident-liaison-terra-xhigh-20261017T1546'
+FIRST = STUDY / 'reprises/incident-double-liaison-20261017T1345'
+RUN = STUDY / 'runs/coverage-gpt-5.6-terra-xhigh'
+COMPARE = BASE / 'outputs/HPC-Forest-Harnais-Comparaison-r1'
+HELPER = STUDY / 'reprises/incident-liaison-20261016T1656/reprendre-relais-r1.py'
+
+def load(path):
+    return json.loads(path.read_text(encoding='utf-8-sig'))
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+def save(path, value):
+    with path.open('x', encoding='utf8') as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=False)
+        stream.write('\n')
+
+assert sha(HELPER) == '1c724a4d9499a093a0fcb19eb40d101a018a97de144c9a98dea83eae14a3fd61'
+observer = module('strict_observer_readonly', PREVIOUS / 'observer-strict.py')
+rows = observer.census()
+save(HERE / 'cim-preparation.json', rows)
+assert not {55304, 14580, 16152, 68736} & {r['ProcessId'] for r in rows}
+assert not [r for r in rows if r['ParentProcessId'] in {55304, 14580, 16152, 68736}]
+source_pair = load(FIRST / 'relais-attendu-source_only.json')
+observer.verify_pair(source_pair, rows)
+expected_observer = load(FIRST / 'identites-observateur-source_only.json')['observer']
+current = next(r for r in rows if r['ProcessId'] == expected_observer['ProcessId'])
+assert all(current[k] == expected_observer[k] for k in observer.FIELDS)
+assert not [r for r in rows if str(HELPER) in (r.get('CommandLine') or '') and '--resume' in r['CommandLine']]
+
+paths = list(RUN.rglob('*')) + [STUDY / 'coordinator-state.json', STUDY / 'coordinator.lock',
+        COMPARE / 'SUIVI-COMPACT.md', COMPARE / 'coordinator-state.json', HELPER]
+paths += [p for p in PREVIOUS.iterdir() if p.is_file()]
+inventory = []
+for path in sorted(set(paths)):
+    assert not path.is_symlink()
+    if not path.is_file():
+        continue
+    before = sha(path)
+    target = HERE / 'avant' / path.relative_to(BASE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    assert not target.exists()
+    shutil.copy2(path, target)
+    assert before == sha(target) == sha(path)
+    inventory.append({'path': str(path.relative_to(BASE)), 'sha256': before,
+                      'bytes': path.stat().st_size, 'copy': str(target.relative_to(HERE))})
+save(HERE / 'inventaire-preserve.json', inventory)
+recovery = module('r1_recovery_readonly', HELPER)
+auth = load(RUN / 'autorisation.json')
+recovery.install_identity(auth['model'], auth['effort'], RUN / 'autorisation.json')
+assert auth['session_id'] == 'bb34f01e2e114cf4a59ae51b02823166'
+assert recovery.frozen_source(Path(auth['source_zip']['path']), recovery.PROJECT, auth['source_zip']['sha256']) == 90
+completed = recovery.cache_state(RUN / 'worker', auth['session_id'])
+assert len(completed) == 52
+claims = list((RUN / 'worker').glob('*/generation-claimed.json'))
+assert len(claims) == 52 and all((p.parent / 'response.json').is_file() for p in claims)
+initial = load(HERE / 'cache-initial.json')
+assert initial['empty'] == ['2b3dfb063ffb40be8e06c8e6e1bee3d6']
+assert not any((RUN / 'worker' / initial['empty'][0]).iterdir())
+old_inventory = load(PREVIOUS / 'inventaire-preserve.json')
+old_responses = [x for x in old_inventory if Path(x['path']).name == 'response.json']
+assert len(old_responses) == 32 and all(sha(BASE / x['path']) == x['sha256'] for x in old_responses)
+save(HERE / 'preparation-verifiee.json', {'verified_at': time.time(), 'preserved_files': len(inventory),
+     'frozen_sources': 90, 'completed_nonces': sorted(completed), 'unanswered_claims': [],
+     'previous_32_responses_unchanged': True, 'helper_sha256': sha(HELPER),
+     'source_only_full_identity_unchanged': True, 'old_r1_processes_and_descendants_absent': True,
+     'empty_unclaimed_folder': initial['empty'], 'same_session_cache_channel': True})
+print(json.dumps({'preserved_files': len(inventory), 'frozen_sources': 90, 'delivered': len(completed), 'unanswered_claims': 0}))

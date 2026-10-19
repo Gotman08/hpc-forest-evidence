@@ -1,0 +1,135 @@
+"""Verify the received post-failure source snapshot and seal a faithfully negative qualification."""
+import hashlib
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+PREPARATION = OUT.parents[1]
+SOURCE = PREPARATION / "revision-source-r4b/revision-r2"
+RESTORED = OUT / "restauration-neuve-r2"
+AFTER_SOURCE = OUT / "source-distante-apres-qualification"
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size}
+
+
+def save(name, value):
+    with (OUT / name).open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def inventory(root):
+    items = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError("Source/evidence links are never followed")
+        if path.is_file():
+            items[path.relative_to(root).as_posix()] = {"sha256": sha(path), "bytes": path.stat().st_size}
+    return items
+
+
+frozen_files = [SOURCE / name for name in ["HPC-Forest-Mere-Dynamique-R4b-MAX.zip", "dynamic-plan-r4b-max.json",
+    "runtime-manifest.json", "hpc-forest-dynamic-r4b-max-qualification-light.tar.gz", "qualifier-r4b.py"]]
+frozen_before = {str(path): sha(path) for path in frozen_files}
+manifest = read(SOURCE / "runtime-manifest.json")
+source_before = inventory(AFTER_SOURCE)
+if len(source_before) != 103 or {name: item["sha256"] for name, item in source_before.items()} != manifest:
+    raise ValueError("Actual post-failure downloaded source103 differs from the frozen manifest")
+q = read(RESTORED / "qualification.json")
+if manifest != q["source_inventory_before"]:
+    raise ValueError("Actual pre-qualification source inventory differs")
+transfer = read(OUT / "transfert-source-apres-brut.json")["structuredContent"]
+if transfer.get("ok") is not True or transfer.get("verifie") is not False:
+    raise ValueError("Preserve the actual recursive MCP transfer verification scope")
+save("SOURCE103-APRES-ECHEC-VERIFIEE.json", {"schema": "hpc-forest-r4b-post-failure-received-source103-proof-v1",
+    "verified": True, "scope": "Actual post-job source directory received over SCP, independently locally hashed against exact frozen ZIP/runtime and driver pre-job inventory",
+    "job_id": "752206", "files": 103, "runtime_manifest": ref(SOURCE / "runtime-manifest.json"),
+    "received_source_root": str(AFTER_SOURCE), "files_inventory": source_before,
+    "mcp_recursive_verified": False, "mcp_recursive_transfer": ref(OUT / "transfert-source-apres-brut.json"),
+    "individual_remote_SHA_replies_received": False, "all_received_file_SHA_equal_frozen_runtime": True,
+    "before_driver_and_received_after_source_SHA_equal": True,
+    "live_source_never_modified_or_executed_by_receiver": True})
+audit_path = OUT / "r2-AUDIT-QUALIFICATION-NEGATIVE.json"
+audit = read(audit_path)
+assert sha(audit_path) == "78d714b1792e7e5b51f3f8dfce7d51dbc24ceaaa61cdd30d0fb7b4ce0e022af0"
+assert audit["verified"] is False and audit["native_model_calls"] == 0
+expected_statuses = read(RESTORED / "expected-reference-statuses.json")
+plan = read(RESTORED / "dynamic-plan.json")
+tests = read(OUT / "r2-junit-metadonnees-reelles.json")
+assert tests["neutral"]["tests"] == 231 and tests["neutral"]["failures_or_errors"] == 0
+assert tests["allocated_C_plumbing"]["tests"] == 2 and tests["allocated_C_plumbing"]["failures_or_errors"] == 1
+test_path = AFTER_SOURCE / "tests/test_r4b_allocated_contracts.py"
+contracts_path = AFTER_SOURCE / "src/hpc_forest/contracts.py"
+test_source, contracts_source = test_path.read_text(encoding="utf8"), contracts_path.read_text(encoding="utf8")
+assert 'protected_manifest(root / "trusted")' in test_source
+assert 'trusted = root / "validation"' in contracts_source and '"validation": str(trusted)' in contracts_source
+assert not (RESTORED / "prepared/prepared-manifest.json").exists()
+assert inventory(RESTORED) == read(OUT / "r2-inventaire-qualification-avant-audit.json")
+assert source_before == inventory(AFTER_SOURCE)
+assert frozen_before == {str(path): sha(path) for path in frozen_files}
+save("inventaire-source-distante-apres-reception.json", source_before)
+save("preservation-sources-scellees-apres-reception.json", {"verified": True,
+    "verification_scope": "Frozen source/plan/runtime/payload/qualifier SHA before and after readonly receiver only",
+    "before": frozen_before, "after": {str(path): sha(path) for path in frozen_files},
+    "source_only_worker_or_source_or_cache_or_lock_touched": False})
+proof_names = ["statut-terminal-frais.json", "efficacite-terminale.json", "enveloppe-distante-brute.json",
+    "qualification-distante-brute.json", "transfert-archive-verifie.json", "journaux-slurm-terminaux.json",
+    "r2-AUDIT-QUALIFICATION-NEGATIVE.json", "r2-junit-metadonnees-reelles.json",
+    "r2-alias-symboliques-non-materialises.json", "r2-inventaire-qualification-avant-audit.json",
+    "r2-inventaire-qualification-apres-audit.json", "r2-inventaire-sources103-avant-audit.json",
+    "r2-inventaire-sources103-apres-audit.json", "SOURCE103-APRES-ECHEC-VERIFIEE.json",
+    "preservation-sources-scellees-apres-reception.json", "premier-refus-recepteur-strict-conserve.json"]
+receipt = {"schema": "hpc-forest-r4b-r2-failed-mechanical-qualification-reception-v1", "verified": False,
+    "created_at": datetime.now(UTC).isoformat(), "job_id": "752206", "scheduler_state": "FAILED", "exit_code": "1:0",
+    "failed_qualification_reception_integrity_verified": True, "mechanical_qualification_received": True,
+    "mechanical_qualification_verified": False,
+    "scope_id": q["scope_id"], "source_zip_sha256": q["source_zip_sha256"], "plan_sha256": q["plan_sha256"],
+    "archive": ref(OUT / "qualification-result.tar.gz"), "announced_remote_local_archive_SHA_equal": True,
+    "qualification": ref(RESTORED / "qualification.json"), "fresh_restored_regular_members": 91,
+    "exact_pytest_symbolic_alias_metadata_quarantined": 2, "symbolic_links_followed_or_created": False,
+    "complete_original_archive_bytes_preserved": True, "source103_restored_and_pre_after_actual_source_SHA_equal": True,
+    "recursive_source_transfer_mcp_verified_flag": False, "source_after_received_files_locally_rehashed_against_frozen_runtime": True,
+    "allocation": q["allocation"], "cpu_affinity": q["cpu_affinity"], "hostname": q["hostname"],
+    "actual_memory_used_MiB": None, "memory_allocated_MiB": 16384,
+    "neutral_tests_passed": 231, "allocated_C_plumbing_tests_passed": 1, "allocated_C_plumbing_tests_failed": 1,
+    "failed_test": "test_actual_evaluator_checker_private_cases_and_five_confirmations",
+    "failure_type": "FileNotFoundError", "failure_path": "prepared/trusted/contract.json",
+    "confirmed_technical_defect": "The allocated test calls protected_manifest(root/'trusted') while contracts.prepare creates and returns root/'validation'",
+    "defect_source_refs": [ref(test_path), ref(contracts_path)],
+    "real_Evaluator_and_five_confirmations_plumbing_fully_qualified": False,
+    "reference_preparation_reached": False, "expected_reference_statuses_count_only": len(expected_statuses),
+    "expected_mechanically_ready_count_only": sum(value == "ready" for value in expected_statuses.values()),
+    "plan_subject_count_only": len(plan["subjects"]), "actual_reference_statuses19_or_ready16_or_admitted15_received": False,
+    "native_model_calls": 0, "native_generation_admitted": False, "native_contracts_admitted": False,
+    "first_normal_native_call_or_evaluation_received": False, "hardware_process_isolation_verified": False,
+    "received_C_Python_CLI_or_model_executed_by_receiver": False, "new_job_or_replay_or_stop_or_install_by_receiver": False,
+    "next_action": "Parent may prepare an isolated technical correction and independent review/new allocated qualification; preserve this failed job and all first refusals",
+    "proofs": [ref(OUT / name) for name in proof_names]}
+save("RECEPTION-QUALIFICATION-NEGATIVE-752206.json", receipt)
+text = f'''# Qualification R4b r2 / 752206 — échec reçu, zéro modèle
+
+Le job Slurm est réellement FAILED 1:0 après11secondes. Les trois empreintes de l’archive concordent : `{receipt["archive"]["sha256"]}` ({receipt["archive"]["bytes"]}octets). Les91membres réguliers sont restaurés neufs et inchangés. Deux liens symboliques pytest `*current` du même job sont conservés comme métadonnées en quarantaine, sans les suivre ou les créer ; l’archive originale complète demeure intacte. Le premier refus de ce récepteur est conservé.
+
+Le vrai profil est ARM64, un nœud, une tâche, quatre CPU, affinité[0,1,2,3],16Gio demandés/alloués, zéro GPU. La mémoire réellement utilisée n’est pas fournie par l’efficacité. Les231tests neutres sont réussis. Parmi les deux tests alloués de plomberie C, un réussit et un échoue : `test_actual_evaluator_checker_private_cases_and_five_confirmations`, FileNotFoundError sur `prepared/trusted/contract.json`. Le test appelle `protected_manifest(root / "trusted")` alors que `contracts.prepare` crée `root / "validation"` et le retourne. Ce constat technique vient du vrai JUnit et des sources reçues ; aucun test n’a été réexécuté ici.
+
+La préparation des19statuts de référence n’a pas été atteinte ; les16références mécaniques et15sujets prévus ne sont pas des réceptions établies. La plomberie complète Evaluator/cinq confirmations reste non qualifiée. Les103sources de l’archive et la copie du projet distant reçue après l’échec ont chacune les mêmes SHA que le manifeste figé et l’inventaire avant du driver. Le transfert récursif MCP conserve `verifie=false` : le présent lecteur a rehashé localement chacun des103fichiers reçus, sans inventer de réponses SHA distantes individuelles. Les sources, plan, payload et qualificateur scellés restent inchangés.
+
+`RECEPTION-QUALIFICATION-NEGATIVE-752206.json` garde verified/qualification/génération/contrats/admission native à false. Seule l’intégrité de la réception négative est vérifiée dans son périmètre déclaré. Aucun appel de modèle, première évaluation native ou isolement matériel n’est admis. Aucun code reçu, C, CLI ou modèle n’a été exécuté par ce récepteur ; aucun job, rejeu, arrêt ou installation. Le worker source-only et ses données n’ont pas été touchés. Toute correction appartient à une révision isolée revue puis à une nouvelle qualification allouée ; ce job échoué et ses preuves doivent être conservés.
+'''
+with (OUT / "REPRISE.md").open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(text)
+print(json.dumps({"receipt_sha256": sha(OUT / "RECEPTION-QUALIFICATION-NEGATIVE-752206.json"),
+    "source_after_proof_sha256": sha(OUT / "SOURCE103-APRES-ECHEC-VERIFIEE.json"),
+    "qualification_sha256": sha(RESTORED / "qualification.json"), "verified": False,
+    "neutral_pass": 231, "C_plumbing_pass": 1, "C_plumbing_fail": 1, "native_model_calls": 0}))

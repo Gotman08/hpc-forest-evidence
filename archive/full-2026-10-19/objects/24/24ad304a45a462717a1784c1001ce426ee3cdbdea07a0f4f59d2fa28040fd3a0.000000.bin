@@ -1,0 +1,285 @@
+#include "knn.h"
+#include <limits.h>
+#include <math.h>
+
+typedef struct {
+    float distance;
+    char label;
+    unsigned long long order;
+} Candidate;
+
+static inline int candidate_is_worse(const Candidate *a, const Candidate *b) {
+    if (a->distance > b->distance) {
+        return 1;
+    }
+    if (a->distance < b->distance) {
+        return 0;
+    }
+    return a->order > b->order;
+}
+
+static void heap_push_max(Candidate *heap, int index, Candidate candidate) {
+    while (index > 0) {
+        int parent = (index - 1) / 2;
+        if (!candidate_is_worse(&candidate, &heap[parent])) {
+            break;
+        }
+        heap[index] = heap[parent];
+        index = parent;
+    }
+    heap[index] = candidate;
+}
+
+static void heap_replace_max_root(Candidate *heap, int heap_size, Candidate candidate) {
+    int index = 0;
+
+    while (index < heap_size / 2) {
+        int child = index * 2 + 1;
+        int right = child + 1;
+
+        if (right < heap_size && candidate_is_worse(&heap[right], &heap[child])) {
+            child = right;
+        }
+        if (!candidate_is_worse(&heap[child], &candidate)) {
+            break;
+        }
+
+        heap[index] = heap[child];
+        index = child;
+    }
+    heap[index] = candidate;
+}
+
+static void heap_push_min(Candidate *heap, int index, Candidate candidate) {
+    while (index > 0) {
+        int parent = (index - 1) / 2;
+        if (!candidate_is_worse(&heap[parent], &candidate)) {
+            break;
+        }
+        heap[index] = heap[parent];
+        index = parent;
+    }
+    heap[index] = candidate;
+}
+
+static void heap_replace_min_root(Candidate *heap, int heap_size, Candidate candidate) {
+    int index = 0;
+
+    while (index < heap_size / 2) {
+        int child = index * 2 + 1;
+        int right = child + 1;
+
+        if (right < heap_size && candidate_is_worse(&heap[child], &heap[right])) {
+            child = right;
+        }
+        if (!candidate_is_worse(&candidate, &heap[child])) {
+            break;
+        }
+
+        heap[index] = heap[child];
+        index = child;
+    }
+    heap[index] = candidate;
+}
+
+static char mode_from_labels(char *labels, int k) {
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+static char knn_original(int n_groups, Group *groups, int k, Point to_evaluate) {
+    char *labels = (char *) malloc(sizeof(char) * k);
+    float *distances = (float *) malloc(sizeof(float) * k);
+
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    char result = mode_from_labels(labels, k);
+    free(distances);
+    free(labels);
+    return result;
+}
+
+static char mode_from_counts(const unsigned long long *counts) {
+    char most_frequent = 0;
+    unsigned long long most_frequent_count = 0;
+
+    for (int value = 0; value <= UCHAR_MAX; value++) {
+        unsigned long long count = counts[value];
+        if (count != 0) {
+            char label = (char) (unsigned char) value;
+            if (count > most_frequent_count ||
+                (count == most_frequent_count &&
+                 compare_for_sort(&label, &most_frequent) < 0)) {
+                most_frequent = label;
+                most_frequent_count = count;
+            }
+        }
+    }
+
+    return most_frequent;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0) {
+        return knn_original(n_groups, groups, k, to_evaluate);
+    }
+
+    unsigned long long total_points = 0;
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            total_points += (unsigned long long) groups[i].length;
+        }
+    }
+
+    int use_complement =
+        total_points >= (unsigned long long) k &&
+        total_points - (unsigned long long) k < (unsigned long long) k;
+    int heap_capacity = use_complement
+        ? (int) (total_points - (unsigned long long) k)
+        : k;
+
+    Candidate *heap = NULL;
+    if (heap_capacity > 0) {
+        heap = (Candidate *) malloc(sizeof(Candidate) * (size_t) heap_capacity);
+        if (heap == NULL) {
+            return knn_original(n_groups, groups, k, to_evaluate);
+        }
+    }
+
+    unsigned long long counts[UCHAR_MAX + 1] = {0};
+    int heap_size = 0;
+    unsigned long long order = 0;
+
+    if (use_complement) {
+        for (int i = 0; i < n_groups; i++) {
+            const Group *g = &groups[i];
+
+            for (int j = 0; j < g->length; j++) {
+                float d = euclidean_distance_no_sqrt(to_evaluate, g->points[j]);
+                if (!isfinite(d) || d < 0.0f) {
+                    free(heap);
+                    return knn_original(n_groups, groups, k, to_evaluate);
+                }
+
+                Candidate candidate;
+                candidate.distance = d;
+                candidate.label = g->label;
+                candidate.order = order++;
+                counts[(unsigned char) candidate.label]++;
+
+                if (heap_size < heap_capacity) {
+                    heap_push_min(heap, heap_size, candidate);
+                    heap_size++;
+                } else if (heap_capacity > 0 &&
+                           candidate_is_worse(&candidate, &heap[0])) {
+                    heap_replace_min_root(heap, heap_size, candidate);
+                }
+            }
+        }
+
+        for (int i = 0; i < heap_size; i++) {
+            counts[(unsigned char) heap[i].label]--;
+        }
+    } else {
+        for (int i = 0; i < n_groups; i++) {
+            const Group *g = &groups[i];
+
+            for (int j = 0; j < g->length; j++) {
+                float d = euclidean_distance_no_sqrt(to_evaluate, g->points[j]);
+                if (!isfinite(d) || d < 0.0f) {
+                    free(heap);
+                    return knn_original(n_groups, groups, k, to_evaluate);
+                }
+
+                Candidate candidate;
+                candidate.distance = d;
+                candidate.label = g->label;
+                candidate.order = order++;
+
+                if (heap_size < k) {
+                    heap_push_max(heap, heap_size, candidate);
+                    counts[(unsigned char) candidate.label]++;
+                    heap_size++;
+                } else if (candidate_is_worse(&heap[0], &candidate)) {
+                    counts[(unsigned char) heap[0].label]--;
+                    counts[(unsigned char) candidate.label]++;
+                    heap_replace_max_root(heap, heap_size, candidate);
+                }
+            }
+        }
+
+        if (heap_size < k) {
+            char empty_label = (char) -1;
+            counts[(unsigned char) empty_label] +=
+                (unsigned long long) (k - heap_size);
+        }
+    }
+
+    char result = mode_from_counts(counts);
+    free(heap);
+    return result;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

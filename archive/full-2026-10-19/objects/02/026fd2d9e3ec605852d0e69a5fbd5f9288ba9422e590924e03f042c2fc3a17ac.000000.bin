@@ -1,0 +1,165 @@
+"""Owned, resumable reference96 relay; never replay a claimed generation."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+from .codex_mailbox import bounded_json, sha256
+from .codex_process import check_dependencies
+from .codex_worker import RomeoFiles, Worker, validate_request
+from .core import FileLock, InfrastructureError, atomic_json
+
+SCOPE = "gpt61sol-max-reference96-20261016-r2"
+
+
+def verify_gate(receipt: Path, session: str):
+    gate = check_dependencies(receipt, {"747504", "747505"})
+    if (gate.get("scope_id") != SCOPE or gate.get("session_id") != session
+            or gate.get("harness_enabled") is not False):
+        raise InfrastructureError("Wrong reference96 scope, session or harness")
+    comparison = gate.get("comparison_received_and_audited", {})
+    if comparison.get("job_id") != "747885":
+        raise InfrastructureError("The comparison dependency is missing")
+    for path_key, hash_key in [("archive_path", "archive_sha256"),
+                               ("audit_path", "audit_sha256")]:
+        path = Path(comparison[path_key])
+        if path.is_symlink() or sha256(path.read_bytes()) != comparison[hash_key]:
+            raise InfrastructureError("Comparison dependency bytes changed")
+    audit = bounded_json(Path(comparison["audit_path"]), 2_000_000)
+    if (not audit.get("all_final_confirmations_verified")
+            or not audit.get("matched_gain_comparison_verified")
+            or not audit.get("read_only_evidence_verified")
+            or len(audit.get("problems", [])) != 6):
+        raise InfrastructureError("The six comparison arms are not audited")
+    stop = bounded_json(Path(comparison["relay_stopped_receipt"]), 65536)
+    if (stop.get("job_id") != "747885" or stop.get("remaining_pids") != []
+            or not stop.get("all_requests_delivered")):
+        raise InfrastructureError("The previous native lane has not been released")
+    return gate
+
+
+def verify_source(archive: Path, project: Path, expected_sha: str):
+    if archive.is_symlink() or sha256(archive.read_bytes()) != expected_sha:
+        raise InfrastructureError("The reference96 source archive changed")
+    count = 0
+    with zipfile.ZipFile(archive) as bundle:
+        for info in bundle.infolist():
+            if info.is_dir():
+                continue
+            if not info.filename.startswith("HPC-Forest/"):
+                raise InfrastructureError("Unexpected source archive root")
+            target = project / info.filename.removeprefix("HPC-Forest/")
+            if (not target.resolve().is_relative_to(project.resolve())
+                    or target.is_symlink() or not target.is_file()
+                    or target.read_bytes() != bundle.read(info)):
+                raise InfrastructureError("Frozen reference96 source mismatch")
+            count += 1
+    return count
+
+
+def delivered_cache(output: Path, session: str):
+    completed = set()
+    for folder in output.iterdir():
+        if not folder.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", folder.name):
+            continue
+        if not (folder / "delivered.json").exists():
+            continue
+        request_file = folder / "downloaded-request.json"
+        request = bounded_json(request_file)
+        validate_request(request, session, folder.name)
+        digest = sha256(request_file.read_bytes())
+        raw = (folder / "response.json").read_bytes()
+        response = bounded_json(folder / "response.json")
+        ready = bounded_json(folder / "response-ready.json")
+        delivered = bounded_json(folder / "delivered.json")
+        expected = {key: request[key] for key in
+                    ("protocol", "nonce", "session_id", "model", "reasoning_effort")}
+        expected["request_sha256"] = digest
+        if (any(response.get(k) != v for k, v in expected.items())
+                or delivered.get("request_sha256") != digest
+                or delivered.get("response_sha256") != sha256(raw)
+                or ready != {"sha256": sha256(raw), "bytes": len(raw)}):
+            raise InfrastructureError("The delivered response cache changed")
+        completed.add(folder.name)
+    return completed
+
+
+def event(output: Path, name: str, **values):
+    with (output / "resume-events.jsonl").open("a", encoding="utf8") as stream:
+        stream.write(json.dumps({"utc_epoch": time.time(), "event": name, **values}) + "\n")
+
+
+async def serve(args):
+    args.output.mkdir(parents=True, exist_ok=True)
+    verify_gate(args.dependency_receipt, args.session_id)
+    count = verify_source(args.source_zip, args.project, args.source_sha256)
+    with FileLock(args.output / "worker.lock"):
+        atomic_json(args.output / "resume-process-identity.json", {
+            "pid": os.getpid(), "parent_pid": os.getppid(), "started_at": time.time(),
+            "executable": sys.executable, "argv": sys.argv, "channel": args.channel,
+            "session_id": args.session_id, "frozen_source_files_verified": count,
+            "source_sha256": args.source_sha256, "resume": True,
+        })
+        end = time.monotonic() + args.max_seconds
+        failures = 0
+        while time.monotonic() < end:
+            try:
+                async with RomeoFiles(args.codex_config) as transfer:
+                    worker = Worker(transfer, args.channel, args.session_id, args.output,
+                                    args.dependency_receipt, {"747504", "747505"})
+                    worker.completed.update(delivered_cache(args.output, args.session_id))
+                    await worker.hello()
+                    event(args.output, "connection_ready", delivered_cache=len(worker.completed))
+                    while time.monotonic() < end:
+                        for name in sorted(await transfer.requests(args.channel)):
+                            nonce = name.split(".")[0]
+                            if nonce in worker.completed:
+                                continue
+                            verify_gate(args.dependency_receipt, args.session_id)
+                            verify_source(args.source_zip, args.project, args.source_sha256)
+                            cache = args.output / nonce
+                            was_claimed = (cache / "generation-claimed.json").exists()
+                            had_response = (cache / "response.json").exists()
+                            if await worker.handle(name):
+                                event(args.output, "request_delivered", nonce=nonce,
+                                      was_claimed=was_claimed, had_response=had_response)
+                        failures = 0
+                        await asyncio.sleep(2)
+            except Exception as exc:
+                failures += 1
+                event(args.output, "relay_failure", attempt=failures,
+                      exception_type=type(exc).__name__, error=str(exc)[:2000])
+                if failures >= 3:
+                    raise
+                await asyncio.sleep(min(30, max(0, end - time.monotonic())))
+        event(args.output, "relay_maximum_reached")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--resume", action="store_true", required=True)
+    parser.add_argument("--channel", required=True)
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--codex-config", type=Path, required=True)
+    parser.add_argument("--dependency-receipt", type=Path, required=True)
+    parser.add_argument("--source-zip", type=Path, required=True)
+    parser.add_argument("--source-sha256", required=True)
+    parser.add_argument("--project", type=Path, required=True)
+    parser.add_argument("--max-seconds", type=int, default=72000)
+    args = parser.parse_args()
+    if not 1 <= args.max_seconds <= 72000:
+        parser.error("The relay must remain within the twenty-hour allocation maximum")
+    return asyncio.run(serve(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,112 @@
+"""UNEXECUTED allocation-only reference mechanics; no native-model admission."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import subprocess
+import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import validate
+
+
+def inventory(root: Path) -> dict:
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def run_once(command: list[str], *, timeout: int, input_bytes: bytes | None = None) -> dict:
+    """Preserve first failure and partial bytes; never retry an execution."""
+    try:
+        result = subprocess.run(command, input=input_bytes, capture_output=True, check=False, timeout=timeout)
+        return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+                "timed_out": False, "os_error": None}
+    except subprocess.TimeoutExpired as exc:
+        return {"returncode": None, "stdout": exc.stdout or b"", "stderr": exc.stderr or b"",
+                "timed_out": True, "os_error": None}
+    except OSError as exc:
+        return {"returncode": None, "stdout": b"", "stderr": str(exc).encode("utf-8"),
+                "timed_out": False, "os_error": type(exc).__name__}
+
+
+def allocation() -> dict:
+    validate.require(platform.system() == "Linux" and platform.machine().lower() in ("aarch64", "arm64"),
+                     "real Linux ARM64 allocation required; Windows execution forbidden")
+    env = os.environ
+    validate.require(bool(env.get("SLURM_JOB_ID")), "Slurm allocation required")
+    validate.require(env.get("SLURM_JOB_NUM_NODES") == "1" and env.get("SLURM_NTASKS") == "1",
+                     "exact one-node one-task qualification requested")
+    validate.require(env.get("SLURM_CPUS_PER_TASK") == "4" and env.get("SLURM_MEM_PER_NODE") == "16384",
+                     "four CPU and 16 GiB qualification allocation required")
+    validate.require(not env.get("SLURM_JOB_GPUS") and env.get("CUDA_VISIBLE_DEVICES", "") in ("", "-1", "NoDevFiles"),
+                     "zero GPU qualification allocation required")
+    validate.require(len(os.sched_getaffinity(0)) >= 4, "fewer than four CPU observed in allocation affinity")
+    validate.require(datetime.now(UTC) + timedelta(minutes=15, hours=3)
+                     < datetime(2026, 10, 31, 23, tzinfo=UTC), "qualification plus reception exceeds exclusive deadline")
+    return {"platform": platform.platform(), "machine": platform.machine(),
+            "python": platform.python_version(),
+            "slurm": {k: env.get(k) for k in ("SLURM_JOB_ID", "SLURM_JOB_NUM_NODES", "SLURM_NTASKS",
+                       "SLURM_CPUS_PER_TASK", "SLURM_MEM_PER_NODE", "SLURM_JOB_GPUS", "CUDA_VISIBLE_DEVICES")},
+            "affinity_cpu_count_observed": len(os.sched_getaffinity(0))}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    resources = allocation()  # Fail before compilation, subprocess or file creation outside allocation.
+    data = args.data.resolve()
+    output = args.output.resolve()
+    validate.require(not output.exists() and not output.is_relative_to(data), "new separate qualification output required")
+    validated = validate.validate_preparation(data)
+    before = inventory(data)
+    output.mkdir(parents=True)
+    start = time.monotonic()
+    compiler = run_once(["gcc", "--version"], timeout=15)
+    binary = output / "official-reference"
+    build = {"returncode": None, "stdout": b"", "stderr": b"compiler version check failed; build not attempted",
+             "timed_out": False, "os_error": None}
+    if compiler["returncode"] == 0:
+        build = run_once(["gcc", "-O2", "-std=c11", str(data / "sources/primetest.c"), "-lm", "-o", str(binary)], timeout=60)
+    (output / "compiler-version.txt").write_bytes(compiler["stdout"] + compiler["stderr"])
+    (output / "build.stdout").write_bytes(build["stdout"])
+    (output / "build.stderr").write_bytes(build["stderr"])
+    rows = []
+    if build["returncode"] == 0:
+        for row in validated["cases"]:
+            folder = data / "private-audit-fixtures" / row["case"]
+            run = run_once([str(binary)], input_bytes=(folder / "input.txt").read_bytes(), timeout=30)
+            (output / (row["case"] + ".stdout")).write_bytes(run["stdout"])
+            (output / (row["case"] + ".stderr")).write_bytes(run["stderr"])
+            rows.append({"case": row["case"], "returncode": run["returncode"],
+                         "stdout_sha256": hashlib.sha256(run["stdout"]).hexdigest(),
+                         "exact_output": run["stdout"] == (folder / "expected.txt").read_bytes(),
+                         "stderr_empty": not run["stderr"], "timed_out": run["timed_out"], "os_error": run["os_error"]})
+            if run["returncode"] != 0 or not rows[-1]["exact_output"] or not rows[-1]["stderr_empty"]:
+                break
+    after = inventory(data)
+    passed = (build["returncode"] == 0 and len(rows) == len(validated["cases"])
+              and all(x["returncode"] == 0 and x["exact_output"] and x["stderr_empty"] for x in rows)
+              and before == after)
+    report = {"schema": 1, "scope": "hpc-forest-primes-max-certifie-r1",
+              "status": "mechanical_reference_passed_not_native_model_admitted" if passed else "mechanical_reference_failed_preserved",
+              "resources": resources, "compiler_returncode": build["returncode"], "cases": rows,
+              "compiler_probe": {k: v for k, v in compiler.items() if k not in ("stdout", "stderr")},
+              "build": {k: v for k, v in build.items() if k not in ("stdout", "stderr")},
+              "source_and_data_unchanged": before == after, "inventory_before": before, "inventory_after": after,
+              "elapsed_seconds": time.monotonic() - start, "native_model_calls": 0,
+              "research_cells_started": 0, "performance_gain_claimed": False,
+              "contract_conflict_unresolved": True, "native_research_admitted": False,
+              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest() if binary.exists() else None}
+    (output / "qualification.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"status": report["status"], "cases": len(rows)}))
+    raise SystemExit(0 if passed else 1)
+
+
+if __name__ == "__main__":
+    main()

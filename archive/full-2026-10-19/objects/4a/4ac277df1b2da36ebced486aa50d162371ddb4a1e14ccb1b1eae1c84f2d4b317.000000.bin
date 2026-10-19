@@ -1,0 +1,307 @@
+"""Independent G terminal metadata/byte audit. No live source, process, SQLite or research execution."""
+import ast
+import hashlib
+import json
+import stat
+import tarfile
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+OUT = Path(__file__).resolve().parent
+BASE = OUT.parents[3]
+REL = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2g"
+AUD = BASE / "outputs/HPC-Forest-Primes-Natif-Audit-r2g"
+COLLECTION = REL / "collecte-finale-pure-r2/execution-reelle-par-etapes-01/COLLECTE-PRE-STOP-POUR-AUDIT.json"
+SOURCE = "f8c2104bad52e3c298de596fd365415fbdfbbb12fbdc41b47b06a94ad68273fe"
+PLAN = "5af07859f99192e169f2475fb2c863c9d4a05a4a8dba07845b3fcc54451e7dba"
+SCOPE = "hpc-forest-primes-native-max-r2g"
+JOBS = {"753498": ("gpt-6-astra", "110cefccf16b439eb226e475c875c8df", 4, 59030),
+        "753497": ("gpt-5.6-terra", "5d8811082a1842f5836a2bdda982500f", 3, 47223),
+        "753499": ("gpt-6.1-sol", "13eaca4e39cf4147a3f677a32fb5a52d", 3, 40423)}
+REPORT_SHAS = {"753498": "e5f3ff5ffd1c7725492e2991560521d1b684e4d0a48fb8f697109c6e551ae63f",
+    "753497": "25a5ed61c4fa45d227091718b2a2bcca85dc92fba157b08993bd72585ca755ab",
+    "753499": "24afc768dc74b70afeec80ae5f86668ee3566c90a75aea4044f3c10d5451e644"}
+FEATURES = {"skip_host_skill_discovery": False, **{name: name == "code_mode_host" for name in (
+    "shell_tool", "unified_exec", "apps", "plugins", "memories", "multi_agent", "multi_agent_v2", "hooks",
+    "skill_search", "browser_use", "computer_use", "image_generation", "view_image", "workspace_dependencies",
+    "code_mode_host", "code_mode", "code_mode_only", "sleep_tool", "unbounded_connection_retries", "shell_snapshot", "goals")}}
+PROTECTED = {}
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def ordinary(path):
+    path = Path(path)
+    need(path.is_absolute() and path.resolve().is_relative_to(BASE), "Owned workspace cold path required")
+    need(not any(path.resolve().is_relative_to(BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2g" / ("worker-" + row[1])) for row in JOBS.values()), "Live source cache forbidden")
+    need(not any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()) for p in (path, *path.parents)), "Linked evidence refused")
+    need(path.name.rstrip(" .").casefold() != "worker.lock", "Lock contents never read")
+    return path
+
+
+def raw(path):
+    path = ordinary(path)
+    before = path.stat()
+    need(stat.S_ISREG(before.st_mode) and before.st_size <= 128 * 1024**2, "Bounded regular cold file required")
+    data = path.read_bytes()
+    after = path.stat()
+    need((before.st_size, before.st_mtime_ns, before.st_ino) == (after.st_size, after.st_mtime_ns, after.st_ino), "Cold file changed")
+    return data
+
+
+def sha_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha(path):
+    return sha_bytes(raw(path))
+
+
+def read(path):
+    return json.loads(raw(path))
+
+
+def ref(path):
+    return {"path": str(Path(path)), "sha256": sha(path)}
+
+
+def checked(value):
+    need(set(value) == {"path", "sha256"}, "Closed ref required")
+    path = ordinary(value["path"])
+    need(sha(path) == value["sha256"], "Referenced cold bytes changed")
+    PROTECTED[str(path)] = value["sha256"]
+    return path
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(Path(root).rglob("*")):
+        need(not path.is_symlink(), "Cold inventory link")
+        if path.is_file():
+            data = raw(path)
+            result[path.relative_to(root).as_posix()] = {"sha256": sha_bytes(data), "bytes": len(data)}
+    return result
+
+
+def verify_tar(archive, root, job):
+    found = {}
+    with tarfile.open(archive, "r:gz") as stream:
+        for member in stream:
+            name = member.name.rstrip("/")
+            rel = PurePosixPath(name)
+            need(name and not rel.is_absolute() and rel.as_posix() == name and ".." not in rel.parts and "\\" not in name
+                 and rel.parts[0] in {"results-" + job, "runtime-preparation-private-audit"}, "Unexpected tar name")
+            need(member.isdir() or member.isfile(), "Tar link/device refused")
+            if member.isfile():
+                need(name not in found and 0 <= member.size <= 128 * 1024**2, "Tar duplicate/oversize")
+                blob = stream.extractfile(member).read()
+                need(len(blob) == member.size, "Tar short member")
+                found[name] = {"sha256": sha_bytes(blob), "bytes": len(blob)}
+    need(found == inventory(root), "Independent tar/restoration inventory mismatch")
+    return len(found)
+
+
+def transfer(value, target, origin):
+    doc = read(checked(value))
+    need(doc.get("isError") is not True, "Transfer error")
+    doc = doc.get("structuredContent", doc)
+    need(doc.get("ok") is True and doc.get("verifie") is True and doc.get("transport") == "scp"
+        and doc.get("downloaded") == origin and PureWindowsPath(doc.get("to", "")) == PureWindowsPath(str(target))
+        and doc.get("bytes") == len(raw(target))
+        and all(doc.get(k) == sha(target) for k in ("remote_sha256", "empreinte_locale", "empreinte_distante")), "Transfer size/source/three SHA differ")
+
+
+def toml(value):
+    if type(value) in {str, int, bool}:
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(toml(v) for v in value) + "]"
+    need(set(value) == {"path", "enabled"} and value["enabled"] is False, "Closed private override required")
+    return "{path=" + toml(value["path"]) + ",enabled=false}"
+
+
+def expected_argv(cli, model, nonce, source_cache, policy):
+    directory = PureWindowsPath(source_cache) / nonce
+    argv = [cli["executable_path"], "exec", "--ignore-user-config", "--strict-config", "--ephemeral", "--skip-git-repo-check",
+        "--sandbox", "read-only", "--json", "--color", "never", "--model", model,
+        "--output-schema", str(directory / "output-schema.json"), "--output-last-message", str(directory / "agent-result.json"), "-C", str(directory)]
+    overrides = {"model_reasoning_effort": "max", "model_instructions_file": str(directory / "instructions.txt"),
+        "model_context_window": 65536, "project_doc_max_bytes": 0, "skills.max_context_tokens": 1,
+        "skills.config": [{"path": p, "enabled": False} for p in policy["skill_candidate_directories"]],
+        "skills.include_instructions": False, "skills.bundled.enabled": False, "approval_policy": "never",
+        "forced_login_method": "chatgpt", "web_search": "disabled", **{"features." + k: v for k, v in FEATURES.items()}}
+    for key, value in overrides.items():
+        argv.extend(["--config", key + "=" + toml(value)])
+    return [*argv, "-"]
+
+
+format_path = AUD / "revision-r3/audit_formats_g.py"
+need(sha(format_path) == "1962da2f53d2c3b707196db325623380a45a19a686b8f49570dcb4987f117951", "Reviewed local format functions changed")
+tree = ast.parse(raw(format_path).decode("utf8"))
+definitions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in {"usage_from_events", "diagnostics_from_events"}]
+namespace = {"json": json, "Path": Path, "TOKEN_CEILING": 196608, "sha256": sha_bytes}
+exec(compile(ast.Module(body=definitions, type_ignores=[]), str(format_path), "exec"), namespace)
+need(sha(COLLECTION) == "7dfd1862ccb7c1ef7bae1a3472c57f07521d092d43f4ce13d4de6011135e7e60", "Actual collection changed")
+collection = read(COLLECTION)
+need(collection["readable_data_collection_completed"] is True and {c["job_id"] for c in collection["cells"]} == set(JOBS), "Exact actual three-cell collection required")
+cohorts = []
+all_nonces, total_tokens, exact_invocations, unmeasured, timeout_count = set(), 0, 0, 0, 0
+for cell in collection["cells"]:
+    job = cell["job_id"]
+    model, session, expected_calls, _ = JOBS[job]
+    binding = read(checked(cell["binding"]))
+    need(binding["model"] == model and binding["session_id"] == session and binding["source_zip_sha256"] == SOURCE
+         and binding["plan_sha256"] == PLAN and binding["effort"] == "max", "Cell identity differs")
+    source_cache = binding["cache_source_root"]
+    need(PureWindowsPath(source_cache) == PureWindowsPath(BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2g" / ("worker-" + session)), "Wrong actual cache parent")
+    root, cache = Path(cell["root"]), Path(cell["cache"])
+    need(cache.is_relative_to(COLLECTION.parent) and not (cache / "worker.lock").exists(), "Only cold copied cache without lock allowed")
+    before_root, before_cache = inventory(root), inventory(cache)
+    reception, preservation = read(checked(cell["reception"])), read(checked(cell["cache_receipt"]))
+    archive = checked(reception["archive"])
+    announcement_path = checked(reception["archive_announcement"])
+    announcement = read(announcement_path)
+    remote = binding["remote_root"]
+    need(announcement["sha256"] == sha(archive), "Archive announced SHA differs")
+    transfer(reception["archive_announcement_transfer"], announcement_path, remote + "/archive.json")
+    transfer(reception["archive_transfer"], archive, remote + "/results-" + job + ".tar.gz")
+    count = verify_tar(archive, root, job)
+    need(reception["files"] == before_root and preservation["files"] == before_cache, "Root/cache inventory receipts differ")
+    need(read(checked(preservation["source_inventory_before"])) == read(checked(preservation["source_inventory_after"])) == before_cache, "Readable source before/after/copy differ")
+    for key in ("source_full_metadata_before", "source_full_metadata_after"):
+        metadata = read(checked(preservation[key]))
+        lock = metadata["worker.lock"]
+        need(lock["bytes"] == 1 and lock["bytes_read"] is False and lock["read_attempted"] is False
+             and lock["read_errno"] is None and lock["sha256"] is None, "Unread lock metadata differs")
+        need(set(metadata) == set(before_cache) | {"worker.lock"}, "Full cache metadata count differs")
+    exception = read(checked(preservation["owned_operational_lock_exception"]))
+    need(exception["read_attempted"] is False and exception["read_errno"] is None and exception["sha256_before"] is None, "Invented lock read/SHA")
+    owner = read(checked(exception["owner_identity_ref"]))
+    need(owner["full_identity"]["ProcessId"] == owner["pid"] and owner["full_identity"]["ParentProcessId"] == owner["parent_pid"]
+         and owner["full_identity"]["ExecutablePath"] == owner["executable"] and owner["full_identity"]["CommandLine"] == owner["command_line"]
+         and owner["full_identity"]["CreationDate"] == owner["creation_time_utc"], "Five-field cold owner proof differs")
+    observation = read(checked(binding["scheduler_observation"]))
+    observation = observation.get("structuredContent", observation)
+    need(observation["job_id"] == job and observation["state"] == "FAILED" and observation["exit_code"] == "1:0"
+         and observation["finished"] is True and observation["observation"]["current_state_observed"] is True, "Terminal FAILED1:0 observation differs")
+    for side in ("controller", "worker"):
+        auth = read(checked(binding[side + "_authorization"]))
+        copies = binding[side + "_admission_copies"]
+        need(len(copies) == 14 and set(copies) == set(auth["artifacts"]), "All14 admission copies required")
+        for key, value in copies.items():
+            checked(value)
+            need(auth["artifacts"][key]["sha256"] == value["sha256"], "Original/copied admission SHA differs")
+    policy_path = checked(binding["private_cli_policy"])
+    policy = read(policy_path)
+    cli = read(checked(binding["worker_admission_copies"]["cli_identity"]))
+    need(policy["schema"] == "hpc-forest-r2g-local-cli-policy-v1" and cli["task_cli_policy_sha256"] == sha(policy_path), "Frozen policy identity differs")
+    need(set(policy["cli_feature_overrides"]) == set(FEATURES) and all(policy["cli_feature_overrides"][k] is v for k, v in FEATURES.items()), "Strict G22 feature map differs")
+    need(policy["code_mode_host_executable_sha256"] == "3b6a9179a4da17fa5fc6948219cd61486dc3b534c683838076d8c61bd311c68e", "Host pin differs")
+    for key in ("scope_id", "model", "effort", "job_id", "session_id", "remote_root", "source_zip_sha256", "plan_sha256"):
+        need(policy[key] == binding[key], "Private policy8 binding differs")
+    output = root / ("results-" + job)
+    mailbox = output / "mailbox"
+    requests = sorted((mailbox / "requests").glob("*.request.json"))
+    need(len(requests) == expected_calls and {p.name for p in cache.iterdir() if p.is_dir()} == {p.name.split(".")[0] for p in requests}, "Exact completed nonces differ")
+    records, known, unknown, tokens = [], 0, 0, 0
+    for request_path in requests:
+        request = read(request_path)
+        nonce = request["nonce"]
+        need(nonce not in all_nonces and request_path.name == nonce + ".request.json", "Duplicate/unsafe nonce")
+        all_nonces.add(nonce)
+        local = cache / nonce
+        request_sha = sha(request_path)
+        need(raw(local / "downloaded-request.json") == raw(request_path) and read(local / "generation-claimed.json")["request_sha256"] == request_sha, "Claim/download mismatch")
+        for name, destination in {"response.json": mailbox / "responses" / (nonce + ".response.json"),
+            "response-ready.json": mailbox / "responses" / (nonce + ".ready.json"), "delivered.json": mailbox / "logs" / (nonce + ".delivered.json"),
+            "codex.jsonl": mailbox / "logs" / (nonce + ".codex.jsonl"), "invocation.json.arm-projection.json": mailbox / "logs" / (nonce + ".invocation.json"),
+            "codex.jsonl.json.arm-projection.json": mailbox / "logs" / (nonce + ".codex.jsonl.json")}.items():
+            need(raw(local / name) == raw(destination), "Cold local/archive raw/projection delivery mismatch")
+        response, ready, delivered = (read(local / name) for name in ("response.json", "response-ready.json", "delivered.json"))
+        need(response["request_sha256"] == delivered["request_sha256"] == request_sha and ready["sha256"] == delivered["response_sha256"] == sha(local / "response.json"), "Response/ready/delivered hashes differ")
+        need(response["nonce"] == nonce and response["session_id"] == session and response["model"] == model and response["reasoning_effort"] == "max", "Response identity differs")
+        expected = expected_argv(cli, model, nonce, source_cache, policy)
+        private = []
+        for name, kind in (("invocation.json", "invocation"), ("codex.jsonl.json", "process")):
+            data = read(local / name)
+            need(data["argv"] == expected, "Private argv differs from exact G policy constructor")
+            private.append(data)
+            indices = [i for i, token in enumerate(expected) if token.startswith("skills.config=")]
+            need(len(indices) == 1 and expected[indices[0] - 1] == "--config", "Single private override required")
+            i = indices[0]
+            projection = {"schema": "hpc-forest-r2e-private-cli-metadata-projection-v1", "kind": kind,
+                "record_without_private_argv": {k: v for k, v in data.items() if k != "argv"},
+                "argv_public": expected[:i - 1] + expected[i + 1:], "private_record_sha256": sha(local / name),
+                "private_argv_sha256": sha_bytes(json.dumps(expected, ensure_ascii=False, sort_keys=True).encode()),
+                "private_skill_override_sha256": sha_bytes(expected[i].encode()), "task_cli_policy_sha256": sha(policy_path),
+                "private_skill_path_count": len(policy["skill_candidate_directories"]), "private_review_required": True,
+                "private_argv_verified": False, "projection_is_executable": False, "raw_record_exported": False}
+            need(read(local / (name + ".arm-projection.json")) == projection, "Exact private/public projection bridge differs")
+        diagnostics = namespace["diagnostics_from_events"](local / "codex.jsonl")
+        usage, tools = namespace["usage_from_events"](local / "codex.jsonl", model)
+        need(read(local / "cli-diagnostics.json") == diagnostics, "Raw/diagnostic sidecar differs")
+        usage.update(cli_diagnostics_sha256=sha(local / "cli-diagnostics.json"), cli_diagnostic_count=len(diagnostics["findings"]))
+        need(response["usage"] == usage, "Response exact/unknown usage differs from preserved event bytes")
+        is_known = usage["token_accounting"] == "exact"
+        if is_known:
+            need(diagnostics["clean"] is True and tools is False and usage["tool_events"] == [], "Known clean delivery unexpectedly has diagnostics/tools")
+            known += 1
+            tokens += usage["tokens"]
+        else:
+            need(usage["tokens"] == 196608 and response["infrastructure_error"] is True and private[1]["timed_out"] is True, "Unknown invocation must remain a timed-out technical call/bound")
+            unknown += 1
+            timeout_count += 1
+        records.append({"nonce": nonce, "request_sha256": request_sha,
+            "raw_invocation_sha256": sha(local / "invocation.json"), "raw_process_sha256": sha(local / "codex.jsonl.json"),
+            "jsonl_sha256": sha(local / "codex.jsonl"), "policy_sha256": sha(policy_path),
+            "private_argv_sha256": sha_bytes(json.dumps(expected, ensure_ascii=False, sort_keys=True).encode()),
+            "token_accounting": usage["token_accounting"], "exact_known_tokens": usage["tokens"] if is_known else None,
+            "upper_bound_not_consumption": None if is_known else 196608,
+            "observed_tool_events": usage["tool_events"], "clean_completed_delivery": bool(is_known and diagnostics["clean"]),
+            "NORMAL_or_scientific_admission_claimed": False})
+    report_path = AUD / "metadata-terminal-r1/companion" / ("audit-metadata-reel-" + job + "-01.json")
+    need(sha(report_path) == REPORT_SHAS[job], "Parent actual audit changed")
+    report = read(report_path)
+    recon_path = report_path.with_name("reconciliation-reelle-" + job + "-01.json")
+    recon = read(recon_path)
+    need(recon["reception"] == ref(report_path) and recon["delivery_and_costs"] == report["reconciliation"], "Paired reconciliation/report differs")
+    need(report["verified"] is True and report["reconciliation"]["exact_known_tokens"] == tokens
+        and report["reconciliation"]["exact_known_invocations"] == known and report["reconciliation"]["unmeasured_invocations"] == unknown
+        and report["reconciliation"]["received_invocations"] == len(requests), "Parent counters differ from independent cold recount")
+    need(all(report[k] is False for k in ("native_research_admitted", "independent_performance_verified", "five_confirmations_verified", "final_scientific_audit_admitted")), "Parent promoted incomplete science")
+    need(report["pipeline_complete_recorded"] is False and report["lock_read_attempted"] is False, "Pipeline/lock limits differ")
+    need(before_root == inventory(root) and before_cache == inventory(cache), "Cold evidence changed during independent audit")
+    cohorts.append({"job_id": job, "model": model, "session_id": session, "terminal_state": "FAILED", "exit_code": "1:0",
+        "archive": ref(archive), "restored_files": count, "snapshot_files": len(before_cache),
+        "all_requests_delivered_and_private_argv_policy_projection_reconciled": True,
+        "source_before_after_snapshot_equal": True, "restoration_before_after_equal": True,
+        "received_invocations": len(requests), "exact_known_invocations": known, "exact_known_tokens": tokens,
+        "unmeasured_invocations": unknown, "exact_total_consumption_available": False,
+        "parent_audit": ref(report_path), "parent_reconciliation": ref(recon_path), "call_records": records,
+        "five_confirmations_verified": False, "native_research_admitted": False, "lock_read_or_stat_source_by_reviewer": False})
+    total_tokens += tokens
+    exact_invocations += known
+    unmeasured += unknown
+need(len(all_nonces) == 10 and total_tokens == 146676 and exact_invocations == 7 and unmeasured == timeout_count == 3, "Actual aggregate exact/unknown recount differs")
+need(all(sha(Path(path)) == expected for path, expected in PROTECTED.items()), "Protected cold proof changed")
+result = {"schema": "hpc-forest-r2g-independent-actual-terminal-metadata-review-v1", "verified": True,
+    "verified_scope": "Independent cold archives/inventory/private argv/policy/projections/delivery/exact-vs-unknown usage only",
+    "blocking_findings": [], "source_zip_sha256": SOURCE, "plan_sha256": PLAN, "scope_id": SCOPE,
+    "collection": ref(COLLECTION), "cohorts": cohorts, "all10_deliveries_reconciled": True,
+    "received_invocations": 10, "exact_known_invocations": 7, "exact_known_tokens": 146676,
+    "unmeasured_invocations": 3, "received_total_consumption": None, "upper_bounds_not_added_to_consumption": True,
+    "seven_clean_completed_deliveries_observed_zero_tools": True, "three_timeouts_not_promoted_to_NORMAL": True,
+    "all_three_terminal_states": "FAILED1:0", "five_confirmations_verified": False,
+    "native_research_admitted": False, "independent_performance_verified": False, "pipeline_complete_admitted": False,
+    "worker_lock_bytes_received": False, "cache_source_or_live_CIM_or_lock_read_stat_access": False,
+    "model_CLI_MCP_network_compiler_SQLite_or_received_source_execution": False,
+    "trusted_local_pinned_format_functions_only": ref(format_path), "pure_format_functions_used_for_actual_received_events": True,
+    "stop_retry_or_new_generation_authorized": False,
+    "limits": "Actual delivery and known/unknown costs are reconciled. Three timed-out invocations remain unmeasured, no global exact token total. No program correctness/performance/five confirmations or stop admission follows."}
+path = OUT / "REVUE-INDEPENDANTE-RESULTATS-REELS-G-METADATA.json"
+with path.open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(result, stream, indent=2, ensure_ascii=False)
+    stream.write("\n")
+print(json.dumps({"review": ref(path), "exact_known_tokens": total_tokens, "exact": exact_invocations, "unmeasured": unmeasured, "stop_admitted": False}))

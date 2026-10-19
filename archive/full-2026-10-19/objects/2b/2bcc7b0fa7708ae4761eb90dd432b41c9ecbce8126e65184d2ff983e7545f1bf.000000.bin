@@ -1,0 +1,55 @@
+"""Read only scalar status fields in restored closed SQLite; no payload/body is selected."""
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+ROOT = OUT / "restauration-neuve-privee"
+REGISTRY = ROOT / "results-752139/primes-max-gpt-6-astra/registry.sqlite3"
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def inventory():
+    return {path.relative_to(ROOT).as_posix(): sha(path) for path in sorted(ROOT.rglob("*")) if path.is_file()}
+
+
+before = inventory()
+if any(Path(str(REGISTRY) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+    raise ValueError("Restored scalar registry must already be closed; no checkpoint or repair")
+database = sqlite3.connect(REGISTRY.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+database.row_factory = sqlite3.Row
+try:
+    values = [dict(row) for row in database.execute("""
+        SELECT CASE WHEN e.experiment_id IN (SELECT id FROM trials) THEN 'model_trial' ELSE 'reference_or_other' END AS role,
+               e.phase,json_extract(e.payload,'$.status') AS status,json_extract(e.payload,'$.correct') AS correct,count(*) AS records
+        FROM evaluations e GROUP BY role,e.phase,status,correct ORDER BY role,e.phase,status,correct
+    """)]
+finally:
+    database.close()
+allowed = {"valid", "incorrect", "build_failed", "runtime_failed", "infrastructure_error", "usage_unavailable", "generation_failed"}
+if any(row["status"] not in allowed or row["correct"] not in {None, 0, 1} for row in values):
+    raise ValueError("Unexpected scalar status retained privately; do not print it")
+normal = {"valid", "incorrect", "build_failed", "runtime_failed"}
+normal_model_rows = sum(row["records"] for row in values if row["role"] == "model_trial" and row["status"] in normal)
+after = inventory()
+if before != after:
+    raise ValueError("Readonly scalar inspection changed archive bytes")
+result = {"schema": "hpc-forest-r2c-astra-closed-scalar-statuses-v1", "verified": False, "job_id": "752139",
+    "verification_scope": "Only scalar SQL JSON status/correct fields, never result/payload/response/trees content",
+    "rows": values, "normal_model_evaluation_records": normal_model_rows,
+    "normal_model_evaluation_is_not_full_cohort_admission": True, "native_research_admitted": False,
+    "archive_before_after_sha256_equal": True, "live_sqlite_opened": False,
+    "model_response_or_reasoning_body_decoded_or_exposed": False}
+with (OUT / "ETATS-SCALAIRES-NEGATIF.json").open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+with (OUT / "inventaire-archive-apres-statuts-scalaires.json").open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(after, ensure_ascii=False, indent=2) + "\n")
+print(json.dumps({"job_id": "752139", "rows": values, "normal_model_evaluation_records": normal_model_rows,
+    "native_research_admitted": False}))

@@ -1,0 +1,72 @@
+"""Prepare one allocation with no native generation, then review the concrete plan."""
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+REMOTE = "/scratch_p/nimarano/hpc-forest-r5-evaluation-20261016-r1-preflight"
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+WHEEL = "/scratch_p/nimarano/hpc-forest-harness-comparison-20261016-r1-ruff-ruff-0.17.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+WHEEL_SHA = "13ee90156522998c3037059d8f66885c8adeeaf7643bdce2caceee196ecd23e0"
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--revision", choices=["r1", "r2"], default="r1")
+    args = parser.parse_args()
+    suffix = "" if args.revision == "r1" else "-corrective-r2"
+    if (ROOT / ("prevol-soumission-commencee" + suffix + ".json")).exists():
+        raise RuntimeError("Reconcile the previous submission; never repeat an uncertain job")
+    if args.revision == "r2":
+        REMOTE += "-corrective-r2"
+    source = json.loads((ROOT / "prevol-source.json").read_bytes())
+    command = f'''set -euo pipefail
+root={shlex.quote(REMOTE)}
+archive={shlex.quote(REMOTE + '.tar.gz')}
+py={shlex.quote(PYTHON)}
+test ! -e "$root"
+printf '%s  %s\\n' {shlex.quote(source['payload_sha256'])} "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" -C "$root"
+mkdir "$root/proofs"
+finish() {{
+  rc=$?
+  trap - EXIT
+  printf '%s\\n' "$rc" > "$root/proofs/exit-code.txt"
+  tar -czf "$root-result-${{SLURM_JOB_ID}}.tar.gz" -C "$root" .
+  sha256sum "$root-result-${{SLURM_JOB_ID}}.tar.gz" | tee "$root-result-${{SLURM_JOB_ID}}.tar.gz.sha256"
+  exit "$rc"
+}}
+trap finish EXIT
+export PYTHONPATH="$root/project/src:/scratch_p/nimarano/hpc-forest-native-matrix-20261015-r1-launchfix1/qa-deps"
+export PYTHONDONTWRITEBYTECODE=1
+export CUDA_VISIBLE_DEVICES=
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+lscpu > "$root/proofs/lscpu.txt"
+gcc --version > "$root/proofs/gcc.txt"
+g++ --version > "$root/proofs/gpp.txt"
+env | sort | grep -E '^(SLURM|OMP|OPENBLAS|MKL|CUDA_VISIBLE_DEVICES)' > "$root/proofs/allocated-environment.txt"
+"$py" "$root/benchmarks/verifier-sources.py" "$root/project" "$root/source-manifest.json" "$root/proofs/source-before.json"
+"$py" -c 'import importlib.metadata,json,platform,sys; print(json.dumps({{"python":sys.version,"machine":platform.machine(),"treequest":importlib.metadata.version("treequest"),"numpy":importlib.metadata.version("numpy")}}))' > "$root/proofs/python.json"
+printf '%s  %s\\n' {shlex.quote(WHEEL_SHA)} {shlex.quote(WHEEL)} | sha256sum -c -
+cp {shlex.quote(WHEEL)} "$root/ruff-0.17.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+"$py" -m pip install --no-index --no-deps --target "$root/qa" "$root/ruff-0.17.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" > "$root/proofs/ruff-install.log" 2>&1
+cd "$root/project"
+"$root/qa/bin/ruff" check --no-cache src tests > "$root/proofs/ruff-project.log" 2>&1
+"$root/qa/bin/ruff" check --no-cache --config "$root/project/pyproject.toml" "$root/benchmarks" > "$root/proofs/ruff-benchmarks.log" 2>&1
+"$py" -m pytest -q --junitxml="$root/proofs/tests-project.xml" > "$root/proofs/tests-project.log" 2>&1
+"$py" -m pytest -q "$root/benchmarks/test_mesures.py" --junitxml="$root/proofs/tests-benchmarks.xml" > "$root/proofs/tests-benchmarks.log" 2>&1
+"$py" "$root/benchmarks/mesurer-controleur.py" "$root/overhead" --trials 8 32 --seeds 23 29 31 --repetitions 5 --warmups 1 > "$root/proofs/overhead.log" 2>&1
+"$py" "$root/benchmarks/verifier-sources.py" "$root/project" "$root/source-manifest.json" "$root/proofs/source-after.json"
+'''
+    request = {"name": "forest-r5-software-and-overhead", "command": "bash -lc " + shlex.quote(command),
+               "arch": "armgpu", "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0,
+               "time_limit": "00:20:00", "workdir": "/scratch_p/nimarano", "cpu_bind": "cores",
+               "spack_packages": ["/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"]}
+    (ROOT / ("prevol-demande" + suffix + ".json")).write_text(json.dumps(request, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"remote_root": REMOTE, "model_calls": 0, "native_lanes_consumed": 0}))

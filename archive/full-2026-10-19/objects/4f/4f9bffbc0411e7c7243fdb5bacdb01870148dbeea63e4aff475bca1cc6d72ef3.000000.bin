@@ -1,0 +1,295 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using Word = std::uint32_t;
+using Element = std::int32_t;
+using Sum = std::int64_t;
+
+class FastInput {
+    static constexpr std::size_t capacity = 1u << 16;
+    unsigned char buffer_[capacity + 1];
+    std::size_t position_ = 0;
+    std::size_t available_ = 0;
+
+    void refill() {
+        available_ = std::fread(buffer_, 1, capacity, stdin);
+        position_ = 0;
+        buffer_[available_] = 0;
+    }
+
+    int next_byte() {
+        if (position_ == available_) {
+            refill();
+            if (available_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    bool read_int(int& value) {
+        int c = next_byte();
+        while (c != EOF && c <= ' ') c = next_byte();
+        if (c == EOF) return false;
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = next_byte();
+        Word magnitude = 0;
+        while (c >= '0' && c <= '9') {
+            magnitude = magnitude * 10u + static_cast<Word>(c - '0');
+            c = next_byte();
+        }
+        const std::int64_t wide = static_cast<std::int64_t>(magnitude);
+        value = static_cast<int>(negative ? -wide : wide);
+        return true;
+    }
+
+    bool read_words(Word* __restrict__ destination, std::size_t count) {
+        unsigned char* cursor = buffer_ + position_;
+        unsigned char* end = buffer_ + available_;
+        for (std::size_t i = 0; i < count; ++i) {
+            for (;;) {
+                while (cursor != end && *cursor <= ' ') ++cursor;
+                if (cursor != end) break;
+                refill();
+                cursor = buffer_;
+                end = buffer_ + available_;
+                if (available_ == 0) return false;
+            }
+
+            const bool negative = *cursor == '-';
+            if (*cursor == '-' || *cursor == '+') ++cursor;
+            Word magnitude = 0;
+            for (;;) {
+                unsigned digit = static_cast<unsigned>(*cursor)
+                               - static_cast<unsigned>('0');
+                while (digit < 10u) {
+                    magnitude = magnitude * 10u + digit;
+                    ++cursor;
+                    digit = static_cast<unsigned>(*cursor)
+                          - static_cast<unsigned>('0');
+                }
+                if (cursor != end) {
+                    ++cursor;
+                    break;
+                }
+                refill();
+                cursor = buffer_;
+                end = buffer_ + available_;
+                if (available_ == 0) break;
+            }
+            destination[i] = negative ? Word(0) - magnitude : magnitude;
+        }
+        position_ = static_cast<std::size_t>(cursor - buffer_);
+        return true;
+    }
+};
+
+static inline Element signed_value(Word bits) {
+    Element value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static inline void add_row(Sum* __restrict__ columns,
+                           const Word* __restrict__ row, int count) {
+    #pragma omp simd
+    for (int c = 0; c < count; ++c) {
+        columns[c] += static_cast<Sum>(signed_value(row[c]));
+    }
+}
+
+static inline void add_summary(Sum* __restrict__ columns,
+                               const Sum* __restrict__ summary, int count) {
+    #pragma omp simd
+    for (int c = 0; c < count; ++c) {
+        columns[c] += summary[c];
+    }
+}
+
+static inline Sum advance_prefix(
+        Sum* __restrict__ columns,
+        const Word* __restrict__ incoming,
+        const Word* __restrict__ outgoing, int count) {
+    Sum delta_sum = 0;
+    #pragma omp simd reduction(+:delta_sum)
+    for (int c = 0; c < count; ++c) {
+        const Sum delta = static_cast<Sum>(signed_value(incoming[c]))
+                        - static_cast<Sum>(signed_value(outgoing[c]));
+        columns[c] += delta;
+        delta_sum += delta;
+    }
+    return delta_sum;
+}
+
+static inline void advance_tile(
+        Sum* __restrict__ columns,
+        const Word* __restrict__ incoming,
+        const Word* __restrict__ outgoing, int count) {
+    #pragma omp simd
+    for (int c = 0; c < count; ++c) {
+        columns[c] += static_cast<Sum>(signed_value(incoming[c]))
+                    - static_cast<Sum>(signed_value(outgoing[c]));
+    }
+}
+
+static inline Sum horizontal_max(const Sum* columns, int n, int s,
+                                 Sum& first_window) {
+    Sum running = 0;
+    #pragma omp simd reduction(+:running)
+    for (int c = 0; c < s; ++c) running += columns[c];
+    first_window = running;
+    Sum best = running;
+    for (int c = s; c < n; ++c) {
+        running += columns[c] - columns[c - s];
+        best = std::max(best, running);
+    }
+    return best;
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.read_int(n) || !input.read_int(s)) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t elements = static_cast<std::size_t>(n) * n;
+    const bool parallel_work = elements >= 65536;
+    const int positions = n - s + 1;
+    int workers = 1;
+#ifdef _OPENMP
+    if (parallel_work) workers = omp_get_max_threads();
+#endif
+    const int bands = std::min(positions, workers);
+    constexpr int block_rows = 64;
+    constexpr int tile_columns = 512;
+    constexpr std::size_t input_tile = 1u << 14;
+    const int block_count = (n + block_rows - 1) / block_rows;
+
+    Sum saved_rows = 0;
+    for (int band = 0; band < bands; ++band) {
+        const int begin = band * positions / bands;
+        const int first_full = (begin + block_rows - 1) / block_rows;
+        const int end_full = (begin + s) / block_rows;
+        const int full_blocks = std::max(0, end_full - first_full);
+        saved_rows += static_cast<Sum>(full_blocks) * (block_rows - 1);
+    }
+    const bool use_summaries = saved_rows > n;
+
+    std::unique_ptr<Word[]> matrix(new Word[elements]);
+    Word* const data = matrix.get();
+    std::unique_ptr<Sum[]> summary_storage;
+    if (use_summaries) {
+        summary_storage.reset(
+            new Sum[static_cast<std::size_t>(block_count) * n]);
+    }
+    Sum* const summaries = summary_storage.get();
+    bool input_ok = true;
+    Sum maximum = std::numeric_limits<Sum>::lowest();
+
+    #pragma omp parallel if(parallel_work) reduction(max:maximum)
+    {
+        #pragma omp single
+        {
+            for (int block = 0; block < block_count; ++block) {
+                const int row_begin = block * block_rows;
+                const int row_end = std::min(n, row_begin + block_rows);
+                std::size_t offset = static_cast<std::size_t>(row_begin) * n;
+                const std::size_t block_end =
+                    static_cast<std::size_t>(row_end) * n;
+                while (offset < block_end) {
+                    const std::size_t count =
+                        std::min(input_tile, block_end - offset);
+                    if (!input.read_words(data + offset, count)) {
+                        input_ok = false;
+                        break;
+                    }
+                    offset += count;
+                }
+                if (!input_ok) break;
+
+                if (use_summaries) {
+                    #pragma omp task firstprivate(block, row_begin, row_end)
+                    {
+                        Sum* const destination = summaries
+                            + static_cast<std::size_t>(block) * n;
+                        std::fill(destination, destination + n, Sum(0));
+                        for (int row = row_begin; row < row_end; ++row) {
+                            const Word* const source = data
+                                + static_cast<std::size_t>(row) * n;
+                            add_row(destination, source, n);
+                        }
+                    }
+                }
+            }
+            #pragma omp taskwait
+        }
+
+        if (input_ok) {
+            #pragma omp for schedule(static)
+            for (int band = 0; band < bands; ++band) {
+                const int begin = band * positions / bands;
+                const int end = (band + 1) * positions / bands;
+                std::vector<Sum> column_storage(n, Sum(0));
+                Sum* const columns = column_storage.data();
+
+                int row = begin;
+                const int initial_end = begin + s;
+                while (row < initial_end) {
+                    if (use_summaries && row % block_rows == 0
+                        && row + block_rows <= initial_end) {
+                        const Sum* const source = summaries
+                            + static_cast<std::size_t>(row / block_rows) * n;
+                        add_summary(columns, source, n);
+                        row += block_rows;
+                    } else {
+                        const Word* const source = data
+                            + static_cast<std::size_t>(row) * n;
+                        add_row(columns, source, n);
+                        ++row;
+                    }
+                }
+
+                Sum first_window;
+                Sum band_maximum = horizontal_max(columns, n, s, first_window);
+                for (int top = begin + 1; top < end; ++top) {
+                    const Word* const incoming = data
+                        + static_cast<std::size_t>(top + s - 1) * n;
+                    const Word* const outgoing = data
+                        + static_cast<std::size_t>(top - 1) * n;
+                    first_window += advance_prefix(columns, incoming, outgoing, s);
+                    Sum running = first_window;
+                    band_maximum = std::max(band_maximum, running);
+
+                    for (int first = s; first < n; first += tile_columns) {
+                        const int count = std::min(tile_columns, n - first);
+                        advance_tile(columns + first, incoming + first,
+                                     outgoing + first, count);
+                        const int limit = first + count;
+                        for (int c = first; c < limit; ++c) {
+                            running += columns[c] - columns[c - s];
+                            band_maximum = std::max(band_maximum, running);
+                        }
+                    }
+                }
+                maximum = std::max(maximum, band_maximum);
+            }
+        }
+    }
+
+    if (!input_ok) return 0;
+    std::printf("%lld\n", static_cast<long long>(maximum));
+    return 0;
+}

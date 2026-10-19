@@ -1,0 +1,81 @@
+import zipfile
+
+import pytest
+
+from hpc_forest.codex_mailbox import EFFORT, MODEL, PROTOCOL, json_bytes, sha256
+from hpc_forest.core import InfrastructureError, atomic_json
+from hpc_forest.reference96_worker import SCOPE, delivered_cache, verify_gate, verify_source
+
+
+def cache(tmp_path):
+    folder = tmp_path / ("a" * 32)
+    folder.mkdir()
+    request = {"protocol": PROTOCOL, "session_id": "b" * 32, "nonce": folder.name,
+               "model": MODEL, "reasoning_effort": EFFORT, "kind": "source-proposal"}
+    atomic_json(folder / "downloaded-request.json", request)
+    digest = sha256((folder / "downloaded-request.json").read_bytes())
+    response = {**request, "request_sha256": digest}
+    raw = json_bytes(response)
+    (folder / "response.json").write_bytes(raw)
+    atomic_json(folder / "response-ready.json", {"sha256": sha256(raw), "bytes": len(raw)})
+    atomic_json(folder / "delivered.json", {"request_sha256": digest, "response_sha256": sha256(raw)})
+    return folder
+
+
+def test_resume_loads_only_fully_verified_deliveries(tmp_path):
+    folder = cache(tmp_path)
+    assert delivered_cache(tmp_path, "b" * 32) == {folder.name}
+    (folder / "delivered.json").unlink()
+    assert delivered_cache(tmp_path, "b" * 32) == set()
+
+
+@pytest.mark.parametrize("name", ["response.json", "response-ready.json", "delivered.json"])
+def test_resume_rejects_changed_cached_bytes(tmp_path, name):
+    folder = cache(tmp_path)
+    (folder / name).write_text("{}", encoding="utf8")
+    with pytest.raises(InfrastructureError):
+        delivered_cache(tmp_path, "b" * 32)
+
+
+def test_resume_rejects_a_sister_session(tmp_path):
+    cache(tmp_path)
+    with pytest.raises(InfrastructureError):
+        delivered_cache(tmp_path, "c" * 32)
+
+
+def test_frozen_source_and_archive_are_both_checked(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "fixture.txt"
+    source.write_bytes(b"original")
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.write(source, "HPC-Forest/fixture.txt")
+    digest = sha256(archive.read_bytes())
+    assert verify_source(archive, project, digest) == 1
+    source.write_bytes(b"changed")
+    with pytest.raises(InfrastructureError):
+        verify_source(archive, project, digest)
+    with pytest.raises(InfrastructureError):
+        verify_source(archive, project, "0" * 64)
+
+
+def test_reception_gate_requires_the_six_audited_arms_and_released_lane(tmp_path, monkeypatch):
+    audit = tmp_path / "audit.json"
+    archive = tmp_path / "comparison.tar.gz"
+    archive.write_bytes(b"archive fixture")
+    stop = tmp_path / "stop.json"
+    atomic_json(audit, {"all_final_confirmations_verified": True,
+                       "matched_gain_comparison_verified": True,
+                       "read_only_evidence_verified": True, "problems": [{}] * 6})
+    atomic_json(stop, {"job_id": "747885", "remaining_pids": [], "all_requests_delivered": True})
+    gate = {"scope_id": SCOPE, "session_id": "b" * 32, "harness_enabled": False,
+            "comparison_received_and_audited": {
+                "job_id": "747885", "archive_path": str(archive),
+                "archive_sha256": sha256(archive.read_bytes()), "audit_path": str(audit),
+                "audit_sha256": sha256(audit.read_bytes()), "relay_stopped_receipt": str(stop)}}
+    monkeypatch.setattr("hpc_forest.reference96_worker.check_dependencies", lambda *args: gate)
+    assert verify_gate(tmp_path / "receipt.json", "b" * 32) == gate
+    atomic_json(stop, {"job_id": "747885", "remaining_pids": [123], "all_requests_delivered": True})
+    with pytest.raises(InfrastructureError):
+        verify_gate(tmp_path / "receipt.json", "b" * 32)

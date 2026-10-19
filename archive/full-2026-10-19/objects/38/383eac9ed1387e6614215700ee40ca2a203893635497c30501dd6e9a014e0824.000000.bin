@@ -1,0 +1,248 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <string.h>
+#include <stdint.h>
+#include <limits.h>
+
+static void *checked_array_alloc(size_t count, size_t element_size) {
+    if (count > SIZE_MAX / element_size)
+        exit(EXIT_FAILURE);
+
+    void *p = malloc(count * element_size);
+    if (p == NULL && count != 0)
+        exit(EXIT_FAILURE);
+    return p;
+}
+
+static uint64_t string_prefix(const char *s, size_t stride) {
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned limit = stride < 8 ? (unsigned)stride : 8;
+    uint64_t key = 0;
+
+    /* Stop at the terminator without reading uninitialized record padding. */
+    for (unsigned j = 0; j < limit; ++j) {
+        const unsigned char c = p[j];
+        key |= (uint64_t)c << (56U - 8U * j);
+        if (c == 0)
+            break;
+    }
+    return key;
+}
+
+static inline int index_leq(const char *strings, size_t stride,
+                            const uint64_t *keys,
+                            long int lhs, long int rhs) {
+    const uint64_t a = keys[(size_t)lhs];
+    const uint64_t b = keys[(size_t)rhs];
+
+    if (a != b)
+        return a < b;
+    if ((a & UINT64_C(0xff)) == 0)
+        return 1;
+
+    return strcmp(strings + (size_t)lhs * stride + 8,
+                  strings + (size_t)rhs * stride + 8) <= 0;
+}
+
+static void initialize_pairs(const char *strings, size_t stride,
+                             const uint64_t *restrict keys,
+                             long int *restrict indices, size_t n) {
+    const size_t pairs = n / 2;
+
+    /* Each iteration reads and writes a distinct pair; no string calls here. */
+#if defined(_OPENMP) && _OPENMP >= 201307
+#pragma omp simd
+#endif
+    for (size_t p = 0; p < pairs; ++p) {
+        const size_t i = 2 * p;
+        const long int reverse = keys[i] > keys[i + 1];
+        indices[i] = (long int)i + reverse;
+        indices[i + 1] = (long int)i + 1 - reverse;
+    }
+
+    if (n % 2 != 0)
+        indices[n - 1] = (long int)(n - 1);
+
+    /* Resolve long common prefixes separately from the vectorizable loop. */
+    for (size_t p = 0; p < pairs; ++p) {
+        const size_t i = 2 * p;
+        if (keys[i] == keys[i + 1] &&
+            (keys[i] & UINT64_C(0xff)) != 0 &&
+            strcmp(strings + i * stride + 8,
+                   strings + (i + 1) * stride + 8) > 0) {
+            indices[i] = (long int)(i + 1);
+            indices[i + 1] = (long int)i;
+        }
+    }
+}
+
+static void merge_indices(const char *strings, size_t stride,
+                          const uint64_t *keys,
+                          const long int *restrict src,
+                          long int *restrict dst,
+                          size_t left, size_t middle, size_t right) {
+    if (middle == right ||
+        index_leq(strings, stride, keys, src[middle - 1], src[middle])) {
+        memcpy(dst + left, src + left, (right - left) * sizeof(*src));
+        return;
+    }
+
+    size_t i = left;
+    size_t j = middle;
+    size_t out = left;
+
+    /* These cursors have real dependencies; only the tail copies are bulk work. */
+    while (i < middle && j < right) {
+        const long int a = src[i];
+        const long int b = src[j];
+        if (index_leq(strings, stride, keys, a, b)) {
+            dst[out++] = a;
+            ++i;
+        } else {
+            dst[out++] = b;
+            ++j;
+        }
+    }
+
+    if (i < middle)
+        memcpy(dst + out, src + i, (middle - i) * sizeof(*src));
+    else if (j < right)
+        memcpy(dst + out, src + j, (right - j) * sizeof(*src));
+}
+
+long int *bucket_sort(char *a, int length, long int size,
+                      int offset, int nbuckets) {
+    (void)offset;
+    (void)nbuckets;
+
+    if (size < 0 || length <= 0)
+        exit(EXIT_FAILURE);
+    if (size == 0)
+        return NULL;
+
+    const size_t n = (size_t)size;
+    const size_t stride = (size_t)length;
+    if (n > SIZE_MAX / stride)
+        exit(EXIT_FAILURE);
+
+    long int *indices = checked_array_alloc(n, sizeof(*indices));
+    if (n == 1) {
+        indices[0] = 0;
+        return indices;
+    }
+
+    uint64_t *keys = checked_array_alloc(n, sizeof(*keys));
+    long int *scratch = checked_array_alloc(n, sizeof(*scratch));
+
+    for (size_t i = 0; i < n; ++i)
+        keys[i] = string_prefix(a + i * stride, stride);
+
+    initialize_pairs(a, stride, keys, indices, n);
+
+    long int *src = indices;
+    long int *dst = scratch;
+    size_t width = 2;
+
+    while (width < n) {
+        size_t left = 0;
+        while (left < n) {
+            const size_t first_count = n - left < width ? n - left : width;
+            const size_t middle = left + first_count;
+            const size_t second_count = n - middle < width ? n - middle : width;
+            const size_t right = middle + second_count;
+
+            merge_indices(a, stride, keys, src, dst, left, middle, right);
+            left = right;
+        }
+
+        long int *tmp = src;
+        src = dst;
+        dst = tmp;
+
+        if (width >= n - width)
+            break;
+        width += width;
+    }
+
+    free(keys);
+    free(dst);
+    return src;
+}
+
+void load(char **vString, long int *N, int *l, int *os, int *nb) {
+    char *strings = NULL;
+    int len, offset, nbucket;
+    long int n;
+
+    if (!fscanf(stdin, "%d", &len)) {
+        printf("ERROR len\n");
+        exit(1);
+    }
+
+    if (!fscanf(stdin, "%ld", &n)) {
+        printf("ERROR n\n");
+        exit(1);
+    }
+
+    if (!fscanf(stdin, "%d", &offset)) {
+        printf("ERROR offset\n");
+        exit(1);
+    }
+
+    if (!fscanf(stdin, "%d", &nbucket)) {
+        printf("ERROR nbucket\n");
+        exit(1);
+    }
+
+    if (n < 0 || len < 0 || len == INT_MAX || nbucket == INT_MAX)
+        exit(EXIT_FAILURE);
+
+    nbucket = nbucket + 1;
+    len = len + 1;
+    strings = checked_array_alloc((size_t)n, (size_t)len);
+
+    for (long int i = 0; i < n; ++i) {
+        if (!fscanf(stdin, "%s", strings + (size_t)i * (size_t)len)) {
+            printf("ERROR %ld\n", i);
+            exit(1);
+        }
+    }
+
+    *vString = strings;
+    *N = n;
+    *l = len;
+    *os = offset;
+    *nb = nbucket;
+}
+
+void print(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; ++i)
+        printf("%ld -> %s\n", i, strings + (size_t)index[i] * (size_t)len);
+}
+
+void save(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; ++i)
+        printf("%s\n", strings + (size_t)index[i] * (size_t)len);
+}
+
+int main(int ac, char **av) {
+    char *strings = NULL;
+    long int N = 0;
+    long int *index = NULL;
+    int len = 0,
+        save2File = 0,
+        offset,
+        nbuckets;
+
+    load(&strings, &N, &len, &offset, &nbuckets);
+    index = bucket_sort(strings, len, N, offset, nbuckets);
+    save(strings, index, N, len);
+
+    if (strings != NULL)
+        free(strings);
+    if (index != NULL)
+        free(index);
+
+    return EXIT_SUCCESS;
+}

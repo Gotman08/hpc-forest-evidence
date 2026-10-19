@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include \"knn.h\"\n#include <string.h>\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\nstatic inline int first_insertion_position(const float * distances, int k, float d) {\n    int x = 0;\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n    const float32x4_t candidate = vdupq_n_f32(d);\n    const float32x4_t empty = vdupq_n_f32(-1.0f);\n\n    /* Compare independent slots together, but retain the first matching slot. */\n    for (; x <= k - 4; x += 4) {\n        const float32x4_t stored = vld1q_f32(distances + x);\n        const uint32x4_t matches = vorrq_u32(\n            vcltq_f32(candidate, stored), vceqq_f32(stored, empty));\n        if (vmaxvq_u32(matches) != 0) {\n            break;\n        }\n    }\n#endif\n\n    for (; x < k; x++) {\n        if (d < distances[x] || distances[x] == -1) {\n            return x;\n        }\n    }\n    return k;\n}\n\nstatic inline void consider_candidate(float * distances, char * labels,\n                                      int k, float d, char label) {\n    float farthest = distances[k - 1];\n\n    /* Equal distances retain their original encounter order. */\n    if (farthest != -1.0f && d >= farthest) {\n        return;\n    }\n\n    int x = first_insertion_position(distances, k, d);\n    if (x < k) {\n        size_t shifted = (size_t) (k - x - 1);\n\n        /* These shifts overlap; memmove preserves their dependencies. */\n        if (shifted != 0) {\n            memmove(distances + x + 1, distances + x,\n                    shifted * sizeof(*distances));\n            memmove(labels + x + 1, labels + x,\n                    shifted * sizeof(*labels));\n        }\n\n        distances[x] = d;\n        labels[x] = label;\n    }\n}\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\nstatic inline int reject_four_points(const Point * points,\n                                     float32x4_t query_x,\n                                     float32x4_t query_y,\n                                     float farthest) {\n    float32x4_t xy01, xy23;\n\n    /* Load object representations without aliasing Point as a float array. */\n    memcpy(&xy01, points, sizeof(xy01));\n    memcpy(&xy23, points + 2, sizeof(xy23));\n\n    const float32x4_t px = vuzp1q_f32(xy01, xy23);\n    const float32x4_t py = vuzp2q_f32(xy01, xy23);\n    const float32x4_t dx = vsubq_f32(px, query_x);\n    const float32x4_t dy = vsubq_f32(py, query_y);\n    const float32x4_t limit = vdupq_n_f32(farthest);\n\n    /* Each component square is a lower bound, even if scalar sums fuse. */\n    const uint32x4_t rejected = vorrq_u32(\n        vcgeq_f32(vmulq_f32(dx, dx), limit),\n        vcgeq_f32(vmulq_f32(dy, dy), limit));\n    return vminvq_u32(rejected) != 0;\n}\n#endif\n\nchar knn(int n_groups, Group * groups, int k, Point to_evaluate) {\n    char * labels = (char *) malloc(sizeof(char) * k);\n    float * distances = (float *) malloc(sizeof(float) * k);\n\n    int i, j;\n\n    for (i = 0; i < k; i++) {\n        labels[i] = -1;\n        distances[i] = -1;\n    }\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n    const float32x4_t query_x = vdupq_n_f32(to_evaluate.x);\n    const float32x4_t query_y = vdupq_n_f32(to_evaluate.y);\n#endif\n\n    for (i = 0; i < n_groups; i++) {\n        Group g = groups[i];\n        j = 0;\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n        for (; sizeof(Point) == 2 * sizeof(float) && j <= g.length - 4;\n             j += 4) {\n            float farthest = distances[k - 1];\n\n            /* Skip only whole blocks that cannot change the full list. */\n            if (farthest != -1.0f &&\n                reject_four_points(g.points + j, query_x, query_y, farthest)) {\n                continue;\n            }\n\n            /* Preserve scalar distance arithmetic and encounter order. */\n            for (int lane = 0; lane < 4; lane++) {\n                float d = euclidean_distance_no_sqrt(\n                    to_evaluate, g.points[j + lane]);\n                consider_candidate(distances, labels, k, d, g.label);\n            }\n        }\n#endif\n\n        for (; j < g.length; j++) {\n            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);\n            consider_candidate(distances, labels, k, d, g.label);\n        }\n    }\n\n    qsort(labels, k, sizeof(char), compare_for_sort);\n\n    char most_frequent = labels[0];\n    int most_frequent_count = 1;\n    int current_frequency = 1;\n\n    for (i = 1; i < k; i++) {\n        if (labels[i] != labels[i - 1]) {\n            if (current_frequency > most_frequent_count) {\n                most_frequent = labels[i - 1];\n                most_frequent_count = current_frequency;\n            }\n\n            current_frequency = 1;\n        } else {\n            current_frequency++;\n        }\n\n        if (i == k - 1 && current_frequency > most_frequent_count) {\n            most_frequent = labels[i - 1];\n            most_frequent_count = current_frequency;\n        }\n    }\n\n    free(distances);\n    free(labels);\n    return most_frequent;\n}\n\nint main() {\n    int n_groups = parse_number_of_groups();\n    \n    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);\n\n    for (int i = 0; i < n_groups; i++) {\n        groups[i] = parse_next_group();\n    }\n\n    int k = parse_k();\n\n    Point to_evaluate = parse_point();\n\n    printf(\"%c\", knn(n_groups, groups, k, to_evaluate));\n}\n",
+        "path": "src/knn.c"
+      }
+    ],
+    "hypothesis": "Four-point NEON rejection using conservative coordinate-square bounds should reduce scalar distance and selection work without changing distance rounding or serial insertion order.",
+    "notes": "Only wholly rejected blocks bypass scalar processing. Tail handling, non-NEON fallback, ties, overlapping shifts, and voting are preserved. No commands or measurements were run.",
+    "sources_kept": [],
+    "transformations": [
+      "Add four-point SIMD screening once the neighbor list is full, rejecting a block only when every point has a squared coordinate difference at least equal to the cutoff.",
+      "Extract the existing insertion logic into an inline helper and process unscreened candidates serially with the original distance function.",
+      "Use fixed-size memcpy loads and NEON deinterleaving, guarded by the Point layout size."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "8b528d7091344733a9d0f4899fe5c477",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "1a4608759669100ea43b2ed68c2b960e1f47524e2f6e5b264a098e2c3d5921f4",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "c72b570520f38c6b84109a791cfb66a3e6c3a7dfb19f031f62801ec4e94a5f2a",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 13155,
+        "output_tokens": 11827,
+        "reasoning_output_tokens": 9993
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 24982,
+    "tool_events": []
+  }
+}

@@ -1,0 +1,119 @@
+"""Cost-aware model-role selection and a small separately trained contextual router."""
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+
+from .contracts import EvolutionError, Identity, fingerprint, identifier, number
+
+
+@dataclass(frozen=True)
+class Route:
+    identity: Identity
+    role: str
+
+    def __post_init__(self):
+        identifier(self.role)
+
+    @property
+    def key(self):
+        return f"{self.identity.key}:{self.role}"
+
+
+class BanditRouter:
+    def __init__(self, routes: list[Route], *, exploration=1.0, cost_weight=0.25):
+        if not routes or len({r.key for r in routes}) != len(routes):
+            raise EvolutionError("Routes must be nonempty and distinct")
+        self.routes = routes
+        self.exploration = number(exploration, "exploration")
+        self.cost_weight = number(cost_weight, "cost_weight", maximum=1)
+        self.observations = {}
+
+    def observe(self, observation_id: str, route: Route, quality: float | None,
+                cost: int | None, baseline=0.0):
+        identifier(observation_id)
+        if route not in self.routes:
+            raise EvolutionError("Observation belongs to an unknown route")
+        if quality is not None:
+            number(quality, "quality", maximum=1)
+        if cost is not None and (type(cost) is not int or cost < 0):
+            raise EvolutionError("Invalid measured cost")
+        number(baseline, "baseline", maximum=1)
+        record = {"route": route.key, "quality": quality, "cost": cost, "baseline": baseline}
+        if observation_id in self.observations and self.observations[observation_id] != record:
+            raise EvolutionError("Conflicting routing observation")
+        self.observations[observation_id] = record
+
+    def select(self, *, seed: int, allowed_roles: set[str] | None = None):
+        routes = [r for r in self.routes if allowed_roles is None or r.role in allowed_roles]
+        if not routes:
+            raise EvolutionError("No route satisfies the workflow")
+        data = {r.key: [o for o in self.observations.values()
+                        if o["route"] == r.key and o["quality"] is not None] for r in routes}
+        unseen = [r for r in routes if not data[r.key]]
+        if unseen:
+            return random.Random(seed).choice(unseen)
+        total = sum(map(len, data.values()))
+        mean_cost = {r.key: sum(o["cost"] for o in data[r.key] if o["cost"] is not None)
+                     / max(1, sum(o["cost"] is not None for o in data[r.key])) for r in routes}
+        # Unknown cost is never represented as a free call.
+        reference = max([1.0, *mean_cost.values()])
+        scores = {}
+        for route in routes:
+            obs = data[route.key]
+            reward = sum(max(0, o["quality"] - o["baseline"]) for o in obs) / len(obs)
+            exploration = self.exploration * math.sqrt(2 * math.log(total + 1) / len(obs))
+            known = all(o["cost"] is not None for o in obs)
+            cost = mean_cost[route.key] / reference if known else 1.0
+            scores[route.key] = reward + exploration - self.cost_weight * cost
+        best = max(scores.values())
+        return random.Random(seed).choice([r for r in routes if scores[r.key] == best])
+
+
+class ContextualRouter:
+    """Trainable linear routing head; not a reproduction of TRINITY's evolved LLM."""
+    def __init__(self, routes: list[str], features: int):
+        if (not routes or len(routes) > 128 or len(routes) != len(set(routes))
+                or type(features) is not int or not 1 <= features <= 64):
+            raise EvolutionError("Invalid contextual router dimensions")
+        self.routes, self.features = routes, features
+        self.weights = [[0.0] * (features + 1) for _ in routes]
+
+    def _vector(self, values):
+        if len(values) != self.features:
+            raise EvolutionError("Wrong router feature vector size")
+        return [1.0, *[number(x, "feature", minimum=-1e6, maximum=1e6) for x in values]]
+
+    def probabilities(self, values):
+        vector = self._vector(values)
+        if len(self.weights) != len(self.routes) or any(len(row) != self.features + 1 for row in self.weights):
+            raise EvolutionError("Router weight shape changed")
+        for row in self.weights:
+            for weight in row:
+                number(weight, "weight", minimum=-1e20, maximum=1e20)
+        scores = [sum(w * v for w, v in zip(row, vector, strict=True)) for row in self.weights]
+        shift = max(scores)
+        exps = [math.exp(s - shift) for s in scores]
+        return [v / sum(exps) for v in exps]
+
+    def train(self, records: list[dict], *, training_scope: str, epochs=100, learning_rate=0.05):
+        if type(epochs) is not int or not 1 <= epochs <= 10000:
+            raise EvolutionError("Invalid bounded router training epochs")
+        number(learning_rate, "learning_rate", minimum=1e-9, maximum=1)
+        if not records or any(r.get("split") != "train" or r.get("scope") != training_scope
+                              or r.get("route") not in self.routes for r in records):
+            raise EvolutionError("Router training accepts only the declared training cohort")
+        for record in records:
+            self._vector(record["features"])
+        for _ in range(epochs):
+            for record in records:
+                vector = self._vector(record["features"])
+                probabilities = self.probabilities(record["features"])
+                for i, row in enumerate(self.weights):
+                    delta = float(self.routes[i] == record["route"]) - probabilities[i]
+                    self.weights[i] = [w + learning_rate * delta * v
+                                       for w, v in zip(row, vector, strict=True)]
+        return {"kind": "linear-contextual-router", "training_scope": training_scope,
+                "records": len(records), "dataset_sha256": fingerprint(records),
+                "base_llm_weights_modified": False, "weights": self.weights}

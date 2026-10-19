@@ -1,0 +1,189 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+class FastInput {
+    unsigned char buffer_[1 << 16];
+    std::size_t position_ = 0;
+    std::size_t length_ = 0;
+
+    int get() {
+        if (position_ == length_) {
+            length_ = std::fread(buffer_, 1, sizeof buffer_, stdin);
+            position_ = 0;
+            if (length_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    bool readInt(int& value) {
+        int c = get();
+        while (c != EOF && c <= ' ') c = get();
+        if (c == EOF) return false;
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = get();
+        std::int64_t magnitude = 0;
+        while (c >= '0' && c <= '9') {
+            magnitude = magnitude * 10 + (c - '0');
+            c = get();
+        }
+        value = static_cast<int>(negative ? -magnitude : magnitude);
+        return true;
+    }
+};
+
+static void advanceBands(const int* matrix, int n, int s, int first,
+                         int count, std::int64_t* bands) {
+    const int* outgoing[4] = {};
+    const int* incoming[4] = {};
+    for (int k = 0; k < count; ++k) {
+        outgoing[k] = matrix + std::size_t(first + k - 1) * n;
+        incoming[k] = outgoing[k] + std::size_t(s) * n;
+    }
+
+    int c = 0;
+#if defined(__aarch64__)
+    if (count == 4) {
+        for (; c + 2 <= n; c += 2) {
+            const int64x2_t last = vld4q_s64(bands + 4 * c).val[3];
+            const int64x2_t d0 = vsubl_s32(vld1_s32(incoming[0] + c),
+                                           vld1_s32(outgoing[0] + c));
+            const int64x2_t d1 = vsubl_s32(vld1_s32(incoming[1] + c),
+                                           vld1_s32(outgoing[1] + c));
+            const int64x2_t d2 = vsubl_s32(vld1_s32(incoming[2] + c),
+                                           vld1_s32(outgoing[2] + c));
+            const int64x2_t d3 = vsubl_s32(vld1_s32(incoming[3] + c),
+                                           vld1_s32(outgoing[3] + c));
+            int64x2x4_t next;
+            next.val[0] = vaddq_s64(last, d0);
+            next.val[1] = vaddq_s64(next.val[0], d1);
+            next.val[2] = vaddq_s64(next.val[1], d2);
+            next.val[3] = vaddq_s64(next.val[2], d3);
+            vst4q_s64(bands + 4 * c, next);
+        }
+    }
+#endif
+    for (; c < n; ++c) {
+        std::int64_t value = bands[4 * c + 3];
+        for (int k = 0; k < 4; ++k) {
+            if (k < count) {
+                value += static_cast<std::int64_t>(incoming[k][c])
+                         - outgoing[k][c];
+            }
+            bands[4 * c + k] = value;
+        }
+    }
+}
+
+#if defined(__aarch64__)
+static inline int64x2_t maximum64(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+static std::int64_t scanBands(const std::int64_t* bands, int n, int s) {
+#if defined(__aarch64__)
+    int64x2_t sum01 = vdupq_n_s64(0);
+    int64x2_t sum23 = vdupq_n_s64(0);
+    for (int c = 0; c < s; ++c) {
+        sum01 = vaddq_s64(sum01, vld1q_s64(bands + 4 * c));
+        sum23 = vaddq_s64(sum23, vld1q_s64(bands + 4 * c + 2));
+    }
+    int64x2_t best01 = sum01;
+    int64x2_t best23 = sum23;
+    for (int c = s; c < n; ++c) {
+        const std::int64_t* entering = bands + 4 * c;
+        const std::int64_t* leaving = bands + 4 * (c - s);
+        sum01 = vaddq_s64(sum01,
+            vsubq_s64(vld1q_s64(entering), vld1q_s64(leaving)));
+        sum23 = vaddq_s64(sum23,
+            vsubq_s64(vld1q_s64(entering + 2), vld1q_s64(leaving + 2)));
+        best01 = maximum64(best01, sum01);
+        best23 = maximum64(best23, sum23);
+    }
+    const int64x2_t best = maximum64(best01, best23);
+    return std::max(vgetq_lane_s64(best, 0), vgetq_lane_s64(best, 1));
+#else
+    std::int64_t sums[4] = {};
+    for (int c = 0; c < s; ++c)
+        for (int k = 0; k < 4; ++k)
+            sums[k] += bands[4 * c + k];
+    std::int64_t best = sums[0];
+    for (int k = 1; k < 4; ++k) best = std::max(best, sums[k]);
+    for (int c = s; c < n; ++c) {
+        for (int k = 0; k < 4; ++k) {
+            sums[k] += bands[4 * c + k] - bands[4 * (c - s) + k];
+            best = std::max(best, sums[k]);
+        }
+    }
+    return best;
+#endif
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.readInt(n) || !input.readInt(s)) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::vector<int> matrix(std::size_t(n) * n);
+    for (std::size_t k = 0; k < matrix.size(); ++k)
+        if (!input.readInt(matrix[k])) return 0;
+
+    std::vector<std::int64_t> vertical(n, 0);
+    for (int r = 0; r < s; ++r) {
+        const int* row = matrix.data() + std::size_t(r) * n;
+        int c = 0;
+#if defined(__aarch64__)
+        for (; c + 4 <= n; c += 4) {
+            const int32x4_t values = vld1q_s32(row + c);
+            vst1q_s64(vertical.data() + c,
+                vaddw_s32(vld1q_s64(vertical.data() + c),
+                          vget_low_s32(values)));
+            vst1q_s64(vertical.data() + c + 2,
+                vaddw_s32(vld1q_s64(vertical.data() + c + 2),
+                          vget_high_s32(values)));
+        }
+#endif
+        for (; c < n; ++c) vertical[c] += row[c];
+    }
+
+    const int width = n - s + 1;
+    // Each column record contains totals for four consecutive output rows.
+    std::vector<std::int64_t> bands(std::size_t(n) * 4);
+    for (int c = 0; c < n; ++c) {
+        std::int64_t value = vertical[c];
+        bands[4 * c] = value;
+        for (int k = 1; k < 4; ++k) {
+            if (k < width) {
+                value += static_cast<std::int64_t>(
+                             matrix[std::size_t(s + k - 1) * n + c])
+                         - matrix[std::size_t(k - 1) * n + c];
+            }
+            bands[4 * c + k] = value;
+        }
+    }
+
+    std::int64_t best = std::numeric_limits<std::int64_t>::lowest();
+    for (int first = 0; first < width; first += 4) {
+        if (first != 0) {
+            advanceBands(matrix.data(), n, s, first,
+                         std::min(4, width - first), bands.data());
+        }
+        best = std::max(best, scanBands(bands.data(), n, s));
+    }
+    std::printf("%lld\n", static_cast<long long>(best));
+    return 0;
+}

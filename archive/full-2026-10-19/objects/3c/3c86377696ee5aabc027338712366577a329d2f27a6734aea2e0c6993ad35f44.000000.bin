@@ -1,0 +1,433 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10
+#define DT 0.01f
+#define SOFTENING 1e-9f
+#define PAIR_TILE 48
+#define TARGET_PACKET 12
+
+/* Preserve the binary input/output layout. */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static inline void body_force_one(Body *p, float dt, int n, int i) {
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  for (int j = 0; j < n; ++j) {
+    float dx = p[j].x - p[i].x;
+    float dy = p[j].y - p[i].y;
+    float dz = p[j].z - p[i].z;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  p[i].vx += dt*fx;
+  p[i].vy += dt*fy;
+  p[i].vz += dt*fz;
+}
+
+void body_force(Body *p, float dt, int n) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(n >= 2 * PAIR_TILE)
+#endif
+  for (int i = 0; i < n; ++i) {
+    body_force_one(p, dt, n, i);
+  }
+}
+
+static void direct_simulation(Body *p, int n) {
+#ifdef _OPENMP
+#pragma omp parallel if(n >= 2 * PAIR_TILE)
+#endif
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < n; ++i) {
+        body_force_one(p, DT, n, i);
+      }
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < n; ++i) {
+        p[i].x += p[i].vx * DT;
+        p[i].y += p[i].vy * DT;
+        p[i].z += p[i].vz * DT;
+      }
+    }
+  }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline __attribute__((always_inline))
+float32x4_t inverse_distance4(float32x4_t squared) {
+  const float64x2_t one = vdupq_n_f64(1.0);
+  float64x2_t lo = vcvt_f64_f32(vget_low_f32(squared));
+  float64x2_t hi = vcvt_f64_f32(vget_high_f32(squared));
+  lo = vdivq_f64(one, vsqrtq_f64(lo));
+  hi = vdivq_f64(one, vsqrtq_f64(hi));
+  return vcombine_f32(vcvt_f32_f64(lo), vcvt_f32_f64(hi));
+}
+
+static inline __attribute__((always_inline))
+float32x4_t squared_distance4(const float *x, const float *y,
+                              const float *z, float32x4_t sx,
+                              float32x4_t sy, float32x4_t sz) {
+  float32x4_t dx = sx - vld1q_f32(x);
+  float32x4_t dy = sy - vld1q_f32(y);
+  float32x4_t dz = sz - vld1q_f32(z);
+  return dx*dx + dy*dy + dz*dz + vdupq_n_f32(SOFTENING);
+}
+#endif
+
+/* Distances are positive, so coefficient production needs no errno checks. */
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER)
+__attribute__((noinline, optimize("no-math-errno")))
+#endif
+static void make_coefficients(const float *restrict x,
+                              const float *restrict y,
+                              const float *restrict z,
+                              int target_first, int target_count,
+                              int source_first, int source_count,
+                              float coefficients[PAIR_TILE][PAIR_TILE]) {
+  for (int j = 0; j < source_count; ++j) {
+    const int s = source_first + j;
+    const float sx = x[s];
+    const float sy = y[s];
+    const float sz = z[s];
+    int q = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const float32x4_t svx = vdupq_n_f32(sx);
+    const float32x4_t svy = vdupq_n_f32(sy);
+    const float32x4_t svz = vdupq_n_f32(sz);
+    for (; q + TARGET_PACKET <= target_count; q += TARGET_PACKET) {
+      const int t = target_first + q;
+      float32x4_t d0 = squared_distance4(x+t, y+t, z+t, svx, svy, svz);
+      float32x4_t d1 = squared_distance4(x+t+4, y+t+4, z+t+4,
+                                        svx, svy, svz);
+      float32x4_t d2 = squared_distance4(x+t+8, y+t+8, z+t+8,
+                                        svx, svy, svz);
+      float32x4_t inv0 = inverse_distance4(d0);
+      float32x4_t inv1 = inverse_distance4(d1);
+      float32x4_t inv2 = inverse_distance4(d2);
+      vst1q_f32(coefficients[j]+q, inv0 * inv0 * inv0);
+      vst1q_f32(coefficients[j]+q+4, inv1 * inv1 * inv1);
+      vst1q_f32(coefficients[j]+q+8, inv2 * inv2 * inv2);
+    }
+    for (; q + 4 <= target_count; q += 4) {
+      const int t = target_first + q;
+      float32x4_t squared = squared_distance4(x+t, y+t, z+t,
+                                             svx, svy, svz);
+      float32x4_t inv = inverse_distance4(squared);
+      vst1q_f32(coefficients[j]+q, inv * inv * inv);
+    }
+#endif
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int k = q; k < target_count; ++k) {
+      float dx = sx - x[target_first+k];
+      float dy = sy - y[target_first+k];
+      float dz = sz - z[target_first+k];
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      coefficients[j][k] = inv_dist3;
+    }
+  }
+}
+
+/* Both source-major orientations remain contiguous in the private workspace. */
+static inline void transpose_coefficients(
+    const float src[PAIR_TILE][PAIR_TILE],
+    float dst[PAIR_TILE][PAIR_TILE], int rows, int cols) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  const int full_rows = rows - rows % 4;
+  const int full_cols = cols - cols % 4;
+  for (int i = 0; i < full_rows; i += 4) {
+    for (int j = 0; j < full_cols; j += 4) {
+      float32x4_t r0 = vld1q_f32(&src[i][j]);
+      float32x4_t r1 = vld1q_f32(&src[i+1][j]);
+      float32x4_t r2 = vld1q_f32(&src[i+2][j]);
+      float32x4_t r3 = vld1q_f32(&src[i+3][j]);
+      float32x4x2_t t0 = vtrnq_f32(r0, r1);
+      float32x4x2_t t1 = vtrnq_f32(r2, r3);
+      vst1q_f32(&dst[j][i],
+                 vcombine_f32(vget_low_f32(t0.val[0]),
+                              vget_low_f32(t1.val[0])));
+      vst1q_f32(&dst[j+1][i],
+                 vcombine_f32(vget_low_f32(t0.val[1]),
+                              vget_low_f32(t1.val[1])));
+      vst1q_f32(&dst[j+2][i],
+                 vcombine_f32(vget_high_f32(t0.val[0]),
+                              vget_high_f32(t1.val[0])));
+      vst1q_f32(&dst[j+3][i],
+                 vcombine_f32(vget_high_f32(t0.val[1]),
+                              vget_high_f32(t1.val[1])));
+    }
+  }
+  for (int i = 0; i < rows; ++i) {
+    const int first = i < full_rows ? full_cols : 0;
+    for (int j = first; j < cols; ++j) {
+      dst[j][i] = src[i][j];
+    }
+  }
+#else
+  for (int i = 0; i < rows; ++i) {
+    for (int j = 0; j < cols; ++j) {
+      dst[j][i] = src[i][j];
+    }
+  }
+#endif
+}
+
+/* Every SIMD lane owns one target and visits sources in ascending order. */
+static void accumulate_panel(float *restrict fx, float *restrict fy,
+                              float *restrict fz,
+                              const float *restrict x,
+                              const float *restrict y,
+                              const float *restrict z,
+                              int target_first, int target_count,
+                              int source_first, int source_count,
+                              const float coefficients[PAIR_TILE][PAIR_TILE]) {
+  int q = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  for (; q + TARGET_PACKET <= target_count; q += TARGET_PACKET) {
+    const int t = target_first + q;
+    const float32x4_t tx0 = vld1q_f32(x+t);
+    const float32x4_t ty0 = vld1q_f32(y+t);
+    const float32x4_t tz0 = vld1q_f32(z+t);
+    const float32x4_t tx1 = vld1q_f32(x+t+4);
+    const float32x4_t ty1 = vld1q_f32(y+t+4);
+    const float32x4_t tz1 = vld1q_f32(z+t+4);
+    const float32x4_t tx2 = vld1q_f32(x+t+8);
+    const float32x4_t ty2 = vld1q_f32(y+t+8);
+    const float32x4_t tz2 = vld1q_f32(z+t+8);
+    float32x4_t ax0 = vld1q_f32(fx+t);
+    float32x4_t ay0 = vld1q_f32(fy+t);
+    float32x4_t az0 = vld1q_f32(fz+t);
+    float32x4_t ax1 = vld1q_f32(fx+t+4);
+    float32x4_t ay1 = vld1q_f32(fy+t+4);
+    float32x4_t az1 = vld1q_f32(fz+t+4);
+    float32x4_t ax2 = vld1q_f32(fx+t+8);
+    float32x4_t ay2 = vld1q_f32(fy+t+8);
+    float32x4_t az2 = vld1q_f32(fz+t+8);
+
+    for (int j = 0; j < source_count; ++j) {
+      const int s = source_first + j;
+      const float32x4_t sx = vdupq_n_f32(x[s]);
+      const float32x4_t sy = vdupq_n_f32(y[s]);
+      const float32x4_t sz = vdupq_n_f32(z[s]);
+      const float32x4_t c0 = vld1q_f32(coefficients[j]+q);
+      ax0 += (sx - tx0) * c0;
+      ay0 += (sy - ty0) * c0;
+      az0 += (sz - tz0) * c0;
+      const float32x4_t c1 = vld1q_f32(coefficients[j]+q+4);
+      ax1 += (sx - tx1) * c1;
+      ay1 += (sy - ty1) * c1;
+      az1 += (sz - tz1) * c1;
+      const float32x4_t c2 = vld1q_f32(coefficients[j]+q+8);
+      ax2 += (sx - tx2) * c2;
+      ay2 += (sy - ty2) * c2;
+      az2 += (sz - tz2) * c2;
+    }
+
+    vst1q_f32(fx+t, ax0);
+    vst1q_f32(fy+t, ay0);
+    vst1q_f32(fz+t, az0);
+    vst1q_f32(fx+t+4, ax1);
+    vst1q_f32(fy+t+4, ay1);
+    vst1q_f32(fz+t+4, az1);
+    vst1q_f32(fx+t+8, ax2);
+    vst1q_f32(fy+t+8, ay2);
+    vst1q_f32(fz+t+8, az2);
+  }
+#endif
+  for (; q < target_count; ++q) {
+    const int t = target_first + q;
+    const float tx = x[t];
+    const float ty = y[t];
+    const float tz = z[t];
+    float ax = fx[t];
+    float ay = fy[t];
+    float az = fz[t];
+    for (int j = 0; j < source_count; ++j) {
+      const int s = source_first + j;
+      float dx = x[s] - tx;
+      float dy = y[s] - ty;
+      float dz = z[s] - tz;
+      float c = coefficients[j][q];
+      ax += dx * c;
+      ay += dy * c;
+      az += dz * c;
+    }
+    fx[t] = ax;
+    fy[t] = ay;
+    fz[t] = az;
+  }
+}
+
+static void simulate(Body *p, int n) {
+  if (n < 2 * PAIR_TILE) {
+    direct_simulation(p, n);
+    return;
+  }
+
+  const size_t stride = ((size_t)n + 15u) & ~(size_t)15u;
+  if (stride > (SIZE_MAX - 63u) / (6u * sizeof(float))) {
+    direct_simulation(p, n);
+    return;
+  }
+  void *allocation = malloc(6u * stride * sizeof(float) + 63u);
+  if (allocation == NULL) {
+    direct_simulation(p, n);
+    return;
+  }
+  float *x = (float *)(((uintptr_t)allocation + 63u) & ~(uintptr_t)63u);
+  float *y = x + stride;
+  float *z = y + stride;
+  float *fx = z + stride;
+  float *fy = fx + stride;
+  float *fz = fy + stride;
+  const int tile_count = n / PAIR_TILE + (n % PAIR_TILE != 0);
+  int scalar_required = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+#if defined(__GNUC__) || defined(__clang__)
+    float coefficients[PAIR_TILE][PAIR_TILE] __attribute__((aligned(64)));
+    float transposed[PAIR_TILE][PAIR_TILE] __attribute__((aligned(64)));
+#else
+    float coefficients[PAIR_TILE][PAIR_TILE];
+    float transposed[PAIR_TILE][PAIR_TILE];
+#endif
+    for (int iter = 0; iter < N_ITER; ++iter) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:scalar_required)
+#endif
+      for (int i = 0; i < n; ++i) {
+        x[i] = p[i].x;
+        y[i] = p[i].y;
+        z[i] = p[i].z;
+        fx[i] = 0.0f;
+        fy[i] = 0.0f;
+        fz[i] = 0.0f;
+        /* Keep squared distances finite; unordered comparisons also fall back. */
+        if (!(fabsf(x[i]) <= 0x1p62f &&
+              fabsf(y[i]) <= 0x1p62f &&
+              fabsf(z[i]) <= 0x1p62f)) {
+          scalar_required |= 1;
+        }
+      }
+
+      if (scalar_required) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < n; ++i) {
+          body_force_one(p, DT, n, i);
+        }
+      } else {
+        /* A fixed target sees source blocks in ascending order of this sum. */
+        for (int diagonal = 0; diagonal < 2 * tile_count - 1; ++diagonal) {
+          const int first = diagonal >= tile_count
+                            ? diagonal - tile_count + 1 : 0;
+          const int last = diagonal / 2;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+          for (int a = first; a <= last; ++a) {
+            const int b = diagonal - a;
+            const int afirst = a * PAIR_TILE;
+            const int bfirst = b * PAIR_TILE;
+            int na = n - afirst;
+            int nb = n - bfirst;
+            if (na > PAIR_TILE) na = PAIR_TILE;
+            if (nb > PAIR_TILE) nb = PAIR_TILE;
+            make_coefficients(x, y, z, afirst, na, bfirst, nb,
+                              coefficients);
+            if (a != b) {
+              transpose_coefficients(coefficients, transposed, nb, na);
+            }
+            accumulate_panel(fx, fy, fz, x, y, z,
+                             afirst, na, bfirst, nb, coefficients);
+            if (a != b) {
+              accumulate_panel(fx, fy, fz, x, y, z,
+                               bfirst, nb, afirst, na, transposed);
+            }
+          }
+        }
+      }
+
+      /* All force reads finish before any position changes. */
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < n; ++i) {
+        if (!scalar_required) {
+          p[i].vx += DT*fx[i];
+          p[i].vy += DT*fy[i];
+          p[i].vz += DT*fz[i];
+        }
+        p[i].x += p[i].vx * DT;
+        p[i].y += p[i].vy * DT;
+        p[i].z += p[i].vz * DT;
+      }
+    }
+  }
+  free(allocation);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+  simulate(bodies, nbodies);
+  write_dataset(nbodies, bodies);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

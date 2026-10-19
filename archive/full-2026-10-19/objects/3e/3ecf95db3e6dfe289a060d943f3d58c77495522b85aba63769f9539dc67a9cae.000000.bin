@@ -1,0 +1,416 @@
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+#ifdef _OPENMP
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <vector>
+#include <omp.h>
+#endif
+
+struct IsWhitespace
+{
+    template <typename Char> auto
+    operator () (Char c) const -> bool
+    {
+        return (c == ' ' )
+            || (c == '\n')
+            || (c == '\r')
+            || (c == '\t')
+            || (c == '\f')
+            || (c == '\v');
+    }
+};
+
+template <typename String> inline auto
+remove_whitespaces (String text) -> String
+{
+    text.erase(std::remove_if(text.begin(), text.end(), IsWhitespace()),
+               text.end());
+    return text;
+}
+
+template <typename String, typename InStream> inline auto
+read_text_from_stdin (InStream& in) -> String
+{
+    std::istreambuf_iterator<char> begin(in), end;
+    std::string text(begin, end);
+    return remove_whitespaces(text);
+}
+
+namespace
+{
+const std::size_t block_size = 64u * 1024u;
+
+class BufferedOutput
+{
+    char data_[block_size];
+    std::size_t used_;
+
+    void flush()
+    {
+        if (used_ != 0) {
+            std::cout.write(data_, static_cast<std::streamsize>(used_));
+            used_ = 0;
+        }
+    }
+
+public:
+    BufferedOutput() : used_(0) {}
+
+    char* reserve(std::size_t length)
+    {
+        if (length > block_size - used_) flush();
+        return data_ + used_;
+    }
+
+    void commit(std::size_t length)
+    {
+        used_ += length;
+    }
+
+    void put(char value)
+    {
+        *reserve(1) = value;
+        commit(1);
+    }
+
+    void finish()
+    {
+        flush();
+    }
+};
+
+template <typename Output>
+void emit_permutation(const std::string& text, Output& output)
+{
+    if (text.size() <= (block_size - 4) / 2) {
+        const std::size_t length = 2 * text.size() + 4;
+        char* destination = output.reserve(length);
+        *destination++ = '[';
+        *destination++ = ' ';
+        for (char value : text) {
+            *destination++ = value;
+            *destination++ = ' ';
+        }
+        *destination++ = ']';
+        *destination = '\n';
+        output.commit(length);
+    } else {
+        output.put('[');
+        output.put(' ');
+        for (char value : text) {
+            output.put(value);
+            output.put(' ');
+        }
+        output.put(']');
+        output.put('\n');
+    }
+}
+
+template <typename Output>
+void generate_subtree(std::string& text, std::size_t prefix_length,
+                      Output& output)
+{
+    do {
+        emit_permutation(text, output);
+    } while (std::next_permutation(text.begin() + prefix_length, text.end()));
+}
+
+void generate_serial(std::string& text)
+{
+    if (text.empty()) return;
+    BufferedOutput output;
+    generate_subtree(text, 0, output);
+    output.finish();
+}
+
+#ifdef _OPENMP
+typedef std::array<std::size_t, 256> Counts;
+
+std::uint64_t gcd_value(std::uint64_t a, std::uint64_t b)
+{
+    while (b != 0) {
+        const std::uint64_t remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return a;
+}
+
+std::uint64_t count_permutations(const Counts& counts,
+                                 const std::vector<char>& symbols)
+{
+    const std::uint64_t limit = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t ways = 1;
+    std::size_t used = 0;
+    for (char symbol : symbols) {
+        const std::size_t amount = counts[static_cast<unsigned char>(symbol)];
+        if (amount == 0) continue;
+        const std::size_t total = used + amount;
+        const std::size_t k = std::min(used, amount);
+        for (std::size_t j = 1; j <= k; ++j) {
+            std::uint64_t numerator = static_cast<std::uint64_t>(total - k + j);
+            std::uint64_t denominator = static_cast<std::uint64_t>(j);
+            const std::uint64_t common = gcd_value(numerator, denominator);
+            numerator /= common;
+            denominator /= common;
+            ways /= denominator;
+            if (ways > limit / numerator) return limit;
+            ways *= numerator;
+        }
+        used = total;
+    }
+    return ways;
+}
+
+std::uint64_t saturated_product(std::uint64_t a, std::uint64_t b)
+{
+    const std::uint64_t limit = std::numeric_limits<std::uint64_t>::max();
+    if (b != 0 && a > limit / b) return limit;
+    return a * b;
+}
+
+struct PrefixTask
+{
+    std::string prefix;
+    std::uint64_t work;
+};
+
+std::vector<PrefixTask> make_tasks(const Counts& counts,
+                                   const std::vector<char>& symbols,
+                                   std::uint64_t total_work,
+                                   std::size_t target)
+{
+    std::vector<PrefixTask> tasks(1);
+    tasks[0].work = total_work;
+    while (tasks.size() < target) {
+        std::size_t best = tasks.size();
+        for (std::size_t i = 0; i < tasks.size(); ++i) {
+            if (tasks[i].work > 1 &&
+                (best == tasks.size() || tasks[i].work > tasks[best].work)) {
+                best = i;
+            }
+        }
+        if (best == tasks.size()) break;
+
+        const PrefixTask parent = tasks[best];
+        Counts remaining = counts;
+        for (char symbol : parent.prefix) {
+            --remaining[static_cast<unsigned char>(symbol)];
+        }
+        std::vector<PrefixTask> children;
+        for (char symbol : symbols) {
+            const unsigned char index = static_cast<unsigned char>(symbol);
+            if (remaining[index] == 0) continue;
+            --remaining[index];
+            PrefixTask child;
+            child.prefix = parent.prefix;
+            child.prefix.push_back(symbol);
+            child.work = count_permutations(remaining, symbols);
+            children.push_back(child);
+            ++remaining[index];
+        }
+        tasks.erase(tasks.begin() + best);
+        tasks.insert(tasks.begin() + best, children.begin(), children.end());
+    }
+    return tasks;
+}
+
+inline void spin_pause(unsigned& spins)
+{
+    if ((++spins & 1023u) == 0) {
+#pragma omp taskyield
+    }
+}
+
+void wait_for_flag(std::atomic<bool>& flag, bool value)
+{
+    unsigned spins = 0;
+    while (flag.load(std::memory_order_acquire) != value) {
+        spin_pause(spins);
+    }
+}
+
+struct OutputSlot
+{
+    std::atomic<bool> ready;
+    std::size_t length;
+    bool last;
+    char data[block_size];
+
+    OutputSlot() : ready(false), length(0), last(false) {}
+};
+
+struct OutputChannel
+{
+    OutputSlot slots[2];
+    unsigned read_slot;
+
+    OutputChannel() : read_slot(0) {}
+};
+
+class QueuedOutput
+{
+    OutputChannel& channel_;
+    unsigned write_slot_;
+    std::size_t used_;
+
+    void publish(bool last)
+    {
+        OutputSlot& slot = channel_.slots[write_slot_];
+        slot.length = used_;
+        slot.last = last;
+        slot.ready.store(true, std::memory_order_release);
+        write_slot_ ^= 1u;
+        used_ = 0;
+        wait_for_flag(channel_.slots[write_slot_].ready, false);
+    }
+
+public:
+    explicit QueuedOutput(OutputChannel& channel)
+        : channel_(channel), write_slot_(0), used_(0)
+    {
+        wait_for_flag(channel_.slots[write_slot_].ready, false);
+    }
+
+    char* reserve(std::size_t length)
+    {
+        if (length > block_size - used_) publish(false);
+        return channel_.slots[write_slot_].data + used_;
+    }
+
+    void commit(std::size_t length)
+    {
+        used_ += length;
+    }
+
+    void put(char value)
+    {
+        *reserve(1) = value;
+        commit(1);
+    }
+
+    void finish_task()
+    {
+        publish(true);
+    }
+};
+
+void drain_tasks(std::size_t task_count, std::atomic<int>* owners,
+                 OutputChannel* channels)
+{
+    for (std::size_t task = 0; task < task_count; ++task) {
+        int producer;
+        unsigned spins = 0;
+        while ((producer = owners[task].load(std::memory_order_acquire)) < 0) {
+            spin_pause(spins);
+        }
+        OutputChannel& channel = channels[producer];
+        bool last;
+        do {
+            OutputSlot& slot = channel.slots[channel.read_slot];
+            wait_for_flag(slot.ready, true);
+            std::cout.write(slot.data, static_cast<std::streamsize>(slot.length));
+            last = slot.last;
+            slot.ready.store(false, std::memory_order_release);
+            channel.read_slot ^= 1u;
+        } while (!last);
+    }
+}
+
+void produce_task(const PrefixTask& task, const Counts& counts,
+                  const std::vector<char>& symbols, std::string& state,
+                  QueuedOutput& output)
+{
+    Counts remaining = counts;
+    for (char symbol : task.prefix) {
+        --remaining[static_cast<unsigned char>(symbol)];
+    }
+    state.assign(task.prefix);
+    for (char symbol : symbols) {
+        state.append(remaining[static_cast<unsigned char>(symbol)], symbol);
+    }
+    generate_subtree(state, task.prefix.size(), output);
+    output.finish_task();
+}
+
+bool try_parallel(std::string& text)
+{
+    int threads = std::min(omp_get_max_threads(), 4);
+    if (threads < 3 || omp_in_parallel()) return false;
+
+    Counts counts = {};
+    std::vector<char> symbols;
+    symbols.reserve(256);
+    for (char symbol : text) {
+        const unsigned char index = static_cast<unsigned char>(symbol);
+        if (counts[index]++ == 0) symbols.push_back(symbol);
+    }
+    const std::uint64_t ways = count_permutations(counts, symbols);
+    const std::uint64_t limit = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t length = static_cast<std::uint64_t>(text.size());
+    const std::uint64_t line_bytes = length > (limit - 4) / 2
+        ? limit : 2 * length + 4;
+    const std::uint64_t output_bytes = saturated_product(ways, line_bytes);
+    if (ways < 16384u || output_bytes < 4u * 1024u * 1024u) return false;
+    if (output_bytes < 16u * 1024u * 1024u) threads = std::min(threads, 3);
+
+    const std::vector<PrefixTask> tasks = make_tasks(
+        counts, symbols, ways, static_cast<std::size_t>(threads - 1) * 32u);
+    if (tasks.size() < 2) return false;
+
+    std::unique_ptr<OutputChannel[]> channels(new OutputChannel[threads - 1]);
+    std::unique_ptr<std::atomic<int>[]> owners(new std::atomic<int>[tasks.size()]);
+    for (std::size_t i = 0; i < tasks.size(); ++i) {
+        owners[i].store(-1, std::memory_order_relaxed);
+    }
+    std::atomic<std::size_t> next_task(0);
+    const std::size_t input_length = text.size();
+
+#pragma omp parallel num_threads(threads)
+    {
+        const int id = omp_get_thread_num();
+        if (omp_get_num_threads() < 3) {
+            if (id == 0) generate_serial(text);
+        } else if (id == 0) {
+            drain_tasks(tasks.size(), owners.get(), channels.get());
+        } else {
+            QueuedOutput output(channels[id - 1]);
+            std::string state;
+            state.reserve(input_length);
+            for (;;) {
+                const std::size_t task = next_task.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (task >= tasks.size()) break;
+                // Every earlier task is already assigned, so the writer's
+                // earliest unfinished task always has a producer.
+                owners[task].store(id - 1, std::memory_order_release);
+                produce_task(tasks[task], counts, symbols, state, output);
+            }
+        }
+    }
+    return true;
+}
+#endif
+}
+
+int main(int argc, char const* argv[])
+{
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    std::string text = read_text_from_stdin<std::string>(std::cin);
+    if (text.empty()) return 0;
+    std::sort(text.begin(), text.end());
+#ifdef _OPENMP
+    if (try_parallel(text)) return 0;
+#endif
+    generate_serial(text);
+    return 0;
+}

@@ -1,0 +1,109 @@
+"""Mechanical neutral-fixture tests; never execute a contest program."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("evaluation", ROOT / "KIT-BENCHMARK/outils/evaluer.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class MechanicalTests(unittest.TestCase):
+    def setup_contract(self, root):
+        cases = []
+        for i, phase in enumerate(["confirmation"] * 3 + ["performance"]):
+            (root / f"{i}.in").write_bytes(b"neutral input\n")
+            (root / f"{i}.out").write_bytes(b"neutral answer\x00\n")
+            cases.append({"case_id": str(i), "phase": phase, "stdin": f"{i}.in",
+                          "stdin_sha256": module.sha(root / f"{i}.in"), "expected_stdout": f"{i}.out",
+                          "expected_stdout_sha256": module.sha(root / f"{i}.out"), "argv": []})
+        contract = {"subject_id": "fixture", "environment": {}, "protected_cases": cases, "case_timeout_seconds": 2}
+        (root / "contrat.json").write_text(json.dumps(contract), encoding="utf-8")
+        return contract
+
+    def test_interleaving_has_five_repetitions_per_program_and_excludes_warmup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            contract = self.setup_contract(root)
+            def runner(command, *_args, **_kwargs):
+                return {"seconds": 2.0 if command[0] == "reference" else 1.0, "correct": True,
+                        "returncode": 0, "timeout": False, "stdout_sha256": "0" * 64}
+            report = module.evaluate(root, contract, {"reference": ["reference"], "candidat": ["candidate"]},
+                                     root / "result", phase="confirmation", runner=runner)
+            self.assertEqual(report["statistics"]["gain_percent"], 50.0)
+            self.assertEqual(len([r for r in report["records"] if r["phase"] == "mesure"]), 10)
+            self.assertEqual(len([r for r in report["records"] if r["phase"] == "chauffe"]), 2)
+            for repeat in range(1, 6):
+                self.assertEqual({r["role"] for r in report["records"] if r["phase"] == "mesure" and r["repeat"] == repeat},
+                                 {"reference", "candidat"})
+
+    def test_invalid_reference_never_accuses_candidate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            contract = self.setup_contract(root)
+            calls = []
+            def runner(command, *_args, **_kwargs):
+                calls.append(command[0])
+                return {"seconds": 1.0, "correct": False}
+            report = module.evaluate(root, contract, {"reference": ["ref"], "candidat": ["cand"]},
+                                     root / "result", phase="confirmation", runner=runner)
+            self.assertEqual(report["status"], "reference_incompatible")
+            self.assertEqual(calls, ["ref"])
+            self.assertIsNone(report["statistics"]["gain_percent"])
+
+    def test_invalid_candidate_stays_a_rejection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            contract = self.setup_contract(root)
+            def runner(command, *_args, **_kwargs):
+                return {"seconds": 1.0, "correct": command[0] == "ref"}
+            report = module.evaluate(root, contract, {"reference": ["ref"], "candidat": ["cand"]},
+                                     root / "result", phase="confirmation", runner=runner)
+            self.assertEqual(report["status"], "candidat_rejete")
+            self.assertIsNone(report["statistics"]["gain_percent"])
+
+    def test_existing_output_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as folder, self.assertRaises(FileExistsError):
+            root = Path(folder)
+            module.evaluate(root, {}, {}, root, phase="confirmation")
+
+    def test_protected_data_tampering_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "x").write_bytes(b"modified")
+            with self.assertRaises(ValueError):
+                module.case_file(root, "x", hashlib.sha256(b"expected").hexdigest())
+
+    @unittest.skipUnless(os.name == "posix", "Linux process execution only")
+    def test_real_neutral_process_preserves_binary_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "input").write_bytes(b"neutral\x00\n")
+            (root / "expected").write_bytes(b"neutral\x00\n")
+            item = module.launch([sys.executable, "-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+                                 root / "input", root / "expected", root / "record", timeout=2, environment=os.environ)
+            self.assertTrue(item["correct"])
+            self.assertEqual((root / "record.stdout").read_bytes(), b"neutral\x00\n")
+
+    @unittest.skipUnless(os.name == "posix", "Linux process execution only")
+    def test_owned_process_timeout_is_preserved(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "input").write_bytes(b"")
+            (root / "expected").write_bytes(b"")
+            item = module.launch([sys.executable, "-c", "import time;time.sleep(5)"],
+                                 root / "input", root / "expected", root / "record", timeout=.05, environment=os.environ)
+            self.assertTrue(item["timeout"])
+            self.assertFalse(item["correct"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2,7 +2,7 @@
 
 _Offline verification with Python 3.11+; optional plotting with a separate environment._
 
-The [19 October received-data inventory](../evidence/received-2026-10-19/README.md) documents the additional complete historical projection, source hashes, retained columns and exclusions. The same verification command also validates that supplement. The original 0.1.0 subset and its calculations below remain available unchanged. Article and appendix PDFs are byte-identical to the reviewed edition identified by [article provenance](article/provenance.json); the public bundle does not rebuild the private research pipeline.
+The [19 October received-data inventory](../evidence/received-2026-10-19/README.md) documents the historical scientific projection, source hashes, retained columns and exclusions. The same verification command validates that supplement. The original 0.1.0 subset and calculations remain unchanged. Article and appendix PDFs are byte-identical to the reviewed edition identified by [article provenance](article/provenance.json). The later [complete snapshot](../reproducibility/README.md) separately releases the available historical source and raw corpus; verification does not execute or rebuild that research pipeline.
 
 ## Verify the release
 
@@ -41,7 +41,7 @@ The CPU subset selection is explicit and includes all four subjects in that larg
 
 `MANIFEST.json` lists SHA-256 hashes and byte lengths for the release files, excluding the manifest itself. It checks consistency within a checkout. A Git commit or release fixes the manifest version. If an attacker replaces both data and manifest, the manifest alone cannot authenticate the original observation; retain the trusted commit identifier when citing or comparing releases.
 
-The provenance files also record original private-archive hashes and audit counts. Those hashes support identity if the original archives are later inspected. Since the archives are not distributed here, the public checks cannot establish their contents or authenticity independently.
+The dated provenance files record original archive hashes and audit counts. They retain their original publication boundary. The later complete snapshot supplies available source archives, raw results and operational materials with a separate path/object inventory. Its verifier checks the released file bytes, including part and complete-file hashes; this does not authenticate an experiment independently of a trusted release or reproduce performance.
 
 ## Render the figures
 
@@ -60,6 +60,6 @@ This regenerates PNG and SVG figures from [results.json](../evidence/results.jso
 
 Public readers can verify record completeness, hash consistency and arithmetic. They can inspect the protocol and run an independent system against a separately prepared benchmark.
 
-They cannot reproduce the internal controller execution from this repository, because its implementation is not distributed. They also cannot re-run the original CPU programs or re-check their outputs without the original binaries and protected inputs. The published correctness and environment observations come from the original audited campaign. These boundaries are part of the evidence, not gaps to fill with assumed success.
+Historical controller implementations and available programs/inputs can now be restored from the complete snapshot. Restoring their bytes does not recreate original hardware, accounts, software installations, time limits or model responses. The published correctness and environment observations still come from the original campaign; no new execution is performed by the restoration tool. The source guides identify the exact R1 historical cohort, its comparison-derived harness and the R2 native edition separately. The R2 transport prototype remains unintegrated, and all experiments remain paused.
 
 To carry out a new hardware experiment, follow the [protocol](PROTOCOL.md) and [comparison guide](COMPARING.md), qualify the benchmark and preserve the actual environment and raw measurements. A new run is a new observation, not a replacement for an older inconvenient result.

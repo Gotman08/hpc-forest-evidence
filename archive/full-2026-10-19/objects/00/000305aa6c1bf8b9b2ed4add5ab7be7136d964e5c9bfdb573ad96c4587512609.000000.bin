@@ -1,0 +1,45 @@
+# Opérateur local, une seule cellule
+
+Le code est dans `work/matrix15-operator-r1/operator.py`, avec les tests `test_operator.py`. Le mode par défaut produit seulement un reçu `PREPARE`, `verified:false` : aucun réseau, modèle, job, recensement CIM, worker ni modification du registre. Aucun mode d'exécution réel n'a été lancé pendant cette préparation.
+
+L'opérateur s'arrête après le démarrage et l'identification du worker persistant d'une cellule. L'audit du premier lot, sa libération, la réception finale et la clôture de réservation restent à la charge de ROOT. Il ne programme aucune automation, ne passe pas automatiquement à la cellule suivante et ne tue aucun processus.
+
+La cellule Sol/count préparée ou exécutée manuellement appartient à ROOT. Ses fichiers ne constituent pas une demande à rejouer. Pour une cellule ultérieure, ROOT doit d'abord réconcilier le pilotage, puis obtenir une nouvelle matérialisation exacte et un `PREPARED.json` du producteur existant.
+
+## Entrées et revue
+
+`INPUT-TEMPLATE.json` est incomplet volontairement et n'autorise rien. ROOT renseigne un identifiant enregistré exact, les références SHA de la matérialisation unitaire revue et du `PREPARED.json` d'extension, les prérequis réels finalisés, le CLI exact et les racines de métadonnées de skills. Les `owned_worker_receipts` sont les reçus réels des workers déjà possédés, avec deux identités `[enfant Python de base, parent venv]`, ou une liste vide explicite. Le producteur d'admission réconcilie cette liste contre le CIM complet courant sous son verrou existant.
+
+La matérialisation est produite par `work/matrix15-unit-operation-r1/materialize_unit.py`. Le constructeur d'extension reste celui de `outputs/HPC-Forest-Matrice15-Extension-Operation-Preparation-r1/build_inputs.py`, SHA `4d26cdab42a7b47cc8d326fbd638e9f44fbe404dbcac40ad64cf7dba42dd99d1`. Ses sources verrouillées sont celles de la livraison Admission-Extension-Preparation-r3, avec le runtime source de 127 fichiers dans `work/matrix15-admission-no-cycle-r2/project`. Le ZIP est `b79e6fdc3e1e0dae5d9d240353510c504ffc1298265a6d425f248a8f2b5489d4`, le manifeste runtime `91684ae8d3d0457d81d049bf6e096c02601fdbdc67fc762fdf697bdc23c35f2b` et le source `RomeoFiles` `a07d231e5bec01b6402503b391afb0a164c833420ce4bc67f5957aabb8ffb3ec`.
+
+La matérialisation consommée doit être la version corrigée r2 ou ultérieure, avec `first_batch_gate` au format REF3 exact `{path, sha256, bytes}`. Avant toute ouverture MCP et donc avant toute soumission, l'opérateur valide le bootstrap avec le producteur existant puis exerce le véritable `read_ref` du helper scellé sur la copie locale reçue du même gate, avec les SHA et taille ARM inchangés (3 119 octets pour le gate actuel). La référence ARM sérialisée n'est pas réécrite. L'ancienne matérialisation REF2 est refusée avant toute action ; l'opérateur ne répare ni ne rejoue le Sol manuel échoué de ROOT.
+
+Une revue fraîche en lecture seule doit examiner le code de l'opérateur, les sources et le corps matérialisé. ROOT fournit ensuite son propre reçu de revue, distinct de la validation locale : schéma `hpc-forest-matrix15-operator-root-review-v1`, `decision:SHIP`, `root_execute_one_approved:true`, `input_sha256`, `operator_sha256`, `job_body_sha256` et `source_pins`. Ce dernier contient `builder`, `RomeoFiles`, les dictionnaires `reviewed_sources` et `reviewed_bootstrap` des SHA contenus dans le `PREPARED.json`, puis `launcher`, référence exacte du launcher dans `VENV-RUNTIME-IDENTITY.json`. Le modèle `REVUE-ROOT-TEMPLATE.json` reste négatif tant que cette revue n'existe pas.
+
+Les chemins et fichiers indiqués par les références restent immuables. Le journal d'un run doit être nouveau. Un run interrompu ou incertain ne se relance pas : ROOT inspecte les reçus et l'état réel avant toute nouvelle décision.
+
+Après les préflights purement locaux et avant l'ouverture MCP, une consommation durable de la cellule est créée exclusivement sous `work/matrix15-operator-r1/claims/<SHA-du-cell_key>.json` et synchronisée sur disque. Elle lie l'unité, la demande, la revue, la session et le journal. Un autre output, une autre demande ou une autre matérialisation de la même cellule ne peut pas créer une deuxième consommation. L'opérateur ne retire jamais ce fichier, y compris après une ouverture MCP ou une soumission incertaine ; la réconciliation et toute éventuelle reprise technique restent hors de cet opérateur et sous contrôle ROOT. Un préflight local REF2 échoué ne crée aucun claim et n'ouvre pas le MCP.
+
+## Exécution ROOT uniquement
+
+Pour éviter qu'un chemin `HPC-Forest` dans la ligne de commande ne soit classé par le recensement existant comme processus natif inconnu, ROOT lance depuis `work/matrix15-operator-r1`, avec des noms d'arguments relatifs neutres. Copier les octets revus de la demande et de la revue dans ce dossier ne change pas leurs SHA. Utiliser le launcher venv exact déclaré dans le sidecar revu.
+
+Préparation sans action, par exemple depuis le dossier de l'opérateur :
+
+```powershell
+python -B operator.py --output runs/prepare-only-01
+```
+
+Le lancement opérationnel est réservé à ROOT après `SHIP`, avec le launcher venv épinglé à la place de `python` :
+
+```powershell
+& 'C:\Users\nicol\Documents\Codex\2026-10-15\cr\work\.venv\Scripts\python.exe' -B operator.py --execute-one --input request.json --input-sha256 <SHA> --root-review review.json --root-review-sha256 <SHA> --output runs/unit-unique
+```
+
+La commande doit être consommée une seule fois. L'opérateur crée un journal `STATE.jsonl` synchronisé sur disque avant chaque action, conserve chaque réponse SDK MCP complète via `model_dump(mode="json", by_alias=True)` et n'aplatit pas les preuves primaires. Le plan de soumission réel et son SHA figurent dans `SUBMISSION-INTENT.json` avant l'unique `job_submit`.
+
+Il prépare les trois fichiers bootstrap dans un répertoire local portant exactement le basename du nouveau stage ARM, puis transfère ce répertoire vers son parent scratch existant. La réponse `verifie:false` propre à un transfert de répertoire n'est jamais comptée comme preuve d'intégrité : les trois fichiers précis sont ensuite reçus par SCP avec leurs empreintes locale/distante et une comparaison exacte des octets. L'opérateur prépare et soumet ensuite le plan une fois, observe le job original et son marqueur zéro modèle, reçoit les neuf preuves SCP neuves (huit statiques et qualification sujet, alias ARM préexistant), effectue les deux probes CLI sans modèle et la lecture des seules métadonnées de skills, appelle le constructeur puis l'assembleur existants. Le CIM complet, la réconciliation des workers et la limite maximale de quatre restent dans le verrou du producteur existant. Les arguments de l'assembleur utilisent un fichier relatif depuis son dossier pour rester neutres.
+
+Tous les membres `ARM-TRANSFER-PENDING.json` sont transférés sous leurs basenames exacts depuis `STAGE`, chacun avec ses SHA et une réception SCP exacte des octets, y compris les binaires et fichiers dépassant un mégaoctet. Aucun de ces artefacts n'est converti en UTF-8 pour être relu. `authorization.sha256.json` est le dernier membre envoyé. Le SHA attendu de l'autorisation ARM est dérivé du membre exact `<admission>/authorization.json` et recoupé avec son commit ; `source_authorization` identifie la version Windows et ne sert pas de SHA ARM. Le format est aussi confronté hors ligne au paquet réel préservé de 43 membres et 6 588 597 octets. La réception ARM effective est attendue avec un budget de lecture valide de 64 000 caractères avant l'unique lancement caché du worker avec son argv, son cwd et son `PYTHONPATH` produits. Le reçu de possession conserve ensuite les cinq champs CIM originaux de l'enfant Python et du parent venv : PID, PPID, exécutable, ligne de commande, création. Les inconnues et échecs sont conservés ; aucune hypothèse de succès n'est utilisée pour continuer.
+
+Cette préparation ne démontre aucun appel de modèle, aucune admission opérationnelle ni performance. Les tests sont exclusivement simulés et marqués `NEUTRAL`; leurs reçus ne doivent jamais servir de preuves opérationnelles.

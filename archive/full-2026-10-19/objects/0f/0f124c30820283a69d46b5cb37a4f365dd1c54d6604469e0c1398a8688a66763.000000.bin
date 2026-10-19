@@ -1,0 +1,66 @@
+"""Validate the actual read-back scheduler plan; write one pre-submit intent."""
+from pathlib import Path
+import hashlib
+import json
+import time
+import shlex
+
+HERE = Path(__file__).resolve().parent
+LAUNCH = HERE.parent / 'lancement-technique-r4b-r1'
+SHA = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+def read(p):
+    return json.loads(p.read_text(encoding='utf-8-sig'))
+def value(x):
+    return x.get('structuredContent') or json.loads(next(v['text'] for v in x['content'] if v['type']=='text'))
+def ref(p):
+    return {'path': str(p), 'sha256': SHA(p)}
+def save(p, x):
+    with p.open('x', encoding='utf-8', newline='\n') as h:
+        json.dump(x, h, ensure_ascii=False, indent=2)
+        h.write('\n')
+request = read(LAUNCH/'roots/job-prepare-propose.json')
+command = LAUNCH/'roots/commande-allouee.sh'
+assert SHA(command) == 'ffcb077000a2177f0e8e1d37ce4d9674628b6428e3d0bf1eee0faaed2b8ea92b'
+parts = shlex.split(request['command'])
+assert len(parts) == 3 and parts[:2] == ['bash', '-lc']
+assert parts[2] == command.read_text(encoding='utf-8')
+created = value(read(HERE/'job-prepare-reel.json')['result'])
+reread = value(read(HERE/'plan-relu-reel.json'))
+assert created['ok'] is True and created['submitted'] is False
+assert reread['ok'] is True and reread['expired'] is False and reread['state']=='ready'
+assert created['plan_id']==reread['plan_id']=='09f99398c24c42c9b65f1df61a1b0f16'
+assert created['plan_sha256']==reread['plan_sha256']=='ab66ab89f1cb95f7c2b738b6ce802b7116060700ab41425d4b7c5232f02d6c97'
+assert reread['expires_at'] > time.time()
+plan = reread['plan']
+assert plan['kind']=='job' and len(plan['entries'])==1 and not plan['runtime_files']
+entry = plan['entries'][0]['plan']
+assert entry['seconds']==3600 and entry['script']==created['script']==plan['preview']['script']
+spec = entry['spec']
+for k in ('command','arch','cpus_per_task','mem_gb','gpus_per_node','workdir','spack_packages'):
+    assert spec[k]==request[k], k
+assert spec['time']==request['time_limit']=='01:00:00'
+assert spec['nodes']==1 and spec['ntasks_per_node']==1 and spec['gpus_per_task']==0
+assert spec['account']=='r250127' and not spec['secret_env_file'] and not spec['container']
+assert entry['script'].count(request['command'])==1 and request['command'].count('exec srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores')==1
+assert time.time()+3600+10800 < 1793487600  # exclusive 2026-10-31 23:00 UTC
+script = HERE/'script-slurm-relu.sh'
+with script.open('x', encoding='utf-8', newline='\n') as h:
+    h.write(entry['script'])
+base = {'scope_id':'hpc-forest-dynamic-independent-roots-r4b-max',
+        'source_zip_sha256':'ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3',
+        'plan_sha256':'9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b',
+        'model':'gpt-6-luna','effort':'max','phase':'roots',
+        'session_id':'97f7a5e17d13486ebed5b4f109aea093','job_id':None,
+        'remote_root':'/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-97f7a5e17d13486ebed5b4f109aea093'}
+save(HERE/'intention-pre-submit-exclusive.json', {
+    **base,'schema':'hpc-forest-dynamic-r4b-submit-intent-v1','verified':True,
+    'one_submit_only':True,'native_model_calls':0,'command':ref(command),
+    'plan_id':reread['plan_id'],'scheduler_plan_sha256':reread['plan_sha256'],
+    'created_at':time.time(),'evidence_refs':[ref(HERE/'job-prepare-reel.json'),ref(HERE/'plan-relu-reel.json'),ref(script)]})
+save(HERE/'plan-script-verifies.json', {
+    **base,'schema':'hpc-forest-dynamic-r4b-pre-submit-script-comparison-v1','verified':True,
+    'command_sha256':SHA(command),'plan_id':reread['plan_id'],
+    'scheduler_plan_sha256':reread['plan_sha256'], 'script':ref(script),
+    'exact_script_command_verified':True,'observed_at':time.time(),
+    'evidence_refs':[ref(HERE/'plan-relu-reel.json'),ref(HERE/'job-prepare-reel.json')]})
+print(json.dumps({'pre_submit_intent_created':True,'submitted':False,'plan_id':reread['plan_id'],'plan_sha256':reread['plan_sha256']}))

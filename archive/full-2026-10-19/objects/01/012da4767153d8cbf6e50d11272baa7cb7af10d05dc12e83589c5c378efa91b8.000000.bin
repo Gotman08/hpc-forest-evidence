@@ -1,0 +1,136 @@
+"""Extend the preserved editorial readers with two explicitly admitted cohorts."""
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+EDITORIAL = HERE.parents[1] / "edition-professionnelle"
+
+
+def once(text, old, new):
+    assert text.count(old) == 1, (old, text.count(old))
+    return text.replace(old, new, 1)
+
+
+def main():
+    changes = {}
+    path = EDITORIAL / "auditer-donnees.py"
+    text = path.read_text(encoding="utf8")
+    a = text.index("def luna_xhigh_accounting(")
+    b = text.index("def source_only_accounting(", a)
+    function = text[a:b]
+    for old, new in [
+        ("luna_xhigh", "astra_xhigh"), ("luna-xhigh", "astra-xhigh"), ("749940", "750205"),
+        ("gpt-6-luna", "gpt-6-astra"),
+        ('assert reconciliation["total_exact_consumption_available"]', 'assert not reconciliation["total_exact_consumption_available"]'),
+        ('("native_calls", 158)', '("native_calls", 115)'),
+        ('("known_exact_tokens", 3434224)', '("known_exact_tokens", 2091845)'),
+        ('("unmetered_calls", 0)', '("unmetered_calls", 12)'),
+        ('== 158', '== 118'), ('"total_exact_consumption_available": True', '"total_exact_consumption_available": False'),
+    ]:
+        assert old in function, old
+        function = function.replace(old, new)
+    function = function.replace('"expired_unanswered_requests": 0}', '"expired_unanswered_requests": 0, "expired_before_invocation": 0}')
+    function = once(function, '        total["native_calls"] += int(native)', '        total["expired_before_invocation"] += int(item.get("not_called_before_expiry", False))\n        total["native_calls"] += int(native)')
+    function = once(function, '    assert len(calls) == reconciliation["published_requests"] == 118', '    assert sum(t["expired_before_invocation"] for t in totals.values()) == 3\n    assert len(calls) == reconciliation["published_requests"] == 118')
+    text = text[:b] + function + text[b:]
+    a = text.index("def source_only_accounting(")
+    b = text.index("def gpt96_accounting(", a)
+    function = text[a:b]
+    for old, new in [("source_only_accounting", "source_only_astra_accounting"),
+                     ("luna", "astra"), ("749843", "750122"), ("couts-source-only.json", "couts-source-only-astra.json")]:
+        assert old in function
+        function = function.replace(old, new)
+    function = once(function, 'assert reconciliation["all_published_requests_delivered"] and reconciliation["total_exact_consumption_available"]', 'assert reconciliation["all_published_requests_delivered"] and not reconciliation["total_exact_consumption_available"]')
+    function = once(function, '"unmetered_calls": 0}', '"unmetered_calls": 0, "expired_before_invocation": 0}')
+    a1 = function.index('        journal = record(')
+    b1 = function.index('        role = "mère"', a1)
+    new_usage = '''        native = item["native_invocation_observed"]
+        journal_path = OUT / "HPC-Forest-Harnais-Comparaison-r1/runs/source-only-gpt-6-astra-max/worker" / item["nonce"] / "codex.jsonl"
+        if native:
+            journal = record(journal_path)
+            events = []
+            for line in journal.read_text(encoding="utf8", errors="replace").splitlines():
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    continue
+            assert all(event.get("item", {}).get("type") in {None, "agent_message", "reasoning", "error"}
+                       for event in events if event.get("type") in {"item.started", "item.completed", "item.updated"})
+            usages = [event["usage"] for event in events if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict)]
+            assert all(type(u[k]) is int and u[k] >= 0 for u in usages for k in ("input_tokens", "output_tokens"))
+            measured = bool(usages)
+            exact = sum(u["input_tokens"] + u["output_tokens"] for u in usages)
+            assert measured == item["usage_measured"] and exact == item["known_exact_tokens"]
+        else:
+            assert item["not_called_before_expiry"] and item["usage_measured"] and item["known_exact_tokens"] == 0
+            assert not journal_path.exists() and not journal_path.with_name("invocation.json").exists()
+            measured, exact = True, 0
+            totals[subject]["expired_before_invocation"] += 1
+        totals[subject]["unmetered_calls"] += int(native and not measured)
+'''
+    function = function[:a1] + new_usage + function[b1:]
+    function = function.replace('roles[subject][request["mission_id"]]', 'roles[subject][request["mission_id"].rsplit("-h", 1)[0]]')
+    function = once(function, 'totals[subject]["native_calls"] += 1', 'totals[subject]["native_calls"] += int(native)')
+    function = once(function, '"native_invocation_observed": True, "usage_measured": True,', '"native_invocation_observed": native, "usage_measured": measured,')
+    function = once(function, '"exact_total": exact, "state": "exact",', '"exact_total": exact if measured else None, "state": "exact" if native and measured else "unmetered" if native else "expired_before_invocation",')
+    function = once(function, 'assert len(calls) == 150 and sum(c["exact_total"] for c in calls) == 3564823', 'assert len(calls) == 101 and sum(c["exact_total"] or 0 for c in calls) == 1856292\n    assert sum(v["native_calls"] for v in totals.values()) == 98\n    assert sum(v["unmetered_calls"] for v in totals.values()) == 13\n    assert sum(v["expired_before_invocation"] for v in totals.values()) == 3')
+    function = once(function, '"total_exact_consumption_available": True', '"total_exact_consumption_available": False')
+    text = text[:b] + function + text[b:]
+    text = once(text, '        "luna_xhigh": read(STUDY / "resultats-couverture-luna-xhigh.json"),', '        "luna_xhigh": read(STUDY / "resultats-couverture-luna-xhigh.json"),\n        "astra_xhigh": read(STUDY / "resultats-couverture-astra-xhigh.json"),\n        "source_only_astra": read(STUDY / "resultats-source-only-astra-max.json"),')
+    anchor = '    old = read(\n'
+    text = once(text, anchor, '''    for group, reader in [("astra_xhigh", astra_xhigh_accounting), ("source_only_astra", source_only_astra_accounting)]:
+        accounting = reader(cohorts[group], admissions)
+        for row in cohorts[group]["rows"]:
+            assert all(row[k] == accounting[row["subject"]][k] for k in ("native_calls", "known_exact_tokens", "unmetered_calls"))
+''' + anchor)
+    old_groups = '("count", "luna", "astra", "terra", "sol", "comparison", "gpt96", "source_only", "luna_xhigh")'
+    assert text.count(old_groups) == 2
+    text = text.replace(old_groups, old_groups[:-1] + ', "astra_xhigh", "source_only_astra")')
+    text = once(text, '    for key in ("count", "luna", "astra", "terra", "sol", "comparison", "gpt96", "luna_xhigh"):', '    for key in ("count", "luna", "astra", "terra", "sol", "comparison", "gpt96", "luna_xhigh", "astra_xhigh", "source_only_astra"):')
+    text = once(text, '        HERE / "admission-luna-xhigh-verifiee.json",', '''        HERE / "admission-luna-xhigh-verifiee.json",
+        HERE / "admission-astra-double-verifiee.json",
+        STUDY / "comparabilite-couverture-astra-xhigh-max.json",
+        STUDY / "comparabilite-source-only-astra-max-r1.json",
+        STUDY / "receptions/coverage-astra-xhigh-750205/reception-verifiee.json",
+        STUDY / "receptions/coverage-astra-xhigh-750205/audit-complementaire.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-astra-max-750122/reception-verifiee.json",
+        OUT / "HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-astra-max-750122/audit-independant.json",
+        OUT / "HPC-Forest-R5-Preconditions-r1/observation-apres-redemarrage-20261017T1402.json",''')
+    changes[path] = text
+    path = EDITORIAL / "figures.py"
+    text = path.read_text(encoding="utf8")
+    text = once(text, '    luna_xhigh_calls = read("couts-luna-xhigh.json")["native_calls"]', '    luna_xhigh_calls = read("couts-luna-xhigh.json")["native_calls"]\n    astra_xhigh_calls = read("couts-astra-xhigh.json")["native_calls"]\n    source_astra_calls = read("couts-source-only-astra.json")["native_calls"]\n    astra_xhigh_campaign = "grille-r1/coverage-gpt-6-astra-xhigh"')
+    text = once(text, '{terra_campaign, sol_campaign, luna_xhigh_campaign}', '{terra_campaign, sol_campaign, luna_xhigh_campaign, astra_xhigh_campaign, "comparaison-source-only/astra-max-750122"}')
+    text = once(text, '+ source_only_calls + luna_xhigh_calls', '+ source_only_calls + luna_xhigh_calls + astra_xhigh_calls + source_astra_calls')
+    text = once(text, '        ("R1 Luna xhigh · 14 sujets", lambda c: c["campaign"] == luna_xhigh_campaign),', '        ("R1 Luna xhigh · 14 sujets", lambda c: c["campaign"] == luna_xhigh_campaign),\n        ("R1 Astra xhigh · 14 sujets", lambda c: c["campaign"] == astra_xhigh_campaign),\n        ("Source-only Astra · 15 sujets", lambda c: c["campaign"] == "comparaison-source-only/astra-max-750122"),')
+    text = once(text, 'plt.subplots(figsize=(7.5, 5.2))', 'plt.subplots(figsize=(7.5, 6.1))')
+    text = once(text, '"couts-luna-xhigh.json", "closed cohorts', '"couts-luna-xhigh.json", "couts-astra-xhigh.json", "couts-source-only-astra.json", "closed cohorts')
+    changes[path] = text
+    path = EDITORIAL / "controler.py"
+    text = path.read_text(encoding="utf8")
+    text = once(text, 'len(rows) == 120 and audit["registry_count"] == 136', 'len(rows) == 149 and audit["registry_count"] == 165')
+    text = once(text, '== 1204', '== 1417')
+    text = once(text, '== 27058029', '== 31006166')
+    text = once(text, '== 81\n    source_only', '== 106\n    source_only')
+    anchor = '    sol = [r for r in rows if r["cohort"] == "sol"]'
+    text = once(text, anchor, '''    for group, subjects, modified, calls, tokens, unknown, cost_file in [
+        ("astra_xhigh", 14, 12, 115, 2091845, 12, "couts-astra-xhigh.json"),
+        ("source_only_astra", 15, 14, 98, 1856292, 13, "couts-source-only-astra.json"),
+    ]:
+        cohort = [r for r in rows if r["cohort"] == group]
+        assert len(cohort) == subjects and sum(not r["baseline_retained"] for r in cohort) == modified
+        assert sum(r["native_calls"] for r in cohort) == calls
+        assert sum(r["known_exact_tokens"] for r in cohort) == tokens
+        assert sum(r["unmetered_calls"] for r in cohort) == unknown
+        accounting = read(HERE / "donnees" / cost_file)
+        assert not accounting["total_exact_consumption_available"]
+        assert sum(v["expired_before_invocation"] for v in accounting["per_subject"].values()) == 3
+''' + anchor)
+    changes[path] = text
+    for path, content in changes.items():
+        assert "\ufffd" not in content
+        path.write_text(content, encoding="utf8")
+    print("Arithmetic readers, figure inputs and independent controls updated for both admitted cohorts")
+
+
+if __name__ == "__main__":
+    main()

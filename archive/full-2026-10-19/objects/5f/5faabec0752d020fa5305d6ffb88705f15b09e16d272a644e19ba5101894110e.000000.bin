@@ -1,0 +1,280 @@
+"""Collect only audited, confirmed frozen programs for a post-hoc CPU study.
+
+No model is invoked, no candidate or official algorithm is written or compiled.
+Accepted older baselines stay explicitly labelled as baselines, not model gains.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import math
+import re
+import shutil
+import sqlite3
+import struct
+import subprocess
+import tarfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE.parent
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write(path, value):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def reviewed(root, job, subject, proof, gate="verified", effort=None):
+    proof = Path(proof)
+    result = read(proof)
+    if result.get(gate) is not True:
+        raise RuntimeError("A positive closed audit is required: " + str(proof))
+    return {"root": str(root), "job_id": str(job), "subject": subject,
+            "audit_path": str(proof.resolve()), "audit_sha256": sha(proof), "effort": effort}
+
+
+def inventory():
+    rows = []
+    base = OUT / "Marathon22-DeepSeek-v11/receptions"
+    for job in ["747504", "747505"]:
+        suffix = "-r2" if job == "747505" else ""
+        proof = base / f"audits-{job}{suffix}/audit-complet.json"
+        if not proof.exists():
+            continue
+        closed = read(proof)
+        if not (closed.get("verified") and closed.get("complete") and closed.get("coverage_verified")):
+            raise RuntimeError("DeepSeek reception is not completely audited: " + job)
+        for s in ["knn", "sum", "nbody"]:
+            rows.append(reviewed(base / f"preuves-{job}/results-{job}" / s, job, "2022-" + s, proof))
+    base = OUT / "Marathon22-GPT61Sol-MAX/harnais-r2"
+    proof = base / "receptions/audit-comparaison-747885.json"
+    if proof.exists():
+        closed = read(proof)
+        if not (closed.get("read_only_evidence_verified") and closed.get("campaign_coverage_complete")
+                and closed.get("all_final_confirmations_verified")
+                and closed.get("matched_gain_comparison_verified")):
+            raise RuntimeError("The six-arm comparison reception is not completely audited")
+        if {(p["arm"], p["problem"]) for p in closed["problems"]} != {
+                (a, s) for a in ["reference", "mixed-harness"] for s in ["knn", "sum", "nbody"]}:
+            raise RuntimeError("The six-arm comparison coverage changed")
+        for p in closed["problems"]:
+            rows.append({**reviewed(base / "preuves-747885/results-747885" / p["arm"] / p["problem"],
+                "747885", "2022-" + p["problem"], proof, "all_final_confirmations_verified", "max"),
+                "arm": p["arm"]})
+    base = OUT / "Marathon22-32B-v9"
+    for s, folder, job in [("knn", "knn", "747113"), ("sum", "sum", "747114"), ("nbody", "nbody-v10b", "747165")]:
+        rows.append(reviewed(base / ("preuves-" + folder) / ("results-" + job) / s,
+            job, "2022-" + s, base / ("verification-preuves-" + folder + ".json")))
+    base = OUT / "Marathon22-interface-v3"
+    for s in ["knn", "sum", "nbody", "bucketsort"]:
+        version, job = ("v4", "746998") if s == "sum" else ("v3", "746984")
+        rows.append(reviewed(base / ("preuves-" + version) / ("results-" + job) / s,
+            job, "2022-" + s, base / ("verification-" + version + ".json")))
+    base = OUT / "Marathon22-diagnostic-v5"
+    for s in ["knn", "sum", "nbody"]:
+        folder, job, suffix = ("preuves-v8", "747084", "v8") if s == "sum" else ("preuves", "747062", "v5")
+        rows.append(reviewed(base / folder / ("results-" + job) / s,
+            job, "2022-" + s, base / ("verification-preuves-" + suffix + ".json")))
+    base = OUT / "HPC-Forest-Harnais-v2/essai-petits-modeles-r2"
+    for model in ["qwen2.5-coder-1.5b", "qwen2.5-coder-3b"]:
+        for s in ["knn", "sum", "nbody"]:
+            rows.append(reviewed(base / "preuves/results-747781" / model / s,
+                "747781", "2022-" + s, base / "audit.json", "audit_verified"))
+    base = OUT / "HPC-Forest-Etude-2020-2024-r1"
+    for group in read(base / "coordinator-state.json")["queue"]:
+        if group["state"] != "received_and_audited":
+            continue
+        for s in group["subjects"]:
+            rows.append(reviewed(base / "runs" / group["key"] / "preuves" / ("results-" + group["job_id"]) / s,
+                group["job_id"], s, group["audit_path"], "coverage_and_final_confirmations_verified", group["effort"]))
+    return rows
+
+
+def domain(subject, raw):
+    """Check input syntax/domain constraints only; never construct a solution."""
+    if subject == "2022-nbody":
+        n = struct.unpack_from("<i", raw)[0]
+        values = struct.unpack_from("<" + "f" * ((len(raw) - 4) // 4), raw, 4)
+        valid = n > 0 and len(raw) == 4 + 24 * n and all(math.isfinite(v) for v in values)
+        return {"checked": valid, "size": n, "parameters": {"particles": n, "six_float32_per_particle": True,
+            "native_reference_count_header_bytes": 4},
+            "limits": "The prose omits the count header used by the supplied C source; source-compatible little-endian fixture, not a portable judge-format certificate."}
+    text = raw.decode("utf8")
+    if subject == "2022-sum":
+        vals = list(map(int, text.split())); n, side = vals[:2]
+        valid = 0 < side < n < 8000 and len(vals) == 2 + n * n and max(map(abs, vals[2:])) * side * side < 2**31
+        return {"checked": valid, "size": n, "parameters": {"matrix_side": n, "window_side": side},
+                "limits": "Conservative integer bound; finite archived matrices, not exhaustive N<8000."}
+    if subject == "2022-knn":
+        lines = text.splitlines(); cursor = 1
+        groups = int(re.fullmatch(r"n_groups=(\d+)", lines[0]).group(1))
+        total = 0; labels = []
+        def coordinate(value):
+            match = re.fullmatch(r"\(([^,]+),([^,]+)\)", value)
+            return match is not None and all(math.isfinite(float(x)) for x in match.groups())
+        valid = groups > 0
+        for _ in range(groups):
+            label = re.fullmatch(r"label=(.)", lines[cursor]).group(1); labels.append(label)
+            length = int(re.fullmatch(r"length=(\d+)", lines[cursor + 1]).group(1))
+            cursor += 2; total += length
+            valid &= length > 0 and all(coordinate(v) for v in lines[cursor:cursor + length])
+            cursor += length
+        k = int(re.fullmatch(r"k=(\d+)", lines[cursor]).group(1))
+        valid &= len(set(labels)) == groups and 1 <= k <= total and coordinate(lines[cursor + 1]) and len(lines) == cursor + 2
+        return {"checked": bool(valid), "size": total, "parameters": {"groups": groups, "points": total, "k": k},
+                "limits": "Valid syntax and finite values; ties and all possible point distributions are not exhaustively certified."}
+    if subject == "2022-bucketsort":
+        vals = text.split(); width, n, offset, buckets = map(int, vals[:4]); data = vals[4:]
+        valid = width > 0 and n > 0 and buckets > 0 and len(data) == n and all(v.isdigit() and len(v) <= width for v in data)
+        return {"checked": valid, "size": n, "parameters": {"string_length": width, "array_size": n, "offset": offset, "buckets": buckets},
+                "limits": "Archived nonnegative decimal data; no proof over every bucket parameter or distribution."}
+    if subject == "2023-count":
+        vals = list(map(int, text.split())); n, m = vals[:2]; coords = list(zip(vals[2::2], vals[3::2]))
+        valid = (0 < n < 200000 and len(vals) == 2 + 2*m and len(set(coords)) == m
+                 and all(0 <= x < n and 0 <= y < n for x,y in coords)
+                 and (n <= 1000 or 100*m < n*n))
+        return {"checked": valid, "size": n, "parameters": {"grid_side": n, "obstacles": m},
+                "limits": "Grid dimensions and obstacle coordinates checked; finite grids, not the full domain."}
+    return {"checked": False, "size": None, "limits": "A new subject-specific domain review is required before scaling admission."}
+
+
+def main(destination, previous_plans=()):
+    destination.mkdir(parents=True, exist_ok=False)
+    payload = destination / "payload"; payload.mkdir(); (payload / "bin").mkdir()
+    (destination / "sources").mkdir()
+    selected = inventory(); campaigns, binaries = [], {}
+    already = {str(Path(c["campaign_root"]).resolve()) for path in previous_plans for c in read(path)["campaigns"]}
+    pending = [{**row, "reason": "A subject-specific format/domain review is required before measurement"}
+               for row in selected if row["subject"] not in {"2022-knn", "2022-sum", "2022-nbody", "2022-bucketsort", "2023-count"}]
+    selected = [r for r in selected if str(Path(r["root"]).resolve()) not in already
+                and r["subject"] in {"2022-knn", "2022-sum", "2022-nbody", "2022-bucketsort", "2023-count"}]
+    write(destination / "pending-subject-domain-reviews.json", pending)
+    if not selected:
+        raise RuntimeError("No fresh audited cells with a reviewed domain; do not submit an empty or repeated batch")
+    canonical_roots = {}; baseline_by_subject = {}
+    for row in selected:
+        root = Path(row["root"])
+        dbpath = root / "registry.sqlite3"
+        db_before = sha(dbpath)
+        with sqlite3.connect(dbpath.resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+            meta = {k: json.loads(v) for k, v in db.execute("SELECT key,value FROM metadata")}
+            best = meta["best_confirmed"]; epoch = best["epoch"]
+            config = read(root / "trusted/config.json"); contract = read(root / "trusted/contract.json")
+            for name, expected in meta["manifest"].items():
+                if sha(root / "trusted" / name) != expected:
+                    raise RuntimeError("Protected campaign bytes changed: " + str(root / name))
+            model = config.get("ollama", {}).get("model") if config.get("backend") == "ollama" else config.get("codex", {}).get("model")
+            if not model:
+                model = read(row["audit_path"]).get("model")
+            keys = {}
+            for label, exp in [("chosen", best["experiment_id"]), ("original_reference", f"baseline-e{epoch}")]:
+                records = [json.loads(v) for v, in db.execute("SELECT payload FROM evaluations WHERE experiment_id=? AND phase='confirmation'", (exp,))]
+                records = [v for v in records if v.get("correct") is True and v.get("binary_sha256")]
+                if not records:
+                    raise RuntimeError("No confirmed executable: " + str(root) + ":" + exp)
+                record = records[-1]; digest = record["binary_sha256"]
+                candidates = list((root / "builds" / f"e{epoch}" / exp / "confirmation").glob("attempt-*/solution"))
+                binary = next((p for p in candidates if sha(p) == digest), None)
+                if binary is None:
+                    raise RuntimeError("Confirmed executable bytes missing")
+                key = row["subject"] + ":" + digest
+                if key not in binaries:
+                    target = payload / "bin" / digest
+                    if not target.exists(): shutil.copyfile(binary, target)
+                    binaries[key] = {"key": key, "subject": row["subject"], "sha256": digest,
+                        "binary": "bin/" + digest, "confirmed_artifact": str(binary.resolve()), "aliases": []}
+                keys[label] = key
+            repo = root / "repo"
+            names = subprocess.run(["git", "-c", "safe.directory=" + str(repo.resolve()), "-C", str(repo),
+                "ls-tree", "-r", "--name-only", best["commit"], "src"], check=True, capture_output=True).stdout.decode().splitlines()
+            sources = {}; static = {"openmp_parallel": [], "openmp_simd": [], "compiler_vector_hint": [], "arm_neon": [], "mpi_calls": [], "cpp_threads": []}
+            patterns = [r"#\s*pragma\s+omp\s+parallel\b", r"#\s*pragma\s+omp\s+simd\b", r"#\s*pragma\s+GCC\s+ivdep\b", r"arm_neon\.h|uint32x4_t", r"\bMPI_\w+\s*\(", r"std::(?:jthread|thread)\b"]
+            for name in names:
+                if Path(name).suffix not in {".c", ".cpp", ".h", ".hpp"}: continue
+                raw = subprocess.run(["git", "-c", "safe.directory=" + str(repo.resolve()), "-C", str(repo),
+                    "show", best["commit"] + ":" + name], check=True, capture_output=True).stdout
+                target = destination / "sources" / (row["job_id"] + "-" + row["subject"] + "-" + best["commit"][:12]) / name
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(raw)
+                sources[name] = {"path": str(target.relative_to(destination)), "sha256": sha(target)}
+                for label, pattern in zip(static, patterns):
+                    static[label] += [{"file": name, "line": i} for i, line in enumerate(raw.decode(errors="replace").splitlines(), 1) if re.search(pattern, line)]
+            enriched = {**row, "campaign_root": str(root.resolve()), "registry_sha256": db_before,
+                "contract_sha256": sha(root / "trusted/contract.json"), "model": model, "best_confirmed": best,
+                "keys": keys, "chosen_is_unchanged_baseline": bool(best["is_baseline"]), "source_files": sources,
+                "static_parallelism_evidence": static, "static_scan_is_not_runtime_proof": True,
+                "official_contest_compliance_certified": False}
+            campaigns.append(enriched)
+            binaries[keys["chosen"]]["aliases"].append({"job_id": row["job_id"], "model": model, "effort": row["effort"], "is_baseline": best["is_baseline"]})
+            baseline_by_subject.setdefault(row["subject"], keys["original_reference"])
+            canonical_roots.setdefault(row["subject"], (root, contract))
+        if sha(dbpath) != db_before: raise RuntimeError("Read-only inventory changed a registry")
+    cases = []
+    for subject, (root, contract) in canonical_roots.items():
+        if contract["comparison"]["mode"] != "bytes":
+            raise RuntimeError("A new explicit comparison review is required")
+        frozen = []
+        for phase in ["search", "confirmation", "benchmark"]:
+            for c in ([contract[phase]] if phase == "benchmark" else contract[phase]):
+                frozen.append((phase, c))
+        if subject == "2023-count":
+            previous = OUT / "HPC-Forest-Conformite-Sujets-r1/preuves-748067/results/inputs"
+            frozen = [("additional_previous_scaling_input", {"name": p.stem, "stdin": str(p.resolve()), "argv": [], "files": [], "capture_files": []}) for p in sorted(previous.glob("*.in"))]
+        seen = set()
+        for phase, c in frozen:
+            input_path = Path(c["stdin"]) if Path(c["stdin"]).is_absolute() else root / "trusted" / c["stdin"]
+            raw = input_path.read_bytes(); checked = domain(subject, raw)
+            if not checked["checked"]: raise RuntimeError("Input domain not admitted: " + subject + "/" + c["name"])
+            if c.get("argv") or c.get("files") or c.get("capture_files"):
+                raise RuntimeError("This batch is explicitly restricted to stdin/stdout programs")
+            digest = sha(input_path)
+            if digest in seen: continue
+            seen.add(digest); target = payload / "inputs" / subject / (digest + ".in")
+            target.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(input_path, target)
+            expected = c.get("expected", {}).get("stdout")
+            if expected is not None:
+                value = base64.b64decode(expected["base64"], validate=True)
+                if hashlib.sha256(value).hexdigest() != expected["sha256"] or len(value) != expected["bytes"]:
+                    raise RuntimeError("Archived expected bytes changed")
+            cases.append({"subject": subject, "key": subject + ":" + digest, "name": c["name"], "phase": phase,
+                "input": str(target.relative_to(payload).as_posix()), "input_sha256": digest,
+                "expected_stdout_sha256": expected["sha256"] if expected else None,
+                "input_domain_review": checked, "canonical_reference_key": baseline_by_subject[subject]})
+    plan = {"schema": "hpc-forest-audited-multimodel-core-study-v2", "observed_utc": datetime.now(UTC).isoformat(),
+        "scope": "posthoc frozen-binary CPU scaling, not a new optimization search",
+        "model_calls": 0, "source_edits": 0, "compilations": 0, "seed": 23,
+        "cores": [1, 2, 4, 8, 16], "repetitions": 5, "warmups": 1,
+        "global_measurement_deadline_seconds": 3000, "per_execution_timeout_seconds": 20,
+        "campaigns": campaigns, "binaries": list(binaries.values()), "cases": cases,
+        "canonical_reference_by_subject": baseline_by_subject,
+        "official_contest_compliance_certified": False, "results_are_never_model_input": True,
+        "excluded": ["Unreceived or unaudited campaigns", "Unconfirmed GPT pilots", "Invalidated original Qwen32 N-body 747112; use corrected 747165", "2020-primes held for input-domain review", "Non-stdin/stdout subjects until a dedicated review is supplied"]}
+    write(payload / "plan.json", plan)
+    shutil.copyfile(HERE / "mesurer.py", payload / "mesurer.py")
+    write(payload / "FILES.sha256.json", {p.relative_to(payload).as_posix(): sha(p) for p in payload.rglob("*") if p.is_file()})
+    archive = destination / "payload.tar.gz"
+    with tarfile.open(archive, "x:gz") as stream: stream.add(payload, arcname="payload")
+    write(destination / "preparation.json", {"plan_sha256": sha(payload / "plan.json"), "payload_sha256": sha(archive),
+        "campaigns": len(campaigns), "unique_executables_by_subject": len(binaries), "input_cases": len(cases),
+        "models": sorted({r["model"] for r in campaigns}), "subjects": sorted(canonical_roots),
+        "model_calls": 0, "source_edits": 0, "compilations": 0})
+    print((destination / "preparation.json").read_text(encoding="utf8"))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("destination", type=Path)
+    parser.add_argument("--previous-plan", type=Path, action="append", default=[])
+    args=parser.parse_args()
+    main(args.destination.resolve(), args.previous_plan)

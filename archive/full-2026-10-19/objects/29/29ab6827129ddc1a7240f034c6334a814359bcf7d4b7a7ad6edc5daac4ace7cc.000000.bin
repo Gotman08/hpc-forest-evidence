@@ -1,0 +1,46 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<stdint.h>\n\n/* Maximum size (in char) for neighbors and compute lists */\n#define MAX 100\n\ntypedef struct {\n  int id;\n  float value;\n  char neighbors[MAX];\n} Node;\n\n/* Zero row_plus_one marks an empty slot, independently of the ID. */\ntypedef struct {\n  int id;\n  int row_plus_one;\n} IdEntry;\n\ntypedef struct {\n  IdEntry *entries;\n  size_t mask;\n} IdIndex;\n\nstatic size_t hash_id(int id) {\n  uint32_t h = (uint32_t)id;\n  h ^= h >> 16;\n  h *= UINT32_C(0x7feb352d);\n  h ^= h >> 15;\n  h *= UINT32_C(0x846ca68b);\n  h ^= h >> 16;\n  return (size_t)h;\n}\n\n/* Build once, retaining the first row for each ID. A null table uses scans. */\nstatic IdIndex build_id_index(const Node *g, int size) {\n  IdIndex index = {NULL, 0};\n  size_t capacity = 2;\n  size_t target;\n\n  if (size <= 0)\n    return index;\n\n  target = (size_t)size;\n  if (target > SIZE_MAX / 2)\n    return index;\n  target *= 2;\n\n  while (capacity < target) {\n    if (capacity > SIZE_MAX / 2)\n      return index;\n    capacity *= 2;\n  }\n\n  if (capacity > SIZE_MAX / sizeof(*index.entries))\n    return index;\n\n  index.entries = (IdEntry*)calloc(capacity, sizeof(*index.entries));\n  if (index.entries == NULL)\n    return index;\n  index.mask = capacity - 1;\n\n  for (int row = 0; row < size; row++) {\n    int id = g[row].id;\n    size_t slot = hash_id(id) & index.mask;\n\n    while (index.entries[slot].row_plus_one != 0 &&\n           index.entries[slot].id != id)\n      slot = (slot + 1) & index.mask;\n\n    if (index.entries[slot].row_plus_one == 0) {\n      index.entries[slot].id = id;\n      index.entries[slot].row_plus_one = row + 1;\n    }\n  }\n\n  return index;\n}\n\n/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */\nNode* read_input(char* fname, int *n, char* list) {\n  \n  Node* data = NULL;\n  FILE *fl = NULL;\n  \n  if (fname == NULL) \n    fl = stdin;\n  else \n    fl = fopen(fname, \"r\");\n  \n  if (fl == NULL) {\n    fprintf(stderr, \"Error!\\n\");\n    exit(1);\n  }\n  \n  // header \n  fscanf(fl, \"%d %[^\\n]\", n, list);\n  \n  if (*n > 0) {\n    data = (Node*) malloc ((*n)*sizeof(Node));\n    if(data == NULL){\n      fprintf(stderr, \"Error!\\n\");\n      exit(1);\n    }    \n  }\n  \n  for(int i = 0; i < *n; i++)\n    fscanf(fl, \"%d %f %[^\\n]\", &data[i].id, &data[i].value, data[i].neighbors);\n  \n  fclose(fl);\n\n  return data;\n  \n}\n\n/* Returns the first row with the given id or -1 if not found. */\nint find_by_id(Node g[], int id, int size, const IdIndex *index) {\n\n  if (index != NULL && index->entries != NULL) {\n    size_t slot = hash_id(id) & index->mask;\n\n    while (index->entries[slot].row_plus_one != 0) {\n      if (index->entries[slot].id == id)\n        return index->entries[slot].row_plus_one - 1;\n      slot = (slot + 1) & index->mask;\n    }\n\n    return -1;\n  }\n\n  int i = 0;\n\n  while((i < size) && g[i].id != id)\n    i++;\n\n  if(i < size)\n    return i;\n\n  return -1;\n\n}\n\n/* Computes the sum for the node with the given id */\nfloat get_costly(Node *g, int id, int size, const IdIndex *index) {\n\n  char *t;\n  int idmax = -1;\n  float max = 0;\n  char *auxptr;\n  \n  int nd = find_by_id(g, id, size, index);\n  if(nd < 0)\n    return max;\n\n  char aux[MAX];\n  strcpy(aux, g[nd].neighbors);\n  t = strtok_r(aux, \" \", &auxptr);\n\n  do {\n    int d = find_by_id(g, atoi(t), size, index);\n    if (d >= 0 && max < g[d].value) {\n      max = g[d].value;\n      idmax = atoi(t);\n    }    \n  } while ((t = strtok_r(NULL, \" \", &auxptr)));\n\n  float r = g[nd].value;\n\n  if(idmax != -1)\n    r += get_costly(g, idmax, size, index);\n  \n  return (r);\n\n}\n\n/* Main program - calls read input, computes sum for each node in the list, prints output */\nint main() {\n  char *fileN = NULL;\n  char computelist[MAX];\n  int n = -1;\n  Node* input = NULL;\n\n  input = read_input(fileN, &n, computelist);\n  IdIndex index = build_id_index(input, n);\n  \n  // process\n  for(char *c = strtok(computelist, \" \"); c != NULL; c = strtok(NULL, \" \"))\n    printf(\"%s: %f\\n\", c, get_costly(input, atoi(c), n, &index));\n  \n  free(index.entries);\n  free(input);\n\n  return 0;\n}\n",
+        "path": "src/graph.c"
+      }
+    ],
+    "hypothesis": "A compact ID-to-row hash index should eliminate repeated strided linear scans while preserving recursive path selection and floating-point evaluation order.",
+    "notes": "Not compiled or measured. On ARM64, the index requires 16 to less than 32 additional bytes per input row, plus fixed overhead. Query spelling, neighbor order, strict comparisons, the -1 recursion sentinel, and child-first float additions are preserved.",
+    "sources_kept": [],
+    "transformations": [
+      "Build one immutable, contiguous open-addressed index per graph with power-of-two capacity and at most 50% occupancy.",
+      "Store adjacent IDs and row-plus-one values, preserve first-row duplicate semantics, and resolve collisions by linear probing without reserving any integer ID.",
+      "Pass the index through recursive lookups; retain linear scans if index sizing or allocation fails, and release the index after processing.",
+      "Allocate the existing node array for every positive row count, including singleton inputs."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "adf9ba12e3274e469ed5cc4f66fae12c",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "8003c1a6d39e7ca5209cde1a5802b3ea8ae75d208ac05181e3199b1bfd0b2293",
+  "session_id": "aa970cf8bf5d4c1aaa0fdabb21d73a72",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "57736245fe48e2380440b126c77873b1f16bdaa7b73cbd2873aa44596ce2b9c0",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 12578,
+        "output_tokens": 8133,
+        "reasoning_output_tokens": 6367
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 20711,
+    "tool_events": []
+  }
+}

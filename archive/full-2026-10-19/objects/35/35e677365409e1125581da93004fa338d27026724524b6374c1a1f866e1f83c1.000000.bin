@@ -1,0 +1,46 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cassert>\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <limits>\n#include <memory>\n#include <vector>\n\nusing Sum = std::int64_t;\n\nclass FastInput {\n    unsigned char buffer[1 << 16];\n    std::size_t position = 0;\n    std::size_t available = 0;\n\n    inline int get() {\n        if (position == available) {\n            available = std::fread(buffer, 1, sizeof(buffer), stdin);\n            position = 0;\n            if (available == 0) return EOF;\n        }\n        return buffer[position++];\n    }\n\npublic:\n    inline int nextInt() {\n        int c = get();\n        while (c != EOF && c <= ' ') c = get();\n        if (c == EOF) return 0;\n        const bool negative = c == '-';\n        if (negative || c == '+') c = get();\n        Sum value = 0;\n        while (c >= '0' && c <= '9') {\n            value = value * 10 + (c - '0');\n            c = get();\n        }\n        return static_cast<int>(negative ? -value : value);\n    }\n};\n\ntemplate<int Batch, bool SaveRows, bool RemoveColumn, bool SaveColumn>\nstatic inline void sweepColumns(\n    int first, int last, int delayLength, int& cursor,\n    const int* const* incoming, int* const* outgoing,\n    Sum* __restrict__ columns, Sum* __restrict__ delayed,\n    Sum* __restrict__ horizontal, Sum* __restrict__ maxima) {\n    for (int c = first; c < last; ++c) {\n        Sum value = columns[c];\n        Sum* saved = delayed + static_cast<std::size_t>(cursor) * Batch;\n        for (int k = 0; k < Batch; ++k) {\n            const int fresh = incoming[k][c];\n            value += static_cast<Sum>(fresh) - static_cast<Sum>(outgoing[k][c]);\n            if (SaveRows) outgoing[k][c] = fresh;\n            if (RemoveColumn) {\n                horizontal[k] += value - saved[k];\n                maxima[k] = std::max(maxima[k], horizontal[k]);\n            } else {\n                horizontal[k] += value;\n            }\n            if (SaveColumn) saved[k] = value;\n        }\n        columns[c] = value;\n        if (RemoveColumn || SaveColumn) {\n            if (++cursor == delayLength) cursor = 0;\n        }\n    }\n}\n\ntemplate<int Batch, bool SaveRows>\nstatic Sum processBatch(\n    int n, int s, const int* const* incoming, int* const* outgoing,\n    Sum* columns, Sum* delayed, Sum best) {\n    const int delayLength = std::min(s, n - s);\n    Sum horizontal[Batch] = {0};\n    Sum maxima[Batch];\n    int cursor = 0;\n\n    sweepColumns<Batch, SaveRows, false, true>(\n        0, delayLength, delayLength, cursor, incoming, outgoing,\n        columns, delayed, horizontal, maxima);\n    sweepColumns<Batch, SaveRows, false, false>(\n        delayLength, s, delayLength, cursor, incoming, outgoing,\n        columns, delayed, horizontal, maxima);\n\n    for (int k = 0; k < Batch; ++k) maxima[k] = horizontal[k];\n\n    sweepColumns<Batch, SaveRows, true, true>(\n        s, n - s, delayLength, cursor, incoming, outgoing,\n        columns, delayed, horizontal, maxima);\n    sweepColumns<Batch, SaveRows, true, false>(\n        std::max(s, n - s), n, delayLength, cursor, incoming, outgoing,\n        columns, delayed, horizontal, maxima);\n\n    for (int k = 0; k < Batch; ++k) best = std::max(best, maxima[k]);\n    return best;\n}\n\ntemplate<bool SaveRows>\nstatic Sum dispatchBatch(\n    int count, int n, int s,\n    const int* const* incoming, int* const* outgoing,\n    Sum* columns, Sum* delayed, Sum best) {\n    switch (count) {\n        case 4:\n            return processBatch<4, SaveRows>(\n                n, s, incoming, outgoing, columns, delayed, best);\n        case 3:\n            return processBatch<3, SaveRows>(\n                n, s, incoming, outgoing, columns, delayed, best);\n        case 2:\n            return processBatch<2, SaveRows>(\n                n, s, incoming, outgoing, columns, delayed, best);\n        default:\n            return processBatch<1, SaveRows>(\n                n, s, incoming, outgoing, columns, delayed, best);\n    }\n}\n\nint main() {\n    FastInput input;\n    const int n = input.nextInt();\n    const int s = input.nextInt();\n    assert(n > 0 && n < 8000);\n    assert(s > 0 && s < n);\n\n    if (s == 1) {\n        int best = std::numeric_limits<int>::min();\n        for (int r = 0; r < n; ++r) {\n            for (int c = 0; c < n; ++c) {\n                best = std::max(best, input.nextInt());\n            }\n        }\n        std::printf(\"%d\\n\", best);\n        return 0;\n    }\n\n    const int retained = std::min(s, n - s);\n    const std::size_t cacheLines = (static_cast<std::size_t>(n) + 15) / 16;\n    const std::size_t stride = (cacheLines | std::size_t(1)) * 16;\n    std::unique_ptr<int[]> history(new int[static_cast<std::size_t>(retained) * stride]);\n    std::unique_ptr<int[]> incomingStorage(new int[4 * stride]);\n    std::unique_ptr<Sum[]> delayed(new Sum[static_cast<std::size_t>(retained) * 4]);\n    std::vector<Sum> columns(n, 0);\n\n    for (int r = 0; r < s; ++r) {\n        int* row = r < retained\n            ? history.get() + static_cast<std::size_t>(r) * stride\n            : incomingStorage.get();\n        for (int c = 0; c < n; ++c) row[c] = input.nextInt();\n        for (int c = 0; c < n; ++c) columns[c] += static_cast<Sum>(row[c]);\n    }\n\n    Sum current = 0;\n    for (int c = 0; c < s; ++c) current += columns[c];\n    Sum best = current;\n    for (int c = s; c < n; ++c) {\n        current += columns[c] - columns[c - s];\n        best = std::max(best, current);\n    }\n\n    int head = 0;\n    int r = s;\n    while (r < n) {\n        int count = std::min(4, std::min(s, n - r));\n        const bool saveRows = r < n - s;\n        if (saveRows) count = std::min(count, n - s - r);\n\n        const int* incoming[4];\n        int* outgoing[4];\n        for (int k = 0; k < count; ++k) {\n            int* row = incomingStorage.get() + static_cast<std::size_t>(k) * stride;\n            for (int c = 0; c < n; ++c) row[c] = input.nextInt();\n            incoming[k] = row;\n            int slot = head + k;\n            if (slot >= retained) slot -= retained;\n            outgoing[k] = history.get() + static_cast<std::size_t>(slot) * stride;\n        }\n\n        if (saveRows) {\n            best = dispatchBatch<true>(\n                count, n, s, incoming, outgoing, columns.data(), delayed.get(), best);\n        } else {\n            best = dispatchBatch<false>(\n                count, n, s, incoming, outgoing, columns.data(), delayed.get(), best);\n        }\n        head += count;\n        if (head >= retained) head -= retained;\n        r += count;\n    }\n\n    std::printf(\"%lld\\n\", static_cast<long long>(best));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Four-row temporal blocking should amortize column-accumulator traffic and expose independent horizontal reductions, while padded row storage and interleaved delay buffers improve cache locality.",
+    "notes": "Not executed. Uses 64-bit sums, preserves the output format, and requires no new compiler flags or runtime settings.",
+    "sources_kept": [],
+    "transformations": [
+      "Replace strided O(SN²) traversal with O(N²) streaming vertical and horizontal sliding sums.",
+      "Process up to four entering rows together with columns outermost and independent per-row maxima.",
+      "Retain only min(S,N-S) raw rows and delayed columns; stop storing rows and columns after their final use.",
+      "Use odd-cache-line row strides, interleaved horizontal delays, and buffered integer input."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "2aaa974957a2494f967552368bf52179",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "2c983aadcc4630f5601108dbfaeb0b27debeb4622a19f7af0bd63ca6286ba9df",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "374d225a95b916b3938de4f5a8d020d596d61dfac37887ac80736ff2753c50d7",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 15158,
+        "output_tokens": 19840,
+        "reasoning_output_tokens": 17610
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 34998,
+    "tool_events": []
+  }
+}

@@ -1,0 +1,808 @@
+"""Passive OBS4 for nine exact MAX technical sessions. No generation or stop."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import time
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[4]
+PREP = HERE.parents[2]
+COMPARE = BASE / "outputs/HPC-Forest-Harnais-Comparaison-r1"
+TRANSITION = COMPARE / "reprises/r3-corrige-r4-parallele-20261018/observateur-source-only-transition"
+OLD = TRANSITION / "observer-max4-r5.py"
+OLD_SHA = "af70c4b7c206e394f2aec0abb66db04ac2c921544a7f8d562395cf13f5180124"
+PROJECT = BASE / "work/hpc-forest-mere-dynamique-r4b-lane-r3/project"
+BOOTSTRAP = HERE.parent / "launcher/bootstrap_worker.py"
+BOOTSTRAP_SHA = '241babfa5f7253890a5ebbeddce1dc34d2207840fabe226545c40df31ae3b709'
+CACHE_PARENT = PREP / "lancement-modeles-max-r3"
+ADMISSION_SHA = "a9a3d90d6c2f73f6f942ae642f088ae43df06f6f0628cfabf29e416c8365c189"
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN = "5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70"
+SOURCE_REVIEW_SHA = "33b05b6825f1eb340073a63c13bdc1e11696db14b3e9b33ce48b3dcfcb0c326a"
+SO_JOB, SO_SESSION = "751592", "665743a02b824021a697b6a4884a667c"
+CLI = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+EFFORT, CAP = "max", 4
+MODELS = ("gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-terra")
+PHASES = ("roots", "advice", "harvest")
+BEGUN_JOBS = {"751592", "751992", "752139", "752140", "752141", "752306"}
+SESSIONS = {'gpt-6.1-sol': {'roots': '80d47d8d3f8f4e35bc26ceb54d06e870', 'advice': 'b86d18fcf35d4031aa2ef0da49397c4e', 'harvest': '7c8bc0c5ae22467da05600fb735fc017'}, 'gpt-6-astra': {'roots': '29583a77237e4777aa09209331ec7ecd', 'advice': '7be16898433e49f4b481045079abbbe8', 'harvest': 'b6fc9cf3951d46d787f319b51905251b'}, 'gpt-5.6-terra': {'roots': '3ae8341d27784c1bbd830ac19e4b77bc', 'advice': '7516e40883c64ab8af8a38637d74de3f', 'harvest': '7d6f357d4e5741bb8349835f358563b2'}}
+INTEGRATION = HERE.parent
+SCIENCE = COMPARE / "receptions/source-only-sol-max-751592/reception-verifiee.json"
+SCIENCE_SHA = "6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7"
+LUNA_NEGATIVE = BASE / "outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r2/operations-parent-roots-20261018/reception-roots-752306/RECONCILIATION-NEGATIVE-FINALE.json"
+LUNA_NEGATIVE_SHA = "d8085d8e077e0d501319bce314ea30ff8b3aca7df312f9acae10cda9325fda6f"
+LEGACY_POLICY = COMPARE / "reprises/r3-corrige-r4-parallele-20261018/reprise-surveillance-apres-negatif-752306/politique-reelle.json"
+LEGACY_POLICY_SHA = "fd6359d30d39f8313b1645f4e52ad0779271ab2f2e9e38430d33dbc5f1a4c488"
+LEGACY_RESUME = LEGACY_POLICY.parent / "reprise-surveillance-verifiee.json"
+LEGACY_RESUME_SHA = "c1eef13a2963be346ad14a52245545e08724b0a9b18e08ac8e3fb10746acb048"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+STAGES = {"absent": 0, "allocated_pending": 1, "worker_ready": 2, "terminal_received": 3}
+CIM_COMMAND = (
+    "$ErrorActionPreference='Stop'; "
+    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+    "$OutputEncoding=[Console]::OutputEncoding; "
+    "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,"
+    "ExecutablePath,CommandLine,@{n='CreationDate';"
+    "e={if($null -eq $_.CreationDate){$null}else{$_.CreationDate.ToUniversalTime().ToString('o')}}}) | ConvertTo-Json -Depth 4 -Compress"
+)
+
+
+def require(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def bound(ref):
+    require(isinstance(ref, dict) and set(ref) == {"path", "sha256"}, "Closed SHA reference required")
+    p = Path(ref["path"])
+    require(p.is_absolute() and p.is_file() and not p.is_symlink()
+            and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]) is not None
+            and digest(p) == ref["sha256"], "Changed/missing bound artifact")
+    return p.resolve()
+
+
+def reference(path):
+    p = Path(path).resolve(strict=True)
+    return {"path": str(p), "sha256": digest(p)}
+
+
+def save(path, value, *, exclusive=False):
+    p = Path(path).resolve()
+    require(p.parent == HERE.resolve(), "Observer writes only its own sidecar directory")
+    raw = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if exclusive:
+        with p.open("xb") as stream:
+            stream.write(raw)
+    else:
+        tmp = p.with_name(p.name + ".tmp-" + str(os.getpid()))
+        with tmp.open("xb") as stream:
+            stream.write(raw)
+        os.replace(tmp, p)
+
+
+def utc_creation(value):
+    require(isinstance(value, str), "Missing full creation timestamp")
+    match = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,7}))?(Z|[+-]\d\d:\d\d)", value)
+    require(match is not None, "Creation timestamp needs an explicit timezone and <=7 fractional digits")
+    dt = datetime.fromisoformat(match[1] + match[3]).astimezone(UTC)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + "." + (match[2] or "").ljust(7, "0") + "Z"
+
+
+def identity(row):
+    require(isinstance(row, dict) and all(k in row and row[k] is not None for k in FIELDS),
+            "All five complete identity fields required")
+    require(all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2]), "Invalid process IDs")
+    require(all(isinstance(row[k], str) and row[k] for k in FIELDS[2:]), "Incomplete identity strings")
+    return tuple(row[k] for k in FIELDS[:-1]) + (utc_creation(row["CreationDate"]),)
+
+
+def same_identity(a, b):
+    # System census rows may omit text fields; unrelated PIDs are not our target.
+    require(isinstance(a, dict) and isinstance(b, dict), "Identity rows required")
+    if a.get("ProcessId") != b.get("ProcessId"):
+        return False
+    return identity(a) == identity(b)
+
+
+def parse_census(raw):
+    require(isinstance(raw, bytes), "Census must be strict UTF-8 bytes")
+    rows = json.loads(raw.decode("utf-8", errors="strict"))
+    require(isinstance(rows, list) and rows, "Complete process census required")
+    ids = set()
+    for row in rows:
+        require(isinstance(row, dict) and all(k in row for k in FIELDS), "Incomplete census row")
+        require(all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2]), "Invalid census IDs")
+        require(row["ProcessId"] not in ids, "Duplicate census PID")
+        ids.add(row["ProcessId"])
+        require(all(row[k] is None or isinstance(row[k], str) for k in FIELDS[2:4]), "Invalid census strings")
+        if row["CreationDate"] is not None:
+            utc_creation(row["CreationDate"])
+            created = datetime.fromisoformat(row["CreationDate"])
+            require(created.utcoffset().total_seconds() == 0 and created.timestamp() <= time.time(), "Census timestamp is non-UTC or future")
+
+    return rows
+
+
+def census():
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", CIM_COMMAND],
+        text=False, capture_output=True, check=False, timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    require(result.returncode == 0 and not result.stderr.decode("utf-8", errors="strict").strip(),
+            "Read-only UTF-8 full CIM census failed")
+    return parse_census(result.stdout)
+
+
+def windows_argv(command):
+    """Parse Windows quoting without a shell or a process."""
+    require(isinstance(command, str) and command and not command[0].isspace()
+            and not any(x in command for x in ("\x00", "\r", "\n")), "Malformed Windows command")
+    import ctypes
+    from ctypes import wintypes
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    parse = shell.CommandLineToArgvW
+    parse.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    parse.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    free = kernel.LocalFree
+    free.argtypes = [ctypes.c_void_p]
+    free.restype = ctypes.c_void_p
+    count = ctypes.c_int()
+    pointer = parse(command, ctypes.byref(count))
+    require(bool(pointer), "CommandLineToArgvW refused command")
+    try:
+        result = [pointer[i] for i in range(count.value)]
+    finally:
+        free(ctypes.cast(pointer, ctypes.c_void_p))
+    require(result and result[0], "Missing executable argv")
+    return result
+
+
+def flag(argv, name):
+    positions = [i for i, arg in enumerate(argv) if arg == name]
+    require(len(positions) == 1 and not any(arg.startswith(name + "=") for arg in argv),
+            "Missing/duplicate exact flag " + name)
+    pos = positions[0]
+    require(pos + 1 < len(argv) and argv[pos + 1] and not argv[pos + 1].startswith("-"), "Missing flag value")
+    return argv[pos + 1]
+
+
+def worker_entry(argv):
+    """Only an exact module or an explicit pinned script may describe a worker."""
+    if "-m" in argv:
+        module = flag(argv, "-m")
+        index = argv.index("-m")
+        require(all(x in {"-B", "-u", "-I"} for x in argv[1:index])
+                and len(set(argv[1:index])) == index - 1, "Unexpected Python prefix")
+        return "module", module
+    index = next((i for i, arg in enumerate(argv[1:], 1) if not arg.startswith("-")), None)
+    require(index is not None and all(x in {"-B", "-u", "-I"} for x in argv[1:index])
+            and len(set(argv[1:index])) == index - 1, "Unexpected Python script prefix")
+    return "script", str(Path(argv[index]).resolve())
+
+
+def exact_options(argv, start, valued, switches):
+    """No hidden extra flags, equals aliases or duplicate switches."""
+    found = set()
+    while start < len(argv):
+        name = argv[start]
+        require(name not in found and name in valued | switches, "Unknown/duplicate worker option")
+        found.add(name)
+        start += 1
+        if name in valued:
+            require(start < len(argv) and argv[start] and not argv[start].startswith("-"), "Missing worker option value")
+            start += 1
+    require(valued <= found, "Missing exact worker options")
+
+
+def native_sessions(rows, parser=windows_argv):
+    result = {}
+    for row in rows:
+        command = row.get("CommandLine") or ""
+        if not re.search(r"hpc_forest\.[A-Za-z0-9_]+|bootstrap_worker\.py|reprendre-relais-r1\.py", command, re.IGNORECASE):
+            continue
+        executable = Path(row.get("ExecutablePath") or "").name.casefold()
+        if executable in {"powershell.exe", "pwsh.exe", "cmd.exe"}:
+            continue  # A shell mentioning a command is never adopted as a worker.
+        identity(row)
+        require(executable in {"python.exe", "pythonw.exe"}, "Unclassified worker executable/opaque identity")
+        argv = parser(command)
+        session = flag(argv, "--session-id")
+        require(re.fullmatch(r"[0-9a-f]{32}", session) is not None, "Unknown worker session")
+        worker_entry(argv)
+        result.setdefault(session, []).append(row)
+    require(len(result) <= CAP, "More than four native worker sessions")
+    for pair in result.values():
+        require(len(pair) <= 2, "More than one launcher/Python pair per session")
+        if len(pair) == 2:
+            verify_pair(pair, rows)
+    return result
+
+
+def verify_pair(expected, rows):
+    require(isinstance(expected, list) and len(expected) == 2, "Full launcher/Python pair required")
+    a, b = expected
+    require(a["ProcessId"] != b["ProcessId"] and a["CommandLine"] == b["CommandLine"]
+            and (a["ParentProcessId"] == b["ProcessId"] or b["ParentProcessId"] == a["ProcessId"]),
+            "Unbound worker pair")
+    for old in expected:
+        require(any(same_identity(old, row) for row in rows), "Worker full identity changed/absent")
+
+
+def complete_cim(value):
+    require(value.get("schema") == "hpc-forest-dynamic-r4b-full-cim-v1" and value.get("complete_census") is True
+            and value.get("strict_utf8_decoding") is True, "Complete cold UTF8 census required")
+    rows = value.get("rows")
+    require(isinstance(rows, list) and rows and type(value.get("rows_count")) is int and len(rows) == value["rows_count"]
+            and all(isinstance(r, dict) and all(k in r for k in FIELDS) and type(r["ProcessId"]) is int and type(r["ParentProcessId"]) is int for r in rows)
+            and len({r["ProcessId"] for r in rows}) == len(rows), "Complete unique cold census field inventory required")
+    return rows
+
+
+def verify_cold_absence(proof, expected, rows, subject, *, initial=False):
+    require(proof.get("schema") == "hpc-forest-passive-owned-pair-absence-v1" and proof.get("verified") is True
+            and proof.get("subject") == subject and proof.get("no_stop_or_replay") is True,
+            "Actual cold pair absence proof required; no boolean-only release")
+    verify_pair(expected, expected)
+    verify_pair(proof.get("owned_full_identities"), proof.get("owned_full_identities"))
+    require({identity(r) for r in proof.get("owned_full_identities", [])} == {identity(r) for r in expected}, "Absence concerns another exact five-field pair")
+    refs = proof.get("evidence_refs", [])
+    require(proof.get("prior_full_cim") in refs and proof.get("fresh_full_cim") in refs, "Prior presence and absence CIM refs required")
+    for ref in refs:
+        bound(ref)
+    prior, after = [read(bound(proof[k])) for k in ("prior_full_cim", "fresh_full_cim")]
+    before_rows, after_rows = complete_cim(prior), complete_cim(after)
+    t0, t1 = [datetime.fromisoformat(v["captured_at_utc"]) for v in (prior, after)]
+    require(t0.tzinfo is not None and t1.tzinfo is not None and t0.utcoffset().total_seconds() == t1.utcoffset().total_seconds() == 0
+            and t0.timestamp() <= t1.timestamp() <= time.time()
+            and type(proof.get("observed_at")) in (int, float) and proof["observed_at"] <= time.time()
+            and 0 <= proof["observed_at"] - t1.timestamp() <= 120,
+            "Cold prior/absence chronology required")
+    if initial:
+        require(0 <= time.time() - t1.timestamp() <= 120, "Fresh <=120seconds absence needed before start")
+    for old in expected:
+        require(datetime.fromisoformat(utc_creation(old["CreationDate"])).timestamp() <= t0.timestamp()
+                and any(same_identity(old, r) for r in before_rows), "Actual prior full identity presence required")
+        require(not any(same_identity(old, r) for r in after_rows) and not any(same_identity(old, r) for r in rows)
+                and not any(r.get("CommandLine") == old["CommandLine"] for r in rows), "Historical pair or equivalent command remains live")
+    if subject == "observer3":
+        script = str(read(LEGACY_RESUME)["code"]["path"]).replace("/", "\\").casefold()
+        require(not any(script in (r.get("CommandLine") or "").replace("/", "\\").casefold()
+                        and (Path(r.get("ExecutablePath") or "").name.casefold() in {"python.exe", "pythonw.exe"}
+                             or r.get("ExecutablePath") is None) for r in rows), "Equivalent OBS3 Python reader remains live")
+
+
+def passive_transport_module():
+    require(digest(OLD) == OLD_SHA, "Frozen passive transport helper changed")
+    spec = importlib.util.spec_from_file_location("obs4_frozen_passive_transport", OLD)
+    old = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old)
+    return old
+
+
+def load_source_only(policy, rows, *, initial=False):
+    """No old coordinator or live cache read: only pinned science and full identities."""
+    require(digest(OLD) == OLD_SHA, "Frozen passive transport helper changed")
+    science = read(bound(policy["source_only_reception"]))
+    require(bound(policy["source_only_reception"]) == SCIENCE.resolve()
+            and digest(SCIENCE) == SCIENCE_SHA and science.get("verified") is True
+            and science.get("job_id") == SO_JOB and science.get("session_id") == SO_SESSION
+            and all(science.get(k) is True for k in ("deliveries_reconciled", "all_started_calls_reconciled", "scientific_reception_verified", "independent_audit_verified")),
+            "Actual scientifically received and reconciled source-only final receipt required")
+    for key in ("baseline", "reconciliation", "independent_audit", "late_remote_readback", "normalization"):
+        bound(science[key])
+    mode = policy["source_only_state"]
+    if mode == "live":
+        verify_pair(policy["source_only_full_identities"], rows)
+        require(policy.get("source_only_absence") is None, "Live SO cannot claim absence")
+    else:
+        require(mode == "received_absent", "Explicit live or received_absent SO state required")
+        absence = read(bound(policy["source_only_absence"]))
+        verify_cold_absence(absence, policy["source_only_full_identities"], rows, "source-only", initial=initial)
+        require(absence.get("scientific_reception") == policy["source_only_reception"], "SO absence must bind the exact final science receipt")
+        require(not any(SO_SESSION in (r.get("CommandLine") or "") and re.search(r"hpc_forest\..*worker|bootstrap_worker\.py", r.get("CommandLine") or "", re.IGNORECASE) for r in rows), "Source-only session is still live")
+    return None, science
+
+def verify_policy(policy):
+    require(policy.get("schema") == "hpc-forest-r4b-obs4-nine-session-policy-v1" and policy.get("verified") is True
+            and policy.get("maximum_native_workers_total") == CAP and policy.get("scope_id") == SCOPE
+            and policy.get("effort") == EFFORT and policy.get("models") == list(MODELS)
+            and policy.get("sessions") == SESSIONS and policy.get("pilots_admitted") is False,
+            "Actual reviewed nine-session MAX passive policy required")
+    for key, expected in (("source_zip", SOURCE), ("plan", PLAN), ("source_review", SOURCE_REVIEW_SHA)):
+        require(digest(bound(policy[key])) == expected, "Unknown source/plan/review")
+    plan, review = read(bound(policy["plan"])), read(bound(policy["source_review"]))
+    require(plan.get("scope_id") == SCOPE and plan.get("source_zip_sha256") == SOURCE
+            and plan.get("efforts") == [EFFORT] and plan.get("maximum_native_workers_total") == CAP
+            and all(plan.get("contract_cells", {}).get(m) == SESSIONS[m] for m in MODELS)
+            and plan.get("automatic_extension") is False, "Frozen technical sessions/cap4 differ")
+    require(review.get("verified_source_preparation_only") is True and review.get("blocking_findings") == []
+            and review.get("source_zip",{}).get("sha256") == SOURCE and review.get("plan",{}).get("sha256") == PLAN, "Source110 preparation review differs")
+    q = read(bound(policy["qualification_reception"]))
+    require(q.get("schema") == "hpc-forest-dynamic-r4b-mechanical-reception-v1" and q.get("verified") is True
+            and q.get("scope_id") == SCOPE and q.get("source_zip_sha256") == SOURCE and q.get("plan_sha256") == PLAN
+            and q.get("native_model_calls") == 0 and all(q.get(k) is True for k in
+                ("source_files_exact", "privacy_neutral_tests_passed", "target_profile_verified", "reference_contracts_reviewed")),
+            "Real independently received/audited zero-model qualification required")
+    for k in ("archive", "qualification", "independent_audit"):
+        bound(q[k])
+    actual_q = read(bound(q["qualification"]))
+    audit = read(bound(q["independent_audit"]))
+    require(actual_q.get("verified") is True and actual_q.get("scope_id") == SCOPE
+            and actual_q.get("source_zip_sha256") == SOURCE and actual_q.get("plan_sha256") == PLAN
+            and actual_q.get("native_model_calls") == 0, "Actual allocated qualification differs")
+    require(audit.get("verified") is True and audit.get("scope_id") == SCOPE
+            and audit.get("source_zip_sha256") == SOURCE and audit.get("plan_sha256") == PLAN
+            and audit.get("qualification_sha256") == q["qualification"]["sha256"]
+            and audit.get("archive_sha256") == q["archive"]["sha256"], "Independent qualification audit binding differs")
+    bridge=integrated_reader(policy)
+    bridge.check_qualification(policy["qualification_reception"])
+    bridge.latest_g_closure(policy.get("latest_native_generation_closure"),
+        json.loads((INTEGRATION/"launcher/pins-source-plan.json").read_text())["latest_native_generation_closure"])
+    scripts = policy.get("bootstrap_scripts")
+    require(isinstance(scripts, list) and len(scripts) == 1 and bound(scripts[0]) == BOOTSTRAP.resolve()
+            and digest(BOOTSTRAP) == BOOTSTRAP_SHA, "Exactly the original reviewed multi-model bootstrap is required")
+    require(Path(policy["source_project"]).resolve() == PROJECT.resolve()
+            and digest(PROJECT / "src/hpc_forest/dynamic_admission.py") == ADMISSION_SHA, "Frozen source validator differs")
+    require(digest(LEGACY_POLICY) == LEGACY_POLICY_SHA and digest(LEGACY_RESUME) == LEGACY_RESUME_SHA,
+            "Historical full identity anchors changed")
+    previous = read(LEGACY_RESUME)["observer_full_identities"]
+    source_only = read(LEGACY_POLICY)["source_only_full_identities"]
+    require({identity(r) for r in policy["previous_reader_identities"]} == {identity(r) for r in previous}
+            and {identity(r) for r in policy["source_only_full_identities"]} == {identity(r) for r in source_only},
+            "Only actual OBS3 and SO full identities are historical anchors")
+    verify_pair(previous, previous)
+    verify_pair(source_only, source_only)
+    bridge = integrated_reader(policy)
+    bridge.integration_review(policy["integration_review"])
+    bridge.check_qualification(policy["qualification_reception"])
+    require(bound(policy["historical_luna_negative"]) == LUNA_NEGATIVE.resolve()
+            and digest(LUNA_NEGATIVE) == LUNA_NEGATIVE_SHA, "Preserve the actual negative Luna terminal")
+    negative = read(LUNA_NEGATIVE)
+    require(negative.get("job_id") == "752306" and negative.get("all_started_calls_reconciled") is True
+            and negative.get("closed_schema_verified") is False and negative.get("normal_native_delivery_verified") is False,
+            "Historical Luna remains negative and never pollable")
+    require(all(policy.get(k) is False for k in ("submit_allowed", "generate_allowed", "receive_allowed", "stop_allowed", "scientific_admission")), "Passive capabilities only")
+    own_review = read(bound(policy["observer_review"]))
+    require(policy["observer_review"] == policy["integration_review"]
+            and own_review.get("schema") == "hpc-forest-dynamic-r4b-integration-review-v1"
+            and own_review.get("verified") is True and own_review.get("blocking_findings") == []
+            and own_review.get("observer_sha256") == digest(__file__)
+            and own_review.get("abi_sha256") == digest(HERE / "ABI.json"), "Separate actual OBS4 code review required")
+    return policy
+
+def cell(route):
+    model, phase = route.get("model"), route.get("phase")
+    require(model in MODELS and phase in PHASES and route.get("session_id") == SESSIONS[model][phase]
+            and route.get("effort") == EFFORT, "Unknown model/phase/MAX/session; Luna and pilot closed")
+    require(route.get("stage") in STAGES, "Unknown lifecycle")
+    job = route.get("job_id")
+    require(route["stage"] == "absent" or isinstance(job, str) and job.isdigit() and job not in BEGUN_JOBS, "Actual distinct future job required")
+    return {"scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+            "model": model, "effort": EFFORT, "phase": phase, "session_id": route["session_id"], "job_id": job,
+            "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + route["session_id"]}
+
+def require_binding(value, expected):
+    require(all(value.get(k) == v for k, v in expected.items() if k != "phase"), "Full cell binding differs")
+
+
+def integrated_reader(policy):
+    path = INTEGRATION / "reader_bridge.py"
+    spec = importlib.util.spec_from_file_location("obs_lane_r2_reader_bridge", path)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    bridge.integration_review(policy["integration_review"])
+    return bridge
+
+
+def sealed_validator():
+    """A private package namespace prevents mixing the historical SO and R4b packages."""
+    import sys
+    import types
+    package = "passive_r4b_observer_validator"
+    directory = PROJECT.resolve(strict=True) / "src/hpc_forest"
+    if package not in sys.modules:
+        module = types.ModuleType(package)
+        module.__path__ = [str(directory)]
+        module.__package__ = package
+        sys.modules[package] = module
+    require(sys.modules[package].__path__ == [str(directory)], "Private validator namespace replaced")
+    module = importlib.import_module(package + ".dynamic_admission")
+    require(Path(module.__file__).resolve() == directory / "dynamic_admission.py"
+            and digest(module.__file__) == ADMISSION_SHA, "Wrong sealed validator implementation")
+    return module
+
+
+def verify_command(argv, expected, authorization_path, cache, cli_path, policy, route):
+    kind, entry = worker_entry(argv)
+    require(kind == "script", "Only the explicitly reviewed R4b bootstrap script is admitted")
+    require(entry in {str(bound(ref)) for ref in policy["bootstrap_scripts"]}, "Unknown/unpinned bootstrap script")
+    index = next(i for i, arg in enumerate(argv) if str(Path(arg).resolve()) == entry)
+    exact_options(argv, index + 1, {"--model", "--effort", "--phase", "--job-id", "--session-id", "--channel", "--output",
+        "--authorization", "--authorization-sha256", "--codex-config", "--codex-config-sha256",
+        "--owner", "--owner-sha256", "--cli-policy", "--cli-policy-sha256"}, {"--execute"})
+    require(flag(argv, "--model") == expected["model"] and flag(argv, "--effort") == EFFORT
+            and flag(argv, "--phase") == expected["phase"] and flag(argv, "--job-id") == expected["job_id"]
+            and Path(flag(argv, "--authorization")).resolve() == authorization_path
+            and flag(argv, "--authorization-sha256") == digest(authorization_path)
+            and argv.count("--execute") == 1, "Bootstrap phase/job/admission differs")
+    for key, option in (("codex_config", "--codex-config"), ("owner", "--owner"), ("cli_policy", "--cli-policy")):
+        artifact = bound(route[key])
+        require(Path(flag(argv, option)).resolve() == artifact
+                and flag(argv, option + "-sha256") == digest(artifact), "Bootstrap config/owner differs")
+    require(flag(argv, "--session-id") == expected["session_id"]
+            and Path(flag(argv, "--output")).resolve() == cache
+            and flag(argv, "--channel") in {expected["remote_root"] + "/results-" + expected["job_id"] + "/mailbox",
+                expected["remote_root"].replace("/scratch_p/", "/gpfs/scratch/", 1) + "/results-" + expected["job_id"] + "/mailbox"},
+            "Worker argv differs")
+    require(cli_path.is_absolute(), "Actual bound CLI path required")
+
+
+def verify_worker(route, policy, rows, actual, parser=windows_argv):
+    expected = cell(route)
+    verify_pair(route["relay_identities"], rows)
+    require(len(actual) == 2 and all(any(same_identity(a, b) for b in actual) for a in route["relay_identities"]),
+            "Worker pair does not match census session")
+    authorization_path = bound(route["authorization"])
+    authorization = read(authorization_path)
+    require_binding(authorization, expected)
+    require(authorization.get("schema") == "hpc-forest-dynamic-r4b-max-authorization-v1"
+            and authorization.get("verified") is True and authorization.get("expires_at", 0) > time.time()
+            and authorization.get("purpose") == ("pilot" if expected["phase"] == "pilot" else "technical-contract"),
+            "Real unexpired exact phase authorization required")
+    if expected["phase"] != "pilot":
+        require(authorization.get("technical_phase") == expected["phase"]
+                and re.fullmatch(r"[0-9a-f]{64}", authorization.get("allowed_request_sha256", "")) is not None,
+                "Exact technical phase/request required")
+    artifacts = authorization["artifacts"]
+    require(artifacts["source_zip"]["sha256"] == SOURCE and artifacts["plan"]["sha256"] == PLAN
+            and artifacts["integration_review"] == policy["integration_review"]
+            and artifacts["qualification_reception"] == policy["qualification_reception"], "Authorization source/Q differs")
+    # The source review above is a different received artifact. The exact
+    # integration reference belongs to this policy and is revalidated against
+    # its schema/source/plan/manifest/component pins, without a cyclic digest.
+    integrated_reader(policy)
+    for ref in artifacts.values():
+        if ref is not None:
+            bound(ref)
+    # Run the sealed pure validator at the operator's future observation time.
+    # This performs reads only; it never installs identity or calls the model.
+    dynamic_admission = sealed_validator()
+    dynamic_admission.validate_authorization(authorization_path, {SCOPE}, initial=False)
+    cache = Path(route["cache_root"]).resolve(strict=True)
+    require(cache == CACHE_PARENT / ("worker-" + expected["session_id"]), "Original reviewed cache namespace required")
+    require(read(bound(route["cell_binding"])) == authorization
+            and bound(route["cell_binding"]).parent == cache, "Actual cache CELL-BINDING differs")
+    ready = read(bound(route["worker_ready"]))
+    require((ready.get("session_id"), ready.get("model"), ready.get("reasoning_effort"))
+            == (expected["session_id"], expected["model"], EFFORT) and ready.get("mode") == "codex"
+            and ready.get("pid") in {r["ProcessId"] for r in actual}, "Actual MAX worker-ready differs")
+    cli = read(bound(artifacts["cli_identity"]))
+    require(route.get("cli_policy") and route["cli_policy"]["sha256"] == cli.get("task_cli_policy_sha256")
+            and ready.get("task_cli_policy_sha256") == cli["task_cli_policy_sha256"]
+            and ready.get("local_skill_paths_exported") is False, "Local task policy/ready binding differs")
+    dynamic_admission.verify_task_cli_policy(authorization, bound(route["cli_policy"]), route["cli_policy"]["sha256"], cli["executable_path"])
+    require(cli.get("executable_sha256") == CLI and digest(Path(cli["executable_path"])) == CLI
+            and Path(ready["codex_executable"]).resolve() == Path(cli["executable_path"]).resolve(), "Actual CLI differs")
+    for row in actual:
+        argv = parser(row["CommandLine"])
+        verify_command(argv, expected, authorization_path, cache, Path(cli["executable_path"]).resolve(), policy, route)
+
+
+def verify_negative_terminal(receipt, expected, route, rows, actual):
+    raise ValueError("Source110 negative metadata contract is not admitted; preserve it for a separately reviewed cold metadata receipt")
+
+
+def verify_routes(bundle, policy, rows, history, *, parser=windows_argv, worker_check=verify_worker):
+    require(bundle.get("schema") == "hpc-forest-r4b-obs4-nine-session-routes-v1"
+            and bundle.get("scope_id") == SCOPE and bundle.get("source_zip_sha256") == SOURCE
+            and bundle.get("plan_sha256") == PLAN, "Unknown nine-cell route registry")
+    routes = bundle.get("routes")
+    require(isinstance(routes, list) and len(routes) == 9, "All nine explicit model+phase routes required")
+    sessions = native_sessions(rows, parser)
+    mode = policy["source_only_state"]
+    require((mode == "live" and SO_SESSION in sessions) or (mode == "received_absent" and SO_SESSION not in sessions), "SO census and declared proven state differ")
+    seen, jobs, next_history, allowed, positive = set(), set(), {}, set(), {}
+    known_sessions = {v for phases in SESSIONS.values() for v in phases.values()}
+    for route in routes:
+        expected = cell(route)
+        session, stage = expected["session_id"], route["stage"]
+        key = expected["model"] + ":" + expected["phase"]
+        require(key not in seen, "Duplicate model+phase route")
+        seen.add(key)
+        prior = history.get(key)
+        if prior:
+            old_cell = dict(prior["cell"])
+            if prior["stage"] == "absent":
+                old_cell["job_id"] = expected["job_id"]
+            require(STAGES[stage] >= STAGES[prior["stage"]] and expected == old_cell, "Route rollback/replacement/replay refused")
+        actual = sessions.get(session, [])
+        if stage == "absent":
+            require(not actual and expected["job_id"] is None, "Absent route has worker or job")
+        else:
+            require(expected["job_id"] not in jobs, "Duplicate dynamic job")
+            jobs.add(expected["job_id"])
+            submitted = read(bound(route["submission_observed"]))
+            submitted = submitted.get("structuredContent", submitted)
+            require(submitted.get("ok") is True and submitted.get("submission_observed") is True
+                    and str(submitted.get("job_id")) == expected["job_id"], "Actual observed submission required")
+            marker = read(bound(route["allocation_marker"]))
+            require_binding(marker, expected)
+            require(marker.get("schema") == "hpc-forest-dynamic-r4b-allocation-marker-v1" and marker.get("verified") is True
+                    and marker.get("phase") == expected["phase"] and marker.get("native_model_calls") == 0
+                    and marker.get("source_files") == 110, "Actual zero-call allocated marker required")
+            if stage != "terminal_received":
+                allowed.add(expected["job_id"])
+            if stage == "allocated_pending":
+                require(not actual, "Worker observed before full-identity route")
+            elif stage == "worker_ready":
+                worker_check(route, policy, rows, actual, parser)
+            else:
+                require(not actual, "A received technical terminal cannot still have a live session")
+                receipt = read(bound(route["terminal_reception"]))
+                require_binding(receipt, expected)
+                if receipt.get("schema") == "hpc-forest-dynamic-r4b-negative-phase-reconciliation-v1":
+                    verify_negative_terminal(receipt, expected, route, rows, actual)
+                    positive[key] = False
+                else:
+                    require(receipt.get("schema") == "hpc-forest-dynamic-r4b-reconciled-phase-receipt-v1"
+                            and receipt.get("verified") is True and receipt.get("normal_native_delivery_verified") is True
+                            and receipt.get("closed_schema_verified") is True and receipt.get("all_started_calls_reconciled") is True
+                            and type(receipt.get("unknown_invocations")) is int and receipt["unknown_invocations"] == 0
+                            and receipt.get("unresolved_invocations") == [] and receipt.get("phase") == expected["phase"], "Strict same-cell positive terminal required")
+                    verify_pair(route.get("relay_identities"), route.get("relay_identities"))
+                    require({identity(r) for r in route["relay_identities"]} == {identity(r) for r in receipt.get("worker_natural_exit", {}).get("owned_full_identities", [])}, "Strict terminal must retain the exact observed route pair")
+                    bridge = integrated_reader(policy)
+                    actual_receipt = bridge.audit_input(route["receiving_input"])
+                    require(bridge.same(receipt, actual_receipt), "Terminal differs from actual frozen R4 cold audit")
+                    positive[key] = True
+        immutable = {k: route[k] for k in ("submission_observed", "allocation_marker") if k in route}
+        worker = {k: route[k] for k in ("authorization", "relay_identities", "cell_binding", "worker_ready", "cache_root", "codex_config", "owner", "cli_policy") if k in route}
+        if prior and prior.get("allocation_binding"):
+            require(prior["allocation_binding"] == immutable, "Allocation/submission proof replaced")
+        if prior and prior.get("worker_binding"):
+            require(prior["worker_binding"] == worker, "Worker/cache/admission replaced; never replay")
+        terminal = {k: route[k] for k in ("terminal_reception", "receiving_input") if k in route}
+        if prior and prior.get("terminal_binding"):
+            require(prior["terminal_binding"] == terminal, "Closed terminal evidence replaced")
+        next_history[key] = {"stage": stage, "cell": expected, "allocation_binding": immutable,
+                             "worker_binding": worker, "terminal_binding": terminal}
+    require(seen == {m + ":" + phase for m in MODELS for phase in PHASES} and set(history) <= seen, "Missing or removed exact model+phase route")
+    for route in routes:
+        if route["stage"] != "absent":
+            for phase in PHASES[:PHASES.index(route["phase"])]:
+                require(positive.get(route["model"] + ":" + phase) is True, "Previous same-model phase must be strictly positive; negative metadata never admits continuation")
+    require(set(sessions) <= known_sessions | ({SO_SESSION} if mode == "live" else set()), "Unclassified native worker/session")
+    reserved = set(sessions) | {r["session_id"] for r in routes if r["stage"] in {"allocated_pending", "worker_ready"}}
+    require(len(reserved) <= CAP, "Four worker lanes total including SO; pairs count once")
+    return next_history, allowed, sessions
+
+def admit_cell(model, phase, policy_path, routes_path, reader_pair_path, rows, history, sessions):
+    require(model in MODELS and phase in PHASES, "Exact --model and technical phase required")
+    routes = read(routes_path)["routes"]
+    found = [r for r in routes if r["model"] == model and r["phase"] == phase]
+    require(len(found) == 1 and found[0]["stage"] == "allocated_pending", "One real pending model+phase cell required")
+    route = found[0]
+    require(SESSIONS[model][phase] not in sessions and len(sessions) < CAP, "Started cell or full cap4")
+    pair = read(reader_pair_path)
+    verify_pair(pair, rows)
+    for row in pair:
+        argv = windows_argv(row["CommandLine"])
+        require(worker_entry(argv) == ("script", str(Path(__file__).resolve()))
+                and flag(argv, "--policy") == str(Path(policy_path).resolve())
+                and flag(argv, "--routes") == str(Path(routes_path).resolve()) and argv.count("--run") == 1, "Actual OBS4 identity required")
+    state_path = HERE / "observer-state.json"
+    state = read(state_path)
+    require(state.get("policy_sha256") == digest(policy_path) and state.get("stage") == "observing"
+            and state.get("transition_verified") is True and 0 <= time.time() - state.get("updated_at", 0) <= 90
+            and state.get("routes_history") == history, "Actual current OBS4 state required")
+    require({identity(r) for r in state.get("observer_full_identities", [])} == {identity(r) for r in pair}, "Reader lock/state owner differs")
+    policy = read(policy_path)
+    live = policy["source_only_state"] == "live"
+    target = HERE / ("admission-cellule-" + model + "-" + phase + "-" + str(time.time_ns()) + ".json")
+    value = {"schema": "hpc-forest-dynamic-r4b-mixed-observer-admission-v1", "verified": True, **cell(route),
+        "maximum_native_workers_total": CAP, "source_only_preserved": live,
+        "source_only_scientifically_closed_and_absent": not live, "source_only_state": policy["source_only_state"],
+        "existing_observer_untouched": True, "all_native_sessions_covered": True, "native_calls_started_zero": True,
+        "active_native_workers_before_start": len(sessions), "observer_full_identities": pair,
+        "observed_at": time.time(), "policy_sha256": digest(policy_path), "routes_sha256": digest(routes_path),
+        "native_worker_started": False, "scientific_admission": False,
+        "factory_SO_present_gate_compatible": True, "observer_code_sha256": digest(__file__),
+        "evidence_refs": [reference(policy_path), reference(routes_path), reference(reader_pair_path), reference(state_path)]}
+    save(target, value, exclusive=True)
+    return target
+
+def check_rpc(name, args, jobs):
+    require(name in {"job_status", "job_efficiency"} and set(args) == {"job_id"}
+            and args["job_id"] in jobs and args["job_id"] not in {SO_JOB, "752306"}
+            and all(isinstance(j, str) and j.isdigit() for j in jobs), "Only explicit unreceived technical status/accounting; never repoll closed SO/Luna")
+
+def guard(policy, bundle, history, rows=None, *, initial=False):
+    verify_policy(policy)
+    rows = census() if rows is None else rows
+    old, so = load_source_only(policy, rows, initial=initial)
+    hist, jobs, sessions = verify_routes(bundle, policy, rows, history)
+    return rows, hist, jobs, sessions, old, so
+
+def verify_transition(admission, rows, expected=None, *, initial=False):
+    require(admission.get("schema") == "hpc-forest-r4b-obs4-transition-v1" and admission.get("verified") is True
+            and admission.get("model_workers_untouched") is True, "Actual OBS3 release required before start or lock")
+    require(expected is not None and {identity(r) for r in admission.get("previous_reader_identities", [])} == {identity(r) for r in expected}, "Transition concerns another reader")
+    receipt = read(bound(admission["previous_reader_absence"]))
+    verify_cold_absence(receipt, expected, rows, "observer3", initial=initial)
+
+def transition_state(policy, bundle, rows, transition_path, *, initial=False):
+    require(transition_path is not None and Path(transition_path).is_file(), "No OBS4 transition/start/lock before actual OBS3 absence")
+    verify_transition(read(transition_path), rows, policy["previous_reader_identities"], initial=initial)
+    return True
+
+async def watch(policy_path, routes_path, transition_path):
+    policy_sha = digest(policy_path)
+    code_sha = digest(__file__)
+    policy, bundle = read(policy_path), read(routes_path)
+    rows, history, jobs, sessions, old, _ = guard(policy, bundle, {}, initial=True)
+    transition_verified = transition_state(policy, bundle, rows, transition_path, initial=True)
+    require(transition_verified, "No lock before actual OBS3 release")
+    transition_sha = digest(transition_path) if transition_verified else None
+    old = passive_transport_module()  # Only AFTER real OBS3 absence, before any lock/RPC.
+    RomeoFiles, FileLock = old.imports()
+    # A sidecar lock only: no shared coordinator lock or shared state is changed.
+    with FileLock(HERE / "observer.lock"):
+        prior = HERE / "observer-state.json"
+        if prior.exists():
+            state = read(prior)
+            require(state.get("policy_sha256") == policy_sha, "Existing sidecar policy differs")
+            history = state["routes_history"]
+        allowed_jobs = jobs
+        class PassiveRpc(RomeoFiles):
+            async def call(self, name, **arguments):
+                check_rpc(name, arguments, allowed_jobs)
+                result = await self.session.call_tool(name, arguments)
+                value = result.structuredContent
+                if value is None:
+                    value = json.loads(next(x.text for x in result.content if x.type == "text"))
+                require(not result.isError and isinstance(value, dict) and value.get("ok") is True, "Passive read failed")
+                return value
+        failures = 0
+        terminal_path = HERE / "terminal-statuses.json"
+        terminal = {}
+        if terminal_path.exists():
+            saved_terminal = read(terminal_path)
+            require(saved_terminal.get("policy_sha256") == policy_sha, "Terminal cache policy differs")
+            terminal = saved_terminal["jobs"]
+        async with PassiveRpc(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+            while True:
+                try:
+                    require(digest(policy_path) == policy_sha, "Immutable observation policy changed")
+                    require(digest(__file__) == code_sha, "Observed reader source changed")
+                    bundle = read(routes_path)
+                    rows, history, jobs, sessions, _, _ = guard(policy, bundle, history)
+                    transition_verified = transition_state(policy, bundle, rows, transition_path)
+                    if transition_verified:
+                        require(transition_sha is None or transition_sha == digest(transition_path), "Reader release proof changed")
+                        transition_sha = digest(transition_path)
+                    allowed_jobs = jobs
+                    observations = {SO_JOB: {"receipt_state": "scientifically_received_closed", "polled": False},
+                                    "752306": {"receipt_state": "negative_metadata_received", "polled": False, "native_contract_admitted": False}}
+                    for job in sorted(jobs):
+                        if job in terminal:
+                            observations[job] = terminal[job]
+                        else:
+                            status = await old.shared.scheduler(rpc, job)
+                            observations[job] = status
+                            if status.get("finished"):
+                                terminal[job] = status
+                                save(terminal_path, {"policy_sha256": policy_sha, "jobs": terminal})
+                    failures = 0
+                    current = next((r for r in rows if r["ProcessId"] == os.getpid()), None)
+                    require(current is not None, "Actual reader identity absent from census")
+                    own = [r for r in rows if r.get("CommandLine") == current["CommandLine"]
+                           and (r.get("ExecutablePath") or "").lower().endswith(("python.exe", "pythonw.exe"))]
+                    verify_pair(own, rows)
+                    save(HERE / "observer-state.json", {"schema": "hpc-forest-r4b-passive-state-v1",
+                        "policy_sha256": policy_sha, "routes_history": history, "observations": observations,
+                        "observer_full_identities": own,
+                        "active_native_workers": len(sessions),
+                        "stage": "observing" if transition_verified else "observing_transition_pending",
+                        "transition_verified": transition_verified, "updated_at": time.time(),
+                        "passive_only": True, "scientific_admission": False})
+                except Exception as exc:
+                    failures += 1
+                    failure = {"at": time.time(), "error": str(exc), "consecutive": failures,
+                               "passive_only": True, "no_repair_replay_or_stop": True}
+                    save(HERE / ("refus-" + str(time.time_ns()) + ".json"), failure, exclusive=True)
+                    save(HERE / "observer-state.json", {"schema": "hpc-forest-r4b-passive-state-v1",
+                        "policy_sha256": policy_sha, "routes_history": history,
+                        "stage": "verification_retry" if failures < 3 else "attention_required",
+                        "error": str(exc), "updated_at": time.time(), "passive_only": True})
+                    if failures >= 3:
+                        save(HERE / "attention-required.json", failure)
+                        raise
+                await asyncio.sleep(30)
+
+
+
+def verify_local_validation():
+    """Real local neutral proof, included under component pins; never a Q receipt."""
+    validation = read(HERE / "validation-locale.json")
+    require(set(validation) == {"schema", "ok", "scope_id", "source_zip_sha256", "plan_sha256",
+        "observer_sha256", "test_sha256", "junit_sha256", "testcases", "new_allocated_Q_required",
+        "CLI_model_process_transport_CIM_or_cache_effects", "native_generation_admitted"}
+        and validation["schema"] == "hpc-forest-source110-obs4-local-neutral-validation-v1"
+        and validation["ok"] is True and validation["scope_id"] == SCOPE
+        and validation["source_zip_sha256"] == SOURCE and validation["plan_sha256"] == PLAN
+        and validation["observer_sha256"] == digest(__file__)
+        and validation["test_sha256"] == digest(HERE / "test_obs4_neutre.py")
+        and validation["junit_sha256"] == digest(HERE / "TESTS-OBS4-NEUTRES.xml")
+        and type(validation["testcases"]) is int and validation["testcases"] == 5
+        and validation["new_allocated_Q_required"] is True
+        and type(validation["CLI_model_process_transport_CIM_or_cache_effects"]) is int
+        and validation["CLI_model_process_transport_CIM_or_cache_effects"] == 0
+        and validation["native_generation_admitted"] is False,
+        "Exact local OBS4 code/test/result proof required; new allocated Q remains mandatory")
+    cases = list(ET.parse(HERE / "TESTS-OBS4-NEUTRES.xml").iter("testcase"))
+    require(len(cases) == 5 and len({(c.get("classname"), c.get("name")) for c in cases}) == 5
+        and all(all(c.find(kind) is None for kind in ("failure", "error", "skipped")) for c in cases),
+        "Five actual local OBS4 neutral cases without failure/skip required")
+    return validation
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--policy", type=Path)
+    p.add_argument("--routes", type=Path)
+    p.add_argument("--transition", type=Path)
+    p.add_argument("--run", action="store_true")
+    p.add_argument("--model", choices=MODELS)
+    p.add_argument("--admit-cell", choices=PHASES)
+    p.add_argument("--reader-identities", type=Path)
+    p.add_argument("--preflight-input", type=Path)
+    p.add_argument("--preflight-input-sha256")
+    p.add_argument("--output", type=Path)
+    args = p.parse_args()
+    if args.preflight_input:
+        require(not args.run and not args.admit_cell and args.preflight_input_sha256 and args.output, "Inert preflight only; no live mode mixed")
+        value = read(bound({"path": str(args.preflight_input.resolve()), "sha256": args.preflight_input_sha256}))
+        require(set(value) == {"policy", "routes", "history", "full_cim", "transition"}, "Closed inert preflight input required")
+        observed = read(bound(value["full_cim"]))
+        rows = complete_cim(observed)
+        _, hist, jobs, sessions, _, _ = guard(read(bound(value["policy"])), read(bound(value["routes"])), value["history"], rows)
+        transition_state(read(bound(value["policy"])), read(bound(value["routes"])), rows, bound(value["transition"]))
+        save(args.output, {"schema": "hpc-forest-obs4-inert-preflight-v1", "verified": False,
+             "inert_checks_passed": True, "observed_at_from_input": observed["captured_at_utc"], "routes_history": hist,
+             "allowed_jobs": sorted(jobs), "active_workers_from_input": len(sessions), "CIM_collected": False,
+             "RPC_calls": 0, "lock_acquired": False, "observer_started": False, "generation_admitted": False}, exclusive=True)
+        return
+    verify_local_validation()
+    require(args.policy and args.routes and args.transition, "Actual policy/routes/OBS3 absence transition required")
+    if args.run:
+        require(not args.model and not args.admit_cell, "Watch observes nine cells; it never selects a generation")
+        asyncio.run(watch(args.policy, args.routes, args.transition))
+        return
+    require(args.admit_cell and args.model and args.reader_identities, "Only an explicit exact model+phase admission may use live preflight")
+    policy,bundle = read(args.policy),read(args.routes)
+    rows,hist,_jobs,sessions,_old,_so = guard(policy,bundle,{},initial=True)
+    transition_state(policy,bundle,rows,args.transition,initial=True)
+    print(json.dumps(reference(admit_cell(args.model,args.admit_cell,args.policy,args.routes,args.reader_identities,rows,hist,sessions))))
+
+
+if __name__ == "__main__":
+    main()

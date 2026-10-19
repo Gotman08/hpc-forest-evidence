@@ -1,0 +1,103 @@
+"""Prepare actual cold-receiver input links and proposed transfers; never perform transport."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import re
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FACTORY = HERE.parents[1] / 'HPC-Forest-Primes-Natif-Lancement-r2f/revision-r1'
+COLLECTOR_SHA = 'c5728e60ea500c577e31a50d266ec6135440a4f3827d096e645688c106df0f43'
+
+
+def load_collector():
+    path = HERE / 'collecter-frontiere.py'
+    if COLLECTOR_SHA is None or hashlib.sha256(path.read_bytes()).hexdigest() != COLLECTOR_SHA:
+        raise ValueError('Reviewed immutable collector pin required before import')
+    spec = importlib.util.spec_from_file_location('r2e_context_collector', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def option(argv, key):
+    if not isinstance(argv, list) or argv.count(key) != 1 or argv.index(key) + 1 >= len(argv):
+        raise ValueError('Exact one actual worker option required')
+    return argv[argv.index(key) + 1]
+
+
+def prepare(model, launch_ref, initial_ref, ready_ref, oauth_ref, output):
+    c = load_collector()
+    launch = c.read(c.item(launch_ref), launch_ref['sha256'])
+    c.need(launch.get('schema') == 'hpc-forest-r2e-owned-worker-launch-input-v1', 'Actual R2e launch input required')
+    c.need(model in c.CELLS, 'Exact selected R2e model required')
+    session, slug = c.CELLS[model]
+    factory = FACTORY / ('admissions-' + slug + '-reelles')
+    argv_ref = launch['worker_argv'][model]
+    c.need(Path(argv_ref['path']) == factory / 'worker-argv-only.json', 'Exact real selected factory directory required')
+    argv = c.read(c.item(argv_ref), argv_ref['sha256'])['argv']
+    policy_ref = {'path': option(argv, '--cli-policy'), 'sha256': option(argv, '--cli-policy-sha256')}
+    c.item(policy_ref)
+    local_auth = c.ref(factory / 'authorization-local.json')
+    c.need(option(argv, '--dependency-receipt') == local_auth['path'], 'Actual worker/auth path differs')
+    auth = c.read(c.item(local_auth), local_auth['sha256'])
+    job = auth.get('job_id')
+    c.selected(model, job)
+    c.need(all(auth.get(k) == v for k, v in {'scope_id': c.SCOPE, 'model': model,
+        'effort': 'max', 'session_id': session}.items()), 'Actual authorization differs from selected source108 cell')
+    readbacks_ref = launch['publication_readbacks']
+    readbacks = c.read(c.item(readbacks_ref), readbacks_ref['sha256'])
+    publications = [c.read(c.item(row['publication']), row['publication']['sha256']) for row in readbacks['evidence']]
+    selected = [row for row in publications if row.get('model') == model and row.get('job_id') == job]
+    c.need(len(selected) == 1, 'One exact real publication for selected job required')
+    for item in (initial_ref, ready_ref, oauth_ref):
+        c.item(item)
+    context = {'schema': 'hpc-forest-r2e-first-batch-real-installation-context-v1',
+        'source_bindings': launch['source_bindings'], 'local_authorization': local_auth,
+        'remote_authorization': c.ref(factory / 'authorization-remote.json'),
+        'upload_manifest': c.ref(factory / 'upload-manifest-propose.json'),
+        'publication_readbacks': readbacks_ref, 'ready_uploads': launch['ready_upload_results'],
+        'allocation_ready': selected[0]['allocation_marker'], 'initial_worker_ready': ready_ref,
+        'initial_installation': initial_ref, 'parent_oauth': oauth_ref, 'cli_policy': policy_ref}
+    c.need(not output.exists() and output.parent == HERE, 'Fresh owned output directory required')
+    output.mkdir()
+    context_ref = c.save(output / 'contexte-installation-reelle.json', context)
+    received = HERE / ('reception-' + slug + '-' + job)
+    base = '/gpfs/scratch/nimarano/' + c.SCOPE + '-' + session + '/results-' + job
+    transfers = [{'tool': 'mcp__romeo__download_from_romeo', 'arguments': {
+        'remote_path': base + '/' + name, 'local_path': str(received / name), 'verify': True}}
+        for name in ('premier-demarrage-verifie.json', 'premier-batch-en-attente.json')]
+    transfers.append({'tool': 'mcp__romeo__download_from_romeo', 'arguments': {
+        'remote_path': base, 'local_path': str(received / 'native'), 'verify': False}})
+    plan_ref = c.save(output / 'TRANSFERTS-PROPOSES-NON-EFFECTUES.json', {
+        'schema': 'hpc-forest-r2e-first-batch-exact-transfers-proposal-v1', 'verified': False,
+        'performed': False, 'model': model, 'job_id': job, 'session_id': session,
+        'received_root': str(received), 'context': context_ref, 'transfers': transfers,
+        'canonical_path_requires_actual_MCP_admission': True, 'no_path_refusal_bypass': True,
+        'directory_transfer_is_not_a_complete_native_scientific_admission': True,
+        'local_named_cache_collection_required_after_receipt': True})
+    return context_ref, plan_ref
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--model', choices=['gpt-6-astra', 'gpt-5.6-terra', 'gpt-6.1-sol'], required=True)
+    for name in ('launch-input', 'initial-installation', 'initial-ready', 'parent-oauth'):
+        parser.add_argument('--' + name, type=Path, required=True)
+        parser.add_argument('--' + name + '-sha256', required=True)
+    parser.add_argument('--output-name', required=True)
+    args = parser.parse_args()
+    if not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.output_name):
+        raise ValueError('Fresh simple output name required')
+    refs = [{'path': str(getattr(args, name).resolve()), 'sha256': getattr(args, name + '_sha256')}
+        for name in ('launch_input', 'initial_installation', 'initial_ready', 'parent_oauth')]
+    context, transfers = prepare(args.model, *refs, HERE / args.output_name)
+    print(json.dumps({'context': context, 'transfer_proposal': transfers, 'performed': False, 'native_calls': 0}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

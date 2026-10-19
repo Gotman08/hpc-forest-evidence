@@ -1,0 +1,62 @@
+"""Explicit host adapter to the existing protected HPC evaluator, never a native-agent admission."""
+from __future__ import annotations
+
+from pathlib import Path
+
+from .contracts import EvolutionError, Measurement, fingerprint, inside
+from .population import code_features
+
+
+class ExistingEvaluatorPort:
+    """Compose with Evaluator only in a separately initialized new campaign.
+
+    stage(files, id) is a trusted host callback returning (worktree, commit).
+    The existing evaluator retains all build/oracle/target-lock checks. Neither
+    this adapter nor agent output may set or replace those checks. This adapter
+    does not start workers, create commits or submit allocations on its own.
+    """
+    def __init__(self, evaluator, stage, *, scope: str, baseline_seconds: float,
+                 official_files: dict, expected_protocol_id: str):
+        from .contracts import identifier, number
+
+        self.evaluator, self.stage = evaluator, stage
+        self.scope = identifier(scope)
+        self.baseline_seconds = number(baseline_seconds, "baseline_seconds", minimum=1e-15)
+        self.official_sha = fingerprint(official_files)
+        if evaluator.protocol_id != expected_protocol_id:
+            raise EvolutionError("The protected evaluator protocol differs from the declared protocol")
+        self.protocol_id = expected_protocol_id
+        marker = evaluator.root / "evolution-new-campaign.json"
+        import json
+
+        if not marker.is_file() or marker.is_symlink():
+            raise EvolutionError("Adapter requires a separate, explicitly marked new campaign")
+        record = json.loads(marker.read_bytes())
+        if record != {"scope": scope, "official_sha256": self.official_sha,
+                      "protocol_id": expected_protocol_id}:
+            raise EvolutionError("New-campaign source/protocol marker does not match")
+
+    def __call__(self, files: dict, program_id: str):
+        code_features(files)
+        if any(not name.startswith("src/") for name in files):
+            raise EvolutionError("Only candidate source files can reach the stage callback")
+        if self.evaluator.protocol_id != self.protocol_id:
+            raise EvolutionError("Evaluator protocol changed")
+        worktree, commit = self.stage(files, program_id)
+        worktree = Path(worktree)
+        if worktree.is_symlink() or not worktree.resolve().is_relative_to(
+                (self.evaluator.root / "worktrees").resolve()):
+            raise EvolutionError("Staged candidate escapes the new campaign's owned worktrees")
+        for name, text in files.items():
+            if inside(worktree, name).read_bytes() != text.encode("utf-8"):
+                raise EvolutionError("Staged candidate bytes differ from the generated source")
+        outcome = self.evaluator.evaluate(program_id, 0, worktree, commit, self.baseline_seconds)
+        if outcome.status == "valid":
+            return Measurement("valid", True, outcome.score, outcome.mean_seconds,
+                               "seconds", tuple(outcome.times))
+        if outcome.status == "infrastructure_error":
+            return Measurement("infrastructure_error", None, None)
+        if outcome.status in {"build_failed", "incorrect", "runtime_failed"}:
+            return Measurement("build_failed" if outcome.status == "build_failed" else "incorrect",
+                               False, 0.0)
+        raise EvolutionError("Existing evaluator returned an unrecognized outcome")

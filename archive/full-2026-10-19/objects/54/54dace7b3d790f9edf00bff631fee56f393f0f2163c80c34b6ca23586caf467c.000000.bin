@@ -1,0 +1,111 @@
+"""Stop only the fully identified GPT96 relay after closed evidence reconciliation."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+WORKSPACE = BASE.parents[3]
+RESEARCH = BASE.parent
+SESSION = "5cbdd08b886a40dcb685b3b4dffa7fe5"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine")
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def save(name, data):
+    with (BASE / name).open("x", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=True, indent=2)
+        stream.write("\n")
+
+
+def census():
+    command = "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{n='CreationDate';e={$_.CreationDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Depth 4 -Compress"
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, check=True, timeout=30, creationflags=NO_WINDOW)
+    return json.loads(result.stdout)
+
+
+def same(a, b):
+    return b is not None and all(a[k] == b[k] for k in FIELDS) and (
+        datetime.fromisoformat(a["CreationDate"]) == datetime.fromisoformat(b["CreationDate"]))
+
+
+def tree(rows, root):
+    selected = {root}
+    while True:
+        expanded = selected | {p["ProcessId"] for p in rows if p["ParentProcessId"] in selected}
+        if expanded == selected:
+            break
+        selected = expanded
+    return sorted([p for p in rows if p["ProcessId"] in selected], key=lambda p: p["ProcessId"])
+
+
+def main():
+    assert not (BASE / "owned-worker-stopped.json").exists(), "Never repeat a completed stop"
+    audit_path = BASE / "audit-complet.json"
+    audit = load(audit_path)
+    terminal = load(BASE / "etat-terminal-verifie.json")
+    assert terminal["current_terminal_state_verified"] and terminal["job_id"] == "748383"
+    assert audit["coverage_and_final_confirmations_verified"] and audit["all_restored_bytes_unchanged"]
+    helper = WORKSPACE / "outputs/HPC-Forest-Harnais-Comparaison-r1/comparison_reception.py"
+    spec = importlib.util.spec_from_file_location("gpt96_stop_delivery_check", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    group = {"job_id": "748383", "session_id": SESSION, "model": "gpt-6.1-sol", "effort": "max"}
+    fresh = module.reconcile_deliveries(BASE / "restauration-02/results-748383", RESEARCH / "worker", group)
+    assert fresh == load(BASE / "livraisons-reconciliees.json") and fresh["all_published_requests_delivered"]
+    expected = load(RESEARCH / "worker-current-cim.json")
+    assert {p["ProcessId"] for p in expected} == {16204, 53492}
+    before = census()
+    owned = tree(before, 16204)
+    reviewed = load(BASE / "arbre-complet-revu.json")["reviewed_tree"]
+    assert len(owned) == len(reviewed) == 7
+    assert all(same(p, next((q for q in owned if q["ProcessId"] == p["ProcessId"]), None)) for p in reviewed)
+    assert all(same(p, next((q for q in owned if q["ProcessId"] == p["ProcessId"]), None)) for p in expected)
+    assert all(all(p.get(k) is not None for k in (*FIELDS, "CreationDate")) for p in owned)
+    assert all(SESSION in p["CommandLine"] and "hpc_forest.reference96_worker --resume" in p["CommandLine"]
+               and str((RESEARCH / "worker").resolve()) in p["CommandLine"] for p in owned if p["ProcessId"] in {16204, 53492})
+    preserved = [p for p in before if p["ProcessId"] in {22244, 1520, 43620, 57212}]
+    assert len(preserved) == 4, "Observe R1 before proceeding"
+    assert all("HPC-Forest-Etude-2020-2024-r1" in p["CommandLine"] for p in preserved)
+    second = census()
+    owned_second = tree(second, 16204)
+    assert owned == owned_second, "Owned descendants changed; inspect before retrying"
+    assert all(same(p, next((q for q in second if q["ProcessId"] == p["ProcessId"]), None)) for p in preserved)
+    save("cim-avant-arret.json", {"first": owned, "second": owned_second, "r1_preserved": preserved})
+    stopped = subprocess.run(["taskkill.exe", "/PID", "16204", "/T", "/F"],
+        capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW)
+    save("commande-arret-resultat.json", {"argv": ["taskkill.exe", "/PID", "16204", "/T", "/F"],
+        "returncode": stopped.returncode, "stdout": stopped.stdout, "stderr": stopped.stderr})
+    after = census()
+    save("cim-apres-arret.json", [p for p in after if p["ProcessId"] in {16204, 53492, 22244, 1520, 43620, 57212}
+                                  or SESSION in (p.get("CommandLine") or "")])
+    assert stopped.returncode == 0
+    assert not any(same(p, q) for p in owned for q in after)
+    assert not any(SESSION in (p.get("CommandLine") or "") and p["ProcessId"] not in {__import__('os').getpid()}
+                   for p in after), "A same-session child remains"
+    assert all(same(p, next((q for q in after if q["ProcessId"] == p["ProcessId"]), None)) for p in preserved)
+    receipt = {"schema": "hpc-forest-owned-relay-stop-v1", "job_id": "748383", "session_id": SESSION,
+        "after_audit": True, "after_deliveries": True, "audit_sha256": sha(audit_path),
+        "verified_process_tree_before_stop": owned, "two_consistent_current_cim_censuses": True,
+        "all_owned_process_identities_absent_after_stop": True, "already_exited_before_stop": False,
+        "r1_worker_and_observer_identities_unchanged": True,
+        "observed_at": datetime.now(timezone.utc).timestamp(), "only_owned_gpt96_relay_stopped": True}
+    save("owned-worker-stopped.json", receipt)
+    print(json.dumps(receipt, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

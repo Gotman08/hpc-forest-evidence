@@ -1,0 +1,132 @@
+"""Build a self-contained private benchmark handoff from verified frozen bytes."""
+from __future__ import annotations
+
+import hashlib
+import json
+import shlex
+import shutil
+from pathlib import Path
+
+from pypdf import PdfReader, PdfWriter
+
+ROOT = Path(__file__).resolve().parent
+BASE = ROOT.parents[1]
+OLD = BASE / "outputs/Protocole-Benchmark-Partage-r1/kit"
+OFFICIAL = BASE / "outputs/HPC-Forest-Etude-2020-2024-r1/sources-officielles"
+KIT = ROOT / "KIT-BENCHMARK"
+PAGES = {
+    "2020-tropical": [4], "2020-quicksort": [5], "2020-permutations": [7, 8], "2020-graph": [10, 11],
+    "2021-graph": [4, 5], "2021-metrics": [6, 7], "2021-sokoban": [8, 9], "2021-jacobi": [11, 12],
+    "2022-knn": [4, 5], "2022-sum": [6], "2022-nbody": [7], "2022-bucketsort": [8],
+    "2023-count": [9, 10], "2023-sum": [4, 5], "2023-npbonacci": [7, 8],
+}
+TITLES = {
+    "2020-tropical": "Maximum Tropical Path Problem", "2020-quicksort": "Recursive Quicksort of Positive Integers",
+    "2020-permutations": "All Permutations, Sorted", "2020-graph": "Graph Search on a DAG",
+    "2021-graph": "Graph Isomorphism Detection", "2021-metrics": "Descriptive Statistics Metrics",
+    "2021-sokoban": "Sokoban", "2021-jacobi": "Jacobi Iterative Method that Solves the Laplace Equation",
+    "2022-knn": "k-Nearest Neighbors Classifier", "2022-sum": "Submatrix of Maximum Sum",
+    "2022-nbody": "N-body", "2022-bucketsort": "Bucketsort",
+    "2023-count": "Number of ways to traverse a grid", "2023-sum": "Number of Submatrices that Sum to k",
+    "2023-npbonacci": "NPbonacci",
+}
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def main():
+    if (ROOT / "preparation-verifiee.json").exists():
+        raise RuntimeError("Preserve this prepared revision")
+    manifest = json.loads((OLD / "MANIFESTE.json").read_bytes())
+    for name, expected in manifest["files"].items():
+        if sha(OLD / name) != expected:
+            raise ValueError(f"Original shared kit changed: {name}")
+    provenance = json.loads((OLD / "provenance.json").read_bytes())
+    copied = []
+    readers = {}
+    for year in ("2020", "2021", "2022", "2023"):
+        document = OFFICIAL / year / "problemset.pdf"
+        expected = next(s["statement_sha256"] for s in provenance["subjects"] if s["subject_id"].startswith(year))
+        if sha(document) != expected:
+            raise ValueError("The official statement snapshot differs")
+        target = KIT / "sources-officielles" / year / "problemset.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(document, target)
+        readers[year] = PdfReader(document)
+    for info in provenance["subjects"]:
+        subject = info["subject_id"]
+        target = KIT / "benchmarks" / subject
+        shutil.copytree(OLD / "a-fournir-au-systeme" / subject, target, dirs_exist_ok=False)
+        # Preserve the old public contract bytes and make the new name explicit.
+        (target / "contrat-public.json").rename(target / "contrat.json")
+        archive = OFFICIAL / subject[:4] / info["official_archive_url"].rsplit("/", 1)[1]
+        if sha(archive) != info["official_archive_sha256"]:
+            raise ValueError(f"Original archive differs: {subject}")
+        shutil.copyfile(archive, target / "origine.zip")
+        writer = PdfWriter()
+        for page in PAGES[subject]:
+            writer.add_page(readers[subject[:4]].pages[page - 1])
+        writer.add_metadata({"/Title": TITLES[subject], "/Subject": f"Official statement extract, pages {PAGES[subject]}"})
+        with (target / "enonce.pdf").open("wb") as handle:
+            writer.write(handle)
+        # New handoff instructions contain only the external task, not a search strategy.
+        write(target / "MISSION.txt", "Optimiser le programme de reference fourni, selon enonce.pdf et contrat.json.\n"
+              "Conserver les formats et sorties exacts, ainsi que les contraintes algorithmiques du sujet.\n"
+              "Rendre les sources completes et les compteurs de ressources connus.\n"
+              "Contexte neuf, aucun candidat herite ; ne pas lire de cas d'evaluation reserves.\n")
+        contract = json.loads((target / "contrat.json").read_bytes())
+        regular = [f for f in contract["compiler_flags"] if not f.startswith("-l")]
+        libraries = [f for f in contract["compiler_flags"] if f.startswith("-l")]
+        compiler = "g++" if contract["language"] == "c++" else "gcc"
+        sources = " ".join('"$SOURCE/' + name + '"' for name in contract["source_files"])
+        write(target / "compiler.sh", "#!/bin/sh\nset -eu\n"
+              'HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
+              'OUT=${1:?Usage: sh compiler.sh /chemin/absolu/programme [dossier-src]}\n'
+              'SOURCE=${2:-"$HERE/src"}\n'
+              f"{compiler} {' '.join(map(shlex.quote, regular))} {sources} -o \"$OUT\" "
+              + " ".join(map(shlex.quote, libraries)) + "\n")
+        evaluator = KIT / "evaluation/cas-reserves" / subject
+        shutil.copytree(OLD / "reserve-evaluateur" / subject, evaluator)
+        for name, expected in info["prepared_reference_source_sha256"].items():
+            if sha(target / "src" / name) != expected:
+                raise ValueError("Prepared reference differs")
+        copied.append({**info, "title": TITLES[subject], "statement_pages_1based": PAGES[subject],
+                       "statement_extract_sha256": sha(target / "enonce.pdf"),
+                       "reference_directory": f"benchmarks/{subject}/src",
+                       "original_archive": f"benchmarks/{subject}/origine.zip"})
+    shutil.copytree(OLD / "gabarits", KIT / "gabarits")
+    shutil.copyfile(OLD / "parametres.json", KIT / "parametres.json")
+    write(KIT / "PROVENANCE.json", json.dumps({"version": "2.0", "subjects": copied,
+          "protected_cases_from_previous_frozen_kit": 105,
+          "source_kit_manifest_sha256": sha(OLD / "MANIFESTE.json"),
+          "reference_inputs_and_expected_outputs_unchanged": True,
+          "original_statements_complete_under": "sources-officielles/"}, ensure_ascii=False, indent=2) + "\n")
+    write(KIT / "LIRE-MOI.txt", "KIT BENCHMARK - 15 SUJETS\n\n"
+          "1. Lire main.pdf (source modifiable : main.tex).\n"
+          "2. Controler les fichiers : python outils/verifier_kit.py\n"
+          "3. Donner a Claude uniquement un dossier benchmarks/<sujet>, dans un environnement separe.\n"
+          "   Pour un transfert pratique : pour-claude/<sujet>.zip.\n"
+          "4. Garder evaluation/, gabarits/ et le ZIP complet chez l'evaluateur humain.\n"
+          "5. Compiler puis evaluer selon les commandes de main.pdf.\n\n"
+          "References preparees, enonces, archives originales et 105 cas figes inclus hors ligne.\n"
+          "Ne pas placer ce kit complet dans le contexte lisible de Claude ni dans un depot public.\n")
+    for year in ("2020", "2021", "2022", "2023"):
+        if sha(OFFICIAL / year / "problemset.pdf") != sha(KIT / "sources-officielles" / year / "problemset.pdf"):
+            raise ValueError("Official source altered during copying")
+    write(ROOT / "preparation-verifiee.json", json.dumps({"subjects": len(copied), "protected_cases": 105,
+          "previous_kit_files_verified": len(manifest["files"]), "official_archives": 15,
+          "full_official_statements": 4, "isolated_statement_extracts": 15,
+          "source_and_case_bytes_unchanged": True, "model_calls": 0,
+          "candidate_executions": 0, "candidate_compilations": 0}, indent=2) + "\n")
+    print(json.dumps({"subjects": len(copied), "cases": 105, "official_archives": 15, "statements": 4}))
+
+
+if __name__ == "__main__":
+    main()

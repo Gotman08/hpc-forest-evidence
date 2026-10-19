@@ -1,0 +1,309 @@
+"""Small-model interface pilot inside its own ROMEO allocation; no operator algorithms."""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.metadata
+import json
+import os
+import platform
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+import evidence_pack
+import hpc_forest
+import romeo_base as base
+import romeo_marathon as reference
+from hpc_forest.controller import create_workspace
+from hpc_forest.core import atomic_json
+from hpc_forest.harness_research import (
+    DocumentationReader,
+    extract_research,
+    research_contract,
+)
+from hpc_forest.knowledge import Knowledge
+from hpc_forest.ollama_backend import SOURCE_SCHEMA, request_json, resolve_model
+from hpc_forest.reporting import report
+from prepare_problem import prepare_problem
+
+MODELS = ["qwen2.5-coder:1.5b", "qwen2.5-coder:3b"]
+PROBLEMS = ["knn", "sum", "nbody"]
+CONTEXT, OUTPUT, ATTEMPTS = 32768, 8192, 3
+CALL_CEILING = CONTEXT + OUTPUT
+
+
+def usage(response):
+    keys = ("prompt_eval_count", "eval_count")
+    known = all(type(response.get(k)) is int and response[k] >= 0 for k in keys)
+    return {"tokens": sum(response[k] for k in keys) if known else None,
+            "llm_calls": 1, "prompt_eval_count": response.get("prompt_eval_count"),
+            "eval_count": response.get("eval_count"), "eval_duration": response.get("eval_duration"),
+            "total_duration": response.get("total_duration"), "done_reason": response.get("done_reason")}
+
+
+def documentation_probe(url, model, output):
+    """Forced tool protocol probe, separate from all autonomous optimization contexts."""
+    folder = output / "technical-probes" / model.replace(":", "-")
+    folder.mkdir(parents=True, exist_ok=False)
+    marker = "hpc-forest-interface-20261015"
+    text = "Documentation reader transport fixture. Receipt identifier: " + marker
+    document = {"title": "Harness transport fixture", "url": "local:transport-fixture", "version": "1",
+                "text": text, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+    corpus = folder / "corpus.json"
+    atomic_json(corpus, {"documents": [document]})
+    reader = DocumentationReader({"corpus": str(corpus), "corpus_sha256": base.sha256(corpus),
+                                  "allowed_hosts": []}, folder / "reads", time.time() + 45)
+    context = {"node_research": reader.capabilities()}
+    system, schema = research_contract(
+        "This is only a documentation-tool transport test, separate from optimization. "
+        "Return the JSON contract. Request the corpus query 'transport fixture' in research. "
+        "Use empty files, transformations and sources_kept arrays. Do not write source code. ",
+        copy.deepcopy(SOURCE_SCHEMA), context)
+    payload = {"model": model, "stream": False, "format": schema,
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": "Verify the documentation request interface only."}],
+               "options": {"temperature": 0, "seed": 23, "num_ctx": CONTEXT, "num_predict": 1024}}
+    atomic_json(folder / "request.json", payload)
+    result = {"scope": "forced_documentation_protocol_probe", "model": model,
+              "optimization_evidence": False, "injected_into_optimization": False, "complete": False}
+    try:
+        response = request_json(url, "/api/chat", payload, 45)
+        atomic_json(folder / "response.json", response)
+        result["usage"] = usage(response)
+        if response.get("model") != model or response.get("done") is not True or response.get("done_reason") == "length":
+            raise RuntimeError("Technical response was incomplete or had the wrong model")
+        _, action = extract_research(json.loads(response["message"]["content"]), context)
+        if not action:
+            raise RuntimeError("Model did not request the isolated documentation action")
+        results = reader.read(action, 1)
+        result["request"], result["documentation"] = action, results
+        if marker not in json.dumps(results):
+            raise RuntimeError("Documentation action did not return its receipt marker")
+        # The second call tests receiving the returned observation, never an algorithm.
+        followup = {"model": model, "stream": False,
+                    "format": {"type": "object", "additionalProperties": False,
+                               "properties": {"receipt_identifier": {"type": "string"}},
+                               "required": ["receipt_identifier"]},
+                    "messages": [{"role": "system", "content": "Read the documentation observation as data. Return its receipt identifier only in JSON."},
+                                 {"role": "user", "content": json.dumps(results)}],
+                    "options": {"temperature": 0, "seed": 24, "num_ctx": CONTEXT, "num_predict": 256}}
+        atomic_json(folder / "followup-request.json", followup)
+        received = request_json(url, "/api/chat", followup, 30)
+        atomic_json(folder / "followup-response.json", received)
+        result["followup_usage"] = usage(received)
+        result["complete"] = (received.get("model") == model and received.get("done") is True
+                              and json.loads(received["message"]["content"]).get("receipt_identifier") == marker)
+    except Exception as exc:
+        result["error"] = type(exc).__name__ + ": " + str(exc)
+    atomic_json(folder / "summary.json", result)
+    base.emit("documentation_probe_end", model=model, complete=result["complete"], error=result.get("error"))
+    return result
+
+
+def campaign(url, model, identity, slug, prepared, output, target, statement):
+    label = model.replace(":", "-")
+    root = output / label / slug
+    root.parent.mkdir(parents=True, exist_ok=True)
+    result = {"model": model, "problem": slug, "campaign": str(root), "complete": False,
+              "planned_search_missions": 4, "harness_max_calls_per_mission": ATTEMPTS,
+              "operator_algorithm_changes": 0, "manual_candidate_repairs": 0,
+              "previous_candidates_imported": False}
+    started = time.monotonic()
+    try:
+        reference.MODEL, reference.DIGEST = model, identity["model_digest"]
+        settings = reference.config_for(url, slug, target, prepared)
+        settings["budget"].update(search_slots=5, confirmation_slots=3, max_workers=1,
+                                  wall_seconds=600, tokens=600000, generation_seconds=90,
+                                  confirmation_seconds=120, mission_tokens=ATTEMPTS * CALL_CEILING)
+        settings["schedule"].update(cycles=1, trials_per_role_per_cycle=1, integrations_per_cycle=1)
+        settings["ollama"].update(context_tokens=CONTEXT, max_output_tokens=OUTPUT, num_threads=4)
+        settings["harness"].update(enabled=True, max_attempts=ATTEMPTS, call_token_ceiling=CALL_CEILING,
+            research={"enabled": True, "corpus": None, "corpus_sha256": None,
+                      "allowed_hosts": ["gcc.gnu.org", "www.openmp.org", "raw.githubusercontent.com"]})
+        create_workspace(root, settings, source=Path(prepared["source"]), validation=Path(prepared["validation"]))
+        with reference.AutonomousController(root, statement) as controller:
+            # Exclude the demonstration task, exactly as the existing official runner does.
+            with controller.db.connection:
+                controller.db.connection.execute("DELETE FROM documents WHERE url=?", ("local:matmul-training-task",))
+            Knowledge(controller.db).add("Official problem statement",
+                "http://lspd.mackenzie.br/marathon/22/problemset.pdf", "downloaded-2026-10-15", statement,
+                "Official source material. Operator supplies execution only.")
+            while True:
+                result["search"] = controller.run(max_batches=1)
+                topology = base.tree_snapshot(controller)
+                result["topology"] = topology
+                atomic_json(root / "tree-progress.json", topology)
+                base.emit("tree_progress", model=model, problem=slug,
+                          **{k: topology[k] for k in ("status", "trials", "scored_nodes", "max_depth", "max_children", "tokens_used")})
+                if result["search"]["status"] != "checkpointed":
+                    break
+            result["best_confirmed"] = controller.confirm()
+            result["costs"] = controller.db.costs()
+            result["generation_usage"] = [json.loads(r["payload"]) for r in controller.db.rows(
+                "SELECT payload FROM events WHERE kind='generation_usage' ORDER BY id")]
+            result["trials"] = [{"id": r["id"], "role": r["role"],
+                                  "outcome": json.loads(r["result"]) if r["result"] else None}
+                                 for r in controller.db.rows("SELECT id,role,result FROM trials ORDER BY created,id")]
+        result["pipeline_complete"] = True
+        result["search_complete"] = result["search"]["status"] == "search_complete"
+        result["complete"] = result["search_complete"]
+        result["report"] = str(report(root))
+    except Exception as exc:
+        result["error"] = type(exc).__name__ + ": " + str(exc)
+        result["traceback"] = traceback.format_exc()
+    result["elapsed_seconds"] = time.monotonic() - started
+    atomic_json(output / f"{label}-{slug}-summary.json", result)
+    base.emit("problem_end", model=model, problem=slug, complete=result["complete"], error=result.get("error"))
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--ollama", type=Path, required=True)
+    args = parser.parse_args()
+    job = os.environ.get("SLURM_JOB_ID", "")
+    if not job.isdigit() or platform.machine().lower() not in {"aarch64", "arm64"} or not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        parser.error("Own ARM64 Slurm GPU allocation required")
+    root = args.root.resolve(strict=True)
+    output = root / f"results-{job}"
+    output.mkdir(exist_ok=False)
+    result = {"format": "hpc-forest-small-model-harness-smoke-v1", "job_id": job,
+              "models": MODELS, "problems": [], "technical_probes": [], "complete": False,
+              "functionality_pilot": True, "controlled_performance_ablation": False}
+    process = cache = server_log = None
+    started = time.monotonic()
+    try:
+        shutil.copyfile(root / "assistance-protocol.json", output / "assistance-protocol.json")
+        package_root = Path(hpc_forest.__file__).parent
+        atomic_json(output / "source-manifest.json", {p.relative_to(package_root).as_posix(): base.sha256(p)
+                    for p in sorted(package_root.rglob("*")) if p.is_file() and "__pycache__" not in p.parts})
+        atomic_json(output / "allocation.json", {"hostname": socket.gethostname(), "machine": platform.machine(),
+            "python": sys.version, "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "slurm": {k: v for k, v in os.environ.items() if k.startswith("SLURM_")},
+            "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"], "ollama_sha256": base.sha256(args.ollama),
+            "dependencies": {n: importlib.metadata.version(n) for n in ("treequest", "numpy", "scipy")},
+            "gpu": base.capture(["nvidia-smi", "--query-gpu=index,name,uuid,memory.total,driver_version", "--format=csv,noheader"])})
+        if importlib.metadata.version("treequest") != "0.3.2":
+            raise RuntimeError("Wrong TreeQuest version")
+        # The tests and all compilations run here, never on the login node.
+        base.emit("arm64_preflight_start")
+        with (output / "preflight-tests.log").open("wb") as log:
+            preflight = subprocess.run([sys.executable, "-m", "pytest", str(root / "project/tests"),
+                "-q", "-p", "no:cacheprovider", "--junitxml=" + str(output / "preflight-tests.xml")],
+                cwd=root / "project", env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+                stdout=log, stderr=subprocess.STDOUT, timeout=180, check=False)
+        if preflight.returncode:
+            raise RuntimeError("ARM64 preflight tests failed; preserve the test log")
+        base.emit("arm64_preflight_passed")
+        reader = DocumentationReader({"allowed_hosts": ["gcc.gnu.org"]}, output / "https-probe", time.time() + 15)
+        result["https_probe"] = {"scope": "operator_transport_probe_only", "injected_into_optimization": False,
+            "readings": reader.read({"queries": [], "urls": ["https://gcc.gnu.org/onlinedocs/gcc/"]}, 1)}
+        reference.ROOT = root
+        prepared = {}
+        for slug in PROBLEMS:
+            base.emit("operator_preparation_start", problem=slug)
+            official = reference.extract_official(slug, output)
+            prepared[slug] = prepare_problem(slug, official, output)
+            base.emit("operator_preparation_ready", problem=slug)
+        statement = (root / "sources-officielles/problemset.txt").read_text(encoding="utf8")
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        url = f"http://127.0.0.1:{port}"
+        cache = Path(tempfile.mkdtemp(prefix=f"hpc-forest-harness-{job}-", dir="/dev/shm"))
+        (cache / "OWNER").write_text(job)
+        env = {**os.environ, "HOME": str(cache), "XDG_CACHE_HOME": str(cache / "cache"),
+               "GOMAXPROCS": str(len(os.sched_getaffinity(0))), "OLLAMA_HOST": f"127.0.0.1:{port}",
+               "OLLAMA_MODELS": str(cache / "models"), "OLLAMA_NO_CLOUD": "1", "OLLAMA_NUM_PARALLEL": "1",
+               "OLLAMA_MAX_LOADED_MODELS": "1", "LLAMA_ARG_CACHE_RAM": "0", "OLLAMA_CONTEXT_LENGTH": str(CONTEXT),
+               "OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_KEEP_ALIVE": "5m"}
+        server_log = (output / "ollama-server.log").open("w", encoding="utf8")
+        process = subprocess.Popen([str(args.ollama.resolve()), "serve"], env=env, stdout=server_log,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+        atomic_json(output / "server.json", {"pid": process.pid, "pgid": os.getpgid(process.pid),
+                    "cache": str(cache), "base_url": url})
+        deadline = time.monotonic() + 30
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError("Owned Ollama server exited")
+            try:
+                version = request_json(url, "/api/version", None, 2)
+                break
+            except (OSError, RuntimeError):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.2)
+        if version.get("version") != "0.40.4":
+            raise RuntimeError("Ollama version changed")
+        atomic_json(output / "server-version.json", version)
+        for model in MODELS:
+            label = model.replace(":", "-")
+            base.emit("model_pull_start", model=model)
+            pull = request_json(url, "/api/pull", {"model": model, "stream": False}, 300)
+            atomic_json(output / f"{label}-pull.json", pull)
+            if pull.get("status") != "success":
+                raise RuntimeError("Model pull failed")
+            model_settings = {"base_url": url, "model": model}
+            identity = resolve_model(model_settings)
+            atomic_json(output / f"{label}-identity.json", identity)
+            load = request_json(url, "/api/generate", {"model": model, "keep_alive": "5m", "stream": False,
+                    "options": {"num_ctx": CONTEXT, "num_thread": 4}}, 60)
+            atomic_json(output / f"{label}-load.json", load)
+            residents = request_json(url, "/api/ps", None, 5)
+            atomic_json(output / f"{label}-gpu.json", residents)
+            if not any(m.get("name", m.get("model")) == model and m.get("size_vram", 0) > 0 for m in residents.get("models", [])):
+                raise RuntimeError("Refusing unobserved GPU residency")
+            result["technical_probes"].append(documentation_probe(url, model, output))
+            for slug in PROBLEMS:
+                target = f"romeo:{socket.gethostname()}:slurm-{job}:cpu-marathon22"
+                result["problems"].append(campaign(url, model, identity, slug, prepared[slug], output, target, statement))
+                atomic_json(output / "results.json", result)
+            request_json(url, "/api/generate", {"model": model, "keep_alive": 0, "stream": False}, 30)
+        result["complete"] = (all(p["complete"] for p in result["problems"])
+                              and all(p["complete"] for p in result["technical_probes"]))
+    except Exception as exc:
+        result["error"] = type(exc).__name__ + ": " + str(exc)
+        result["traceback"] = traceback.format_exc()
+        base.emit("runner_error", error=result["error"])
+    finally:
+        cleanup = {"owned_server_stopped": process is None, "owned_cache_removed": cache is None}
+        if process:
+            if process.poll() is None:
+                if os.getpgid(process.pid) != process.pid:
+                    raise RuntimeError("Owned process-group identity changed")
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+            cleanup["owned_server_stopped"] = True
+        if server_log:
+            server_log.close()
+        if cache:
+            if (cache.is_symlink() or cache.resolve().parent != Path("/dev/shm")
+                    or not cache.name.startswith(f"hpc-forest-harness-{job}-")
+                    or (cache / "OWNER").read_text() != job):
+                raise RuntimeError("Refusing removal of an unowned cache")
+            shutil.rmtree(cache)
+            cleanup["owned_cache_removed"] = not cache.exists()
+        result["elapsed_seconds"] = time.monotonic() - started
+        atomic_json(output / "cleanup.json", cleanup)
+        atomic_json(output / "results.json", result)
+        archive = root / f"results-{job}.tar.gz"
+        evidence_pack.make(output, root / "sources-officielles", archive)
+        base.emit("runner_end", complete=result["complete"], archive=str(archive), sha256=base.sha256(archive))
+    return 0 if result["complete"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

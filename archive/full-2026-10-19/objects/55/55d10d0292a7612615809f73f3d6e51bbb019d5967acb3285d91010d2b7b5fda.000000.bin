@@ -1,0 +1,323 @@
+"""Inert fixtures only: no census, process, RPC, C, model or production admission."""
+import copy
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("mixed_observer_under_test", HERE / "observer-mixte.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+def row(pid, parent, command, date="2026-10-17T00:00:00.1234567Z"):
+    return {"ProcessId": pid, "ParentProcessId": parent, "ExecutablePath": "C:/neutral/python.exe",
+            "CommandLine": command, "CreationDate": date}
+
+
+def command(session, module="hpc_forest.matrix_worker"):
+    return subprocess.list2cmdline(["C:/neutral/python.exe", "-I", "-B", "-u", "-m", module,
+                                  "--session-id", session])
+
+
+def pair(session, pid=20):
+    cmd = command(session)
+    return [row(pid, 1, cmd), row(pid + 1, pid, cmd)]
+
+
+class ObserverTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="test-neutral-", dir=HERE))
+        self.rows = pair(m.SO_SESSION, 10)
+
+    def artifact(self, name, value):
+        p = self.temp / name
+        p.write_text(json.dumps(value), encoding="utf-8")
+        return m.reference(p)
+
+    def route(self, phase="roots", stage="allocated_pending", job="999901"):
+        value = {"phase": phase, "stage": stage, "job_id": None if stage == "absent" else job,
+                 "model": m.MODEL, "effort": "max", "session_id": m.SESSIONS[phase]}
+        if stage != "absent":
+            bind = m.cell(value)
+            value["submission_observed"] = self.artifact(phase + "-submission.json",
+                {"ok": True, "submission_observed": True, "job_id": job, "neutral_fixture_only": True})
+            value["allocation_marker"] = self.artifact(phase + "-marker.json",
+                {**bind, "schema": "hpc-forest-dynamic-r4b-allocation-marker-v1", "verified": True,
+                 "native_model_calls": 0, "source_files": 103, "neutral_fixture_only": True})
+        return value
+
+    def bundle(self, routes):
+        return {"schema": "hpc-forest-r4b-passive-routes-v1", "scope_id": m.SCOPE,
+                "source_zip_sha256": m.SOURCE, "plan_sha256": m.PLAN, "routes": routes}
+
+    def verify(self, routes, rows=None, history=None):
+        return m.verify_routes(self.bundle(routes), {}, self.rows if rows is None else rows,
+                               {} if history is None else history, worker_check=lambda *args: None)
+
+    def test_quoted_and_bare_modules_parse_identically(self):
+        a = ['C:/neutral/python.exe', '-I', '-B', '-u', '-m', 'hpc_forest.matrix_worker', '--session-id', m.SESSIONS['roots']]
+        quoted = ' '.join('"' + x + '"' for x in a)
+        self.assertEqual(m.windows_argv(quoted), a)
+        self.assertEqual(m.windows_argv(subprocess.list2cmdline(a)), a)
+        self.assertEqual(m.flag(m.windows_argv(quoted), '--session-id'), a[-1])
+
+    def test_malformed_windows_commands_refused(self):
+        for value in ['', ' leading', 'x\x00y', 'x\ny', 'x\ry']:
+            with self.subTest(value=repr(value)), self.assertRaises(ValueError):
+                m.windows_argv(value)
+
+    def test_exact_flags_refuse_duplicate_alias_missing(self):
+        for args in [[], ['--x'], ['--x', 'a', '--x', 'b'], ['--x=a'], ['--x', '--other']]:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                m.flag(args, '--x')
+
+    def test_python_prefix_refuses_code_and_duplicate(self):
+        for args in [['python', '-c', 'bad', '-m', 'hpc_forest.matrix_worker'],
+                     ['python', '-I', '-I', '-m', 'hpc_forest.matrix_worker']]:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                m.worker_entry(args)
+
+    def test_date_preserves_seventh_digit_and_normalizes_offset(self):
+        self.assertEqual(m.utc_creation('2026-10-17T02:00:00.1234567+02:00'), '2026-10-17T00:00:00.1234567Z')
+        a = row(1, 0, 'a')
+        b = dict(a, CreationDate='2026-10-17T02:00:00.1234567+02:00')
+        self.assertTrue(m.same_identity(a, b))
+        self.assertFalse(m.same_identity(a, dict(a, CreationDate='2026-10-17T00:00:00.1234568Z')))
+
+    def test_date_incomplete_future_nonUTC_census_refused(self):
+        for value in ['2026-10-17T00:00:00', '2026-10-17T00:00:00.12345678Z', 'bad']:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                m.utc_creation(value)
+        for value in ['2999-01-01T00:00:00Z', '2026-10-17T02:00:00+02:00']:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                m.parse_census(json.dumps([row(1, 0, 'a', value)]).encode())
+
+    def test_census_UTF8_complete_unique_required(self):
+        self.assertEqual(m.parse_census(json.dumps(self.rows).encode()), self.rows)
+        for raw in [b'\xff', b'{}', b'[]', json.dumps([self.rows[0], self.rows[0]]).encode(),
+                    json.dumps([{k: v for k, v in self.rows[0].items() if k != 'CreationDate'}]).encode()]:
+            with self.subTest(raw=raw), self.assertRaises((ValueError, UnicodeDecodeError)):
+                m.parse_census(raw)
+
+    def test_each_full_identity_field_is_guarded(self):
+        for key, value in [('ProcessId', 999), ('ParentProcessId', 999), ('ExecutablePath', 'C:/other/python.exe'),
+                           ('CommandLine', 'other'), ('CreationDate', '2026-10-17T00:00:00.1234568Z')]:
+            altered = copy.deepcopy(self.rows)
+            altered[0][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                m.verify_pair(self.rows, altered)
+
+    def test_pair_parent_command_size_guarded(self):
+        for value in [self.rows[:1], self.rows + self.rows[:1],
+                      [self.rows[0], dict(self.rows[1], ParentProcessId=999)],
+                      [self.rows[0], dict(self.rows[1], CommandLine='other')]]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                m.verify_pair(value, value)
+
+    def test_bootstrap_counted_case_insensitive_and_unknown_module_counted(self):
+        session = m.SESSIONS['roots']
+        text = '"C:/neutral/python.exe" "-I" "-B" "-u" "C:/neutral/BOOTSTRAP_WORKER.PY" "--session-id" "' + session + '"'
+        rows = [row(20, 1, text), row(21, 20, text)]
+        self.assertEqual(set(m.native_sessions(rows)), {session})
+        self.assertIn(session, m.native_sessions(pair(session, 30)))
+        self.assertIn(session, m.native_sessions(pair(session, 40)[:-1]))
+
+    def test_shell_mention_is_not_adopted_as_native_worker(self):
+        shell = row(90, 1, command(m.SESSIONS['roots']))
+        shell['ExecutablePath'] = 'C:/Windows/powershell.exe'
+        self.assertEqual(m.native_sessions([shell]), {})
+
+    def test_unknown_session_never_escapes(self):
+        with self.assertRaises(ValueError):
+            self.verify([], self.rows + pair('f' * 32))
+
+    def test_more_than_four_workers_refused(self):
+        rows = self.rows[:]
+        for i, session in enumerate(m.SESSIONS.values()):
+            rows += pair(session, 20 + i * 2)
+        with self.assertRaises(ValueError):
+            m.native_sessions(rows)
+
+    def test_duplicate_session_more_than_pair_refused(self):
+        with self.assertRaises(ValueError):
+            m.native_sessions(self.rows + pair(m.SO_SESSION, 30))
+
+    def test_absent_and_pending_are_distinct(self):
+        absent = self.route(stage='absent')
+        history, jobs, _ = self.verify([absent])
+        self.assertEqual(jobs, {m.SO_JOB})
+        pending = self.route()
+        history, jobs, _ = self.verify([pending], history=history)
+        self.assertEqual(jobs, {m.SO_JOB, '999901'})
+        self.assertEqual(history[m.SESSIONS['roots']]['stage'], 'allocated_pending')
+
+    def test_worker_requires_full_route_publication(self):
+        with self.assertRaises(ValueError):
+            self.verify([self.route()], self.rows + pair(m.SESSIONS['roots']))
+
+    def test_cap_four_allows_three_pending_not_four(self):
+        self.verify([self.route(phase, job=str(999901 + i)) for i, phase in enumerate(['roots', 'advice', 'harvest'])])
+        with self.assertRaises(ValueError):
+            self.verify([self.route(phase, job=str(999901 + i)) for i, phase in enumerate(m.SESSIONS)])
+
+    def test_model_effort_phase_session_and_source_mutations_refused(self):
+        for key, bad in [('model', 'gpt-6-astra'), ('effort', 'low'), ('phase', 'unknown'), ('session_id', 'f' * 32)]:
+            value = self.route()
+            value[key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.verify([value])
+        for key in ['source_zip_sha256', 'plan_sha256', 'scope_id', 'schema']:
+            bundle = self.bundle([])
+            bundle[key] = 'bad'
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                m.verify_routes(bundle, {}, self.rows, {})
+
+    def test_route_duplicate_job_or_session_refused(self):
+        for routes in [[self.route(), self.route()], [self.route(), self.route('advice')]]:
+            with self.subTest(routes=routes), self.assertRaises(ValueError):
+                self.verify(routes)
+
+    def test_history_rollback_remove_job_and_proof_replacement_refused(self):
+        pending = self.route()
+        history, _, _ = self.verify([pending])
+        for routes in [[], [self.route(stage='absent')], [dict(pending, job_id='999902')],
+                       [dict(pending, submission_observed=self.artifact('other.json', {'ok': True}))]]:
+            with self.subTest(routes=routes), self.assertRaises(ValueError):
+                self.verify(routes, history=history)
+
+    def test_known_terminal_not_repolled_and_cannot_reopen(self):
+        pending = self.route()
+        terminal = dict(pending, stage='terminal_received')
+        terminal['terminal_reception'] = self.artifact('terminal.json', {**m.cell(terminal),
+            'schema': 'hpc-forest-dynamic-r4b-reconciled-phase-receipt-v1',
+            'verified': True, 'all_started_calls_reconciled': True, 'unknown_invocations': 0,
+            'evidence_refs': [pending['submission_observed']], 'neutral_fixture_only': True})
+        history, jobs, _ = self.verify([terminal])
+        self.assertEqual(jobs, {m.SO_JOB})
+        with self.assertRaises(ValueError):
+            self.verify([pending], history=history)
+
+    def test_RPC_allowlist_only_two_names(self):
+        jobs = {m.SO_JOB, '999901'}
+        for name in ['job_status', 'job_efficiency']:
+            m.check_rpc(name, {'job_id': '999901'}, jobs)
+        for name, args in [('job_submit', {'job_id': m.SO_JOB}), ('download_from_romeo', {'job_id': m.SO_JOB}),
+                           ('job_cancel', {'job_id': m.SO_JOB}), ('job_status', {'job_id': 'unknown'}),
+                           ('job_status', {'job_id': m.SO_JOB, 'extra': True})]:
+            with self.subTest(name=name, args=args), self.assertRaises(ValueError):
+                m.check_rpc(name, args, jobs)
+
+    def test_bootstrap_exact_command_positive_and_mutations(self):
+        route = self.route()
+        expected = m.cell(route)
+        for name in ['bootstrap_worker.py', 'authorization.json', 'config.toml', 'owner.json']:
+            (self.temp / name).write_text('NEUTRAL ONLY', encoding='utf-8')
+        auth = self.temp / 'authorization.json'
+        route.update(codex_config=m.reference(self.temp / 'config.toml'), owner=m.reference(self.temp / 'owner.json'))
+        policy = {'bootstrap_scripts': [m.reference(self.temp / 'bootstrap_worker.py')]}
+        cache = self.temp / 'cache'
+        argv = ['C:/neutral/python.exe', '-I', '-B', '-u', str(self.temp / 'bootstrap_worker.py'),
+            '--phase', 'roots', '--job-id', '999901', '--session-id', expected['session_id'],
+            '--channel', expected['remote_root'] + '/results-999901/mailbox', '--output', str(cache),
+            '--authorization', str(auth), '--authorization-sha256', m.digest(auth),
+            '--codex-config', route['codex_config']['path'], '--codex-config-sha256', route['codex_config']['sha256'],
+            '--owner', route['owner']['path'], '--owner-sha256', route['owner']['sha256'], '--execute']
+        cli = (self.temp / 'codex.exe').resolve()
+        m.verify_command(argv, expected, auth.resolve(), cache.resolve(), cli, policy, route)
+        quoted = ' '.join('"' + x + '"' for x in argv)
+        m.verify_command(m.windows_argv(quoted), expected, auth.resolve(), cache.resolve(), cli, policy, route)
+        bad_values = {'--phase': 'advice', '--job-id': '999902', '--session-id': 'f' * 32,
+                      '--authorization-sha256': 'a' * 64, '--owner-sha256': 'a' * 64,
+                      '--codex-config-sha256': 'a' * 64, '--channel': '/other', '--output': str(self.temp / 'other')}
+        for name, bad in bad_values.items():
+            altered = argv[:]
+            altered[altered.index(name) + 1] = bad
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.verify_command(altered, expected, auth.resolve(), cache.resolve(), cli, policy, route)
+        for extra in [['--resume'], ['--transport-smoke'], ['--execute'], ['--phase', 'roots'], ['--phase=roots']]:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                m.verify_command(argv + extra, expected, auth.resolve(), cache.resolve(), cli, policy, route)
+        altered = argv[:]
+        altered[4] = str(self.temp / 'other' / 'bootstrap_worker.py')
+        with self.assertRaises(ValueError):
+            m.verify_command(altered, expected, auth.resolve(), cache.resolve(), cli, policy, route)
+        with self.assertRaises(ValueError):
+            m.verify_command(['python', '-m', 'hpc_forest.matrix_worker'], expected, auth.resolve(), cache.resolve(), cli, policy, route)
+
+    def test_zero_or_false_policy_cannot_start(self):
+        for value in [{}, {'verified': False}, {'verified': True}]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                m.verify_policy(value)
+
+    def test_sealed_validator_isolated_from_historical_SO_package(self):
+        historical = types.ModuleType('hpc_forest')
+        with patch.dict(sys.modules, {'hpc_forest': historical}):
+            module = m.sealed_validator()
+            self.assertIs(sys.modules['hpc_forest'], historical)
+            self.assertTrue(module.__name__.startswith('passive_r4b_observer_validator.'))
+            self.assertEqual(m.digest(module.__file__), m.ADMISSION_SHA)
+
+    def test_transition_allows_SO_only_overlap_but_never_dynamic_start(self):
+        old = pair('e' * 32, 70)
+        policy = {'previous_reader_identities': old}
+        bundle = self.bundle([self.route(stage='absent')])
+        self.assertFalse(m.transition_state(policy, bundle, self.rows + old, self.temp / 'not-written.json'))
+        with self.assertRaises(ValueError):
+            m.transition_state(policy, self.bundle([self.route()]), self.rows + old, self.temp / 'not-written.json')
+        with self.assertRaises(ValueError):
+            m.transition_state(policy, bundle, self.rows, self.temp / 'not-written.json')
+
+    def test_transition_requires_actual_bound_receipt_and_absence(self):
+        old = pair('e' * 32, 70)
+        proof = self.artifact('old-reader-absence.json', {'verified': True, 'source_only_preserved': True,
+            'model_workers_stopped': False, 'neutral_fixture_only': True})
+        wrapper = {'schema': 'hpc-forest-r4b-passive-observer-transition-v1', 'verified': True,
+            'model_workers_untouched': True, 'previous_reader_absence': proof, 'previous_reader_identities': old}
+        ref = self.artifact('transition.json', wrapper)
+        self.assertTrue(m.transition_state({'previous_reader_identities': old}, self.bundle([]), self.rows, ref['path']))
+        with self.assertRaises(ValueError):
+            m.transition_state({'previous_reader_identities': old}, self.bundle([]), self.rows + old, ref['path'])
+        with self.assertRaises(ValueError):
+            m.transition_state({'previous_reader_identities': pair('f' * 32, 80)}, self.bundle([]), self.rows, ref['path'])
+
+
+    def test_unrelated_system_null_rows_before_after_pair_are_ignored(self):
+        system = [{"ProcessId": pid, "ParentProcessId": 0, "ExecutablePath": None,
+                   "CommandLine": None, "CreationDate": "2026-10-17T00:00:00Z"} for pid in [0, 4, 8]]
+        m.verify_pair(self.rows, system + self.rows + system)
+        for expected in self.rows:
+            for actual in system:
+                self.assertFalse(m.same_identity(expected, actual))
+
+    def test_matched_PID_null_identity_never_passes(self):
+        expected = self.rows[0]
+        for field in ["ExecutablePath", "CommandLine", "CreationDate"]:
+            actual = dict(expected)
+            actual[field] = None
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                m.same_identity(expected, actual)
+        actual = dict(expected, ExecutablePath=None, CommandLine=None)
+        with self.assertRaises(ValueError):
+            m.verify_pair(self.rows, [actual, self.rows[1]])
+
+    def test_same_PID_reuse_and_seventh_digit_never_match(self):
+        expected = self.rows[0]
+        for field, value in [("ParentProcessId", 999), ("CommandLine", "reused PID"),
+                             ("CreationDate", "2026-10-17T00:00:00.1234568Z")]:
+            actual = dict(expected)
+            actual[field] = value
+            with self.subTest(field=field):
+                self.assertFalse(m.same_identity(expected, actual))
+                with self.assertRaises(ValueError):
+                    m.verify_pair(self.rows, [actual, self.rows[1]])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

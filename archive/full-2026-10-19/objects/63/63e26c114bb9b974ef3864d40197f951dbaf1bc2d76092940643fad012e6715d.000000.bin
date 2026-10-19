@@ -1,0 +1,61 @@
+"""One isolated native source-envelope probe, without a competition problem."""
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from pathlib import Path
+
+from hpc_forest.codex_mailbox import EFFORT, MODEL, PROTOCOL, TOKEN_CEILING, json_bytes, sha256
+from hpc_forest.codex_process import run_codex
+from hpc_forest.core import atomic_json
+from hpc_forest.ollama_backend import SOURCE_SCHEMA, validate_files
+from hpc_forest.reference96_worker import verify_gate
+
+
+def main():
+    root = Path(__file__).resolve().parent
+    receipt = root / "deepseek-reception-validee.json"
+    gate = json.loads(receipt.read_text(encoding="utf8"))
+    verify_gate(receipt, gate["session_id"])
+    output = root / "validation-interface"
+    output.mkdir(exist_ok=False)
+    marker = "reference96-transport-" + uuid.uuid4().hex
+    request = {"protocol": PROTOCOL, "kind": "source-proposal", "nonce": uuid.uuid4().hex,
+               "session_id": gate["session_id"], "model": MODEL, "reasoning_effort": EFFORT,
+               "expires_at": time.time() + 180, "token_ceiling": TOKEN_CEILING,
+               "messages": [{"role": "system", "content":
+                             "This is only a source-envelope transport test. Do not solve any "
+                             "programming or competition problem. Return exactly one file "
+                             "src/transport.c with a single C comment containing the supplied "
+                             "receipt marker, no executable statements, empty transformations "
+                             "and sources_kept, and no tools."},
+                            {"role": "user", "content": marker}], "schema": SOURCE_SCHEMA}
+    atomic_json(output / "generation-claimed.json", {"nonce": request["nonce"],
+                "started_at": time.time(), "never_replay": True})
+    response = run_codex(request, sha256(json_bytes(request)), output, receipt, {"747504", "747505"})
+    if response.get("error"):
+        raise RuntimeError(response["error"])
+    source = output / "source-fixture"
+    (source / "src").mkdir(parents=True)
+    edits = validate_files(source, response["data"], [])
+    if (len(edits) != 1 or edits[0][0] != source / "src/transport.c"
+            or edits[0][1].strip() != "/* " + marker + " */"):
+        raise RuntimeError("The source envelope changed the isolated marker")
+    usage = response["usage"]
+    if usage["token_accounting"] != "exact" or usage["tool_events"]:
+        raise RuntimeError("The native interface lacks exact usage or attempted a tool")
+    result = {"schema": "hpc-forest-reference96-native-interface-probe-v1",
+              "verified": True, "optimization_evidence": False, "model_input": False,
+              "model": MODEL, "reasoning_effort": EFFORT, "calls": 1,
+              "request_sha256": sha256((output / "request.json").read_bytes()),
+              "response_sha256": sha256((output / "response.json").read_bytes()),
+              "usage": usage, "source_envelope_verified": True,
+              "no_executable_code_or_competition_context": True}
+    atomic_json(output / "verification.json", result)
+    print(json.dumps(result, ensure_ascii=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

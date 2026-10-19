@@ -1,0 +1,141 @@
+"""Apply bounded deterministic edits to the NEW unsealed external candidate only."""
+import ast
+import hashlib
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE / 'revision-r2-integration'
+BASE = HERE.parents[2]
+PREP = HERE.parent
+
+
+def update(name, changes):
+    path = ROOT / name
+    text = path.read_text()
+    for old, new in changes:
+        assert old in text, (name, old[:100])
+        text = text.replace(old,new)
+    path.write_text(text,encoding='utf8',newline='\n')
+
+
+def replace_functions(name, replacements):
+    path = ROOT/name
+    text = path.read_text()
+    tree = ast.parse(text)
+    lines = text.splitlines(keepends=True)
+    for node in sorted((n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in replacements),key=lambda n:n.lineno,reverse=True):
+        lines[node.lineno-1:node.end_lineno] = [replacements[node.name].rstrip()+'\n']
+    path.write_text(''.join(lines),encoding='utf8',newline='\n')
+
+
+def main():
+    review = PREP/'revue-independante-source-r1/REVUE-INDEPENDANTE-SOURCE-R3-R4B110.json'
+    review_sha = hashlib.sha256(review.read_bytes()).hexdigest()
+    runtime_sha = '66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766'
+    update('chain_contract.py', [('Q_REVISION = "lane-r2-integration"','Q_REVISION = "r4b-source110-external-adapters-r1"')])
+    replace_functions('chain_contract.py', {
+        'local_delta':'''def local_delta(root):
+    """New complete chain110; historical Q105 is ancestry, never this qualification."""
+    root = Path(root)
+    manifest = json.loads((root / "COMPONENTS.json").read_text(encoding="utf8"))
+    need(manifest.get("schema") == "hpc-forest-lane-r3-chain-components-v1"
+         and manifest.get("source_zip_sha256") == SOURCE and manifest.get("plan_sha256") == PLAN
+         and manifest.get("adapter_revision") == Q_REVISION, "New complete110 component graph required")
+    ancestry = json.loads((root / "PROVENANCE-SOCLE-HISTORIQUE.json").read_text())
+    need(ancestry.get("old_source105_or_Q_qualifies_source110") is False
+         and ancestry["old_qualified_components"]["sha256"] == QUALIFIED_COMPONENTS_SHA,
+         "Historical105 provenance must remain separate")
+    old = read(ancestry["old_active_components"])
+    need(ancestry["old_active_components"]["sha256"] == "c03ed75936ae5b833cbe0acc8a875083bd2a06831853fb706a8d2907968c5203",
+         "Exact historical ancestor required")
+    for name, checksum in old["code_pins"].items():
+        need(sha(Path(ancestry["old_active_components"]["path"]).parent / name) == checksum,
+             "Historical105 ancestor changed")
+    need(isinstance(manifest.get("code_pins"), None), "unreachable") if False else None
+    for name, checksum in manifest["code_pins"].items():
+        need(not Path(name).is_absolute() and ".." not in Path(name).parts and sha(root / name) == checksum,
+             "New110 integration component changed")
+    current = sha(root / "COMPONENTS.json")
+    return {"qualified_components_sha256":current,"active_components_sha256":current,
+            "historical_components_sha256":QUALIFIED_COMPONENTS_SHA}
+''',
+        'check_local_delta':'''def check_local_delta(base_pins, active_pins, delta):
+    raise ValueError("Historical105 local-only delta cannot qualify a source110 ARM change")
+'''})
+    update('chain_contract.py', [
+        ('source_tests, adapter_tests = actual.get("source_lane_contract_tests"), actual.get("adapter_portable_tests")',
+         'source_tests, adapter_tests = actual.get("source_lane_contract_tests"), actual.get("adapter_portable_tests")\n    need(actual.get("source_cli_privacy_tests") == {"passed":152,"failed":0}\n         and actual.get("source_prior_privacy_tests") == {"passed":9,"failed":0}\n         and all(type(v) is int for label in ("source_cli_privacy_tests","source_prior_privacy_tests") for v in actual[label].values()),\n         "Actual152CLI/privacy and9prior-privacy tests distinct from26lane required")')])
+    with (ROOT/'chain_contract.py').open('a',encoding='utf8') as stream:
+        stream.write('''\n\ndef source_review(value):
+    need(value.get("verified_source_preparation_only") is True and value.get("blocking_findings") == []
+         and value.get("source_zip",{}).get("sha256") == SOURCE
+         and value.get("plan",{}).get("sha256") == PLAN
+         and value.get("native_generation_admitted") is False,
+         "Independent source110 preparation review required; it is not native admission")
+    return value
+''')
+    update('reader_bridge.py', [
+        ('PREP = HERE.parents[2]','PREP = HERE.parents[1]'),
+        ('BASE = PREP.parents[1]','BASE = HERE.parents[3]'),
+        ('"hpc-forest-lane-r2-chain-components-v1"','"hpc-forest-lane-r3-chain-components-v1"'),
+        ('pins["independent_source_review"]["sha256"] == "b903ad78f736fbec86faa47cc24bf99670d5093b9e2367a811a1cc50b5a822d6"',f'pins["independent_source_review"]["sha256"] == "{review_sha}"'),
+        ('review.get("verified") is True','review.get("verified_source_preparation_only") is True'),
+        ('contract.bind(review)','contract.source_review(review)'),
+        ('set(value) == {"refs", "expected", "snapshot", "natural_exit"}','set(value) == {"refs", "expected", "snapshot", "natural_exit", "private_cli"}'),
+        ('return load_reader().receive(value["refs"], expected, value["snapshot"], value["natural_exit"])','return load_reader().receive(value["refs"], expected, value["snapshot"], value["natural_exit"], private_cli=value["private_cli"])')])
+    update('launcher/bootstrap_worker.py', [
+        ('BASE = HERE.parents[5]','BASE = HERE.parents[4]'),
+        ('CACHE_ROOT = HERE.parents[3]','CACHE_ROOT = HERE.parents[2]'),
+        ('session_id=None, channel=None, pins=None):','session_id=None, channel=None, pins=None, cli_policy_ref=None):'),
+        ('session_id=None, channel=None, pins=None) -> list[str]:','session_id=None, channel=None, pins=None, cli_policy_ref=None) -> list[str]:'),
+        ('("OWNER", owner_ref)):', '("OWNER", owner_ref), ("private task policy", cli_policy_ref)):'),
+        ('"codex_config_ref": dict(codex_config_ref), "owner_ref": dict(owner_ref), "pins": pins}',
+         '"codex_config_ref": dict(codex_config_ref), "owner_ref": dict(owner_ref), "pins": pins, "cli_policy_ref":dict(cli_policy_ref)}'),
+        ('return [*args, "--once"]','return [*args, "--once", "--cli-policy", spec["cli_policy_ref"]["path"], "--cli-policy-sha256", spec["cli_policy_ref"]["sha256"]]'),
+        ('channel=channel, pins=pins))','channel=channel, pins=pins, cli_policy_ref=cli_policy_ref))'),
+        ('"job_id": spec["job_id"]}','"job_id": spec["job_id"], "owner": spec["job_id"]}'),
+        ('admission.verify_local_cli(value, spec["pins"]["copied_cli_executable"])',
+         'admission.verify_task_cli_policy(value, Path(spec["cli_policy_ref"]["path"]), spec["cli_policy_ref"]["sha256"], spec["pins"]["copied_cli_executable"])'),
+        ('("private Codex config", spec["codex_config_ref"])):', '("private Codex config", spec["codex_config_ref"]), ("private task policy",spec["cli_policy_ref"])):'),
+        ('"codex-config", "codex-config-sha256", "owner", "owner-sha256"):', '"codex-config", "codex-config-sha256", "owner", "owner-sha256", "cli-policy", "cli-policy-sha256"):'),
+        ('"owner_ref": {"path": args.owner, "sha256": args.owner_sha256}}',
+         '"owner_ref": {"path": args.owner, "sha256": args.owner_sha256},\n                 "cli_policy_ref": {"path":args.cli_policy,"sha256":args.cli_policy_sha256}}')])
+    update('launcher/remote_stage.py', [
+        ('"job_id": allocation["slurm_job_id"]}', '"job_id": allocation["slurm_job_id"], "owner":allocation["slurm_job_id"]}'),
+    ])
+    shared='/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-qualification-20261018-eaff9217499f'
+    for name in ('assemble_admissions.py','launcher/render_launch.py'):
+        update(name,[('/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r2-qualification-20261018-60db53fb69e0',shared)])
+    update('assemble_admissions.py', [
+        ('BASE = INTEGRATION_ROOT.parents[4]','BASE = INTEGRATION_ROOT.parents[3]'),
+        ('PREP = INTEGRATION_ROOT.parents[2]','PREP = INTEGRATION_ROOT.parents[1]'),
+        ('REVIEW = "b903ad78f736fbec86faa47cc24bf99670d5093b9e2367a811a1cc50b5a822d6"', f'REVIEW = "{review_sha}"'),
+        ('"native_contract_phase_receipts", "private_lane_inputs", "source_state_binding"}', '"native_contract_phase_receipts", "private_lane_inputs", "source_state_binding", "cli_policy"}'),
+        ('bind(read(pins["independent_source_review"]), base)','reader_bridge.contract.source_review(read(pins["independent_source_review"]))'),
+        ('config = artifact(inputs["codex_config"])','config = artifact(inputs["codex_config"])\n    policy_path = artifact(inputs["cli_policy"])\n    from hpc_forest.codex_process import load_task_cli_policy\n    private_policy = load_task_cli_policy(policy_path, inputs["cli_policy"]["sha256"], cell, admission.CLI_SHA256)\n    require(private_policy["instruction_or_SKILL_body_read"] is False, "Private task metadata only")'),
+        ('"oauth_observation_sha256": inputs["oauth_observation"]["sha256"], "configuration_contents_exported": False}',
+         '"oauth_observation_sha256": inputs["oauth_observation"]["sha256"], "configuration_contents_exported": False,\n        "task_cli_policy_sha256":inputs["cli_policy"]["sha256"]}'),
+        ('admission.verify_local_cli(auth, str(cli_path))','admission.verify_task_cli_policy(auth, policy_path, inputs["cli_policy"]["sha256"], str(cli_path))')])
+    update('launcher/render_launch.py',[
+        ('hpc-forest-dynamic-r4b-native-interface-lane-r2-60db53fb69e0','hpc-forest-dynamic-r4b-native-interface-lane-r3-eaff9217499f'),
+        ('hpc-forest-dynamic-r4b-stage-lane-r2-','hpc-forest-dynamic-r4b-stage-lane-r3-'),
+        ('"source_state_binding": None,','"source_state_binding": None, "cli_policy":None,'),
+        ('native-interface-models-max-r2.tar.gz','native-interface-models-max-r3.tar.gz')])
+    update('observer/observer-mixte.py', [
+        ('BASE = HERE.parents[5]','BASE = HERE.parents[4]'),
+        ('PREP = HERE.parents[3]','PREP = HERE.parents[2]'),
+        ('"--owner", "--owner-sha256"}', '"--owner", "--owner-sha256", "--cli-policy", "--cli-policy-sha256"}'),
+        ('(("codex_config", "--codex-config"), ("owner", "--owner"))','(("codex_config", "--codex-config"), ("owner", "--owner"), ("cli_policy", "--cli-policy"))'),
+        ('"codex_config", "owner") if k in route','"codex_config", "owner", "cli_policy") if k in route'),
+        ('cli = read(bound(artifacts["cli_identity"]))','cli = read(bound(artifacts["cli_identity"]))\n    require(route.get("cli_policy") and route["cli_policy"]["sha256"] == cli.get("task_cli_policy_sha256")\n            and ready.get("task_cli_policy_sha256") == cli["task_cli_policy_sha256"]\n            and ready.get("local_skill_paths_exported") is False, "Local task policy/ready binding differs")\n    dynamic_admission.verify_task_cli_policy(authorization, bound(route["cli_policy"]), route["cli_policy"]["sha256"], cli["executable_path"])')])
+    update('reader/receipt_native.py', [
+        ("Path(__file__).resolve().parents[4] / 'lancement-modeles-max-r3'", "Path(__file__).resolve().parents[3] / 'lancement-modeles-max-r3'"),
+        ('base = Path(__file__).resolve().parents[6]','base = Path(__file__).resolve().parents[5]'),
+        ('"b903ad78f736fbec86faa47cc24bf99670d5093b9e2367a811a1cc50b5a822d6"',f'"{review_sha}"'),
+        ('"890b20a1ac050fc3952f1409eb884a9013b9c01ddde5f8a79304485187f523ac"',f'"{runtime_sha}"')])
+    print(json.dumps({'new_root':str(ROOT),'mechanical_port_written':True,'runtime_effects':False}))
+
+
+if __name__ == '__main__':
+    main()

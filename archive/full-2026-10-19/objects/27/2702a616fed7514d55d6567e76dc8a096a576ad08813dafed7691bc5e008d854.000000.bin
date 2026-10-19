@@ -1,0 +1,291 @@
+# Optimisation autonome de programmes HPC par forêt AB-MCTS : mécanismes, résultats vérifiables et protocole d’étude multi-modèles
+
+*Rapport de recherche expérimental — HPC-Forest. Version de travail produite le {{DATE}}. Ce document décrit une étude locale ; il n’a pas été soumis à une revue ni à un concours. Les résultats en cours portent explicitement leur niveau de vérification.*
+
+## 🔬 Résumé
+
+Nous étudions un système dans lequel un modèle de langage propose des programmes, une forêt de recherche adaptative choisit les expériences suivantes et un évaluateur indépendant décide de leur correction et de leur performance. L’opérateur prépare les machines, les formats d’entrée, les outils et les preuves ; il n’écrit ni ne corrige les optimisations des candidats. Ce rapport réunit l’historique des campagnes disponibles, détaille le comportement observable de GPT-6.1 Sol MAX et prépare une extension aux archives de la Marathon of Parallel Programming. Les sélections finales corrigées du modèle Qwen2.5-Coder 32B montrent des réductions du temps de 0 % pour k-NN, 6,38 % pour la somme et 8,18 % pour N-body. Un ancien résultat N-body de 72,47 % a été invalidé à cause de variables non initialisées. Le pilote GPT contient 16 programmes mesurés, une profondeur maximale de trois et jusqu’à quatre fils par sommet, mais aucune confirmation finale ; son meilleur gain de recherche ne constitue donc pas un gain acquis. Les campagnes DeepSeek et la comparaison GPT avec harnais se poursuivent. La nouvelle grille prévoit quatre modèles, cinq efforts et 19 sujets publiés entre 2020 et 2023, soit 380 configurations théoriques ; la page 2024 ne fournit pas de sujets. Nous distinguons les budgets, les appels, les sommets, les confirmations et les limites de comparaison entre machines.
+
+![Résumé graphique de la méthode](figures/01-resume-graphique.svg)
+
+**Mots-clés :** programmation haute performance, AB-MCTS, recherche arborescente, modèle de langage, harnais, reproductibilité, contrôle de correction.
+
+Le premier résultat de cette nouvelle grille est désormais reçu et audité : Luna MAX avec modèle mère réduit de 89,9794 % le temps de la grille 2023 sur nos entrées, avec huit programmes évalués. Une correction de préparation validée séparément rend seize des dix-neuf sujets testables au total. Les résultats de ces nouvelles recherches ne sont pas assimilés aux campagnes historiques ni à un classement officiel.
+
+## 📋 Introduction et questions de recherche
+
+Un programme peut devenir plus rapide parce que son algorithme change, parce que ses accès mémoire deviennent plus favorables, parce que le compilateur exploite mieux le parallélisme, ou parce que la mesure ne vérifie plus réellement le travail demandé. Ces mécanismes ont des implications scientifiques très différentes. Notre objectif est de conserver une chaîne de preuves qui permette de les distinguer. L’indicateur central n’est pas une explication convaincante du modèle : c’est un programme donné, compilé avec une configuration connue, correct sur les contrôles retenus et plus rapide lors d’une confirmation indépendante.
+
+La première question est de savoir si la recherche crée seulement une suite de programmes ou une véritable structure avec plusieurs fils et plusieurs niveaux. La seconde porte sur l’utilité d’un harnais qui autorise le modèle à compiler, observer ses erreurs et proposer une nouvelle version à l’intérieur d’une mission. La troisième concerne l’effet du modèle et de son effort de raisonnement à budget de recherche borné. La quatrième examine une organisation hiérarchique : un modèle mère peut-il préparer des objectifs puis synthétiser les résultats sans intervention algorithmique de l’opérateur ?
+
+AB-MCTS est un cadre de recherche qui adapte l’arbitrage entre élargissement et approfondissement à partir d’un retour d’évaluation. L’article de référence d’Inoue et collaborateurs présente cette famille de méthodes ; TreeQuest en fournit une implantation avec interfaces de sélection et de retour des résultats.[^abmcts] Dans notre logiciel, `Search` instancie réellement `treequest.ABMCTSA()` en version 0.3.2 : nous n’employons pas une recherche UCT renommée AB-MCTS. Les mécanismes et chiffres qui suivent proviennent de notre code et de nos journaux, et ne sont pas des résultats attribués à l’article externe.
+
+## ⚙️ Méthodes et organisation réelle du système
+
+### Ce qu’est un sommet
+
+Un sommet représente un état du programme et, lorsqu’une évaluation est possible, un résultat numérique. Il ne contient pas une copie des poids d’un modèle. Les requêtes de plusieurs sommets peuvent appeler le même service de modèle avec des contextes différents. Une mission contient notamment un identifiant, un rôle, un parent de recherche, un commit de départ, une profondeur et d’éventuelles sources d’intégration. Le code produit devient un état versionné. Les contrôles mécaniques ne proviennent pas du modèle qui propose ce code.
+
+Le mode historique comporte quatre arbres de rôle. A explore les aspects de localité et d’organisation mémoire, B les transformations SIMD légales, C les variantes OpenMP et G les intégrations. Ces catégories générales appartiennent au cadre initial ; elles constituent un biais de recherche déclaré. L’opérateur ne fournit pas ensuite une variante de tas, de tri, de sélection ou de parallélisation particulière pour un sujet donné. TreeQuest décide du parent à développer à l’intérieur de chaque arbre. Le contrôleur extérieur organise l’ordre et le budget des rôles.
+
+Il faut distinguer le parent de délégation, le parent MCTS et les sources d’intégration. Le parent de délégation indique la responsabilité du rôle. Le parent MCTS fournit le programme à partir duquel une branche progresse. Les sources G sont des programmes que le modèle intégrateur peut consulter et dont il doit déclarer les idées retenues. Une intégration est recompilée et mesurée comme un nouveau programme : son temps n’est ni la somme ni le minimum copié des temps sources. La forêt MCTS et ses liens d’intégration forment ensemble un graphe d’expériences ; les liens d’intégration ne sont pas comptés comme des fils MCTS.
+
+```mermaid
+flowchart LR
+    accTitle: Responsabilités et preuves du système
+    accDescr: Le modèle propose les programmes, TreeQuest choisit les branches et un évaluateur extérieur décide des résultats. Les archives sont observées sans être réinjectées.
+    official["Sources officielles et cible"] --> prepare["Préparation mécanique figée"]
+    prepare --> trees["Forêt réelle AB-MCTS-A"]
+    trees --> model["Modèle : proposition de fichiers"]
+    model --> check["Compilation et oracle protégé"]
+    check --> measure["Mesures de recherche"]
+    measure --> trees
+    measure --> confirm["Autres contrôles et confirmations"]
+    confirm --> evidence["Archives, empreintes et rapport"]
+```
+
+### Élargir ou approfondir
+
+Un nouveau fils de la racine explore une proposition indépendante à partir de la référence. Un fils d’un programme existant recherche une évolution de ce programme. Une profondeur de trois signifie trois transformations successives depuis la racine de rôle, qui est au niveau zéro. Le nombre maximal de fils indique le maximum des enfants directs de recherche pour un même sommet ; il ne mesure ni le nombre de rôles ni le nombre d’appels internes.
+
+Cette distinction explique pourquoi plusieurs missions peuvent revenir à la racine alors qu’un excellent programme existe déjà. La recherche conserve une capacité d’exploration. Elle peut aussi approfondir un programme intermédiaire lorsque son retour le justifie. L’absence d’un fils à un instant donné peut simplement correspondre à une mission encore en génération, à une proposition rejetée avant évaluation ou à un budget épuisé. Elle ne prouve pas un défaut de branchement.
+
+### Score, réduction du temps et accélération
+
+Le score transmis à TreeQuest pour un programme valide est `s = 1 / (1 + Tc / Tref)`, où `Tc` est son temps moyen de recherche et `Tref` celui de la référence de l’évaluation. Une référence de même temps reçoit donc un score de 0,5. Un score de 0,98 ne signifie pas directement « 98 % de réduction ». Un échec de compilation ou de correction reçoit un score nul ; une panne d’infrastructure conserve un score absent. Cette convention doit être respectée dans toute analyse des arbres.
+
+Nous calculons séparément l’accélération `S = Tref / Tc` et la réduction relative `R = 100 × (1 − Tc / Tref)`. Par exemple, une accélération de deux correspond à une réduction de 50 %, et non de 200 %. Un gain de recherche est un indicateur de sélection. Un gain final nécessite les contrôles et mesures de confirmation prévus. L’absence de confirmation reste une donnée manquante : elle ne vaut pas zéro. En revanche, lorsque la référence est confirmée et retenue, la réduction finale est bien de zéro.
+
+### Harnais à l’intérieur d’une mission
+
+Le nouveau harnais permet jusqu’à trois appels du modèle dans une même mission. Le modèle peut soumettre des fichiers, recevoir le diagnostic mécanique d’une compilation ou d’un test de développement raté, puis proposer lui-même une reprise. Le premier programme qui passe ces contrôles termine l’épisode interne. Ce mécanisme ne transforme pas automatiquement chaque appel en nouveau sommet MCTS. Seul le programme final proposé à l’évaluation extérieure reçoit éventuellement un nouveau score de recherche.
+
+Le harnais interne ne reçoit ni score chronométrique ni données de confirmation. La mesure qui influence l’arbre reste extérieure. Le mode documentaire autorise des lectures HTTPS choisies par le modèle sur `gcc.gnu.org`, `www.openmp.org` et `raw.githubusercontent.com`. Il ne fournit pas de moteur de recherche général ni de corpus de solutions préchargé. Les sondes techniques imposées pour vérifier cette interface sont comptées séparément des consultations spontanées pendant une recherche.
+
+### Exécution et confirmation
+
+Les essais actuels mesurent les candidats sur ROMEO avec quatre cœurs ARM64 et zéro GPU. Pour GPT, la CLI native sur le PC utilise la connexion ChatGPT existante ; l’inférence est hébergée par OpenAI. Ce n’est pas un calcul des poids de GPT sur le PC ou sur ROMEO. Les deux campagnes DeepSeek utilisent au contraire des modèles locaux sur les GPU de ROMEO, avec des ressources d’inférence distinctes des quatre cœurs employés par les candidats.
+
+Les contrôles utilisent des sorties exactes par rapport à la référence officielle, des entrées de développement distinctes des entrées de confirmation, des diagnostics GCC sur les variables non initialisées, trois mesures de recherche et cinq mesures finales intercalées. Le seuil d’acceptation est de 3 %. Les sources, le compilateur, les paramètres OpenMP, les entrées, les sorties attendues et les empreintes de protocole sont conservés. Ces contrôles restent finis : ils ne sont pas une démonstration formelle de correction sur tous les inputs possibles.
+
+## 🌲 Résultats détaillés de GPT-6.1 Sol MAX
+
+### Le pilote terminé : ce qui a réellement eu lieu
+
+Le pilote 747664 portait sur k-NN, avec 24 créneaux prévus, une limite de deux heures et 1,5 million de jetons de budget. Il a enregistré 21 missions : 16 programmes valides, quatre interruptions d’infrastructure et une annulation de budget. Le graphe mesuré comprend 16 sommets de programme, auxquels s’ajoutent quatre racines de rôle, soit 20 sommets si l’on inclut ces racines. La profondeur maximale est de trois et le nombre maximal de fils directs est de quatre. Cela répond expérimentalement à la question initiale : la recherche crée plusieurs fils et descend sur plusieurs niveaux.
+
+![Forêt réelle du pilote GPT avec liens enregistrés](figures/02-foret-gpt-pilote.svg)
+
+La meilleure proposition observée dans ce pilote est une version A à sélection radix, identifiée par `ce7c9229e14d46d2`, commit `befb7a049fae4268782d8ab1135c3ba7e319f36e`. L’inspection antérieure des fichiers archivés montre des histogrammes de 2048 classes, des blocs de 256 points et jusqu’à trois balayages de sélection. Sur l’entrée de mesure comportant 98070 points et `k = 73705`, le temps de recherche était de 0,023470485 s contre 2,048389426 s pour la référence, soit une réduction de 98,8542 % et un facteur 87,2751. Cette proposition a passé les tests de recherche. Elle n’a pas subi la confirmation finale ; ces nombres demeurent provisoires.
+
+L’explication plausible est que la référence effectue un travail important de maintien des voisins lorsque k est grand, alors que cette proposition organise la sélection en passages sur des données compactes. Il s’agit d’une interprétation du code et de la charge observée, pas d’une mesure directe des caches ou du débit mémoire : nous n’avons pas de compteurs matériels permettant de quantifier chaque mécanisme. Le résultat ne démontre pas la même accélération pour de petits k ou sur une autre distribution de données.
+
+Les trois intégrations G valides du pilote ont mesuré environ 0,026258 s, 0,026464 s et 0,188088 s. Elles sont plus lentes que le meilleur programme A. La combinaison d’idées utiles n’a donc pas automatiquement amélioré le meilleur parent. Cette observation justifie l’évaluation indépendante de chaque intégration et le maintien de la possibilité de sélectionner un programme non intégré.
+
+![Issues des missions du pilote](figures/05-missions-et-issues.svg)
+
+Le compteur exact connu dans les événements natifs archivés est de 489092 jetons. Trois invocations n’ont pas de compteur final exact. Le registre conservateur charge 1275524 jetons, avec quatre créneaux à usage borné. Il existe 20 invocations natives archivées : une mission interrompue en file n’a pas nécessairement lancé le service, et une proposition reçue n’a pas nécessairement été mesurée. Ces compteurs ne doivent pas être fusionnés en une seule colonne « essais ».
+
+Le pilote s’est arrêté sans confirmation parce qu’un défaut de gestion de l’échéance permettait à une génération ou à son évaluation de consommer la réserve finale. Ce défaut d’infrastructure a été reproduit, corrigé et testé dans la nouvelle copie. Aucun candidat du pilote n’a été réparé ou injecté dans la comparaison suivante. Les 874 fichiers du pilote ont été reçus avec empreintes ; son archive a le SHA-256 `ebf3ee50ac4dc2d751a8f194bf14b89f047134b6c2eca168da7d2ac5c05c6ab9`.
+
+### Nouvelle recherche : observation bornée dans le temps
+
+L’instantané du {{CURRENT_UTC}} concerne le témoin k-NN du job 747885. Il contient {{CURRENT_NODES}} sommets évalués, une profondeur maximale de {{CURRENT_DEPTH}}, jusqu’à {{CURRENT_CHILDREN}} fils directs et {{CURRENT_TOKENS}} jetons inscrits au registre. Le bras avec harnais n’a pas commencé dans cet instantané. Les temps du tableau suivant sont donc des résultats de recherche du témoin, et non une mesure d’efficacité du harnais.
+
+{{CURRENT_TABLE}}
+
+![Forêt GPT de la nouvelle comparaison au moment de l’instantané](figures/03-foret-gpt-courante.svg)
+
+Le premier A propose un tas maximal compact de voisins avec rejet rapide par la racine ; son fichier reçu décrit une conservation des règles de départage et un chemin de repli. Il mesure 0,028102325 s en recherche, contre une référence associée de 2,089583014 s, soit 98,6551 % de réduction et un facteur 74,3562. Le deuxième A propose des clés compactes et des histogrammes radix ; le troisième A décrit une partition en place. Les temps observés de ces deux propositions sont proches de 0,0222 s. Les descriptions sont des hypothèses et transformations déclarées par le modèle, confrontables aux fichiers reçus ; l’audit de l’archive finale doit encore établir toute la chaîne Git–binaire–confirmation.
+
+Le premier B cherche à séparer le calcul indépendant des distances des mises à jour dépendantes de la sélection. Son fils B approfondit ce programme avec du filtrage NEON, mais les deux temps observés restent proches de deux secondes. Cette branche montre qu’un approfondissement réel peut produire une amélioration modeste même lorsqu’une autre branche est déjà très rapide. Les propositions C utilisent des partitions OpenMP avec états privés et fusion déterministe ; leurs temps de recherche varient fortement selon le programme reçu. Cette diversité est un résultat observable de la recherche, pas une preuve que le parallélisme seul explique les meilleurs gains.
+
+La comparaison complète prévoit six recherches fraîches : témoin et harnais pour k-NN, somme et N-body. Chaque recherche prévoit 24 créneaux, deux heures et 1,5 million de jetons. La préparation officielle et les entrées sont figées une fois par sujet et partagées entre modes ; aucun candidat n’est partagé. L’ordre des modes est alterné entre sujets. Une seule paire par sujet ne suffit pas à établir une supériorité statistique générale du harnais.
+
+À la fin de l’instantané détaillé, A5 déclare avoir remplacé les lectures `scanf` répétées par une fenêtre de lecture `fread` réutilisable de 64 Kio, avec conversion des nombres par `strtof` et `strtol`. Ce fils de A4 conserve la sélection déjà écrite par son parent et atteint 0,016033908 s en recherche, avec trois mesures entre 0,015931146 et 0,016226374 s. Cette amélioration supplémentaire concerne donc aussi le coût des entrées-sorties. La description provient de la proposition du modèle et des mesures enregistrées ; la reconstruction Git complète de cette campagne reste soumise à la réception finale. Le statut de recherche est `budget_exhausted` à 22:11:48 UTC : 19 programmes sont mesurés, mais ce statut ne décide pas à lui seul du résultat des confirmations qui suivent.
+
+## 📊 Comparaison des données disponibles
+
+### Sélections historiques corrigées
+
+Le tableau suivant emploie les sélections finales corrigées et conserve les temps absolus. Les campagnes 14B de diagnostic ne forment pas une seule expérience homogène. Les campagnes 32B utilisent 96 créneaux prévus par sujet ; les essais 14B de diagnostic en prévoient 24. Les changements de budgets, de code et de protocole empêchent d’interpréter leur écart comme le seul effet de la taille du modèle.
+
+{{COMPARISON_TABLE}}
+
+![Gains corrigés des sélections 32B](figures/04-gains-32b-corriges.svg)
+
+La première série 32B avait retenu pour N-body un programme à 0,186402 s contre 0,677083 s, présenté comme un gain de 72,47 %. L’examen GCC a ensuite mis en évidence des variables `fx`, `fy` et `fz` utilisées sans initialisation dans une réduction OpenMP. Cette sélection a été invalidée, et non simplement remplacée discrètement dans les tableaux. La campagne fraîche 747165, avec les contrôles renforcés, a confirmé 0,610259 s contre 0,664590 s, soit 8,1752 % de réduction. L’ancien résultat reste dans les preuves et dans l’historique avec son motif de rejet.
+
+### Petits modèles et état du harnais
+
+Les essais corrigés sur Qwen2.5-Coder 1.5B et 3B ont terminé les six recherches k-NN, somme et N-body. Les audits de ces recherches passent, avec 138 tests logiciels ARM64 réussis et un test MCP optionnel ignoré. Les recherches ont consommé 54 appels réels et 447778 jetons. Quatre appels techniques supplémentaires ont consommé 1074 jetons. Les deux sondes documentaires imposées ont réussi.
+
+{{SMALL_TABLE}}
+
+Aucune réduction finale n’a été confirmée. Dix contrôles internes ont été exécutés, aucune reprise de proposition n’a réussi et aucune lecture documentaire spontanée n’a été enregistrée. Les intégrations réelles G n’ont pas été exercées, faute de sources admissibles. Les corrections ont notamment supprimé un compteur qui attribuait auparavant des appels à G même lorsqu’aucun modèle n’était appelé. Ces résultats établissent un fonctionnement mécanique de plusieurs parties du harnais ; ils ne démontrent ni un bénéfice de performance ni la validation de tous ses chemins possibles.
+
+### DeepSeek : sous-résultats reçus, audit final encore attendu
+
+Les résumés individuels téléchargés avec vérification SHA-256 indiquent des confirmations côté cluster pour les lignes ci-dessous. Les jobs complets sont encore actifs et leurs archives globales ne sont pas reçues dans cette version. Ces nombres sont donc des résultats déclarés par des résumés applicatifs, avec un audit de bout en bout encore en attente. Ils sont séparés du tableau des sélections historiques déjà livrées.
+
+{{DEEP_TABLE}}
+
+Cette distinction est importante pour V4-Flash-0731 : malgré des candidats de recherche rapides, le résumé k-NN retient la référence lors de la confirmation. Une bonne valeur de recherche n’est donc pas systématiquement conservée à la fin. Pour V4-Flash, les résumés reçus annoncent des réductions de 98,6696 % sur k-NN et 89,7674 % sur la somme. Nous ne transformons pas ces sous-résultats en bilan final audité avant la réception des preuves complètes.
+
+### Coûts, vitesse du modèle et limites d’interprétation
+
+Le nombre de jetons inclut une comptabilité de requête, et non seulement des caractères visibles. Les jetons de raisonnement font partie des jetons de sortie lorsqu’ils sont ainsi déclarés ; ils ne doivent pas être ajoutés une seconde fois. Les réservations conservatrices ne représentent pas une consommation mesurée. Pour GPT, une interruption sans compteur final reçoit une borne déclarée. Il n’existe pas ici d’équivalent strict au `num_predict` d’Ollama ; la CLI peut également ajouter son contexte natif.
+
+Un débit d’inférence DeepSeek calculé comme `eval_count / eval_duration` décrit le décodage mesuré par Ollama. Le quotient « jetons de sortie / durée totale d’une requête GPT » inclurait la préparation, le raisonnement, le réseau et les attentes ; il n’est pas le même instrument. Ce rapport ne fabrique donc pas une comparaison de jetons par seconde à partir de compteurs incompatibles. Les nombres bruts et les informations d’usage disponibles restent dans les JSON sources.
+
+### Jetons détaillés par modèle, effort et rôle
+
+L’inventaire suivant est arrêté à {{TOKENS_SNAPSHOT_UTC}}. Les appels natifs sont dédupliqués par session et nonce, y compris les copies des preuves techniques. Les cumuls réunissent plusieurs problèmes, pilotes et contrôles d’interface ; ils ne sont pas une comparaison à charge identique. Une consommation encore inconnue ou un appel en cours rend le total mesuré incomplet.
+
+{{TOKENS_NATIVE_TABLE}}
+
+Pour Luna MAX sur la grille 2023, 145805 jetons d’entrée et 96809 de sortie donnent exactement 242614. Les 84916 jetons de raisonnement font déjà partie de la sortie : ils ne s’ajoutent pas au total. Les 43093 jetons de mère, 132253 d’enfants et 67268 d’intégration totalisent eux aussi 242614. La mère représente 17,762 % de ce coût. La moyenne des dix appels mesurés vaut 24261,4 jetons ; rapporter le coût total aux huit programmes évalués donne 30326,75 jetons par programme, en incluant explicitement les coûts de mère et de récolte.
+
+Astra possède 84489 jetons exactement mesurés, dont 17058 pour sa mère, soit 20,190 % du total connu. L’appel interrompu n’a pas de compteur final exact. La réservation budgétaire de 196608 pour cet appel porte le registre à 281097 ; elle ne prouve pas que le service a réellement consommé 281097 jetons. Les jetons de cache sont inclus dans l’entrée, et ceux de raisonnement dans la sortie. Les totaux et pourcentages calculés sur les appels connus sont donc distingués des réservations et des inconnues.
+
+{{TOKENS_HISTORY_TABLE}}
+
+Le tableau historique conserve les consommations des programmes ultérieurement invalidés ; une mauvaise solution consomme aussi des ressources. Plusieurs anciennes versions ne distinguent pas entièrement les usages exacts des réservations : l’absence de champ exact ne vaut pas zéro. DeepSeek emploie un autre moteur d’inférence et ses archives complètes sont encore attendues ; ses compteurs de progression restent séparés de cet inventaire natif. Le [détail de comptabilité](../HPC-Forest-Mere-Dynamique-r3/COMPTABILITE-TOKENS.md), son CSV et son JSON donnent les sous-totaux par campagne et les empreintes de chaque requête/réponse. Aucun coût en euros n’est inventé pour la connexion ChatGPT. Aucun débit de décodage natif n’est déduit du temps d’exécution d’un programme optimisé.
+
+## 🧠 Nouvelle expérience avec modèle mère et grille d’efforts
+
+### Organisation expérimentale
+
+La variante nouvelle ajoute deux épisodes de modèle mère. Le premier lit l’énoncé, les sources officielles et les faits de la cible ; il rédige lui-même des objectifs pour A, B, C et G. Le second synthétise les programmes admissibles et les mesures de la même recherche avant l’intégration. Ses résultats sont des textes structurés enregistrés. Ils ne peuvent fournir un score, modifier les tests ou autoriser une commande. Les modèles enfants continuent à écrire les programmes. Les contrôles finaux décident si la meilleure optimisation proposée est réellement meilleure.
+
+Les intégrations de cette variante peuvent consulter tous les programmes distincts, corrects et mesurés de la recherche courante, plutôt qu’un seul choix imposé par rôle. Le modèle choisit les idées qu’il retient. Cette modification et l’ajout de la mère constituent ensemble une nouvelle organisation ; leur effet causal individuel ne peut être isolé sans un témoin qui conserve le même ensemble de sources G. Nous ne revendiquons pas que la nouvelle variante surpasse l’ancienne avant les mesures.
+
+```mermaid
+sequenceDiagram
+    accTitle: Organisation du modèle mère expérimental
+    accDescr: La mère prépare les objectifs et synthétise les résultats du même essai. Les arbres écrivent les candidats et un évaluateur indépendant décide de leur performance.
+    participant prep as Préparation figée
+    participant mother as Modèle mère
+    participant forest as Arbres A B C
+    participant global as Arbre G
+    participant oracle as Évaluateur
+    prep->>mother: Énoncé, sources officielles et cible
+    mother-->>forest: Objectifs qu’elle choisit elle-même
+    forest->>oracle: Programmes candidats
+    oracle-->>forest: Correction et mesures de recherche
+    forest->>mother: Archives admissibles de cette recherche
+    mother-->>global: Synthèse choisie par le modèle
+    global->>oracle: Nouveau programme intégré
+    oracle-->>prep: Confirmation ou rejet
+```
+
+La grille demandée comprend les modèles exacts `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-astra` et `gpt-5.6-terra`, chacun aux efforts `max`, `xhigh`, `high`, `medium` et `low`. Le catalogue local déclare ces capacités. Cela ne prouve pas qu’un appel réel de chaque combinaison est terminé : cette preuve sera fournie par les arguments de la CLI, l’identité de session, les événements natifs et les résultats reçus. Aucun modèle voisin n’est utilisé comme remplacement silencieux.
+
+La mère et ses enfants utilisent le même modèle et le même effort dans une configuration. La graine 23 contrôle la recherche TreeQuest ; elle ne fixe pas la génération stochastique du service GPT. Avec deux essais par rôle dans ce dépistage, la profondeur atteignable d’un arbre de rôle est au plus deux, même si le plafond général est six. La « meilleure optimisation » signifie la meilleure parmi les programmes effectivement évalués et confirmés sous ce budget, sans garantie d’optimalité globale.
+
+![Grille des modèles et efforts prévus](figures/06-grille-modeles-efforts.svg)
+
+Chaque configuration repart d’un programme officiel, d’une base de recherche neuve et des mêmes entrées figées pour le sujet. Elle prévoit huit créneaux enfants, deux appels de mère au maximum, une profondeur maximale de six, 30 minutes de durée totale et 1,5 million de jetons. Le harnais peut employer jusqu’à trois appels pour une mission enfant, dans une échéance partagée de dix minutes. Les appels de mère sont facturés au même budget global, avec une réserve propre. Une limite égale de durée peut donner des nombres d’appels différents entre efforts ; ces nombres devront être analysés, et non supposés égaux.
+
+La couverture théorique de 19 sujets, quatre modèles et cinq efforts est de 380 configurations, sans répétition indépendante. Au plafond de 30 minutes chacune, cela représente 190 heures de recherche, soit environ huit jours hors préparation et attente. Les sujets non préparables sont conservés comme exclusions documentées. La première série constitue un dépistage de faisabilité et de performance sous budget. Une répétition ciblée et contrôlée est nécessaire avant toute conclusion générale sur un modèle ou un effort.
+
+### Sujets recensés dans les archives officielles
+
+| Année | Sujets publiés recensés | Nombre |
+|---|---|---:|
+| 2020 | chemin tropical maximal ; quicksort récursif ; solveur linéaire de Jacobi ; permutations triées ; nombres premiers ; recherche sur DAG | 6 |
+| 2021 | isomorphisme de graphes ; statistiques descriptives ; Sokoban ; Johnson SSSP ; Jacobi pour Laplace | 5 |
+| 2022 | k-NN ; somme ; N-body ; bucket sort | 4 |
+| 2023 | sous-matrices de somme k ; chemin maximal dans un arbre ; NPbonacci ; parcours d’une grille | 4 |
+| 2024 | page officielle d’attente, sans archives de sujets exposées | 0 disponible |
+
+Le suffixe `sum` de 2023 désigne un comptage de sous-matrices et non le problème de somme de 2022. Les clés comportent donc l’année, afin de ne pas confondre deux sujets dont le nom de fichier se ressemble. La page 2025 fournie initialement affiche elle aussi une annonce d’attente dans la copie téléchargée. Nous n’inventons pas de sujets pour ces années.[^archives]
+
+Le prévol réel 747946 a terminé avec 193 tests ARM64 réussis et un test MCP optionnel ignoré. Il admet quinze sujets sous le contrat initial et conserve quatre exclusions : Jacobi 2020 ne montre qu’un bit de contrôle, le préparateur rejette une sortie vide pourtant possible pour les nombres premiers 2020, les entrées Johnson 2021 demandent une vérification supplémentaire de leur mécanisme de checksum, et le code officiel du chemin d’arbre 2023 déclenche le diagnostic GCC de variable potentiellement non initialisée. Ces exclusions ne sont pas des échecs des vingt configurations de modèles. Le défaut de prise en charge d’une sortie vide relève de l’interface et doit être corrigé dans une nouvelle version isolée, sans modifier les recherches actives.
+
+La première recherche réelle de la grille est le job 747952 : GPT-6 Luna, effort MAX, sur le sujet de grille 2023. Elle a terminé en 19 min 51 s. Son archive a été reçue, son SHA-256 recalculé et ses preuves restaurées puis auditées sans modification. Le résultat Astra MAX du job 747967 est également reçu et audité ; la grille passe ensuite à Terra MAX. Les appels enfants et leurs programmes sont suivis dans le [tableau local de la grille](MATRICE.html). Les résultats chiffrés n’y deviennent confirmés qu’après réception et audit. Le tableau conserve aussi les configurations non commencées et les exclusions ; une identité appelée ne valide pas les dix-neuf autres par extrapolation.
+
+La préparation ne comporte pas de solution optimisée écrite par l’opérateur. Elle traite les unités C/C++, les ABI, les jeux d’entrée, les bibliothèques requises et la référence. Le macro de checksum déjà prévu dans le quicksort 2020 est activé pour observer le résultat trié, plutôt que seulement une ligne vide. Les cas dont la référence ne fournit pas une observation suffisante pour valider le calcul doivent être exclus ou faire l’objet d’un protocole distinct explicitement vérifié. Le solveur Jacobi 2020, qui n’imprime qu’un bit de contrôle interne, est signalé à ce titre ; nous ne qualifierons pas un retour constant de véritable optimisation du calcul.
+
+Le défaut des sorties vides est maintenant corrigé dans un supplément R2 isolé. Le prévol réel 747976 réussit 203 tests ARM64 et ignore un test MCP optionnel. Le contrat explicite accepte un cas individuel sans résultat tout en exigeant un résultat observable dans chaque phase et dans le cas chronométré ; un programme qui ne produit jamais rien reste rejeté. Le code officiel est inchangé. Vingt recherches fraîches sur `2020-primes` sont préparées pour après R1. La couverture exécutable cumulée prévue atteint ainsi seize sujets, soit 320 cellules ; soixante cellules restent exclues pour les trois autres références. Le [guide R2](../HPC-Forest-Etude-2020-2024-r2/REPRISE.md) conserve les preuves et les différences de protocole. Cette validation de préparation ne constitue pas encore un appel réel des modèles sur ce sujet.
+
+### Premier résultat confirmé du modèle mère : Luna MAX sur la grille 2023
+
+{{MATRIX_VERIFIED_TABLE}}
+
+Luna MAX a produit huit programmes, tous admis par les contrôles de cette recherche, et deux réponses du modèle mère. Dix appels natifs ont consommé 242614 jetons exacts au total, sans invocation non mesurée. Les huit programmes ont chacun passé un contrôle interne de développement ; aucun n’a nécessité une reprise et aucune lecture documentaire spontanée n’a été enregistrée. La forêt contient huit sommets évalués, en plus des quatre racines de rôle, une profondeur maximale de deux et jusqu’à deux fils pour un même parent. Les deux épisodes de mère sont des appels et des enregistrements d’orchestration, pas deux sommets supplémentaires de la forêt.
+
+La préparation de la mère examine la référence officielle et le résultat de référence de cette nouvelle recherche. Elle propose elle-même une voie combinatoire pour A, une voie de programmation dynamique économe en mémoire pour B et une voie parallèle par blocs pour C. Ces idées sont présentes dans sa réponse native archivée ; elles ne viennent pas de ce rapport ni de l’opérateur. Les enfants écrivent ensuite leurs programmes. Le premier B choisit un balayage par anti-diagonales ; le second B, qui descend réellement du premier, retire le test d’obstacle de la boucle de calcul et remet à zéro les positions bloquées à la fin de chaque diagonale. Le code retenu confirme deux tampons de taille O(N), un tri des obstacles, des additions modulaires et des boucles annotées `GCC ivdep`. L’annotation exprime une possibilité de vectorisation ; aucun relevé d’assembleur ou compteur matériel ne prouve ici quelle fraction du gain vient du SIMD.
+
+![Forêt Luna MAX : les liens MCTS sont pleins et les liens de sources d’intégration sont pointillés. Les appels mère restent hors des sommets.](figures/07-foret-luna-max-count.svg)
+
+La mère de synthèse reçoit les six programmes de rôle déjà mesurés dans cette même recherche. Elle constate que B est le meilleur et recommande au modèle intégrateur de ne conserver une combinaison qu’après mesure du programme complet. Deux G sont écrits et évalués : ils essaient une combinaison du calcul combinatoire et du balayage par anti-diagonales, puis un cas sans obstacle. Le dernier G obtient le meilleur temps de recherche, 0,008210037 s, mais la confirmation finale retient le second B, `36e61dc364844be3`, commit `d641a22d33dd4957c8e42169d3d3f83eb586c861`. Le modèle mère aide donc réellement les recherches et synthétise leurs résultats ; sa proposition finale n’est pas imposée au vérificateur.
+
+Les cinq mesures finales intercalées conduisent à 0,008052559 s pour B contre 0,080359999 s pour la référence, soit une réduction de 89,9794 % et un facteur d’accélération d’environ 9,98. L’audit vérifie les fichiers protégés, la reconstruction des huit programmes depuis les réponses natives, les vrais arguments Luna/MAX, l’ordre des sources G et le résultat final. Ce gain est confirmé sur les entrées finies de cette expérience. Il ne prouve ni une correction pour toute entrée admissible, ni une supériorité de Luna sur les modèles encore en attente, ni un effet causal isolé du modèle mère. Le jeu de données et la cible diffèrent du jugement officiel.
+
+### Classements publiés et impossibilité d’attribuer un rang ROMEO aujourd’hui
+
+Les pages officielles consultées publient un classement chiffré en 2020 et 2021. En 2020, le concours distant place Os #pragmaticos en tête avec 4926,764586 points, devant In thrust we trust à 1939,145553 et IPA – GPPD à 423,457847. En 2021, LaPeSD/UFSC obtient 184,47 points, devant Daemon Dragons à 99,40 et Los-Pampa à 96,81. Les pages 2022 à 2024 consultées ne fournissent pas de tableau chiffré exploitable.[^winners]
+
+Les machines officielles 2020 incluaient notamment des serveurs Xeon, KNL, GPU K80 et SX-Aurora ; l’édition 2021 annonçait notamment des machines EPYC, Xeon, GPU A100 et une configuration MPI. Nos quatre cœurs ARM64 ne reproduisent pas ces environnements.[^machines] Nous pouvons comparer des programmes sur notre cible commune ; nous ne pouvons pas ajouter nos accélérations locales à une table officielle et conclure « top 1 » ou « top 3 ». Les entrées exactes du jugement, les cibles, la formule applicable et toutes les conditions de mesure seraient nécessaires. Aucune soumission au concours n’est effectuée.
+
+## 🌿 Clarification de la mère R : racines dynamiques et conseil cloisonné
+
+La demande humaine du 16 octobre précise une architecture plus générale que celle de la première grille : la mère R choisit elle-même un nombre n d’axes d’optimisation plausibles pour le même problème. Chaque axe possède sa racine de MCTS et son harnais ; ce ne sont pas des problèmes de concours différents. La version R1 impose encore A/B/C et G dans son schéma. Ses résultats ne démontrent donc pas qu’une mère a choisi librement le nombre et la nature de ses racines.
+
+La copie isolée R3 prépare ce choix dynamique. Le modèle renvoie ses objectifs et les capacités requises, sans liste de techniques imposée par l’opérateur. Le contrôleur attribue des identifiants neutres T001, T002, etc., admet les pistes compatibles avec les capacités vérifiées et conserve les motifs d’exclusion. Un axe MPI ou GPU n’est pas déclaré testable sur la seule proposition du modèle : compilateur, lanceur, ressources et contrat de mesure doivent avoir été préparés et vérifiés. La première configuration garde un budget global de huit propositions enfants et deux intégrations ; augmenter n répartit ce budget, sans le multiplier silencieusement.
+
+![Schéma conceptuel de la nouvelle mère R, des branches isolées et de la récolte distincte. Il ne représente pas des résultats de recherche déjà obtenus.](figures/08-racines-independantes-concept.svg)
+
+La mère conseille une branche à partir de la référence, de son objectif, de son code et de son seul historique mesuré. Chaque conseil est un appel séparé, sans conversation réutilisée entre branches. Le contrôleur supprime les retours globaux d’intégration et les documents partagés du contexte enfant ; il refuse un parent MCTS d’une branche sœur et cloisonne aussi le cache de mesures par racine. Un même programme découvert indépendamment dans deux racines peut donc être mesuré séparément. Le conseil et les appels internes du harnais partagent le délai restant de la mission ; un conseil ne peut pas réinitialiser le compteur de temps.
+
+Les évaluations alimentent le vrai `tell` TreeQuest de leur arbre. R reçoit aussi un journal agrégé des retours, mais R est un orchestrateur : il n’est pas un programme auquel on attribue artificiellement un score de performance. La récolte constitue un autre canal. Elle peut consulter les programmes admissibles des différentes branches, choisir des sources et demander un nouveau candidat combiné. Ce candidat est compilé, vérifié, mesuré puis confirmé séparément. Son score ne remplace pas celui des branches sources, et son code ne devient pas leur nouveau point de départ. Le meilleur programme confirmé peut donc rester une branche individuelle.
+
+Les contrôles mécaniques R3 ont passé le prévol réel ROMEO 748006 : 220 tests ARM64 réussis et un test MCP optionnel ignoré. Les tests couvrent notamment n égal à 1, 3 et 6, les canaris de non-transfert de code/mesures/documents vers le conseil d’une autre branche, la reprise sans rejeu d’un appel mère, les récompenses G séparées et le délai partagé. Ils attestent les flux du contrôleur dans ces scénarios, pas une preuve formelle d’isolation du système d’exploitation. Aucun appel réel de modèle R3 ni campagne algorithmique R3 n’est encore validé dans cette livraison. Des appels techniques puis un pilote frais sont requis avant la grille étendue ; les campagnes existantes restent figées.
+
+## 🧪 Discussion scientifique et menaces sur la validité
+
+L’observation la plus solide sur le branchement est structurelle : les fichiers contiennent de vrais liens parent–fils et plusieurs niveaux. Le meilleur temps provisoire du pilote GPT n’est pas encore une conclusion solide sur la performance finale. L’expérience des intégrations G montre également que l’architecture peut conserver une combinaison moins efficace que sa meilleure source. L’intégration est donc une hypothèse à tester, pas une opération qui garantit un gain.
+
+Les petites campagnes du harnais établissent son exécution mécanique sur plusieurs chemins, mais elles ne valident pas une réparation réussie, une consultation documentaire spontanée utile ou une intégration réelle dans toutes les conditions. Une sonde documentaire imposée ne peut pas être présentée comme une initiative scientifique du modèle. La nouvelle comparaison GPT doit mesurer séparément la probabilité de produire un candidat compilable, le nombre de reprises réussies, les lectures choisies et le temps final confirmé.
+
+Les budgets, les jeux et les versions ont changé au cours de l’historique. Une série 32B à 96 créneaux ne constitue pas une ablation propre face à un 14B à 24 créneaux ou à un pilote GPT interrompu. De même, les campagnes avec et sans mère diffèrent actuellement dans leur politique d’exposition des sources G. Les tableaux historiques servent à documenter le parcours, pas à calculer un classement causal global des modèles.
+
+Les cinq répétitions finales sont des répétitions techniques de mesure sur une machine. Elles ne remplacent pas cinq recherches indépendantes, cinq graines ou cinq familles de charges. Le meilleur résultat de nombreuses propositions souffre d’un biais de sélection ; des confirmations séparées réduisent ce risque sans l’annuler. Les très courtes charges peuvent être dominées par le lancement et les entrées-sorties. Les gains doivent donc être rapportés avec leurs temps absolus, leurs dispersions disponibles, la taille des données et le périmètre de validité.
+
+Le grand k de notre charge k-NN favorise une analyse particulière de la maintenance des voisins. Une amélioration sur cette charge n’établit pas qu’un programme domine sur toute la surface `(n, k, dimension, distribution, architecture)`. Aucun compteur matériel de cache, de vectorisation effective ou d’énergie n’est utilisé pour attribuer causalement le gain à une micro-optimisation. Une hypothèse annoncée par le modèle et un changement de code visible sont des indices, à distinguer d’une mesure de mécanisme.
+
+Enfin, les modèles hébergés ne fournissent pas ici une empreinte de poids reproductible comparable à un digest Ollama. Nous conservons l’identifiant demandé, l’effort, la version de CLI, les arguments, les contextes, les réponses et les compteurs. Une reproduction future du même nom de service peut néanmoins différer. Cette limite reste distincte de l’intégrité de nos fichiers, contrôlée par SHA-256.
+
+## 🗂️ Historique, incidents et reproductibilité
+
+L’historique est conservé avec les résultats négatifs, les campagnes interrompues et les erreurs corrigées. Les premières tentatives ont révélé des problèmes de contrat et de préparation ; les séries suivantes ont renforcé les formats d’entrée et les diagnostics. Le candidat N-body invalidé reste identifiable. Le premier essai du harnais a révélé des compteurs G incorrects sans appel réel. Le pilote GPT a révélé une consommation de la réserve finale. La préparation 747848 a été annulée après reproduction d’un problème de réservation groupée A/B/C. La soumission 747870 a échoué sur un chemin Python avant tout appel de modèle ; le même payload a été relancé dans une racine neuve avec un lanceur corrigé.
+
+Ces incidents ne sont pas confondus avec un candidat qui compile mal, donne une réponse incorrecte ou n’améliore pas la référence. Les erreurs normales de recherche ne sont pas corrigées manuellement et ne justifient pas une nouvelle campagne opérateur. Une modification de l’interface, de la cible ou du protocole crée une nouvelle identité expérimentale. Les campagnes actives restent figées.
+
+Le registre machine `historique-campagnes.jsonl` contient {{HISTORY_COUNT}} résumés de campagnes dédoublonnés, avec leurs chemins et empreintes. `donnees-consolidees.json` conserve les tableaux détaillés, les 21 missions du pilote et les instantanés reçus. `comparaison-corrigee.csv` permet une réanalyse des sélections corrigées. Le rapport est reconstruit par `construire-article.py` à partir de ces sources ; son manifeste décrit les fichiers livrés. Les instantanés futurs doivent être datés et ajoutés sans effacer ceux de cette version.
+
+Les archives fermées sont restaurées avant audit, et les fichiers sont vérifiés avant et après une lecture seule. Les bases SQLite sont ouvertes sans écriture ; les journaux actifs ne sont pas traités comme des bases fermées sans précaution. Les archives et le checkout initial restent conservés. Ce rapport d’observation se trouve hors des contextes de génération : ses commentaires sur les algorithmes ne deviennent pas des conseils donnés aux arbres.
+
+### Programme expérimental et échéance humaine
+
+Le registre [ID.md](../../ID.md) recense 37 idées issues des demandes et du rapport, avec leurs états, tests et critères de clôture. L’échéance est le 1er novembre 2026 à 00:00, heure de Paris, soit le 31 octobre à 23:00 UTC. Le périmètre doit être fini et borné : 320 cellules plafonnées à trente minutes représentent déjà 160 heures de recherche par grille, hors attente Slurm et réception. Le plan d’échéance chiffre les expériences restantes, les contrôles, les répétitions ciblées et une réserve finale. Une nouvelle allocation ne sera pas admise si son temps maximal plus la marge de réception/audit dépasse l’échéance. Les idées non terminées à cette date devront être nommées avec leur cause ; la quantité d’essais ne justifie pas une déclaration de validation sans preuves.
+
+### Annexe : toutes les missions du pilote GPT
+
+{{PILOT_TABLE}}
+
+### Annexe : index des résumés historiques
+
+Les lignes suivantes sont un index de preuves, et non une liste de gains tous acceptés sous un protocole homogène. Les anciennes déclarations de sélection restent consultables, même lorsqu’un examen ultérieur les invalide.
+
+{{HISTORY_TABLE}}
+
+## 🔗 Références et preuves
+
+[^abmcts]: Inoue, Y., Misaki, K., Imajuku, Y., Kuroki, S., Nakamura, T. et Akiba, T. *Wider or Deeper? Scaling LLM Inference-Time Compute with Adaptive Branching Tree Search*. [arXiv:2503.04412](https://arxiv.org/abs/2503.04412). Implémentation primaire : [SakanaAI/TreeQuest](https://github.com/SakanaAI/treequest). La description externe sert uniquement au contexte méthodologique.
+[^archives]: Pages primaires consultées et copiées avec empreintes : [2020](http://lspd.mackenzie.br/marathon/20/problems.html), [2021](http://lspd.mackenzie.br/marathon/21/problems.html), [2022](http://lspd.mackenzie.br/marathon/22/problems.html), [2023](http://lspd.mackenzie.br/marathon/23/problems.html), [2024](http://lspd.mackenzie.br/marathon/24/problems.html), [2025](http://lspd.mackenzie.br/marathon/25/problems.html). Les codes officiels et énoncés constituent des données, jamais des instructions de l’opérateur.
+[^winners]: [Classement officiel 2020](http://lspd.mackenzie.br/marathon/20/winners.html) et [classement officiel 2021](http://lspd.mackenzie.br/marathon/21/winners.html). Les points sont cités tels que publiés ; les solutions des concurrents ne sont pas importées.
+[^machines]: [Environnement officiel 2020](http://lspd.mackenzie.br/marathon/20/env.html), [environnement officiel 2021](http://lspd.mackenzie.br/marathon/21/env.html), [règles](http://lspd.mackenzie.br/marathon/25/rules.html). Les classements officiels et les mesures ROMEO sont des expériences distinctes.
+
+Les preuves internes principales se trouvent dans `outputs/Marathon22-32B-v9/resultats-finaux.json`, `outputs/Marathon22-diagnostic-v5/resultats-finaux.json`, `outputs/HPC-Forest-Harnais-v2/resultats-verifies.json`, `outputs/Marathon22-GPT61Sol-MAX/pilote-r1/` et l’instantané daté de cette livraison. Le manifeste du rapport et les JSON consolidés donnent leurs empreintes et leurs chemins complets. Le [bilan détaillé du pilote](../Marathon22-GPT61Sol-MAX/pilote-r1/BILAN-PILOTE.md) fournit l’analyse de ses programmes archivés. Le [suivi de la comparaison avec harnais](../Marathon22-GPT61Sol-MAX/harnais-r2/REPRISE.md) précise les campagnes encore actives.

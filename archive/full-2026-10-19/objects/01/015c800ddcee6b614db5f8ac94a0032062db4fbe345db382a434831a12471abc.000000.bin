@@ -1,0 +1,283 @@
+"""Delivery only of closed Q752546. No test/source/CLI/C/model execution."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import platform
+import re
+import stat
+import sys
+import tarfile
+import time
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+ORIGINAL = "/scratch_p/nimarano/hpc-forest-lane-r2-zero-model-20261018-r4-60db53fb69e0-1bb5d38fe272"
+SOURCE_JOB = "752546"
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE = "60db53fb69e014133a9c77ebaea9ae09ae7891c1433070a9af4eae30b0d05e6d"
+PLAN = "b1b39b999cb89374a17191c5b3aef2b4eee255287a4cdbb80ed9c8b5d2ac1e1c"
+RUNTIME = "890b20a1ac050fc3952f1409eb884a9013b9c01ddde5f8a79304485187f523ac"
+COMPONENTS = "d18259c0017f0273522a54c638aaf14da9f5db8c32b12618852157f879323977"
+ORIGINAL_BINDINGS = "f33be7941ffe6c77d6608614a60d07703d3a2fa773d80ce11e110526554bfab5"
+ORIGINAL_WRAPPER = "e30bb6d4a3c829bc7b384b35dcafff94ac73ae1d0d105d20a9ded8a262634900"
+QUALIFICATION_SHA = "334d79433d169bad70945af6389ef3830b810d9742d9080a112b4eba03726114"
+SOURCE_JUNIT_SHA = "aa3098181dd69fbfcf596ee18f0d9e784574013feb874ce85711905c63742891"
+ADAPTER_JUNIT_SHA = "7c1ce23f7751228faf1f3152be30a7862e91aebad212cb6b2289c1afb7730e36"
+PARTIAL_SHA = "523fd8d5f32423d9cc2e2e4680b8aaf74746c78362e86d55e2e2fc460f3c5890"
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+
+
+def need(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def read_regular(path):
+    """Never follow a link, including a swap between lstat and open."""
+    before = path.lstat()
+    need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1, "One regular unlinked file required: " + str(path))
+    need(before.st_size <= 256 * 1024 * 1024, "Delivery member exceeds bound")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        actual = os.fstat(stream.fileno())
+        need((actual.st_dev, actual.st_ino, actual.st_mode, actual.st_nlink, actual.st_size)
+             == (before.st_dev, before.st_ino, before.st_mode, before.st_nlink, before.st_size),
+             "File identity changed during delivery")
+        raw = stream.read()
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size and (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns),
+         "File bytes changed during delivery")
+    return raw
+
+
+def sha(path):
+    return hashlib.sha256(read_regular(path)).hexdigest()
+
+
+def json_bytes(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, "Duplicate JSON member")
+            result[key] = value
+        return result
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+
+
+def save(path, value):
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=True, indent=2) + "\n")
+
+
+def allocation_guard():
+    need(time.time() + 180 + 10800 < 1793487600, "3min delivery plus audit reserve must precede deadline")
+    need(platform.machine().lower() == "aarch64", "ARM64 allocation required")
+    need(all(os.environ.get(k) == v for k, v in {
+        "SLURM_CPUS_PER_TASK": "4", "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
+        "SLURM_MEM_PER_NODE": "16384"}.items()), "Exact 4CPU/1task/1node/16GiB allocation required")
+    job = os.environ.get("SLURM_JOB_ID", "")
+    need(re.fullmatch(r"[0-9]+", job) is not None and job != SOURCE_JOB, "A new delivery-only Slurm allocation is required")
+    need(not os.environ.get("SLURM_JOB_GPUS", "") and not os.environ.get("SLURM_STEP_GPUS", "")
+         and os.environ.get("SLURM_GPUS", "0") == "0"
+         and os.environ.get("SLURM_GPUS_ON_NODE", "0") == "0", "Zero GPU required")
+    affinity = sorted(os.sched_getaffinity(0))
+    need(len(affinity) == 4, "Unique srun must bind exactly four CPUs")
+    return {"architecture": "ARM64", "cpu_cores": 4, "tasks": 1, "nodes": 1,
+            "allocated_memory_mib": 16384, "allocated_gpus": 0, "slurm_job_id": job,
+            "affinity_cpu_ids": affinity}
+
+
+def inventory(root):
+    """scandir without link traversal; link targets are recorded as strings only."""
+    need(stat.S_ISDIR(root.lstat().st_mode), "A real directory is required")
+    result = {}
+
+    def visit(directory):
+        with os.scandir(directory) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                path = Path(entry.path)
+                rel = path.relative_to(root).as_posix()
+                observed = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(observed.st_mode):
+                    target = os.readlink(path)
+                    result[rel] = {"kind": "symbolic_link_metadata_only", "target": target,
+                                   "target_text_sha256": hashlib.sha256(os.fsencode(target)).hexdigest(),
+                                   "lstat_mode": observed.st_mode}
+                elif stat.S_ISDIR(observed.st_mode):
+                    result[rel] = {"kind": "directory"}
+                    visit(path)
+                elif stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1:
+                    raw = read_regular(path)
+                    result[rel] = {"kind": "regular", "bytes": len(raw),
+                                   "sha256": hashlib.sha256(raw).hexdigest()}
+                else:
+                    # Hard-link targets cannot be inferred without leaving this
+                    # closed root; special files must never be opened.
+                    result[rel] = {"kind": "hardlink_or_special_metadata_only", "lstat_mode": observed.st_mode,
+                                   "hardlink_count": observed.st_nlink, "size": observed.st_size}
+    visit(root)
+    return result
+
+
+def regular_hashes(value):
+    return {name: item["sha256"] for name, item in value.items() if item["kind"] == "regular"}
+
+
+def safe_arcname(label, relative):
+    rel = PurePosixPath(relative)
+    if (not rel.is_absolute() and ".." not in rel.parts and "\\" not in relative
+            and not re.match(r"^[A-Za-z]:", relative)):
+        return "original/" + label + "/" + relative
+    # Preserve odd fixture names as data, never executable extraction paths.
+    return "opaque-names/" + label + "/" + hashlib.sha256(os.fsencode(relative)).hexdigest() + ".bin"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--delivery-root", required=True, type=Path)
+    args = parser.parse_args()
+    profile = allocation_guard()  # Before original-root reads or output writes.
+    need(Path(sys.executable).resolve(strict=True) == Path(PYTHON).resolve(strict=True), "Existing allocated Python only")
+    delivery = args.delivery_root.resolve(strict=True)
+    config = json_bytes(read_regular(delivery / "delivery-bindings.json"))
+    need(delivery == Path(config["delivery_root"]).resolve(strict=True), "Dedicated delivery root differs")
+    original = Path(ORIGINAL).resolve(strict=True)
+    need(not delivery.is_relative_to(original) and not original.is_relative_to(delivery), "Delivery must be separate from original Q")
+    need(sha(original / "bindings.json") == ORIGINAL_BINDINGS
+         and sha(original / "qualification-wrapper.py") == ORIGINAL_WRAPPER, "Original Q4 identity/pins changed")
+    binding = json_bytes(read_regular(original / "bindings.json"))
+    need(binding["scope_id"] == SCOPE and binding["source_zip_sha256"] == SOURCE
+         and binding["plan_sha256"] == PLAN and binding["adapter_components_manifest_sha256"] == COMPONENTS,
+         "Original exact source/plan/adapters required")
+    qpath = original / "qualification-output/qualification.json"
+    qsha = sha(qpath)
+    need(qsha == config["original_qualification_sha256"] == QUALIFICATION_SHA, "Parent-received actual qualification SHA differs")
+    need(sha(original / "qualification-output/source-lane-junit.xml") == SOURCE_JUNIT_SHA
+         and sha(original / "qualification-output/adapter-portable-junit.xml") == ADAPTER_JUNIT_SHA,
+         "Exact already executed JUnit bytes required; never rerun tests")
+    qualification = json_bytes(read_regular(qpath))
+    need(qualification.get("scope_id") == SCOPE and qualification.get("source_zip_sha256") == SOURCE
+         and qualification.get("plan_sha256") == PLAN
+         and qualification.get("allocation", {}).get("slurm_job_id") == SOURCE_JOB
+         and qualification.get("adapter_components_manifest_sha256") == COMPONENTS
+         and type(qualification.get("native_model_calls")) is int and qualification["native_model_calls"] == 0
+         and type(qualification.get("verified")) is bool, "Original qualification identity differs; verdict is never upgraded")
+    trees = {name: original / name for name in ("source", "adapters", "qualification-output")}
+    before = {name: inventory(path) for name, path in trees.items()}
+    source = original / "source"
+    need(sha(source / "project.zip") == SOURCE and sha(source / "dynamic-plan.json") == PLAN
+         and sha(source / "runtime-manifest.json") == RUNTIME, "Original source ZIP/plan/runtime changed")
+    runtime = json_bytes(read_regular(source / "runtime-manifest.json"))
+    project_files = {name.removeprefix("project/"): item["sha256"] for name, item in before["source"].items()
+                     if name.startswith("project/") and item["kind"] == "regular"}
+    need(len(runtime) == 105 and project_files == runtime, "Exact 105 original source files required")
+    need(sha(original / "adapters/COMPONENTS.json") == COMPONENTS, "Original adapter manifest changed")
+    components = json_bytes(read_regular(original / "adapters/COMPONENTS.json"))
+    adapter_files = regular_hashes(before["adapters"])
+    need(len(adapter_files) == 32 and set(adapter_files) == set(components["code_pins"]) | {"COMPONENTS.json"}
+         and all(adapter_files[name] == checksum for name, checksum in components["code_pins"].items()),
+         "Exact 32 original adapter files required")
+    extras = ["bindings.json", "packet-manifest.json", "bootstrap-allocation.json", "qualification-wrapper.py",
+              "source-bundle.tar.gz", "adapter-bundle.tar.gz"]
+    extra_before = {name: sha(original / name) for name in extras}
+    need(extra_before["source-bundle.tar.gz"] == binding["source_bundle_sha256"]
+         and extra_before["adapter-bundle.tar.gz"] == binding["adapter_bundle_sha256"]
+         and extra_before["packet-manifest.json"] == config["original_packet_manifest_sha256"],
+         "Original closed packet/source/adapter pins changed")
+    partial = original / f"qualification-results-{SOURCE_JOB}.tar.gz"
+    try:
+        partial.lstat()
+        partial_exists = True
+    except FileNotFoundError:
+        partial_exists = False
+    need(partial_exists and sha(partial) == PARTIAL_SHA and partial.lstat().st_size == 3121,
+         "Original failed partial archive must remain exactly preserved")
+    if partial_exists:
+        extra_before[partial.name] = sha(partial)  # Raw bytes only; never decode the partial archive.
+    output = delivery / "delivery-output"
+    output.mkdir(exist_ok=False)
+    save(output / "original-before.json", before)
+    links = {label: {name: item for name, item in values.items()
+                     if item["kind"] in {"symbolic_link_metadata_only", "hardlink_or_special_metadata_only"}}
+             for label, values in before.items()}
+    save(output / "links-metadata-only.json", links)
+    archive = delivery / f"delivery-only-752546-{profile['slurm_job_id']}.tar.gz"
+    member_map = {}
+    with tarfile.open(archive, "x:gz") as packed:
+        for label, values in before.items():
+            for name, info in sorted(values.items()):
+                if info["kind"] != "regular":
+                    continue
+                raw = read_regular(trees[label].joinpath(*PurePosixPath(name).parts))
+                need(hashlib.sha256(raw).hexdigest() == info["sha256"], "Original file changed before archive")
+                member = safe_arcname(label, name)
+                need(member not in member_map, "Duplicate delivery archive member")
+                entry = tarfile.TarInfo(member)
+                entry.size, entry.mode, entry.mtime = len(raw), 0o600, 0
+                packed.addfile(entry, io.BytesIO(raw))
+                member_map[member] = {"original_group": label, "original_relative": name,
+                                      "sha256": info["sha256"], "bytes": len(raw)}
+        for name, expected in extra_before.items():
+            raw = read_regular(original / name)
+            need(hashlib.sha256(raw).hexdigest() == expected, "Original root metadata/partial archive changed")
+            member = "original-root/" + name
+            entry = tarfile.TarInfo(member)
+            entry.size, entry.mode, entry.mtime = len(raw), 0o600, 0
+            packed.addfile(entry, io.BytesIO(raw))
+            member_map[member] = {"original_group": "root", "original_relative": name,
+                                  "sha256": expected, "bytes": len(raw)}
+        after = {name: inventory(path) for name, path in trees.items()}
+        extra_after = {name: sha(original / name) for name in extra_before}
+        need(before == after and extra_before == extra_after, "Original bytes or link metadata changed during delivery")
+        save(output / "original-after.json", after)
+        save(output / "archive-member-map.json", member_map)
+        producer = {"schema": "hpc-forest-lane-r2-delivery-only-producer-v1", "verified": True,
+                    "verification_scope": "Immutable-byte delivery only; original qualification and FAILED job are unchanged",
+                    "source_job_id": SOURCE_JOB, "source_job_terminal_state": "FAILED",
+                    "source_job_exit_code": "1:0", "delivery_allocation": profile,
+                    "original_root": str(original), "scope_id": SCOPE, "source_zip_sha256": SOURCE,
+                    "plan_sha256": PLAN, "adapter_components_manifest_sha256": COMPONENTS,
+                    "original_qualification_sha256": qsha,
+                    "original_qualification_verified": qualification["verified"],
+                    "original_allocated_contract_tests_returncode": qualification.get("allocated_contract_tests_returncode"),
+                    "original_source_lane_contract_tests": qualification.get("source_lane_contract_tests"),
+                    "original_adapter_portable_tests": qualification.get("adapter_portable_tests"),
+                    "source_file_count": 105, "adapter_file_count": 32,
+                    "delivery_script_sha256": sha(delivery / "livrer-sans-reexecution.py"),
+                    "original_partial_archive_present": partial_exists, "original_root_extra_sha256": extra_before,
+                    "original_archive_producer_announcement_received": False,
+                    "original_archive_three_SHA_equality_claimed": False,
+                    "inventories_before_after_identical": True, "links_followed": False,
+                    "links_preserved_as_metadata_only": True, "full_filesystem_clone_claimed": False,
+                    "tests_reexecuted": 0, "pytest_or_source_modules_imported": False,
+                    "native_model_calls": 0, "CLI_C_compiler_install_or_RPC_calls": 0,
+                    "native_generation_admitted": False, "normal_first_start_verified": False,
+                    "finished_at_utc": datetime.now(UTC).isoformat()}
+        save(output / "delivery-producer.json", producer)
+        for path in sorted(output.iterdir()):
+            raw = read_regular(path)
+            entry = tarfile.TarInfo("delivery-metadata/" + path.name)
+            entry.size, entry.mode, entry.mtime = len(raw), 0o600, 0
+            packed.addfile(entry, io.BytesIO(raw))
+        for name in ("livrer-sans-reexecution.py", "delivery-bindings.json", "packet-manifest.json", "bootstrap-allocation.json"):
+            raw = read_regular(delivery / name)
+            entry = tarfile.TarInfo("delivery-code/" + name)
+            entry.size, entry.mode, entry.mtime = len(raw), 0o600, 0
+            packed.addfile(entry, io.BytesIO(raw))
+    envelope = {"schema": "hpc-forest-lane-r2-delivery-only-envelope-v1", "verified": True,
+                "verification_scope": "New delivery archive only; no qualification verdict upgrade",
+                "source_job_id": SOURCE_JOB, "source_job_terminal_state": "FAILED",
+                "delivery_job_id": profile["slurm_job_id"], "native_model_calls": 0, "tests_reexecuted": 0,
+                "archive": {"path": str(archive), "sha256": sha(archive), "bytes": archive.stat().st_size},
+                "producer": {"path": str(output / "delivery-producer.json"), "sha256": sha(output / "delivery-producer.json")}}
+    save(delivery / "delivery-envelope.json", envelope)
+    print(json.dumps(envelope), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

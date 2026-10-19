@@ -1,0 +1,142 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#define N_ITER 10
+#define DT 0.01f
+#define SOFTENING 1e-9f
+#define FORCE_TILE 16
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Process a small target-body tile at a time.  Each target retains its
+ * ascending j accumulation order while a loaded source coordinate is reused
+ * by all targets in the tile.
+ */
+static void body_force(float * restrict x, float * restrict y,
+                       float * restrict z, float * restrict vx,
+                       float * restrict vy, float * restrict vz,
+                       float dt, int n) {
+#pragma omp parallel for schedule(static)
+  for (int ib = 0; ib < n; ib += FORCE_TILE) {
+    const int count = (n - ib < FORCE_TILE) ? n - ib : FORCE_TILE;
+    float xi[FORCE_TILE];
+    float yi[FORCE_TILE];
+    float zi[FORCE_TILE];
+    float fx[FORCE_TILE] = {0.0f};
+    float fy[FORCE_TILE] = {0.0f};
+    float fz[FORCE_TILE] = {0.0f};
+
+    for (int ii = 0; ii < count; ++ii) {
+      const int i = ib + ii;
+      xi[ii] = x[i];
+      yi[ii] = y[i];
+      zi[ii] = z[i];
+    }
+
+    for (int j = 0; j < n; ++j) {
+      const float xj = x[j];
+      const float yj = y[j];
+      const float zj = z[j];
+
+      for (int ii = 0; ii < count; ++ii) {
+        const float dx = xj - xi[ii];
+        const float dy = yj - yi[ii];
+        const float dz = zj - zi[ii];
+        const float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        const float inv_dist = 1 / sqrt(sqrd_dist);
+        const float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx[ii] += dx * inv_dist3;
+        fy[ii] += dy * inv_dist3;
+        fz[ii] += dz * inv_dist3;
+      }
+    }
+
+    for (int ii = 0; ii < count; ++ii) {
+      const int i = ib + ii;
+      vx[i] += dt * fx[ii];
+      vy[i] += dt * fy[ii];
+      vz[i] += dt * fz[ii];
+    }
+  }
+}
+
+static void integrate(float * restrict x, float * restrict y,
+                      float * restrict z, const float * restrict vx,
+                      const float * restrict vy, const float * restrict vz,
+                      int n) {
+#pragma omp parallel for schedule(static)
+  for (int i = 0; i < n; ++i) {
+    x[i] += vx[i] * DT;
+    y[i] += vy[i] * DT;
+    z[i] += vz[i] * DT;
+  }
+}
+
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr, "\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr, "\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr, "\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+  float *state = (float *)malloc((size_t)nbodies * 6 * sizeof(*state));
+  float *x = state;
+  float *y = x + nbodies;
+  float *z = y + nbodies;
+  float *vx = z + nbodies;
+  float *vy = vx + nbodies;
+  float *vz = vy + nbodies;
+
+  for (int i = 0; i < nbodies; ++i) {
+    x[i] = bodies[i].x;
+    y[i] = bodies[i].y;
+    z[i] = bodies[i].z;
+    vx[i] = bodies[i].vx;
+    vy[i] = bodies[i].vy;
+    vz[i] = bodies[i].vz;
+  }
+
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(x, y, z, vx, vy, vz, DT, nbodies);
+    integrate(x, y, z, vx, vy, vz, nbodies);
+  }
+
+  for (int i = 0; i < nbodies; ++i) {
+    bodies[i].x = x[i];
+    bodies[i].y = y[i];
+    bodies[i].z = z[i];
+    bodies[i].vx = vx[i];
+    bodies[i].vy = vy[i];
+    bodies[i].vz = vz[i];
+  }
+
+  write_dataset(nbodies, bodies);
+  free(state);
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

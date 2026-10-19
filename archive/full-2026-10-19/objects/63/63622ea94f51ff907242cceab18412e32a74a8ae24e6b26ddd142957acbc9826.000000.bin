@@ -1,0 +1,59 @@
+"""Read-only verification plus one new receipt; no runtime/transport execution."""
+from __future__ import annotations
+
+import hashlib
+import json
+import tarfile
+import zipfile
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+BASE = OUT.parents[1]
+PROJECT = BASE / "work/hpc-forest-primes-native-max-r2/project"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+delivery = json.loads((OUT / "LIVRAISON-LOCALE.json").read_text(encoding="utf8"))
+for key in ("source_zip", "plan", "bundle", "bundle_manifest"):
+    if sha(Path(delivery[key]["path"])) != delivery[key]["sha256"]:
+        raise RuntimeError("Sealed delivery differs: " + key)
+runtime = json.loads((OUT / "runtime-manifest-r2max.json").read_text(encoding="utf8"))
+actual = {p.relative_to(PROJECT).as_posix(): sha(p) for p in sorted(PROJECT.rglob("*"))
+          if p.is_file() and not any(x in {"__pycache__", ".pytest_cache", ".ruff_cache"} for x in p.relative_to(PROJECT).parts)}
+if actual != runtime:
+    raise RuntimeError("Source changed after sealing")
+with zipfile.ZipFile(delivery["source_zip"]["path"]) as archive:
+    members = {name.removeprefix("HPC-Forest/"): hashlib.sha256(archive.read(name)).hexdigest() for name in archive.namelist()}
+    if len(archive.namelist()) != len(members) or members != runtime:
+        raise RuntimeError("Restored ZIP/source inventory differs")
+manifest = json.loads((OUT / "proposal-bundle-manifest.json").read_text(encoding="utf8"))["files"]
+with tarfile.open(delivery["bundle"]["path"], "r:gz") as archive:
+    payload = {}
+    for member in archive.getmembers():
+        if not member.isfile() or member.name in payload:
+            raise RuntimeError("Nonregular or duplicate package member")
+        payload[member.name] = hashlib.sha256(archive.extractfile(member).read()).hexdigest()
+    if payload.pop("proposal-bundle-manifest.json") != sha(OUT / "proposal-bundle-manifest.json") or payload != manifest:
+        raise RuntimeError("Package manifest differs")
+    for name, expected in manifest.items():
+        path = PROJECT / name.removeprefix("HPC-Forest/") if name.startswith("HPC-Forest/") else OUT / name
+        if sha(path) != expected:
+            raise RuntimeError("Local sealed package input changed: " + name)
+origin = json.loads((OUT / "origine-et-preservation-avant.json").read_text(encoding="utf8"))
+if any(sha(Path(name)) != value for name, value in origin["original_files"].items()):
+    raise RuntimeError("Original r1b proof changed")
+proof = {"schema": "hpc-forest-r2max-r2-final-byte-verification-v1", "verified": True,
+         "source_zip_plan_bundle_manifest_current_sha256_equal": True, "source_files": len(runtime),
+         "zip_regular_unique_source_inventory_equal": True, "bundle_regular_members": len(manifest) + 1,
+         "bundle_member_bytes_equal_current_inputs": True, "original_r1b_files_unchanged": len(origin["original_files"]),
+         "core_run_process_unchanged": runtime["src/hpc_forest/core.py"] == origin["restored_file_sha256"]["src/hpc_forest/core.py"],
+         "delivery_sha256": sha(OUT / "LIVRAISON-LOCALE.json"), "native_research_admitted": False,
+         "arm64_qualification_admitted": False, "local_c_cli_model_socket_romeo_executions": 0, "jobs_submitted": 0}
+path = OUT / "verification-finale-octets.json"
+with path.open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(proof, ensure_ascii=False, indent=2) + "\n")
+print(json.dumps({"verification_sha256": sha(path), "delivery_sha256": sha(OUT / "LIVRAISON-LOCALE.json"),
+                  "source_files": len(runtime), "r1b_original_artifacts_unchanged": len(origin["original_files"])}, indent=2))

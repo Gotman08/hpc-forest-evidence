@@ -1,0 +1,97 @@
+"""Summarize receipts; never alters model candidates or tests."""
+import argparse
+import hashlib
+import json
+import pickle
+import sqlite3
+from collections import Counter
+from pathlib import Path
+
+def read(path,default=None):
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else default
+
+def analyse(root):
+    overall=read(root/"results.json",{})
+    summary={"job_id":overall.get("job_id"),"complete":overall.get("complete"),
+             "elapsed_seconds":overall.get("elapsed_seconds"),"cleanup":read(root/"cleanup.json"),"problems":[]}
+    for slug in ["knn","sum","nbody","bucketsort"]:
+        result=read(root/f"{slug}-summary.json",{})
+        prep=read(root/"preparation"/slug/"history.json",[])
+        report=read(root/slug/"report/experiments.json",{})
+        trials=report.get("experiments",[])
+        topology=read(root/f"{slug}-progress.json",{})
+        item={"problem":slug,"complete":result.get("complete",False),"error":result.get("error"),
+              "elapsed_seconds":result.get("elapsed_seconds"),"preparation_attempts":len(prep),
+              "preparation_errors":[h.get("error") for h in prep if not h.get("ready")],
+              "preparation_tokens":sum((h.get("usage",{}).get("prompt_eval_count") or 0)+(h.get("usage",{}).get("eval_count") or 0) for h in prep),
+              "trials":len(trials),"states":dict(Counter(t["state"] for t in trials)),"roles":dict(Counter(t["role"] for t in trials)),
+              "costs":result.get("costs"),"best_confirmed":result.get("best_confirmed"),"trees":topology.get("trees",[]),
+              "scored_nodes":topology.get("scored_nodes",0),"total_tree_nodes":sum(len(t["nodes"]) for t in topology.get("trees",[])),
+              "max_depth":topology.get("max_depth",0),"max_children":topology.get("max_children",0),"cases":[],"official_source_identity":[]}
+        # This is our own checkpoint, from the integrity-verified job archive.
+        r_checkpoint=root/"preparation"/slug/"r-tree.pkl"
+        if r_checkpoint.is_file():
+            state=pickle.loads(r_checkpoint.read_bytes())
+            queue=[(state.tree.root,None,0)]
+            nodes=[]
+            while queue:
+                node,parent,depth=queue.pop(0)
+                key=node.state["experiment_id"] if node.state else "R"
+                nodes.append({"id":key,"label":key,"parent":parent,"depth":depth,"score":node.score,"child_count":len(node.children)})
+                queue.extend((child,key,depth+1) for child in node.children)
+            item["preparation_tree"]={"nodes":nodes,"max_depth":max(n["depth"] for n in nodes),"max_children":max(n["child_count"] for n in nodes)}
+        item["preparation_details"]=[]
+        for h in prep:
+            attempt=root/"preparation"/slug/f"attempt-{h['attempt']}"
+            c=read(attempt/"model-contract.json",{})
+            modes=Counter()
+            for case in [*c.get("search_cases",[]),*c.get("confirmation_cases",[])]+([c["benchmark_case"]] if "benchmark_case" in c else []):
+                selected=[key for key in ["stdin_file","stdin_text","stdin_python"] if case.get(key)]
+                modes.update(selected or ["empty"])
+            checks=[]
+            for p in sorted((attempt/"prepared/source/src").rglob("*")):
+                if p.is_file():
+                    original=root/"official"/slug/p.relative_to(attempt/"prepared/source/src")
+                    checks.append({"path":p.relative_to(attempt/"prepared/source/src").as_posix(),"identical":original.is_file() and original.read_bytes()==p.read_bytes()})
+            item["preparation_details"].append({"attempt":h["attempt"],"ready":h["ready"],"error":h.get("error"),"source_files":c.get("source_files"),"input_modes":dict(modes),"official_source_checks":checks})
+        trusted=root/slug/"trusted"
+        contract=read(trusted/"contract.json")
+        if contract:
+            item["comparison"]=contract["comparison"]
+            item["compiler_flags"]=contract["compiler_flags"]
+            for phase in ["search","confirmation","benchmark"]:
+                cases=contract[phase] if phase!="benchmark" else [contract[phase]]
+                for c in cases:
+                    data=(trusted/c["stdin"]).read_bytes()
+                    item["cases"].append({"phase":phase,"name":c["name"],"argv":c["argv"],"stdin_bytes":len(data),
+                        "stdin_sha256":hashlib.sha256(data).hexdigest(),"first_line":data.splitlines()[0].decode(errors="replace")[:150] if data else "",
+                        "capture_files":c["capture_files"]})
+            accepted=next((h for h in prep if h.get("ready")),None)
+            if accepted:
+                original=root/"official"/slug
+                source=Path(accepted["source"])
+                # Remote paths are translated into this downloaded archive.
+                parts=source.parts
+                relative=parts[parts.index(root.name)+1:]
+                local=root.joinpath(*relative)
+                for p in sorted((local/"src").rglob("*")):
+                    if p.is_file():
+                        q=original/p.relative_to(local/"src")
+                        item["official_source_identity"].append({"path":p.relative_to(local/"src").as_posix(),"identical":q.is_file() and q.read_bytes()==p.read_bytes(),"sha256":hashlib.sha256(p.read_bytes()).hexdigest()})
+        item["events"]=[{"id":t["id"],"label":t["role"]+str(i+1),"role":t["role"],"parent":t["search_parent"],"state":t["state"],"score":t["score"],"mean_seconds":t["mean_seconds"],"hypothesis":t["hypothesis"],"sources":t["sources"]} for i,t in enumerate(trials)]
+        # Role labels use per-role ordinals, matching the checkpoints.
+        ordinals=Counter()
+        for event in item["events"]:
+            ordinals[event["role"]]+=1
+            event["label"]=event["role"]+str(ordinals[event["role"]])
+        summary["problems"].append(item)
+    return summary
+
+if __name__=="__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument("root",type=Path)
+    parser.add_argument("destination",type=Path)
+    args=parser.parse_args()
+    result=analyse(args.root)
+    args.destination.write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+    print(json.dumps({"job_id":result["job_id"],"complete":result["complete"],"problems":[{k:p[k] for k in ["problem","complete","error","trials","states","scored_nodes","max_depth","max_children","best_confirmed"]} for p in result["problems"]]},ensure_ascii=False))

@@ -1,0 +1,359 @@
+#include "knn.h"
+#include <limits.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+typedef struct {
+    float distance;
+    int group;
+} KnnCandidate;
+
+typedef struct {
+    KnnCandidate *candidates;
+    size_t capacity;
+    size_t count;
+} KnnPartial;
+
+/* Equal-distance points within one group have identical labels. */
+static inline int knn_farther(KnnCandidate a, KnnCandidate b) {
+    return a.distance > b.distance ||
+           (a.distance == b.distance && a.group > b.group);
+}
+
+static inline void knn_sift_down(KnnCandidate *heap, size_t count,
+                                 size_t root, KnnCandidate value) {
+    size_t child = root * 2 + 1;
+
+    while (child < count) {
+        if (child + 1 < count &&
+            knn_farther(heap[child + 1], heap[child])) {
+            child++;
+        }
+        if (!knn_farther(heap[child], value)) {
+            break;
+        }
+        heap[root] = heap[child];
+        root = child;
+        child = root * 2 + 1;
+    }
+    heap[root] = value;
+}
+
+static inline void knn_partial_offer(KnnPartial *partial,
+                                      float distance, int group) {
+    KnnCandidate candidate = {distance, group};
+
+    if (partial->count < partial->capacity) {
+        partial->candidates[partial->count++] = candidate;
+        if (partial->count == partial->capacity) {
+            for (size_t root = partial->count / 2; root > 0; root--) {
+                KnnCandidate value = partial->candidates[root - 1];
+                knn_sift_down(partial->candidates, partial->count,
+                              root - 1, value);
+            }
+        }
+        return;
+    }
+
+    if (knn_farther(partial->candidates[0], candidate)) {
+        knn_sift_down(partial->candidates, partial->count, 0, candidate);
+    }
+}
+
+static int knn_scan_points(KnnPartial *partial, const Point *points,
+                           size_t count, int group, Point to_evaluate) {
+    enum { TILE_POINTS = 256 };
+    float distance_tile[TILE_POINTS];
+    size_t begin = 0;
+
+    while (begin < count) {
+        size_t remaining = count - begin;
+        int length = remaining > TILE_POINTS ? TILE_POINTS : (int) remaining;
+        const int have_cutoff = partial->count == partial->capacity;
+        const float cutoff = have_cutoff ? partial->candidates[0].distance : 0.0f;
+        const int cutoff_group = have_cutoff ? partial->candidates[0].group : 0;
+        const int earlier_group = group < cutoff_group;
+        int any_candidate = 0;
+        int bad_distance = 0;
+
+#if defined(_OPENMP)
+#pragma omp simd reduction(|:any_candidate,bad_distance)
+#elif defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
+        for (int p = 0; p < length; p++) {
+            float d = euclidean_distance_no_sqrt(
+                to_evaluate, points[begin + (size_t) p]);
+            int retain = !have_cutoff || d < cutoff ||
+                         (d == cutoff && earlier_group);
+            distance_tile[p] = retain ? d : -1.0f;
+            any_candidate |= retain;
+            bad_distance |= !(d >= 0.0f);
+        }
+
+        if (bad_distance) {
+            return 0;
+        }
+        if (any_candidate) {
+            for (int p = 0; p < length; p++) {
+                float d = distance_tile[p];
+                if (d != -1.0f) {
+                    knn_partial_offer(partial, d, group);
+                }
+            }
+        }
+        begin += (size_t) length;
+    }
+    return 1;
+}
+
+static char knn_reference(int n_groups, Group *groups, int k,
+                           Point to_evaluate) {
+    char *labels = (char *) malloc(sizeof(char) * k);
+    float *distances = (float *) malloc(sizeof(float) * k);
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+#ifdef _OPENMP
+static int knn_select_parallel(int n_groups, Group *groups,
+                               size_t total, size_t capacity,
+                               Point to_evaluate, KnnPartial *selection) {
+    int workers = omp_get_max_threads();
+    size_t max_workers = total / 4096;
+    if (max_workers < (size_t) workers) {
+        workers = (int) max_workers;
+    }
+    if (workers < 2) {
+        return 0;
+    }
+
+    if ((size_t) n_groups + 1 > ((size_t) -1) / sizeof(size_t)) {
+        return 0;
+    }
+    size_t *offsets = (size_t *) malloc(
+        ((size_t) n_groups + 1) * sizeof(*offsets));
+    if (offsets == NULL) {
+        return 0;
+    }
+    KnnPartial *partials = (KnnPartial *) calloc(
+        (size_t) workers, sizeof(*partials));
+    if (partials == NULL) {
+        free(offsets);
+        return 0;
+    }
+
+    offsets[0] = 0;
+    for (int i = 0; i < n_groups; i++) {
+        offsets[i + 1] = offsets[i] + (size_t) groups[i].length;
+    }
+
+    size_t block_size = total / ((size_t) workers * 8);
+    if (block_size < 1024) block_size = 1024;
+    if (block_size > 16384) block_size = 16384;
+    size_t blocks = total / block_size + (total % block_size != 0);
+    int failed = 0;
+
+#pragma omp parallel num_threads(workers) reduction(|:failed)
+    {
+        KnnPartial local = {0};
+        local.capacity = capacity;
+        local.candidates = (KnnCandidate *) malloc(
+            capacity * sizeof(*local.candidates));
+        int invalid = local.candidates == NULL;
+
+#pragma omp for schedule(dynamic, 1)
+        for (size_t block = 0; block < blocks; block++) {
+            if (invalid) continue;
+
+            size_t begin = block * block_size;
+            size_t remaining = total - begin;
+            size_t end = begin + (remaining < block_size ? remaining : block_size);
+            size_t low = 0;
+            size_t high = (size_t) n_groups;
+
+            while (low < high) {
+                size_t middle = low + (high - low) / 2;
+                if (offsets[middle + 1] <= begin) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+
+            for (int group = (int) low;
+                 group < n_groups && offsets[group] < end; group++) {
+                size_t first = begin > offsets[group] ? begin - offsets[group] : 0;
+                size_t stop = offsets[group + 1];
+                if (stop > end) stop = end;
+                size_t last = stop - offsets[group];
+
+                if (last > first &&
+                    !knn_scan_points(&local, groups[group].points + first,
+                                     last - first, group, to_evaluate)) {
+                    invalid = 1;
+                    break;
+                }
+            }
+        }
+
+        partials[omp_get_thread_num()] = local;
+        failed |= invalid;
+    }
+
+    free(offsets);
+    if (failed) {
+        for (int worker = 0; worker < workers; worker++) {
+            free(partials[worker].candidates);
+        }
+        free(partials);
+        return 0;
+    }
+
+    *selection = partials[0];
+    for (int worker = 1; worker < workers; worker++) {
+        KnnPartial *other = &partials[worker];
+        for (size_t i = 0; i < other->count; i++) {
+            KnnCandidate candidate = other->candidates[i];
+            knn_partial_offer(selection, candidate.distance, candidate.group);
+        }
+        free(other->candidates);
+    }
+    free(partials);
+    return 1;
+}
+#endif
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0) {
+        return knn_reference(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length < 0) {
+            return knn_reference(n_groups, groups, k, to_evaluate);
+        }
+        size_t length = (size_t) groups[i].length;
+        if (length > ((size_t) -1) - total) {
+            return knn_reference(n_groups, groups, k, to_evaluate);
+        }
+        total += length;
+    }
+    if (total == 0) {
+        return (char) -1;
+    }
+
+    const size_t capacity = total < (size_t) k ? total : (size_t) k;
+    if (capacity > ((size_t) -1) / sizeof(KnnCandidate)) {
+        return knn_reference(n_groups, groups, k, to_evaluate);
+    }
+
+    KnnPartial selected = {0};
+    int parallel_selected = 0;
+#ifdef _OPENMP
+    parallel_selected = knn_select_parallel(
+        n_groups, groups, total, capacity, to_evaluate, &selected);
+#endif
+    if (!parallel_selected) {
+        selected.capacity = capacity;
+        selected.candidates = (KnnCandidate *) malloc(
+            capacity * sizeof(*selected.candidates));
+        if (selected.candidates == NULL) {
+            return knn_reference(n_groups, groups, k, to_evaluate);
+        }
+
+        for (int i = 0; i < n_groups; i++) {
+            if (!knn_scan_points(&selected, groups[i].points,
+                                 (size_t) groups[i].length, i, to_evaluate)) {
+                free(selected.candidates);
+                return knn_reference(n_groups, groups, k, to_evaluate);
+            }
+        }
+    }
+
+    size_t frequencies[UCHAR_MAX + 1] = {0};
+    frequencies[(unsigned char) ((char) -1)] = (size_t) k - selected.count;
+    for (size_t i = 0; i < selected.count; i++) {
+        char label = groups[selected.candidates[i].group].label;
+        frequencies[(unsigned char) label]++;
+    }
+
+    char most_frequent = (char) CHAR_MIN;
+    size_t most_frequent_count = 0;
+    for (int label = CHAR_MIN; label <= CHAR_MAX; label++) {
+        size_t frequency = frequencies[(unsigned char) label];
+        if (frequency > most_frequent_count) {
+            most_frequent = (char) label;
+            most_frequent_count = frequency;
+        }
+    }
+
+    free(selected.candidates);
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

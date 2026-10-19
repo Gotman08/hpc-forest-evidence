@@ -1,0 +1,182 @@
+"""Neutral envelope tests. Never import or run project code, a CLI, C or ROMEO."""
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import os
+import tarfile
+import tempfile
+import unittest
+import zipfile
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("qualified_envelope", HERE / "qualification-wrapper.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+class EnvelopeTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir=HERE)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def tar(self, entries):
+        path = self.root / "input.tar.gz"
+        with tarfile.open(path, "w:gz") as archive:
+            for name, raw, kind in entries:
+                info = tarfile.TarInfo(name)
+                info.type = kind
+                info.size = len(raw) if kind == tarfile.REGTYPE else 0
+                info.linkname = "outside" if kind in {tarfile.LNKTYPE, tarfile.SYMTYPE} else ""
+                archive.addfile(info, io.BytesIO(raw) if kind == tarfile.REGTYPE else None)
+        return path
+
+    def test_normal_tar_is_read_only(self):
+        path = self.tar([("r/a.txt", b"first", tarfile.REGTYPE), ("r/d/b.txt", b"second", tarfile.REGTYPE)])
+        before = sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*"))
+        self.assertEqual(mod.read_tar(path, "r", 2), {"a.txt": b"first", "d/b.txt": b"second"})
+        self.assertEqual(before, sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*")))
+
+    def test_tar_absolute_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("/r/a", b"x", tarfile.REGTYPE)]), "r", 1)
+
+    def test_tar_parent_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("r/../a", b"x", tarfile.REGTYPE)]), "r", 1)
+
+    def test_tar_backslash_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("r/a\\b", b"x", tarfile.REGTYPE)]), "r", 1)
+
+    def test_tar_duplicate_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("r/a", b"x", tarfile.REGTYPE), ("r/a", b"y", tarfile.REGTYPE)]), "r", 2)
+
+    def test_tar_symlink_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("r/a", b"", tarfile.SYMTYPE)]), "r", 1)
+
+    def test_tar_hardlink_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("r/a", b"", tarfile.LNKTYPE)]), "r", 1)
+
+    def test_tar_directory_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("r/a", b"", tarfile.DIRTYPE)]), "r", 1)
+
+    def test_tar_wrong_root_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("other/a", b"x", tarfile.REGTYPE)]), "r", 1)
+
+    def test_tar_noncanonical_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.read_tar(self.tar([("r//a", b"x", tarfile.REGTYPE)]), "r", 1)
+
+    def test_zip_manifest_and_regular_bytes(self):
+        raw = io.BytesIO()
+        with zipfile.ZipFile(raw, "w") as archive:
+            archive.writestr("HPC-Forest/a.py", b"# inert\n")
+        self.assertEqual(mod.read_zip(raw.getvalue(), {"a.py": mod.digest(b"# inert\n")}, 1),
+                         {"a.py": b"# inert\n"})
+        with self.assertRaises(RuntimeError):
+            mod.read_zip(raw.getvalue(), {"a.py": "0" * 64}, 1)
+
+    def test_zip_symlink_refused(self):
+        raw = io.BytesIO()
+        with zipfile.ZipFile(raw, "w") as archive:
+            info = zipfile.ZipInfo("HPC-Forest/a.py")
+            info.external_attr = 0o120777 << 16
+            archive.writestr(info, b"outside")
+        with self.assertRaises(RuntimeError):
+            mod.read_zip(raw.getvalue(), {"a.py": mod.digest(b"outside")}, 1)
+
+    def test_exact_deadline_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.deadline_guard(mod.DEADLINE - timedelta(seconds=11700))
+        mod.deadline_guard(mod.DEADLINE - timedelta(seconds=11701))
+
+    def allocation(self, environment=None, affinity=(1, 2, 3, 4)):
+        env = {"SLURM_JOB_ID": "123", "SLURM_JOB_NUM_NODES": "1", "SLURM_NTASKS": "1",
+               "SLURM_CPUS_PER_TASK": "4", "SLURM_MEM_PER_NODE": "16384"}
+        env.update(environment or {})
+        with patch.dict(os.environ, env, clear=True), patch.object(mod.platform, "system", return_value="Linux"), \
+                patch.object(mod.platform, "machine", return_value="aarch64"), \
+                patch.object(mod.os, "sched_getaffinity", return_value=set(affinity), create=True), \
+                patch.object(mod, "deadline_guard"):
+            return mod.allocation_guard()
+
+    def test_allocation_exact_affinity(self):
+        self.assertEqual(self.allocation()["affinity_cpu_ids"], [1, 2, 3, 4])
+        for affinity in ((1, 2, 3), (1, 2, 3, 4, 5)):
+            with self.subTest(affinity=affinity), self.assertRaises(RuntimeError):
+                self.allocation(affinity=affinity)
+
+    def test_gpu_wrong_resources_or_restart_refused(self):
+        for env in ({"SLURM_GPUS": "1"}, {"SLURM_MEM_PER_NODE": "8192"}, {"SLURM_NTASKS": "2"},
+                    {"SLURM_RESTART_COUNT": "1"}, {"SLURM_JOB_ID": ""}):
+            with self.subTest(env=env), self.assertRaises(RuntimeError):
+                self.allocation(env)
+
+    def test_guard_refuses_before_work(self):
+        with patch.object(mod.platform, "system", return_value="Windows"), \
+                patch.object(mod.Path, "mkdir") as mkdir, patch.object(mod.subprocess, "run") as run:
+            with self.assertRaises(RuntimeError):
+                mod.main({})
+            mkdir.assert_not_called()
+            run.assert_not_called()
+
+    def test_placeholder_bindings_refused(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_bindings({"status": "waiting_for_final_review"})
+
+    def test_qualifier_common_allocation_with_independent_affinity(self):
+        observed = self.allocation()
+        qualified = {key: value for key, value in observed.items() if not key.startswith("affinity_")}
+        self.assertTrue(mod.qualification_allocation_matches(qualified, observed))
+        self.assertNotIn("affinity_cpu_ids", qualified)
+        self.assertTrue(mod.qualification_allocation_matches(observed, observed))
+        self.assertFalse(mod.qualification_allocation_matches({**qualified, "cpus_per_task": 8}, observed))
+        self.assertFalse(mod.qualification_allocation_matches({**qualified, "affinity_cpu_count": 8}, observed))
+        self.assertFalse(mod.qualification_allocation_matches({**qualified, "job_id": "124"}, observed))
+
+    def test_safe_fresh_tree_and_overwrite_refused(self):
+        target = self.root / "extraction"
+        material = {"a.txt": b"original", "inside/b.txt": b"second"}
+        mod.write_new_tree(target, material)
+        with self.assertRaises(FileExistsError):
+            mod.write_new_tree(target, material)
+        self.assertEqual((target / "a.txt").read_bytes(), b"original")
+
+    def test_shell_has_one_exact_qualification_after_spack(self):
+        argv, shell = mod.make_command(Path("/safe/extraction"), Path("/safe/Q"))
+        self.assertEqual(argv.count("--package"), 1)
+        self.assertIn("qualify_r2max_contract.py", argv[3])
+        self.assertEqual(shell[:2], ["bash", "-lc"])
+        self.assertEqual(shell[2].count("spack load"), 1)
+        self.assertEqual(shell[2].count("exec "), 1)
+        self.assertLess(shell[2].index("spack load"), shell[2].index("exec "))
+
+    def test_final_r1b_bundle_metadata_without_project_execution(self):
+        source = HERE.parent / "HPC-Forest-Primes-Natif-MAX-r1/revision-r1b"
+        delivery = json.loads((source / "LIVRAISON-LOCALE.json").read_text(encoding="utf8"))
+        bindings = {"payload_bytes": Path(delivery["bundle"]["path"]).stat().st_size,
+                    "payload_sha256": delivery["bundle"]["sha256"], "payload_root": mod.SCOPE,
+                    "payload_member_count": delivery["bundle_regular_members_verified"],
+                    "bundle_manifest_sha256": delivery["bundle_manifest"]["sha256"],
+                    "source_zip_sha256": delivery["source_zip"]["sha256"],
+                    "plan_sha256": delivery["plan"]["sha256"],
+                    "runtime_manifest_sha256": mod.file_sha(source / "runtime-manifest-r2max.json"),
+                    "source_member_count": delivery["source_files_verified"]}
+        material, sources = mod.validate_bundle(bindings, Path(delivery["bundle"]["path"]))
+        self.assertEqual((len(material), len(sources)), (86, 99))
+        self.assertEqual(mod.digest(material["native-max-plan.json"]), bindings["plan_sha256"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

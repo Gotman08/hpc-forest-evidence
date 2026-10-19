@@ -1,0 +1,101 @@
+"""Data packet and allocated command proposal only. Never compile/submit/run it."""
+import ast
+import gzip
+import hashlib
+import io
+import json
+import shlex
+import tarfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PREP = HERE.parent
+QLOCAL = PREP / 'qualification-allouee-source110-G-recu-r1/reception-fichiers-reguliers'
+OLD_BOOTSTRAP = PREP / 'adaptateurs-source110-r1/qualification-complete110-r4-G-bound/bootstrap-alloue.py'
+SHARED = '/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-qualification-20261018-eaff9217499f'
+DRIVER = '/scratch_p/nimarano/hpc-forest-r4b-target-profile-source110-20261018-r1'
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def rawjson(value):
+    return (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode()
+
+
+def save(path, raw):
+    with path.open('xb') as stream:
+        stream.write(raw)
+
+
+def main():
+    q = {'q753709-qualification.json': (QLOCAL / 'qualification-output/qualification.json').read_bytes(),
+        'q753709-bootstrap-allocation.json': (QLOCAL / 'bootstrap-allocation.json').read_bytes(),
+        'q753709-bindings.json': (QLOCAL / 'bindings.json').read_bytes()}
+    expected = {'q753709-qualification.json': '520573e89fb4505e791a0b70a4a97ee6d59db149af5d79f6af535aabd747724f',
+        'q753709-bootstrap-allocation.json': '3a749cb4a40d718f1006ca2313734793796e3b90c560ec87d75550ab45d540b0',
+        'q753709-bindings.json': '93241a738d3eff2bb3501b4df631e9f059a7666ed566df52f90538276d2c53e7'}
+    assert {name: sha(raw) for name, raw in q.items()} == expected
+    files = {'qualifier-cible-source110.py': (HERE / 'qualifier-cible-source110.py').read_bytes(), **q,
+        'target-qualification-bindings.json': rawjson({'schema': 'hpc-forest-source110-current-target-packet-bindings-v1',
+            'shared113_root': SHARED, 'new_driver': DRIVER, 'Q_original_three_pins': expected,
+            'native_generation_admitted': False, 'reference_campaigns_or_neutral_tests_replayed': False})}
+    files['packet-manifest.json'] = rawjson({name: sha(raw) for name, raw in files.items()})
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, filename='', mode='wb', mtime=0) as zipped, tarfile.open(fileobj=zipped, mode='w') as archive:
+        for name, raw in sorted(files.items()):
+            item = tarfile.TarInfo(name); item.size = len(raw); item.mode = 0o600; item.mtime = 0
+            archive.addfile(item, io.BytesIO(raw))
+    packet = buffer.getvalue()
+    for name, raw in files.items():
+        if name != 'qualifier-cible-source110.py':
+            save(HERE / name, raw)
+    save(HERE / 'qualification-cible-source110-packet.tar.gz', packet)
+    original = OLD_BOOTSTRAP.read_text()
+    old = '''    expected = {"qualification-wrapper.py", "bindings.json", "source-bundle.tar.gz",
+                "adapter-bundle.tar.gz", "packet-manifest.json"}'''
+    new = '    expected = ' + repr(set(files))
+    assert old in original
+    bootstrap = original.replace(old, new).replace('Exact five regular packet files required', 'Exact six regular target packet files required')
+    old = '''    sys.argv = [str(root / "qualification-wrapper.py"), "--root", str(root)]
+    runpy.run_path(str(root / "qualification-wrapper.py"), run_name="__main__")'''
+    new = f'''    sys.argv = [str(root / "qualifier-cible-source110.py"), "--driver", str(root), "--shared", {SHARED!r}]
+    runpy.run_path(str(root / "qualifier-cible-source110.py"), run_name="__main__")'''
+    assert old in bootstrap
+    bootstrap = bootstrap.replace(old, new)
+    ast.parse(bootstrap)
+    save(HERE / 'bootstrap-cible-alloue.py', bootstrap.encode())
+    command = f'''set -euo pipefail
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+packet={DRIVER}.tar.gz
+root={DRIVER}
+test -x "$py"
+test ! -e "$root"
+test -d {SHARED}
+printf '%s  %s\\n' {sha(packet)} "$packet" | sha256sum -c -
+romeo_load_armgpu_env
+spack load /zrtbeqke25s2vbqo4yrhsowjz7mg3pjf
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1 CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=TRUE OPENBLAS_NUM_THREADS=1
+exec srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores "$py" -I -S -B - "$packet" "$root" {sha(packet)} <<'SOURCE110_TARGET_BOOTSTRAP'
+'''+bootstrap+'\nSOURCE110_TARGET_BOOTSTRAP\n'
+    save(HERE / 'commande-cible-allouee.sh', command.encode())
+    save(HERE / 'job-prepare-PROPOSITION-NON-SOUMISE.json', rawjson({'name': 'forest-source110-cible-neutre-r1',
+        'command': 'bash -lc ' + shlex.quote(command), 'arch': 'armgpu', 'cpus_per_task': 4, 'mem_gb': 16,
+        'gpus_per_node': 0, 'time_limit': '00:10:00', 'workdir': '/scratch_p/nimarano',
+        'spack_packages': [], 'data_files': []}))
+    save(HERE / 'DERIVATION-BOOTSTRAP-ET-PROPOSITION.json', rawjson({
+        'original_bootstrap': {'path': str(OLD_BOOTSTRAP), 'sha256': sha(OLD_BOOTSTRAP.read_bytes())},
+        'new_bootstrap_sha256': sha(bootstrap.encode()), 'only_changes': ['Exact six packet member names',
+            'Target helper argv and script name; same allocation/deadline/regular-member manifest bootstrap'],
+        'shared113_full_validation_precedes_import_and_compilation': True, 'packet_regular_members': 6,
+        'packet_sha256': sha(packet), 'remote_packet_proposed': DRIVER + '.tar.gz',
+        'official_target_function_only_one_call': True, 'two_official_neutral_compilers_only': ['gcc', 'g++'],
+        'no_source_or_subprocess_monkeypatch': True, 'no16reference_or265neutral_test_or_model_replay': True,
+        'current_target_profile_received': False, 'native_generation_admitted': False,
+        'job_or_transport_or_compilation_executed_by_author': False}))
+    print(json.dumps({'packet_sha256': sha(packet), 'regular_members': 6, 'new_jobs_or_models': 0}))
+
+
+if __name__ == '__main__':
+    main()

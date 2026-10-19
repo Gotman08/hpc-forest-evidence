@@ -1,0 +1,151 @@
+"""Publish audited receipts only; this script never calls a model or ROMEO."""
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+DELIVERY = HERE.parent
+OUTPUTS = DELIVERY.parent
+WORKSPACE = OUTPUTS.parent
+STAMP = "20261015T2302Z"
+
+
+def load(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def dump(path, data):
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def main():
+    audit_path = HERE / "audits-747504/audit-complet.json"
+    audit = load(audit_path)
+    assert audit["verified"] and audit["coverage_verified"] and audit["complete"]
+    assert audit["integrity_before"] == audit["integrity_after"]
+    now = datetime.now(timezone.utc).isoformat()
+    backup = HERE / ("versions-avant-" + STAMP)
+    backup.mkdir(exist_ok=False)
+    guide = DELIVERY / "cadre-execution/REPRISE-AUTOMATIQUE.md"
+    status_path = DELIVERY / "cadre-execution/current-jobs.json"
+    campaign_path = DELIVERY / "etat-campagne.json"
+    report_path = DELIVERY / "rapport-deepseek.md"
+    registry = WORKSPACE / "ID.md"
+    registry_json = OUTPUTS / "HPC-Forest-Mere-Dynamique-r3/registre-idees.json"
+    for path in [guide, status_path, campaign_path, report_path, registry, registry_json]:
+        shutil.copy2(path, backup / path.name)
+    all_closed = []
+    for p in audit["problems"]:
+        root = Path(audit["root"])
+        contract = load(root / p["problem"] / "trusted/contract.json")
+        assert contract["coverage"]["independent_input_sets"]
+        assert not contract["coverage"]["shared_search_confirmation_inputs"]
+        assert len(contract["search"]) == len(contract["confirmation"]) == 3
+        p["search_correctness_cases"] = 3
+        p["confirmation_correctness_cases"] = 3
+        p["benchmark_input_bytes"] = contract["benchmark"]["stdin_bytes"]
+        p["benchmark_input_fingerprint"] = contract["benchmark"]["input_fingerprint"]
+        all_closed.append(p)
+    result = {"schema": "hpc-forest-deepseek-verified-results-partial-v1", "observed_utc": now,
+              "all_deepseek_received_and_audited": False,
+              "verified_jobs": [{"job_id": "747504", "model": audit["model"],
+                                 "archive_sha256": audit["archive_sha256"],
+                                 "audit_path": str(audit_path.resolve()),
+                                 "audit_sha256": hashlib.sha256(audit_path.read_bytes()).hexdigest(),
+                                 "exact_tokens": audit["exact_total_tokens"], "problems": all_closed}],
+              "still_running_jobs_last_observed": ["747505"],
+              "operator_analysis_never_model_input": True}
+    dump(DELIVERY / "resultats-verifies-partiels.json", result)
+    lines = ["# DeepSeek V4-Flash : première campagne complète reçue et auditée", "",
+             f"_Job 747504 · réception vérifiée le {now} · les résultats 0731 restent attendus._", "", "---", "",
+             "Le modèle local V4-Flash améliore les trois charges finies testées. L’archive complète est reçue, son SHA-256 est recalculé et les 10 209 fichiers sont revérifiés avant et après les audits en lecture seule. Les trois recherches sont terminées. Ce bilan concerne ce modèle et cette version ; le second DeepSeek, la comparaison GPT et les grilles continuent dans leurs protocoles propres.", "",
+             "## 📊 Temps finaux et vrais arbres", "",
+             "| Sujet | Référence finale (s) | Candidat final (s) | Réduction du temps | Accélération | Sommets avec score | Profondeur | Fils max. | Programmes corrects en recherche |",
+             "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for p in all_closed:
+        b = p["best_confirmed"]
+        lines.append(f"| {p['problem']} | {b['reference_seconds']:.9f} | {b['mean_seconds']:.9f} | {b['improvement_fraction']*100:.4f} % | {p['speedup']:.3f}× | {p['scored_nodes']} | {p['max_depth']} | {p['max_children']} | {p['outcomes'].get('valid',0)} |")
+    lines += ["", "Chaque recherche compte 96 missions enregistrées et quatre racines de rôle A/B/C/G. Le nombre de sommets avec score inclut les évaluations auxquelles le contrôleur attribue un score d’échec ; il ne signifie pas autant de programmes corrects chronométrés. Les racines de rôle ajoutent quatre sommets structurels : la mère n’est pas ici un programme mesuré, ni une mère dynamique R3. Les liens de parenté, profondeurs, nombres de fils et sources G ont été contrôlés depuis les exports archivés.", "",
+              "## 🔬 Ce que les programmes retenus ont fait", "",
+              "Les trois gagnants viennent de la branche A et possèdent chacun un parent MCTS propre ; aucun gagnant final n’est G. Les déclarations suivantes sont l’analyse après réception des fichiers du modèle. Elles restent hors des contextes de génération.", "",
+              "Pour k-NN, le candidat maintient un tas de voisins, parcourt directement les groupes sans tableau intermédiaire aplati et compte les étiquettes dans un tableau de fréquences. Pour la somme de sous-matrices, il fusionne lecture et construction des préfixes, retire le stockage séparé de la matrice et déclare un bloc de 64 ainsi que des indications de vectorisation. Pour N-body, il traite deux corps à la fois en réutilisant les coordonnées chargées dans la boucle interne ; le modèle déclare maintenir l’ordre d’accumulation propre à chaque corps. Les tests exacts livrés ont accepté ces programmes ; sans compteurs matériels, ces hypothèses de cache/vectorisation ne constituent pas une attribution causale mesurée.", "",
+              "## 🧮 Jetons et vitesse du modèle local", "",
+              "| Sujet | Appels réels terminés | Entrée | Sortie, réflexion comprise | Total exact | Décodage pondéré (jetons/s) |",
+              "|---|---:|---:|---:|---:|---:|"]
+    for p in all_closed:
+        lines.append(f"| {p['problem']} | {p['model_calls']} | {p['input_tokens']} | {p['output_tokens']} | {p['exact_tokens']} | {p['decode_tokens_per_second_weighted']:.2f} |")
+    lines += ["", f"Total exact : **{audit['exact_total_tokens']:,} jetons**. Chaque total est la somme de `prompt_eval_count + eval_count` des réponses Ollama, identique au registre. Les débits pondérés valent somme des jetons de sortie divisée par somme des `eval_duration` ; ils portent sur le décodage renseigné par Ollama. Ils ne sont ni le temps total du job, ni le débit d’un appel natif GPT. Une réservation ne s’ajoute pas à ces totaux. Les sorties de réflexion ne sont pas comptées une deuxième fois.", "",
+              "## 🧪 Vérification et limites", "",
+              "Chaque protocole conserve trois entrées de recherche et trois entrées de confirmation distinctes, plus la charge chronométrée. Les sorties sont comparées octet par octet avec tolérances nulles. GCC conserve ses deux erreurs sur les variables non initialisées. Trois mesures alimentent la recherche ; la référence et les finalistes ont chacun cinq mesures intercalées de confirmation. Le seuil minimal est 3 %. Les sources officielles, écritures du modèle, paquets retenus, digests de confirmation, identité des fragments et absence d’import des anciens candidats sont vérifiés.", "",
+              "Ce sont des confirmations sur les charges finies livrées, pas une preuve de correction sur toutes les entrées, de supériorité statistique générale ni d’un rang officiel au concours. La comparaison historique avec Qwen change notamment modèle, ressources et budget. L’opérateur n’a écrit ni réparé aucun candidat.", "",
+              "Le compte rendu Slurm donne 7 h 47 min 36 s, quatre cœurs ARM64 et deux GPU pour l’inférence, 43,9 % d’efficacité CPU et 28,3 % d’utilisation de la mémoire réservée. Les candidats utilisent quatre cœurs et zéro GPU. Les reçus confirment l’arrêt du serveur et le retrait du cache possédés par le job. Le chemin de référence d’un ancien auditeur hors ligne a été adapté à ce dossier de réception ; son erreur initiale et toutes ses assertions sont conservées, sans réexécuter de recherche.", "",
+              "## 🔗 Preuves et suite", "",
+              "[Résultats JSON vérifiés](resultats-verifies-partiels.json) · [Audit complet](receptions/audits-747504/audit-complet.json) · [Efficacité Slurm](cadre-execution/v4flash-job-efficiency.json) · [Reçu SHA-256](receptions/recu-747504.json).", "",
+              f"Archive SHA-256 : `{audit['archive_sha256']}`. Le modèle 0731, job 747505, continue. La référence GPT complète à 96 créneaux attend toujours la réception auditée des deux DeepSeek et la fin de la comparaison 747885. Le suivi programmé reste actif.", ""]
+    (DELIVERY / "BILAN-V4-FLASH-747504.md").write_text("\n".join(lines), encoding="utf8")
+    old_report = report_path.read_text(encoding="utf8")
+    title, rest = old_report.split("\n", 1)
+    report_path.write_text(title + "\n\n**Mise à jour du 16 octobre : V4-Flash 747504 est entièrement reçu et audité.** Réductions confirmées sur les charges livrées : k-NN 98,6696 %, somme 89,7674 %, N-body 75,8003 %. Lire le [bilan complet reçu](BILAN-V4-FLASH-747504.md) et les [résultats JSON](resultats-verifies-partiels.json). V4-Flash-0731 continue. Les paragraphes datés ci-dessous conservent l’historique des états antérieurs.\n" + rest, encoding="utf8")
+    state = load(status_path)
+    first = state["jobs"]["v4flash"]
+    first.update(scheduler_state="COMPLETED", results_received=True, results_audited=True,
+                 archive_sha256=audit["archive_sha256"], audit_path=str(audit_path.resolve()),
+                 completed_utc="2026-10-15T22:49:35Z")
+    for slug, key in [("nbody", "latest_tree_progress")]:
+        p = next(x for x in all_closed if x["problem"] == slug)
+        first[key] = {k: p[k] for k in ["scored_nodes", "max_depth", "max_children", "trials"]}
+        first[key].update(problem=slug, status="search_complete", tokens_used=p["exact_tokens"])
+    state.update(observed_utc=now, partial_verified_results="../resultats-verifies-partiels.json")
+    dump(status_path, state)
+    campaign = load(campaign_path)
+    campaign.update(observed_utc=now, state="one_campaign_received_and_audited_one_running",
+                    all_campaigns_received_and_audited=False, new_gain_confirmed=True,
+                    verified_results="resultats-verifies-partiels.json")
+    campaign["observations"]["747504"] = {"scheduler_state": "COMPLETED", "results_received": True,
+         "results_audited": True, "archive_sha256": audit["archive_sha256"],
+         "confirmed_gain_fractions": {p["problem"]: p["best_confirmed"]["improvement_fraction"] for p in all_closed}}
+    dump(campaign_path, campaign)
+    note = ("\n\n## Réception vérifiée du 16 octobre, 01 h Paris\n\n"
+            "747504 est COMPLETED, reçu et audité ; ne plus le surveiller ni le relancer. Archive SHA-256 "
+            + audit["archive_sha256"] + ". Les 10 209 fichiers sont restaurés et vérifiés avant/après lecture seule. "
+            "Les trois recherches sont complètes ; gains confirmés k-NN 98,6696 %, somme 89,7674 %, N-body 75,8003 %, "
+            "5 057 148 jetons exacts. Lire ../BILAN-V4-FLASH-747504.md et ../resultats-verifies-partiels.json. "
+            "Les audits sont sous ../receptions/audits-747504/. L’auditeur feedback adapté change seulement le chemin "
+            "des références historiques ; le premier diagnostic est conservé. Poursuivre 747505 seulement ; ne créer "
+            "le reçu global DeepSeek ni la référence GPT complète qu’après audit du second modèle et fin du comparatif.\n")
+    guide.write_text(guide.read_text(encoding="utf8") + note, encoding="utf8")
+    ids = registry.read_text(encoding="utf8")
+    ids = ids.replace("| Essayer les DeepSeek récents sur ROMEO | En cours |", "| Essayer les DeepSeek récents sur ROMEO | V4-Flash reçu et audité ; 0731 en cours |")
+    ids = ids.replace("Luna/Astra MAX reçus sur count 2023 ; Terra MAX en cours", "Luna/Astra/Terra MAX reçus et audités sur count 2023 ; Sol MAX en cours")
+    ids += ("\n## Observation vérifiée du 16 octobre 2026, après 01 h Paris\n\n"
+            "ID-008 : V4-Flash 747504 est terminé, reçu et audité sur les trois sujets ; 0731 reste en cours. "
+            "Le bilan versionné conserve les gains, arbres et 5 057 148 jetons exacts. ID-021/022 : les trois premières "
+            "cellules MAX de la grille fixe R1 (Luna, Astra, Terra) sont reçues et auditées ; Sol MAX 748008 travaille. "
+            "Terra confirme 71,1387 % sur 2023-count, avec un seul sommet noté et deux interruptions de génération, "
+            "37 514 jetons natifs connus et des consommations non mesurées distinctes des réservations. Cela ne valide "
+            "pas le protocole dynamique R3. Aucune campagne n’a été relancée ou modifiée pour ses résultats.\n")
+    registry.write_text(ids, encoding="utf8")
+    machine = load(registry_json)
+    for idea in machine["ideas"]:
+        if idea["id"] == "ID-008":idea["status"] = "V4-Flash reçu et audité ; 0731 en cours"
+        if idea["id"] == "ID-021":idea["evidence"] = "Luna/Astra/Terra MAX reçus et audités sur count 2023 ; Sol MAX en cours"
+    machine.update(source_sha256=hashlib.sha256(registry.read_bytes()).hexdigest(), updated_utc=now)
+    dump(registry_json, machine)
+    # Add evidence without rewriting the earlier dated report's conclusions.
+    consolidated = OUTPUTS / "HPC-Forest-Etude-2020-2024-r1/donnees-consolidees.json"
+    shutil.copy2(consolidated, backup / consolidated.name)
+    data = load(consolidated)
+    data["deepseek_verified_campaigns"] = result["verified_jobs"]
+    data["latest_verified_addendum_utc"] = now
+    data["latest_verified_addendum"] = str((DELIVERY / "BILAN-V4-FLASH-747504.md").resolve())
+    dump(consolidated, data)
+    article_guide = OUTPUTS / "HPC-Forest-Etude-2020-2024-r1/REPRISE-ACTUALISEE.md"
+    article_guide.write_text(article_guide.read_text(encoding="utf8") + note.replace("../BILAN-V4-FLASH-747504.md", "../Marathon22-DeepSeek-v11/BILAN-V4-FLASH-747504.md").replace("../resultats-verifies-partiels.json", "../Marathon22-DeepSeek-v11/resultats-verifies-partiels.json"), encoding="utf8")
+    print(json.dumps({"published": True, "exact_tokens": audit["exact_total_tokens"], "verified_job": "747504", "other_deepseek_finished": False}))
+
+
+if __name__ == "__main__":main()

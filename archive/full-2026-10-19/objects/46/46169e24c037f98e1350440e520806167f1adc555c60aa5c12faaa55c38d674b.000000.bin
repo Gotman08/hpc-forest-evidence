@@ -1,0 +1,285 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <limits.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#define BYTE_BUCKETS (UCHAR_MAX + 1)
+#define INSERTION_LIMIT 32
+#define PARALLEL_LIMIT 32768
+#define MIN_TASK_GRAIN 4096
+
+typedef struct {
+    long int *data;
+    int length;
+    long int total;
+} bucket;
+
+static void allocation_error(void) {
+    fputs("ERROR allocation\n", stderr);
+    exit(EXIT_FAILURE);
+}
+
+static void *checked_array(size_t count, size_t element_size) {
+    if (element_size != 0 && count > SIZE_MAX / element_size)
+        allocation_error();
+    size_t bytes = count * element_size;
+    void *result = malloc(bytes != 0 ? bytes : 1);
+    if (result == NULL)
+        allocation_error();
+    return result;
+}
+
+static int compare_keys(const char *a, size_t length,
+                        long int left, long int right) {
+    return strcmp(a + (size_t)left * length,
+                  a + (size_t)right * length);
+}
+
+static void merge_ranges(const char *a, size_t length,
+                         long int *index, long int *scratch,
+                         size_t lo, size_t mid, size_t hi) {
+    if (compare_keys(a, length, index[mid - 1], index[mid]) <= 0)
+        return;
+
+    size_t left = lo;
+    size_t right = mid;
+    size_t out = lo;
+    while (left < mid && right < hi) {
+        if (compare_keys(a, length, index[left], index[right]) <= 0)
+            scratch[out++] = index[left++];
+        else
+            scratch[out++] = index[right++];
+    }
+    while (left < mid)
+        scratch[out++] = index[left++];
+    while (right < hi)
+        scratch[out++] = index[right++];
+    memcpy(index + lo, scratch + lo, (hi - lo) * sizeof(*index));
+}
+
+static void sort_serial(const char *a, size_t length,
+                        long int *index, long int *scratch,
+                        size_t lo, size_t hi) {
+    if (hi - lo <= INSERTION_LIMIT) {
+        for (size_t j = lo + 1; j < hi; ++j) {
+            long int key = index[j];
+            size_t i = j;
+            while (i > lo &&
+                   compare_keys(a, length, index[i - 1], key) > 0) {
+                index[i] = index[i - 1];
+                --i;
+            }
+            index[i] = key;
+        }
+        return;
+    }
+
+    size_t mid = lo + (hi - lo) / 2;
+    sort_serial(a, length, index, scratch, lo, mid);
+    sort_serial(a, length, index, scratch, mid, hi);
+    merge_ranges(a, length, index, scratch, lo, mid, hi);
+}
+
+void sort(char *a, bucket *b) {
+    if (b->total < 2)
+        return;
+    if (b->length <= 0)
+        allocation_error();
+    size_t count = (size_t)b->total;
+    long int *scratch = checked_array(count, sizeof(*scratch));
+    sort_serial(a, (size_t)b->length, b->data, scratch, 0, count);
+    free(scratch);
+}
+
+#ifdef _OPENMP
+static void sort_tasks(const char *a, size_t length,
+                       long int *index, long int *scratch,
+                       size_t lo, size_t hi, size_t grain) {
+    if (hi - lo <= grain) {
+        sort_serial(a, length, index, scratch, lo, hi);
+        return;
+    }
+
+    size_t mid = lo + (hi - lo) / 2;
+    #pragma omp task default(none) firstprivate(a, length, index, scratch, lo, mid, grain)
+    {
+        sort_tasks(a, length, index, scratch, lo, mid, grain);
+    }
+    #pragma omp task default(none) firstprivate(a, length, index, scratch, mid, hi, grain)
+    {
+        sort_tasks(a, length, index, scratch, mid, hi, grain);
+    }
+    #pragma omp taskwait
+    merge_ranges(a, length, index, scratch, lo, mid, hi);
+}
+#endif
+
+long int *bucket_sort(char *a, int length, long int size,
+                      int offset, int nbuckets) {
+    if (size < 0 || length <= 0)
+        allocation_error();
+    size_t n = (size_t)size;
+    size_t stride = (size_t)length;
+    if (n > SIZE_MAX / stride)
+        allocation_error();
+
+    long int *index = checked_array(n, sizeof(*index));
+    if (n < 2) {
+        if (n != 0)
+            index[0] = 0;
+        return index;
+    }
+
+    size_t counts[BYTE_BUCKETS] = {0};
+    size_t boundaries[BYTE_BUCKETS + 1];
+    size_t cursor[BYTE_BUCKETS];
+    int declared_buckets = nbuckets > 0 && nbuckets <= BYTE_BUCKETS;
+
+    if (declared_buckets) {
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char first = (unsigned char)a[i * stride];
+            long long b = (long long)first - (long long)offset;
+            if (b < 0 || b >= nbuckets) {
+                declared_buckets = 0;
+                break;
+            }
+            ++counts[(size_t)b];
+        }
+    }
+
+    /* Unsigned-byte buckets also cover records outside the declared range. */
+    if (!declared_buckets) {
+        memset(counts, 0, sizeof(counts));
+        for (size_t i = 0; i < n; ++i)
+            ++counts[(unsigned char)a[i * stride]];
+    }
+    int bucket_count = declared_buckets ? nbuckets : BYTE_BUCKETS;
+
+    boundaries[0] = 0;
+    for (int b = 0; b < bucket_count; ++b) {
+        boundaries[b + 1] = boundaries[b] + counts[b];
+        cursor[b] = boundaries[b];
+    }
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char first = (unsigned char)a[i * stride];
+        size_t b = declared_buckets
+            ? (size_t)((long long)first - (long long)offset)
+            : (size_t)first;
+        index[cursor[b]++] = (long int)i;
+    }
+
+    long int *scratch = checked_array(n, sizeof(*scratch));
+#ifdef _OPENMP
+    int threads = omp_get_max_threads();
+    if (threads > 1 && n >= PARALLEL_LIMIT) {
+        size_t grain = n / (size_t)threads / 4;
+        if (grain < MIN_TASK_GRAIN)
+            grain = MIN_TASK_GRAIN;
+
+        /* Bucket ranges and sibling task ranges never overlap. */
+        #pragma omp parallel default(none) firstprivate(a, stride, index, scratch, bucket_count, grain) shared(boundaries)
+        {
+            #pragma omp single nowait
+            {
+                for (int b = 0; b < bucket_count; ++b) {
+                    size_t lo = boundaries[b];
+                    size_t hi = boundaries[b + 1];
+                    if (hi - lo > 1) {
+                        #pragma omp task default(none) firstprivate(a, stride, index, scratch, lo, hi, grain)
+                        {
+                            sort_tasks(a, stride, index, scratch, lo, hi, grain);
+                        }
+                    }
+                }
+            }
+        }
+        free(scratch);
+        return index;
+    }
+#endif
+
+    for (int b = 0; b < bucket_count; ++b) {
+        if (boundaries[b + 1] - boundaries[b] > 1)
+            sort_serial(a, stride, index, scratch,
+                        boundaries[b], boundaries[b + 1]);
+    }
+    free(scratch);
+    return index;
+}
+
+static void input_error(const char *field) {
+    printf("ERROR %s\n", field);
+    exit(EXIT_FAILURE);
+}
+
+void load(char **vString, long int *N, int *l, int *os, int *nb) {
+    int len, offset, nbucket;
+    long int n;
+
+    if (fscanf(stdin, "%d", &len) != 1)
+        input_error("len");
+    if (fscanf(stdin, "%ld", &n) != 1)
+        input_error("n");
+    if (fscanf(stdin, "%d", &offset) != 1)
+        input_error("offset");
+    if (fscanf(stdin, "%d", &nbucket) != 1)
+        input_error("nbucket");
+
+    if (len < 0 || len == INT_MAX || (len == 0 && n > 0))
+        input_error("len");
+    if (n < 0)
+        input_error("n");
+    if (nbucket < 0 || nbucket == INT_MAX)
+        input_error("nbucket");
+
+    size_t stride = (size_t)len + 1;
+    char *strings = checked_array((size_t)n, stride);
+    char token_format[32];
+    snprintf(token_format, sizeof(token_format), "%%%ds", len > 0 ? len : 1);
+    for (long int i = 0; i < n; ++i) {
+        if (fscanf(stdin, token_format, strings + (size_t)i * stride) != 1) {
+            printf("ERROR %ld\n", i);
+            free(strings);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    *vString = strings;
+    *N = n;
+    *l = len + 1;
+    *os = offset;
+    *nb = nbucket + 1;
+}
+
+void print(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; ++i)
+        printf("%ld -> %s\n", i,
+               strings + (size_t)index[i] * (size_t)len);
+}
+
+void save(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; ++i)
+        printf("%s\n", strings + (size_t)index[i] * (size_t)len);
+}
+
+int main(int ac, char **av) {
+    char *strings = NULL;
+    long int N = 0;
+    long int *index = NULL;
+    int len = 0;
+    int offset, nbuckets;
+    (void)ac;
+    (void)av;
+
+    load(&strings, &N, &len, &offset, &nbuckets);
+    index = bucket_sort(strings, len, N, offset, nbuckets);
+    save(strings, index, N, len);
+
+    free(strings);
+    free(index);
+    return EXIT_SUCCESS;
+}

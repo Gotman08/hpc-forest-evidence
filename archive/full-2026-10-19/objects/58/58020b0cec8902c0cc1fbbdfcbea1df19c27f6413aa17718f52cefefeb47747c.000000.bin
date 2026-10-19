@@ -1,0 +1,153 @@
+"""Seal reports after visual review; verify closed raw evidence without rerunning it."""
+from __future__ import annotations
+
+import hashlib
+import json
+import tomllib
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parent / "HPC-Forest-Etude-2020-2024-r1"
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write(path, data):
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def main():
+    now = datetime.now(UTC).isoformat()
+    control = read(STUDY / "controle-pdf.json")
+    assert control["visual_review_completed"] and not control["page_boundary_issues"]
+    assert control["pdf_sha256"] == sha(STUDY / "ARTICLE.pdf")
+    assert control["pages"] == 56 and control["figure_count"] == 20
+    raw_verified = payload_verified = archives_verified = 0
+    audits = []
+    for path in sorted(HERE.glob("serie-*/audit.json")):
+        root = path.parent
+        audit = read(path)
+        assert audit["evidence_integrity_verified"] and audit["all_cases_and_physical_core_counts_received"]
+        assert audit["measurement_completed"] and audit["failed_or_incomplete_configurations"] == 0
+        assert sha(root / "results.tar.gz") == audit["archive_sha256"]
+        evidence = root / "preuves/results"
+        manifest = read(evidence / "FILES.sha256.json")
+        assert {p.relative_to(evidence).as_posix() for p in evidence.rglob("*") if p.is_file()} == {*manifest, "FILES.sha256.json"}
+        for name, digest in manifest.items():
+            assert sha(evidence / name) == digest
+            raw_verified += 1
+        payload = read(root / "payload/FILES.sha256.json")
+        for name, digest in payload.items():
+            assert sha(root / "payload" / name) == digest
+            payload_verified += 1
+        audits.append(audit)
+    cohort = read(STUDY / "resultats-quatre-low.json")
+    assert cohort["native_calls"] == 50 and cohort["exact_native_tokens"] == 743280 and cohort["scored_nodes"] == 30
+    for row in cohort["rows"]:
+        root = Path(row["audit_path"]).parent
+        assert sha(root / ("results-" + row["job_id"] + ".tar.gz")) == row["archive_sha256"]
+        original_audit = read(row["audit_path"])
+        assert original_audit["coverage_and_final_confirmations_verified"]
+        assert original_audit["read_only_file_verification_before_and_after"]
+        assert sha(row["audit_path"]) == row["audit_sha256"]
+        archives_verified += 1
+    for episode in read(STUDY / "episodes-harnais-quatre-low.json"):
+        assert sha(episode["path"]) == episode["sha256"]
+        assert not episode["holdout_access"] and not episode["outer_tree_reward_assigned"]
+    grid = read(STUDY / "resultats-vingt-couples-count.json")
+    assert grid["cells_received"] == 20 and grid["native_calls"] == 201
+    assert grid["known_exact_tokens"] == 3311561 and grid["unmetered_calls"] == 7
+    deep_root = HERE.parent / "Marathon22-DeepSeek-v11"
+    deep = read(deep_root / "resultats-verifies-complets.json")
+    assert deep["all_deepseek_received_and_audited"] and deep["exact_total_tokens"] == 11416821
+    deep_files_verified = 0
+    for item in deep["verified_jobs"]:
+        assert item["verified"] and item["complete"] and item["coverage_verified"]
+        assert sha(item["archive"]) == item["archive_sha256"]
+        assert item["integrity_before"] == item["integrity_after"]
+        restore_root = Path(item["root"]).parent
+        restored_manifest = read(restore_root / "manifest-verifie.json")
+        for entry in restored_manifest["files"]:
+            evidence_path = restore_root / entry["path"]
+            assert evidence_path.stat().st_size == entry["bytes"] and sha(evidence_path) == entry["sha256"]
+            deep_files_verified += 1
+    negative = deep["verified_jobs"][1]["problems"][0]["final_confirmation_gate"]
+    assert negative["negative_confirmation_records"] == 2 and negative["best_eligible_selection_verified"]
+    assert deep["verified_jobs"][1]["problems"][0]["best_confirmed"]["is_baseline"]
+    text = (STUDY / "ARTICLE.md").read_text(encoding="utf8")
+    table_rows = 0
+    width = None
+    for line in text.splitlines():
+        if line.startswith("|"):
+            count = len(line.split("|"))
+            if width is None:
+                width = count
+            assert count == width, line
+            table_rows += 1
+        else:
+            width = None
+    auto_path = Path("C:/Users/nicol/.codex/automations/terminer-les-essais-deepseek-sur-romeo/automation.toml")
+    auto = tomllib.loads(auto_path.read_text(encoding="utf8"))
+    request = read(HERE / "serie-06/automation-update-request.json")
+    # The app trims trailing line endings when saving an automation prompt.
+    assert auto["status"] == "ACTIVE" and auto["prompt"].rstrip("\r\n") == request["prompt"].rstrip("\r\n")
+    manifest = read(STUDY / "rapport-manifest.json")
+    additions = ["BILAN-QUATRE-LOW-ET-VINGT-COUPLES.md", "resultats-quatre-low.json", "details-missions-quatre-low.json",
+                 "episodes-harnais-quatre-low.json", "jetons-par-appel-quatre-low.csv",
+                 "comparabilite-max-xhigh-high-medium-low.json", "comparer-cohorte-low.py"]
+    additions += ["resultats-vingt-couples-count.json", "jetons-par-appel-vingt-couples-count.csv", "tracer-vingt-couples.py",
+                  "figure-vingt-couples-provenance.json", "figures/09-vingt-couples-gains-tokens.png", "figures/09-vingt-couples-gains-tokens.svg",
+                  "../Marathon22-DeepSeek-v11/BILAN-V4-FLASH-0731-747505.md", "../Marathon22-DeepSeek-v11/resultats-verifies-complets.json",
+                  "../Marathon22-DeepSeek-v11/receptions/audits-747505-r2/audit-complet.json",
+                  "../Marathon22-DeepSeek-v11/receptions/correction-auditeur-confirmations.json"]
+    for name in [*manifest["files"], *additions]:
+        manifest["files"][name] = sha(STUDY / name)
+    manifest.update(generated_utc=now, pages=control["pages"], figure_count=control["figure_count"],
+        visual_review_completed=True, current_pdf_regeneration_pending=False,
+        current_multibatch_summary=read(HERE / "BILAN-CUMULE.json"),
+        current_update_tools={str(p.resolve()): sha(p) for p in sorted(HERE.glob("*.py"))},
+        latest_low_cohort_report="BILAN-QUATRE-LOW-ET-VINGT-COUPLES.md",
+        latest_version_preserved="versions/20261016-avant-low-coeurs05/")
+    write(STUDY / "rapport-manifest.json", manifest)
+    for name, digest in manifest["files"].items():
+        assert sha(STUDY / name) == digest
+    receipt = {"observed_utc": now, "low_research_archives_received_and_audited": True,
+        "low_archives_sha256_rechecked": archives_verified, "low_models": 4,
+        "low_exact_tokens": cohort["exact_native_tokens"], "low_native_calls": cohort["native_calls"],
+        "low_scored_nodes": cohort["scored_nodes"], "new_scaling_job": "748260",
+        "scaling_archive_sha256": cohort["scaling_audit"]["archive_sha256"],
+        "received_files_reverified": cohort["scaling_audit"]["files_verified_before_and_after"],
+        "all_six_batches_raw_files_rechecked": raw_verified, "all_six_batches_payload_files_rechecked": payload_verified,
+        "new_scaling_points": 125, "new_timed_runs": 625, "all_new_finite_checks_correct": True,
+        "new_candidate_edits": 0, "new_compilations": 0, "new_model_invocations_for_scaling": 0,
+        "article_pages": control["pages"], "article_figures": control["figure_count"],
+        "article_pdf_sha256": control["pdf_sha256"], "article_manifest_files_verified": len(manifest["files"]),
+        "article_table_rows_shape_checked": table_rows, "old_raw_evidence_unchanged": True,
+        "automation_active_and_updated": True, "official_contest_compliance_certified": False,
+        "source_reports_are_never_model_input": True,
+        "twenty_count_cells_received": 20, "twenty_count_native_calls": grid["native_calls"],
+        "twenty_count_known_exact_tokens": grid["known_exact_tokens"], "twenty_count_unmetered_calls": grid["unmetered_calls"],
+        "both_deepseek_received_and_audited": True, "deepseek_exact_tokens": deep["exact_total_tokens"],
+        "deepseek_files_rechecked": deep_files_verified, "deepseek_0731_exact_tokens": 6359673,
+        "negative_finalists_excluded": 2, "confirmation_reader_positive_negative_tests": 9,
+        "additional_scaling_job": "748264", "additional_scaling_points": 175, "additional_timed_runs": 875,
+        "additional_scaling_archive_sha256": read(HERE / "serie-06/audit.json")["archive_sha256"]}
+    write(HERE / "livraison-low-deepseek-verifiee.json", receipt)
+    files = {p.relative_to(HERE).as_posix(): sha(p) for p in HERE.rglob("*")
+             if p.is_file() and p.name != "MANIFEST-LIVRAISON.json" and p.suffix != ".pyc"
+             and not {"__pycache__", ".pytest_cache"}.intersection(p.parts)}
+    write(HERE / "MANIFEST-LIVRAISON.json", {"generated_utc": now, "files": files})
+    for name, digest in files.items():
+        assert sha(HERE / name) == digest
+    print(json.dumps({**receipt, "delivery_manifest_files_verified": len(files)}))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,165 @@
+"""Bind the exact reviewed reader to true actor authorizations and incomplete cache evidence.
+
+No response or reasoning body is read, copied or printed by this preparer.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+OUT = Path(__file__).resolve().parent
+BASE = OUT.parents[2]
+AUDITOR = BASE / "outputs/HPC-Forest-Primes-Natif-Audit-r2c/revision-r3"
+LAUNCH = OUT.parent
+ADMISSIONS = LAUNCH / "revision-r6-commandes/admissions-terra-max-reelles"
+SOURCE = BASE / "outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2c"
+JOB = "752140"
+MODEL = "gpt-5.6-terra"
+SESSION = "a35692d6da3f46278fe3840f5c56984e"
+SCOPE = "hpc-forest-primes-native-max-r2c"
+SOURCE_SHA = "ade344bfec4322e8aaecc99cfbf7bd502e6d39b55c62180e8f552a3d6391e680"
+PLAN_SHA = "bac579fdb44850c636a6522c014175f95d4ce867bab502d86dd15c1bff31032e"
+PREPARATION = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+
+
+def need(value, reason):
+    if not value:
+        raise ValueError(reason)
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def read(path):
+    need(path.is_file() and not path.is_symlink() and path.stat().st_size <= 8 * 1024**2, "Bounded original metadata required")
+    return json.loads(path.read_bytes())
+
+
+def ref(path):
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def save(name, value):
+    path = OUT / ("r3-" + name)
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    return path
+
+
+review = AUDITOR / "REVUE-INDEPENDANTE-PARENT.json"
+need(sha(review) == "4709af13c7c6adf1292416f80b3f7f94c216259231fea41aa8ea92716ba5b698",
+     "Exact parent independent review of the r3 reader required")
+reviewed = read(review)
+need(reviewed.get("verified") is True and reviewed.get("actual_controller_actor") == "ARM/POSIX"
+     and reviewed.get("actual_worker_actor") == "Windows/local", "Reader r3 actor review is not admissible")
+delivery_path = AUDITOR / "LIVRAISON-AUDITEUR-REVISION-R3.json"
+need(sha(delivery_path) == reviewed["delivery_sha256"] == "36412cb5905817c2850c704668573c27a765d061e76d434dfe6504a75405fc67",
+     "Reviewed r3 delivery changed")
+delivery = read(delivery_path)
+manifest = read(AUDITOR / "manifeste-auditeur.json")["files"]
+need(sha(AUDITOR / "manifeste-auditeur.json") == delivery["manifest"]["sha256"], "Reviewed r3 manifest changed")
+for name, expected_sha in manifest.items():
+    need(sha(AUDITOR / name) == expected_sha, "Reviewed r3 manifest member changed")
+private_reader = OUT / "lecteur-revu-octets-identiques-r3"
+need(not private_reader.exists(), "No reuse or overwrite of an earlier reader run")
+private_reader.mkdir()
+reader_before = {}
+for path in sorted(AUDITOR.iterdir()):
+    if not path.is_file() or not (path.name.startswith("audit") and path.suffix == ".py" or path.name == "git_loose_readonly.py"):
+        continue
+    need(sha(path) == manifest[path.name],
+         "A reviewed runtime reader byte changed")
+    raw = path.read_bytes()
+    with (private_reader / path.name).open("xb") as stream:
+        stream.write(raw)
+    reader_before[path.name] = sha(private_reader / path.name)
+need("audit_r2_native.py" in reader_before and "audit_cli_namespaces.py" in reader_before, "Incomplete exact reader copy")
+save("copie-lecteur-revu-verifiee.json", {"review": ref(review), "source_delivery": ref(delivery_path),
+    "source_reader_directory": str(AUDITOR), "local_reader_directory": str(private_reader),
+    "runtime_files": reader_before, "all_copied_bytes_equal_reviewed_originals": True,
+    "reason": "Report-location guard stays inside this exact isolated reader copy, outside all private evidence"})
+controller_path = ADMISSIONS / "authorization-remote.json"
+worker_path = ADMISSIONS / "authorization-local.json"
+controller, worker = read(controller_path), read(worker_path)
+upload = read(ADMISSIONS / "upload-manifest-propose.json")
+publication = read(ADMISSIONS / "publication-locale/publication-arguments.json")
+readback = Path(publication["directory_readback"]["arguments"]["local_path"])
+aliases = {entry["remote_path"]: entry["local"] for entry in upload["dependencies"] + upload["existing_qualified_files"]}
+copies = {}
+for actor, authorization in (("controller", controller), ("worker", worker)):
+    actual = {}
+    for name, original in authorization["artifacts"].items():
+        if actor == "controller":
+            need(original["path"] in aliases, "Original ARM controller dependency has no explicit mirror")
+            local = aliases[original["path"]]
+            if original["path"].startswith(publication["remote_root"] + "/"):
+                local = ref(readback / original["path"].rsplit("/", 1)[1])
+        else:
+            local = original
+        need(local["sha256"] == original["sha256"] == sha(Path(local["path"])), "True actor original/mirror artifact SHA mismatch")
+        actual[name] = local
+    copies[actor] = actual
+need(len(copies["controller"]) == len(copies["worker"]) == 14, "Both true original actors need all14admissions")
+prepared_binding = save("attente-native-acteurs-originaux-v2.json", {
+    "schema": "hpc-forest-primes-r2c-native-cell-audit-expectation-v2", "scope_id": SCOPE,
+    "model": MODEL, "effort": "max", "session_id": SESSION, "job_id": JOB,
+    "remote_root": "/scratch_p/nimarano/" + SCOPE + "-" + SESSION,
+    "cache_source_root": str(LAUNCH / ("worker-" + SESSION)), "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+    "scheduler_observation": ref(OUT / "statut-terminal-frais.json"),
+    "controller_authorization": ref(controller_path), "worker_authorization": ref(worker_path),
+    "controller_admission_copies": copies["controller"], "worker_admission_copies": copies["worker"],
+    "admission_namespace_aliases": {"upload_manifest": ref(ADMISSIONS / "upload-manifest-propose.json"),
+        "publication": ref(ADMISSIONS / "publication-locale/publication-arguments.json"),
+        "download_receipt": ref(LAUNCH / "operations-parent-max4/terra-max/directory-readback-result.json")},
+    "actual_actor_semantics": {"controller": "ARM remote authorization and POSIX refs",
+        "worker": "Windows local authorization and Windows refs"},
+    "native_research_admitted": False})
+binding = OUT / "attente-native-acteurs-originaux-v2.json"
+need(read(binding) == read(prepared_binding), "Authentic original actor expectation changed")
+common = {"scope_id": SCOPE, "model": MODEL, "effort": "max", "session_id": SESSION, "job_id": JOB,
+    "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA, "preparation_manifest_sha256": PREPARATION}
+root = OUT / "restauration-neuve-privee"
+reception = save("reception-archive-pour-lecteur-strict.json", {**common,
+    "schema": "hpc-forest-primes-r2max-reception-for-audit-v1", "verified": True,
+    "verification_scope": "Actual terminal archive SHA and safe fresh restoration only",
+    "fresh_restore": True, "live_controller": False, "restored_root": str(root),
+    "archive": ref(OUT / "results-752140.tar.gz"), "files": read(OUT / "inventaire-archive-avant-audit.json"),
+    "transfer_receipts": [ref(OUT / "archive-transfert.json")]})
+missing_cache = OUT / "cache-complet-non-recu"
+missing_cache.mkdir(exist_ok=True)
+cache_receipt = save("cache-incomplet-non-admis.json", {**common,
+    "schema": "hpc-forest-primes-r2max-cache-preservation-for-audit-v1", "verified": False,
+    "preservation_phase": "metadata_only_response_body_copy_not_performed", "source_cache_complete": False,
+    "source_cache_stable": False, "snapshot_is_live": False, "snapshot_root": str(missing_cache),
+    "snapshot_kind": "No complete body snapshot claimed; empty nonadmitted report location only",
+    "metadata_only_reconciliation": ref(OUT / "RECONCILIATION-METADONNEES-NEGATIF.json"),
+    "response_body_read_or_copied_from_live_cache": False, "worker_lock_read_or_stopped": False,
+    "reason": "The previous automatic metadata-only refusal is preserved; no stable_snapshot response retry or bypass"})
+report = private_reader / "AUDIT-NATIF-STRICT-REFUS-752140.json"
+argv = [sys.executable, "-B", str(private_reader / "audit_r2_native.py"), "--binding", str(binding),
+    "--root", str(root), "--cache", str(missing_cache), "--reception", str(reception),
+    "--cache-receipt", str(cache_receipt), "--source-zip", str(SOURCE / "HPC-Forest-Primes-Natif-MAX-r2c.zip"),
+    "--plan", str(SOURCE / "native-max-plan.json"), "--certified", str(SOURCE / "certified-preparation"), "--output", str(report)]
+process = subprocess.run(argv, capture_output=True, check=False, timeout=120)
+need(process.stdout == b"" and process.stderr == b"", "Unexpected reader console bytes remain private; do not print them")
+result = read(report)
+need(result.get("verified") is False and result.get("native_research_admitted") is False,
+     "Failed cohort must never become a native admission")
+need({name: sha(private_reader / name) for name in reader_before} == reader_before,
+     "Exact isolated reviewed reader bytes changed")
+error = result.get("audit_error", "")
+summary = {"schema": "hpc-forest-r2c-strict-reader-refusal-metadata-v1", "job_id": JOB,
+    "reviewed_reader_returncode": process.returncode, "report": ref(report),
+    "audit_error_sha256": hashlib.sha256(error.encode()).hexdigest(),
+    "actual_actor_binding_preserved": True,
+    "known_cli_actor_namespace_refusal": error == "ValueError: Immutable audit binding: worker CLI identity is not the actual received remote mirror",
+    "known_incomplete_cache_refusal": "cache receipt must be verified" in error,
+    "incomplete_cache_remains_nonadmitted": True, "native_research_admitted": False,
+    "response_or_reasoning_body_exposed_to_assistant": False, "model_or_process_action": False}
+save("REFUS-LECTEUR-NATIF-METADONNEES.json", summary)
+print(json.dumps(summary))

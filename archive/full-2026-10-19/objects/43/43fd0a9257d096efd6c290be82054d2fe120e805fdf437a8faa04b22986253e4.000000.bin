@@ -1,0 +1,176 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using Sum = std::int64_t;
+
+class FastInput {
+    unsigned char buffer[1 << 16];
+    std::size_t position = 0;
+    std::size_t available = 0;
+
+    int next() {
+        if (position == available) {
+            available = std::fread(buffer, 1, sizeof(buffer), stdin);
+            position = 0;
+            if (available == 0)
+                return EOF;
+        }
+        return buffer[position++];
+    }
+
+public:
+    bool readInt(int& result) {
+        int c = next();
+        while (c != EOF && c <= ' ')
+            c = next();
+        if (c == EOF)
+            return false;
+
+        bool negative = false;
+        if (c == '-' || c == '+') {
+            negative = c == '-';
+            c = next();
+        }
+
+        std::uint32_t magnitude = 0;
+        while (c >= '0' && c <= '9') {
+            magnitude = magnitude * 10u + static_cast<unsigned>(c - '0');
+            c = next();
+        }
+        const Sum value = static_cast<Sum>(magnitude);
+        result = static_cast<int>(negative ? -value : value);
+        return true;
+    }
+};
+
+#if defined(__aarch64__)
+static inline int64x2_t max_pair(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+
+static inline void update_pair(const Sum* fresh, Sum* previous, Sum* totals,
+                               int64x2_t& maximum) {
+    const int64x2_t incoming = vld1q_s64(fresh);
+    const int64x2_t outgoing = vld1q_s64(previous);
+    const int64x2_t value = vaddq_s64(
+        vsubq_s64(vld1q_s64(totals), outgoing), incoming);
+    vst1q_s64(totals, value);
+    vst1q_s64(previous, incoming);
+    maximum = max_pair(maximum, value);
+}
+#endif
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.readInt(n) || !input.readInt(s))
+        return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const int width = n - s + 1;
+    std::vector<int> row(n);
+    std::vector<Sum> horizontal(width);
+    std::vector<Sum> totals(width, 0);
+    std::unique_ptr<Sum[]> history(
+        new Sum[static_cast<std::size_t>(s) * width]);
+    Sum best = std::numeric_limits<Sum>::lowest();
+
+#if defined(__aarch64__)
+    int64x2_t best0 = vdupq_n_s64(std::numeric_limits<Sum>::lowest());
+    int64x2_t best1 = best0;
+    int64x2_t best2 = best0;
+    int64x2_t best3 = best0;
+#endif
+
+    for (int r = 0; r < n; ++r) {
+        for (int col = 0; col < n; ++col) {
+            if (!input.readInt(row[col]))
+                return 0;
+        }
+
+        Sum running = 0;
+        #pragma omp simd reduction(+:running)
+        for (int col = 0; col < s; ++col)
+            running += static_cast<Sum>(row[col]);
+        horizontal[0] = running;
+        for (int col = s; col < n; ++col) {
+            running += static_cast<Sum>(row[col])
+                     - static_cast<Sum>(row[col - s]);
+            horizontal[col - s + 1] = running;
+        }
+
+        Sum* previous = history.get()
+                      + static_cast<std::size_t>(r % s) * width;
+        if (r < s - 1) {
+            #pragma omp simd
+            for (int col = 0; col < width; ++col) {
+                totals[col] += horizontal[col];
+                previous[col] = horizontal[col];
+            }
+        } else if (r == s - 1) {
+            #pragma omp simd reduction(max:best)
+            for (int col = 0; col < width; ++col) {
+                const Sum value = totals[col] + horizontal[col];
+                totals[col] = value;
+                previous[col] = horizontal[col];
+                best = std::max(best, value);
+            }
+        } else {
+#if defined(__aarch64__)
+            int col = 0;
+            for (; col + 7 < width; col += 8) {
+                update_pair(horizontal.data() + col,
+                            previous + col, totals.data() + col, best0);
+                update_pair(horizontal.data() + col + 2,
+                            previous + col + 2, totals.data() + col + 2, best1);
+                update_pair(horizontal.data() + col + 4,
+                            previous + col + 4, totals.data() + col + 4, best2);
+                update_pair(horizontal.data() + col + 6,
+                            previous + col + 6, totals.data() + col + 6, best3);
+            }
+            for (; col + 1 < width; col += 2)
+                update_pair(horizontal.data() + col,
+                            previous + col, totals.data() + col, best0);
+            for (; col < width; ++col) {
+                const Sum value = totals[col] - previous[col] + horizontal[col];
+                totals[col] = value;
+                previous[col] = horizontal[col];
+                best = std::max(best, value);
+            }
+#else
+            #pragma omp simd reduction(max:best)
+            for (int col = 0; col < width; ++col) {
+                const Sum value = totals[col] - previous[col] + horizontal[col];
+                totals[col] = value;
+                previous[col] = horizontal[col];
+                best = std::max(best, value);
+            }
+#endif
+        }
+    }
+
+#if defined(__aarch64__)
+    best0 = max_pair(best0, best1);
+    best2 = max_pair(best2, best3);
+    best0 = max_pair(best0, best2);
+    best = std::max(best, static_cast<Sum>(vgetq_lane_s64(best0, 0)));
+    best = std::max(best, static_cast<Sum>(vgetq_lane_s64(best0, 1)));
+#endif
+
+    std::printf("%d\n", static_cast<int>(best));
+    return 0;
+}

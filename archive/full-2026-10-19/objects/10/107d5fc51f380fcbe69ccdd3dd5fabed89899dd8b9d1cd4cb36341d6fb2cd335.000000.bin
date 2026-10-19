@@ -1,0 +1,187 @@
+/*
+    Solve Laplace's equation using synchronous Jacobi iteration.
+    Adjacent iterations are pipelined by rows to reuse intermediate values.
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+#include <sys/time.h>
+
+#define CONV_THRESHOLD 1.0e-5f
+
+// matrix to be solved
+double **grid;
+
+// auxiliary matrix
+double **new_grid;
+
+static double *grid_storage;
+static double *new_grid_storage;
+
+// size of each side of the grid
+int size;
+int iter_max_num;
+
+// return the absolute value of a number
+double absolute(double num){
+    if(num < 0)
+        return -1.0 * num;
+    return num;
+}
+
+// allocate contiguous storage while retaining row-pointer indexing
+void allocate_memory(){
+    const size_t n = size > 0 ? (size_t)size : 0;
+    if(n != 0 && n > (SIZE_MAX / sizeof(double)) / n)
+        exit(EXIT_FAILURE);
+
+    grid = (double **) malloc(n * sizeof(double *));
+    new_grid = (double **) malloc(n * sizeof(double *));
+    grid_storage = (double *) malloc(n * n * sizeof(double));
+    new_grid_storage = (double *) malloc(n * n * sizeof(double));
+
+    if(n != 0 && (!grid || !new_grid || !grid_storage || !new_grid_storage)){
+        free(grid);
+        free(new_grid);
+        free(grid_storage);
+        free(new_grid_storage);
+        exit(EXIT_FAILURE);
+    }
+
+    for(int i = 0; i < size; i++){
+        grid[i] = grid_storage + (size_t)i * n;
+        new_grid[i] = new_grid_storage + (size_t)i * n;
+    }
+}
+
+// initialize both grids with identical fixed boundaries
+void initialize_grid(){
+    int center = size / 2;
+    int linf = center - (size / 10);
+    int lsup = center + (size / 10);
+    for(int i = 0; i < size; i++){
+        for(int j = 0; j < size; j++){
+            if(i >= linf && i <= lsup && j >= linf && j <= lsup)
+                grid[i][j] = 100;
+            else
+                grid[i][j] = 0;
+            new_grid[i][j] = grid[i][j];
+        }
+    }
+}
+
+// save the grid in a file
+void save_grid(){
+    for(int i = 0; i < size; i++){
+        for(int j = 0; j < size; j++){
+            fprintf(stdout, "%lf ", grid[i][j]);
+        }
+        fprintf(stdout, "\n");
+    }
+}
+
+static inline int jacobi_row(const double *restrict current,
+                             const double *restrict north,
+                             const double *restrict south,
+                             double *restrict next,
+                             int n){
+    int changed = 0;
+    for(int j = 1; j < n - 1; j++){
+        double value = 0.25 * (current[j+1] + current[j-1] +
+                              north[j] + south[j]);
+        next[j] = value;
+        double errorCurrent = absolute(value - current[j]);
+        changed |= (errorCurrent > CONV_THRESHOLD);
+    }
+    return changed;
+}
+
+int main(int argc, char *argv[]){
+    fscanf(stdin, "%d", &size);
+    fscanf(stdin, "%d", &iter_max_num);
+
+    int hasError = 1;
+    int iter = 0;
+
+    struct timeval time_start;
+    struct timeval time_end;
+
+    // allocate memory to the grid (matrix)
+    allocate_memory();
+
+    // set grid initial conditions
+    initialize_grid();
+
+    //printf("Jacobi relaxation calculation: %d x %d grid\n", size, size);
+
+    // get the start time
+    //gettimeofday(&time_start, NULL);
+
+    while(hasError && iter < iter_max_num){
+        if(iter_max_num - iter == 1){
+            // A single remaining iteration uses ordinary buffer swapping.
+            hasError = 0;
+            for(int i = 1; i < size - 1; i++){
+                hasError |= jacobi_row(grid[i], grid[i-1], grid[i+1],
+                                       new_grid[i], size);
+            }
+            double **tmp = grid;
+            grid = new_grid;
+            new_grid = tmp;
+            iter++;
+        } else {
+            int firstError = 0;
+            int secondError = 0;
+
+            if(size > 2){
+                firstError |= jacobi_row(grid[1], grid[0], grid[2],
+                                         new_grid[1], size);
+
+                for(int i = 1; i < size - 2; i++){
+                    // This is the last first-step row to read old grid[i].
+                    firstError |= jacobi_row(grid[i+1], grid[i], grid[i+2],
+                                             new_grid[i+1], size);
+
+                    // All three intermediate rows are now available.
+                    secondError |= jacobi_row(new_grid[i], new_grid[i-1],
+                                              new_grid[i+1], grid[i], size);
+                }
+
+                // The final intermediate neighbor is the fixed boundary.
+                int i = size - 2;
+                secondError |= jacobi_row(new_grid[i], new_grid[i-1],
+                                          new_grid[i+1], grid[i], size);
+            }
+
+            if(!firstError){
+                // Discard the speculative second step if the first converged.
+                double **tmp = grid;
+                grid = new_grid;
+                new_grid = tmp;
+                hasError = 0;
+                iter++;
+            } else {
+                hasError = secondError;
+                iter += 2;
+            }
+        }
+    }
+
+    // get the end time
+    //gettimeofday(&time_end, NULL);
+
+    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +
+    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;
+
+    //save the final grid in file
+    save_grid();
+
+    //printf("\nKernel executed in %lf seconds with %d iterations.\n", exec_time, iter);
+
+    free(grid_storage);
+    free(new_grid_storage);
+    free(grid);
+    free(new_grid);
+    return 0;
+}

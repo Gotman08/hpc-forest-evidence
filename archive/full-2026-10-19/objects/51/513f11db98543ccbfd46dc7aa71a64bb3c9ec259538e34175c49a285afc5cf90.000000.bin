@@ -1,0 +1,149 @@
+"""Render a new data-only Q packet; do not submit, execute or admit it."""
+import ast
+import gzip
+import hashlib
+import io
+import json
+import tarfile
+from pathlib import Path
+
+HERE=Path(__file__).resolve().parent
+BASE=HERE.parents[2]
+ROOT=HERE/'revision-r3-integration-negative-closed'
+Q=HERE/'qualification-complete110-r2-negative-closed'
+OLD=BASE/'outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r2/qualification-lane-r2-zero-model'
+PREP=HERE.parent
+SOURCE='eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48'
+PLAN='d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27'
+RUNTIME='66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766'
+BUNDLE='033a4625e70bf4430c73f337cabf988afff2c927986379e9007356552dac271e'
+
+
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def raw_json(value):return (json.dumps(value,indent=2,ensure_ascii=False)+'\n').encode()
+def save(path,raw):
+    with path.open('xb') as stream:stream.write(raw)
+def pack(files):
+    output=io.BytesIO()
+    with gzip.GzipFile(fileobj=output,filename='',mode='wb',mtime=0) as zipped,tarfile.open(fileobj=zipped,mode='w') as archive:
+        for name,raw in sorted(files.items()):
+            item=tarfile.TarInfo(name);item.size=len(raw);item.mode=0o600;item.mtime=0
+            archive.addfile(item,io.BytesIO(raw))
+    return output.getvalue()
+
+
+def main():
+    Q.mkdir(exist_ok=False)
+    source=(PREP/'qualification-zero-modele-r1/source110-neutral-data.tar.gz').read_bytes()
+    assert sha(source)==BUNDLE
+    components=(ROOT/'COMPONENTS.json').read_bytes()
+    manifest=json.loads(components)
+    names=set(manifest['code_pins'])|{'COMPONENTS.json'}
+    adapter_files={name:(ROOT/name).read_bytes() for name in names}
+    assert all(sha(adapter_files[name])==checksum for name,checksum in manifest['code_pins'].items())
+    adapters=pack(adapter_files)
+    text=(OLD/'qualification-wrapper.py').read_text()
+    replacements={
+        '60db53fb69e014133a9c77ebaea9ae09ae7891c1433070a9af4eae30b0d05e6d':SOURCE,
+        'b1b39b999cb89374a17191c5b3aef2b4eee255287a4cdbb80ed9c8b5d2ac1e1c':PLAN,
+        '890b20a1ac050fc3952f1409eb884a9013b9c01ddde5f8a79304485187f523ac':RUNTIME,
+        'f1ff59777d4c2a0b09038bc32f2cead5e327badd865a9a1a904fdc9b4f72adb6':BUNDLE,
+        '== 105':'== 110','Exact 105 source':'Exact110 source',
+        'expected_count=111':'expected_count=116','Exact 111 source':'Exact116 source',
+        '"adapter_revision": "lane-r2-integration"':'"adapter_revision": "r4b-source110-external-adapters-r1"'}
+    for old,new in replacements.items():
+        assert old in text,old
+        text=text.replace(old,new)
+    a=text.index('    argv = [sys.executable, "-B", "-m", "pytest", str(test),')
+    b=text.index('    timeout = ',a)
+    text=text[:a]+'''    targets=[str(item) for item in test] if isinstance(test,list) else [str(test)]
+    runner=("import sys;from pathlib import Path;src=Path(sys.argv.pop(1));sys.path.insert(0,str(src));"
+            "import hpc_forest;assert Path(hpc_forest.__file__).resolve().is_relative_to(src);"
+            "import pytest;raise SystemExit(pytest.main(sys.argv[1:]))")
+    argv=[sys.executable,"-I","-B","-c",runner,str(root/"source/project/src"),*targets,
+        "--confcutdir",str(cutoff),"-q","-p","no:cacheprovider","--basetemp",
+        str(output/f"{label}-NEUTRAL-fixtures"),"--junitxml",str(junit)]
+'''+text[b:]
+    a=text.index('    with (output / f"{label}-stdout.log").open("xb")')
+    b=text.index('    counts, details = junit_counts(junit)',a)
+    text=text[:a]+'''    try:
+        with (output/f"{label}-stdout.log").open("xb") as stdout,(output/f"{label}-stderr.log").open("xb") as stderr:
+            result=subprocess.run(argv,cwd=root,env=environment,stdout=stdout,stderr=stderr,timeout=timeout,check=False)
+    except subprocess.TimeoutExpired:
+        save(output/f"{label}-execution.json",{"argv":argv,"returncode":124,"timed_out":True,
+            "timeout_seconds":timeout,"run_count":1,"model_calls":0,"stdout_stderr_preserved":True})
+        raise
+'''+text[b:]
+    a=text.index('        first, source_counts, source_details = run_suite(')
+    b=text.index('        record.update(verified=True',a)
+    text=text[:a]+'''        suites={
+            "source-lane":([root/"source/project/tests/test_lane_contract.py"],26),
+            "source-cli-privacy":([root/"source/project/tests"/name for name in
+                ("test_cli_contract_lane_r3.py","test_owned_timeout_lane_r3.py","test_matrix_worker_cli_lane_r3.py","test_dynamic_runtime_gate_lane_r3.py")],152),
+            "source-prior-privacy":([str(root/"source/project/tests/test_r4b_privacy.py")+"::"+name for name in
+                ("test_max_identity_requires_receipt_and_never_installs_default_generation",
+                 "test_false_admission_and_generic_native_request_are_refused",
+                 "test_cli_verifier_checks_actual_argument_and_all_companion_bytes",
+                 "test_first_start_receiving_flag_never_overrides_missing_verification",
+                 "test_contract_session_must_be_the_exact_declared_phase_cell")],9),
+            "adapter-portable":([root/"adapters/test_portable_chain110.py",root/"adapters/test_contrat_source110.py"],49)}
+        suite_results={}
+        for label,(targets,expected_count) in suites.items():
+            cutoff=root/("adapters" if label=="adapter-portable" else "source/project/tests")
+            rc,counts,details=run_suite(label,targets,cutoff,output,root,started)
+            suite_results[label]={"returncode":rc,"counts":counts,"details":details}
+            need(type(rc) is int and rc==0 and counts=={"passed":expected_count,"failed":0}
+                 and details["skipped"]==0,"Exact single-execution suite failed/refused: "+label)
+        record.update(source_lane_contract_tests=suite_results["source-lane"]["counts"],
+            source_cli_privacy_tests=suite_results["source-cli-privacy"]["counts"],
+            source_prior_privacy_tests=suite_results["source-prior-privacy"]["counts"],
+            adapter_portable_tests=suite_results["adapter-portable"]["counts"],
+            source_neutral_unique_count=187,adapter_neutral_unique_count=49,
+            allocated_contract_tests_returncode=0,suite_results=suite_results)
+        source_after=verify_source(root/"source")
+        adapter_after=inventory(root/"adapters")
+        save(output/"source-after.json",source_after)
+        save(output/"adapter-after.json",adapter_after)
+        need(source_after==source_before and adapter_after==adapter_before,"Source/adapter bytes changed during neutral tests")
+'''+text[b:]
+    ast.parse(text)
+    # The complete new Q receives its own remote root; no previous Q bytes are rewritten.
+    remote='/scratch_p/nimarano/hpc-forest-r4b-source110-completeQ-20261018-'+sha(components)[:12]
+    bindings={'scope_id':'hpc-forest-dynamic-independent-roots-r4b-max','source_zip_sha256':SOURCE,
+        'plan_sha256':PLAN,'source_bundle_sha256':BUNDLE,'source_bundle_member_count':116,
+        'adapter_bundle_sha256':sha(adapters),'adapter_bundle_member_count':len(adapter_files),
+        'adapter_components_manifest_sha256':sha(components),'remote_root':remote,
+        'native_generation_admitted':False,'old_Q_promoted':False}
+    files={'qualification-wrapper.py':text.encode(),'bindings.json':raw_json(bindings),
+        'source-bundle.tar.gz':source,'adapter-bundle.tar.gz':adapters}
+    files['packet-manifest.json']=raw_json({name:sha(raw) for name,raw in files.items()})
+    for name,raw in files.items():save(Q/name,raw)
+    packet=pack(files);save(Q/'complete-source110-neutral-packet.tar.gz',packet)
+    bootstrap=(OLD/'bootstrap-alloue.py').read_bytes();save(Q/'bootstrap-alloue.py',bootstrap)
+    original=(OLD/'commande-allouee-zero-modele.sh').read_text()
+    prefix=original[:original.index('py=')]
+    command=prefix+f'''py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+packet={remote}.tar.gz
+root={remote}
+test -x "$py"
+test ! -e "$root"
+printf '%s  %s\\n' {sha(packet)} "$packet" | sha256sum -c -
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1 CUDA_VISIBLE_DEVICES=
+srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores "$py" -I -B -u - "$packet" "$root" {sha(packet)} <<'R4B_Q110_BOOTSTRAP'
+'''+bootstrap.decode()+"\nR4B_Q110_BOOTSTRAP\n"
+    save(Q/'commande-allouee-zero-modele.sh',command.encode())
+    save(Q/'PROPOSITION-Q-COMPLETE-NON-ADMISE.json',raw_json({'schema':'hpc-forest-r4b-source110-complete-Q-proposal-v1',
+        'prepared_only':True,'verified':False,'native_generation_admitted':False,'job_prepared_or_submitted':False,
+        'remote_root_proposed':remote,'packet_sha256':sha(packet),'packet_files':5,'source_members':110,
+        'source_bundle_members':116,'adapter_bundle_members':len(adapter_files),'adapter_components_manifest_sha256':sha(components),
+        'source_suites':{'lane':26,'cli_privacy':152,'prior_privacy':9,'unique_total':187},'adapter_tests':49,
+        'allocation':{'nodes':1,'tasks':1,'cpu_cores':4,'memory_mib':16384,'gpus':0,'architecture':'ARM64','max_seconds':600},
+        'audit_reserve_seconds':10800,'deadline_exclusive_utc':'2026-10-31T23:00:00Z',
+        'compilation_installation_cli_model_transport_calls':0,'one_execution_per_suite_no_retry':True,
+        'reference_target_contracts_not_inferred_from_source_tests':True,
+        'future_mechanical_reception_requires_explicit_target_reference_linkage_and_independent_audit':True}))
+    print(json.dumps({'Q':str(Q),'packet_sha256':sha(packet),'component_sha256':sha(components),'jobs':0,'models':0}))
+
+
+if __name__=='__main__':
+    main()

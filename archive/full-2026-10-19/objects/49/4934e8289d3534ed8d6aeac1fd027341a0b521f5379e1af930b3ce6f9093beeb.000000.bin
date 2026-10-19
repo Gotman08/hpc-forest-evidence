@@ -1,0 +1,40 @@
+from pathlib import Path, PurePosixPath
+import hashlib,json,tarfile
+ROOT=Path(__file__).resolve().parents[1]
+CELLS={'753498':'0aa363d7085ec53b109908f64a1a788fa0ebc58c7761f9292ee152062c7f8096','753497':'f80e62f8b7ac52fd77afdc97ce81a9dba7e5be44800540eb5fbb1a7c71b21e75','753499':'31d8b1eedd33cfcf74e8727c87463377909439db408ae19befbc58e331762ef4'}
+def read(p):return json.loads(p.read_bytes())
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def inventory(d):return {p.relative_to(d).as_posix():{'sha256':sha(p),'bytes':p.stat().st_size} for p in sorted(d.rglob('*')) if p.is_file()}
+for job,expected in CELLS.items():
+    directory=ROOT/f'reception-terminal-{job}'
+    arc=directory/f'results-{job}.tar.gz'
+    announcement=read(directory/'archive.json')
+    transfer=read(directory/(arc.name+'.transfer.json'))['structuredContent']
+    assert transfer['ok'] and transfer['verifie'] and transfer['empreinte_locale']==transfer['empreinte_distante']==expected==sha(arc)
+    assert announcement.get('sha256')==expected or expected in announcement.values()
+    restore=directory/'restauration-neuve-parent-r1'
+    assert not restore.exists()
+    with tarfile.open(arc,'r:gz') as tar:
+        members=tar.getmembers(); names=[m.name for m in members]
+        assert len(names)==len(set(names))
+        for m in members:
+            path=PurePosixPath(m.name)
+            assert not path.is_absolute() and '..' not in path.parts and '\\' not in m.name and ':' not in m.name
+            assert m.isdir() or m.isfile(), f'Preserve refused nonregular member: {m.name}'
+            assert path.parts[0] in {f'results-{job}', 'runtime-preparation-private-audit'}
+        assert {PurePosixPath(m.name).parts[0] for m in members} == {f'results-{job}', 'runtime-preparation-private-audit'}
+        restore.mkdir()
+        for m in members:
+            target=restore.joinpath(*PurePosixPath(m.name).parts)
+            assert target.resolve().is_relative_to(restore.resolve())
+            if m.isdir():target.mkdir(parents=True,exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True,exist_ok=True)
+                data=tar.extractfile(m).read()
+                assert len(data)==m.size
+                with target.open('xb') as f:f.write(data)
+    inv=inventory(restore)
+    with (directory/'INVENTAIRE-RESTAURATION-PARENT.json').open('x',encoding='utf8') as f:json.dump(inv,f,indent=2);f.write('\n')
+    out={'archive_sha256':expected,'announced_remote_local_sha_equal':True,'restored_files':len(inv),'archive_members':len(members),'untrusted_code_executed':False,'scientific_admission':False,'restore_root':str(restore.resolve()),'root_json_files':[p.name for p in (restore/f'results-{job}').glob('*.json')]}
+    with (directory/'RESTAURATION-PARENT-VERIFIEE.json').open('x',encoding='utf8') as f:json.dump(out,f,indent=2);f.write('\n')
+    print(json.dumps({'job':job,**out}))

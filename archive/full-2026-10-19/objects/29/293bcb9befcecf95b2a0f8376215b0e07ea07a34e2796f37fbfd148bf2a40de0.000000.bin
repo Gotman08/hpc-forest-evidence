@@ -1,0 +1,49 @@
+set -euo pipefail
+archive=/scratch_p/nimarano/hpc-forest-dynamic-roots-r4-light-rpc.tar.gz
+shared=/scratch_p/nimarano/hpc-forest-dynamic-roots-20261016-r4
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+test ! -e "$shared"
+printf '%s  %s\n' '557fb364e1beee593592ff0318b5e162828f8f44a286bc244c030b75d0eceeb5' "$archive" | sha256sum -c -
+mkdir "$shared"
+tar -xzf "$archive" --strip-components=1 -C "$shared"
+"$py" - "$shared" <<'PYCODE'
+import hashlib,json,shutil,stat,sys,zipfile
+from pathlib import Path
+root=Path(sys.argv[1]).resolve()
+for name,expected in json.loads((root/'payload-manifest.json').read_text()).items():
+    p=root/name
+    assert p.resolve().is_relative_to(root.resolve())
+    assert hashlib.sha256(p.read_bytes()).hexdigest()==expected,name
+for item in json.loads((root/'existing-official-dependencies.json').read_text()):
+    source=Path(item['source']);target=root/item['destination']
+    assert hashlib.sha256(source.read_bytes()).hexdigest()==item['sha256']
+    shutil.copyfile(source,target)
+    assert hashlib.sha256(target.read_bytes()).hexdigest()==item['sha256']
+with zipfile.ZipFile(root/'project.zip') as z:
+    for info in z.infolist():
+        assert info.filename.startswith('HPC-Forest/') and not stat.S_ISLNK(info.external_attr >> 16)
+        p=root/'project'/info.filename.removeprefix('HPC-Forest/')
+        assert p.resolve().is_relative_to(root/'project')
+        if info.is_dir():p.mkdir(parents=True,exist_ok=True)
+        else:
+            p.parent.mkdir(parents=True,exist_ok=True)
+            p.write_bytes(z.read(info))
+print('Source and official dependencies verified',flush=True)
+PYCODE
+export PYTHONPATH="$shared/project/src:$shared/qa-deps"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export OPENBLAS_NUM_THREADS=1
+ulimit -s unlimited
+cd "$shared/project"
+"$py" - "$shared" <<'PROFILE'
+import json,sys
+from pathlib import Path
+from hpc_forest.target_profile import prepare_target_profile
+root=Path(sys.argv[1]);profile=prepare_target_profile()
+(root/'target-profile-preflight.json').write_text(json.dumps(profile,indent=2)+'\n')
+print('R4 neutral allocation/compiler/OpenMP probes verified',flush=True)
+PROFILE
+flock -w 120 /tmp/hpc-forest-preflight-nimarano.lock "$py" -m pytest tests -q -p no:cacheprovider --junitxml="$shared/preflight-junit.xml" > "$shared/preflight-tests.log" 2>&1
+cat "$shared/preflight-tests.log"
+exec "$py" -u "$shared/project/examples/marathon22/prepare_archive_suite.py" --root "$shared"

@@ -1,0 +1,131 @@
+"""Read-only supplemental GPT96 delivery and confirmation checks."""
+from __future__ import annotations
+
+import collections
+import hashlib
+import importlib.util
+import json
+import math
+import sqlite3
+import statistics
+import sys
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+WORKSPACE = BASE.parents[3]
+RESEARCH = BASE.parent
+ROOT = BASE / "restauration-02/results-748383"
+WORKER = RESEARCH / "worker"
+SOURCE = RESEARCH / "HPC-Forest-GPT61Sol-MAX-Reference96-r2.zip"
+PROJECT = WORKSPACE / "work/marathon-gpt61sol-max/reference96-r2/project"
+SESSION = "5cbdd08b886a40dcb685b3b4dffa7fe5"
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def save(name, data):
+    path = BASE / name
+    assert not path.exists(), path
+    path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def dependency(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def main():
+    native = load(BASE / "audit-natif-initial.json")
+    assert native["all_final_confirmations_verified"] and native["campaign_coverage_complete"]
+    assert load(BASE / "integrite-restauration-audit.json")["all_restored_bytes_unchanged"]
+    before = load(BASE / "inventaire-apres-audit.json")
+    helpers = {
+        "reception": WORKSPACE / "outputs/HPC-Forest-Harnais-Comparaison-r1/comparison_reception.py",
+        "selection": WORKSPACE / "outputs/Marathon22-DeepSeek-v11/receptions/confirmation_audit.py",
+    }
+    save("outils-complementaires-empreintes.json", {str(p): sha(p) for p in helpers.values()})
+    reception = dependency("gpt96_reception_helpers", helpers["reception"])
+    selection = dependency("gpt96_confirmation_helpers", helpers["selection"])
+    group = {"job_id": "748383", "session_id": SESSION, "model": "gpt-6.1-sol", "effort": "max"}
+    deliveries = reception.reconcile_deliveries(ROOT, WORKER, group)
+    assert deliveries["all_published_requests_delivered"] and deliveries["requests"] == 179
+    save("livraisons-reconciliees.json", deliveries)
+    with zipfile.ZipFile(SOURCE) as archive:
+        manifest = json.loads(archive.read("HPC-Forest/FILES.sha256.json"))
+    assert all(sha(PROJECT / name) == expected for name, expected in manifest.items())
+    source_count = len(manifest)
+    details = []
+    for slug in ("knn", "sum", "nbody"):
+        campaign = ROOT / slug
+        with sqlite3.connect((campaign / "registry.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+            meta = {k: json.loads(v) for k, v in db.execute("SELECT key,value FROM metadata")}
+            config = meta["config"]
+            assert config["harness"] == {"enabled": False}
+            assert config["codex"]["model"] == "gpt-6.1-sol" and config["codex"]["reasoning_effort"] == "max"
+            assert config["codex"]["session_id"] == SESSION and config["seed"] == 23
+            assert config["schedule"] == {"cycles": 4, "trials_per_role_per_cycle": 6, "integrations_per_cycle": 6}
+            assert config["budget"]["wall_seconds"] == 21600 and config["budget"]["tokens"] == 4000000
+            confirmations = [{"experiment_id": exp, "outcome": json.loads(raw)} for exp, raw in
+                             db.execute("SELECT experiment_id,payload FROM evaluations WHERE phase='confirmation'")]
+            plan = meta["confirmation_plan:1"]
+            assert {p["id"] for p in plan} == {p["experiment_id"] for p in confirmations}
+            trial_commits = {exp: json.loads(raw).get("commit") for exp, raw in db.execute("SELECT id,result FROM trials")}
+            trial_commits["baseline-e1"] = meta["baseline"]["commit"] if "baseline" in meta else None
+            for row in confirmations:
+                if row["experiment_id"] != "baseline-e1":
+                    assert trial_commits[row["experiment_id"]] == row["outcome"]["commit"]
+            contract = load(campaign / "trusted/contract.json")
+            checked = selection.verify_final_selection(confirmations, meta["best_confirmed"], contract, ROOT, .03)
+            for row in confirmations:
+                outcome = row["outcome"]
+                if outcome["correct"]:
+                    folder = campaign / "logs/e1" / row["experiment_id"] / "confirmation/attempt-001"
+                    diagnostic = load(folder / "correctness.log")
+                    assert diagnostic["correct"] is True
+                    for index, seconds in enumerate(outcome["times"]):
+                        sample = load(folder / f"sample-{index}.log.json")
+                        assert sample["returncode"] == 0 and sample["timed_out"] is False
+                        assert math.isclose(sample["seconds"], seconds, rel_tol=1e-12)
+            winner = meta["best_confirmed"]
+            baseline = next(c["outcome"] for c in confirmations if c["experiment_id"] == "baseline-e1")
+            selected = next(c["outcome"] for c in confirmations if c["experiment_id"] == winner["experiment_id"])
+            roles = dict(collections.Counter(role for (role,) in db.execute("SELECT role FROM trials")))
+            details.append({"problem": slug, "confirmation_selection": checked,
+                "planned_program_slots": 96, "actual_trials_by_role": roles,
+                "baseline_confirmation_times": baseline["times"], "retained_confirmation_times": selected["times"],
+                "baseline_mean_seconds": statistics.mean(baseline["times"]),
+                "retained_mean_seconds": statistics.mean(selected["times"]),
+                "speedup_within_this_allocation": baseline["mean_seconds"] / selected["mean_seconds"],
+                "reduction_fraction_within_this_allocation": 1 - selected["mean_seconds"] / baseline["mean_seconds"],
+                "retained_binary_sha256": selected["binary_sha256"],
+                "search_schedule_complete": load(ROOT / f"{slug}-summary.json")["complete"],
+                "finite_contract_only": True, "universal_algorithmic_or_official_rank_claim": False})
+    after = {p.relative_to(ROOT.parent).as_posix(): {"bytes": p.stat().st_size, "sha256": sha(p)}
+             for p in sorted(ROOT.parent.rglob("*")) if p.is_file()}
+    assert before == after
+    assert sum(p["archived_native_invocations"] for p in native["problems"]) <= deliveries["native_invocations_observed"]
+    result = {"schema": "hpc-forest-gpt96-supplemental-readonly-audit-v1", "job_id": "748383",
+        "session_id": SESSION, "verified_utc": datetime.now(timezone.utc).isoformat(),
+        "read_only_evidence_verified": True, "all_restored_bytes_unchanged": True,
+        "frozen_source_manifest_entries_verified": source_count, "harness_disabled_verified": True,
+        "all_planned_finalists_accounted_for": True, "all_final_confirmations_verified": True,
+        "actual_deliveries": {k: v for k, v in deliveries.items() if k not in ("records", "local_delivery_attachment_sha256")},
+        "problems": details, "candidate_execution_or_compilation": False,
+        "scope": "Generic delivery and final-selection helper functions reused only; no source-only admission claimed"}
+    save("audit-complementaire.json", result)
+    print(json.dumps({k: v for k, v in result.items() if k != "problems"}, ensure_ascii=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()

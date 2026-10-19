@@ -1,0 +1,178 @@
+"""Truthful external factory preflight. Always non-admitted; no authorizations written."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PREP = HERE.parent
+BASE = PREP.parents[1]
+OLD = PREP / "integration-factory-lecteur-r4-r1"
+OBS = PREP / "observateur-neuf-sessions-r4"
+SOURCE = "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3"
+PLAN = "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b"
+PINS = {
+    OLD / "LIVRAISON-INTEGRATION.json": "c292f6af4a3a858f8361bacf3efd95774089dd96ff9b19b501dbd11bd1b7ab51",
+    OLD / "assemble_admissions.py": "ea74b7f23e0e019339bbb077911a7a18a3917b457cfdd51849f4c80221c4cea3",
+    OLD / "reader_bridge.py": "76b45f463cabd81bd85f24fde41451fa4ecc04835bfd927fcf4a4712e2fded37",
+    OBS / "LIVRAISON-OBS4-NON-ADMISE-FINALE.json": "0362b87fbb4de945b6e845889f8d0a7cd15f06262d2ed6e866ad6aa0ecb31bf9",
+    OBS / "observer-mixte.py": "a8903b386a2d53cb663e75d719a50c2c8c39931e91d9c3e664f0d41bd29d54a8",
+    OBS / "ABI.json": "bb716e29b1d1acfc931dc2d0ae2903e23039713afabc1844ae4a9190bc1a719b",
+    OBS / "revue-secondaire-parent/REVUE-OBS4-PREPARATION.json": "02c0bbb0f8070e1ddf360c36e9b07ffc1bae213e45e38cb11ea501b6e19ba5b4",
+}
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+STATE_SHA = "617816e7b028460a16a2bc301f81913d2c45001a0d856569306f9940d149d3d8"
+if hashlib.sha256((HERE / "source_only_state.py").read_bytes()).hexdigest() != STATE_SHA:
+    raise ValueError("SO proof reader changed before import")
+state = load(HERE / "source_only_state.py", "factory_so_state_no_transport")
+
+
+def dependencies():
+    for path, expected in PINS.items():
+        state.need(state.digest(path) == expected, "Frozen predecessor changed: " + path.name)
+    # Both imports are pure definitions/hash checks; no reader watch, transport, census or CLI is called.
+    original = load(OLD / "assemble_admissions.py", "frozen_r1_factory_for_preflight")
+    observer = load(OBS / "observer-mixte.py", "frozen_obs4_for_preflight")
+    return original, observer
+
+
+def check_census(census, closure, original, mode, absence_ref, science_ref, recon_ref, expected_pair, *, now=None, selected_session=None):
+    if mode == "live":
+        # Preserve the original live gate and its truthful output exactly.
+        state.validate_state(mode, census, expected_pair, now=now)
+        old_pair, count = original.check_census(census, closure, now=now, selected_session=selected_session)
+        return {"source_only_state": "live", "source_only_preserved": True,
+                "source_only_scientifically_closed_and_absent": False,
+                "source_only_full_identities": old_pair, "active_native_workers_before_start": count}
+    result = state.validate_state(mode, census, expected_pair, absence_ref=absence_ref,
+                                  science_ref=science_ref, recon_ref=recon_ref, now=now)
+    # The actual current census is never augmented with historical SO identities.
+    rows, _ = state.complete_census(census, now=now, fresh=True)
+    by_pid = {r["ProcessId"]: r for r in rows}
+    original.require(closure.get("verified") is True
+        and closure.get("schema") == "hpc-forest-r2c-owned-main-only-stop-receipt-v1"
+        and closure.get("all_three_main_identities_absent") is True
+        and closure.get("source_only_identities_preserved") is True, "Actual historical R2 closure required")
+    original.require({state.identity(r) for r in closure["source_only"]} == {state.identity(r) for r in expected_pair}, "Historical SO anchors differ")
+    original.require(len(closure["actions"]) == 3, "Three historical R2 mains required")
+    for action in closure["actions"]:
+        old = action["identity"]
+        state.identity(old)
+        if old["ProcessId"] in by_pid:
+            original.require(state.identity(by_pid[old["ProcessId"]]) != state.identity(old), "A closed R2 main is present")
+    groups = census.get("other_native_groups", [])
+    original.require(isinstance(groups, list), "Closed active group list required")
+    owned_pids, sessions = set(), set()
+    for group in groups:
+        original.require(isinstance(group, dict) and set(group) == {
+            "model", "phase", "session_id", "job_id", "full_identities", "authorization"}, "Exact active-group fields required")
+        session = original.cells.select(group["model"], group["phase"], effort="max", session_id=group["session_id"], job_id=group["job_id"])
+        original.require(session != selected_session and session not in sessions, "Started or duplicate session refused")
+        sessions.add(session)
+        identities = group["full_identities"]
+        original.require(isinstance(identities, list) and len(identities) == 2, "Full launcher/Python pair required")
+        a, b = [original.full_identity(r) for r in identities]
+        original.require(a["ProcessId"] != b["ProcessId"] and a["CommandLine"] == b["CommandLine"]
+            and (a["ParentProcessId"] == b["ProcessId"] or b["ParentProcessId"] == a["ProcessId"]), "Unbound active pair")
+        pids = {a["ProcessId"], b["ProcessId"]}
+        original.require(not owned_pids.intersection(pids), "Duplicate/reused active identity")
+        for r in (a, b):
+            original.require(r["ProcessId"] in by_pid and original.full_identity(by_pid[r["ProcessId"]]) == r
+                and session in r["CommandLine"] and group["model"] in r["CommandLine"]
+                and str(original.HERE / "bootstrap_worker.py").lower() in r["CommandLine"].lower(), "Active binding differs")
+        authorization = original.read(group["authorization"])
+        original.bind(authorization, {"scope_id": original.SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+            "model": group["model"], "effort": "max", "session_id": session, "job_id": group["job_id"],
+            "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session})
+        original.require(authorization.get("verified") is True and authorization.get("purpose") == "technical-contract"
+            and authorization.get("technical_phase") == group["phase"], "Actual technical authorization required")
+        _, admission = original.bootstrap_source()
+        admission.validate_authorization(original.artifact(group["authorization"]), {original.SCOPE})
+        owned_pids.update(pids)
+    count = len(groups)
+    original.require(0 <= count < 4, "Cap4 includes the proposed worker; SO closed counts zero")
+    native = [r for r in rows if original.detection.is_native_worker_command(r.get("CommandLine"))]
+    original.require({r["ProcessId"] for r in native} == owned_pids, "Unclassified native worker/fifth lane refused")
+    return {**result, "source_only_full_identities": [], "active_native_workers_before_start": count}
+
+
+def source_gate_blocker():
+    path = BASE / "work/hpc-forest-mere-dynamique-r4b-max/project/src/hpc_forest/dynamic_admission.py"
+    state.need(state.digest(path) == "c9688578461cb325f4db60728b422ee86b4b0050926f911ebc31ac8af5af1278", "Frozen source validator changed")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    matches = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Compare)
+        and isinstance(n.left, ast.Call) and isinstance(n.left.func, ast.Attribute)
+        and isinstance(n.left.func.value, ast.Name) and n.left.func.value.id == "lane"
+        and n.left.func.attr == "get" and n.left.args and isinstance(n.left.args[0], ast.Constant)
+        and n.left.args[0].value == "source_only_preserved"
+        and any(isinstance(op, ast.Is) for op in n.ops)
+        and any(isinstance(c, ast.Constant) and c.value is True for c in n.comparators)]
+    state.need(len(matches) == 1, "Expected immutable source gate no longer exact")
+    return {"code": "FROZEN_SOURCE_REQUIRES_SO_PRESERVED_TRUE", "path": str(path),
+            "sha256": state.digest(path), "line": matches[0], "source_only_preserved_required": True}
+
+
+def preflight(value, *, now=None):
+    state.need(isinstance(value, dict) and set(value) == {"schema", "cell", "source_only_state", "science", "reconciliation",
+        "source_only_absence", "fresh_private_full_cim", "r2_main_closure", "obs4_policy", "obs3_release"}
+        and value.get("schema") == "hpc-forest-r4b-so-state-factory-preflight-input-v1", "Closed preflight input required")
+    original, observer = dependencies()
+    selected = value["cell"]
+    state.need(isinstance(selected, dict) and set(selected) == {"model", "phase", "session_id", "job_id", "effort"}, "Exact selected cell fields required")
+    session = original.cells.select(**selected)
+    state.need(selected["job_id"] is not None, "Actual observed job required; no guessed job")
+    policy = state.read(value["obs4_policy"])
+    observer.verify_policy(policy)
+    state.need(policy["source_only_state"] == value["source_only_state"]
+        and policy["source_only_reception"] == value["science"], "Factory/observer SO facts differ")
+    census = state.read(value["fresh_private_full_cim"])
+    rows, _ = state.complete_census(census, now=now, fresh=True)
+    source_pins, _admission = original.bootstrap_source()
+    state.need(value["r2_main_closure"] == source_pins["real_r2_main_closure"], "Exact already-received R2 closure required")
+    state.need(policy.get("source_only_absence") == value["source_only_absence"], "One exact SO absence evidence graph required")
+    observer.load_source_only(policy, rows, initial=True)
+    # This proof is independent of SO closure; no start/import transport/lock is attempted.
+    observer.verify_transition(state.read(value["obs3_release"]), rows, policy["previous_reader_identities"], initial=True)
+    lane = check_census(census, state.read(value["r2_main_closure"]), original,
+        value["source_only_state"], value["source_only_absence"], value["science"], value["reconciliation"],
+        policy["source_only_full_identities"], now=now, selected_session=session)
+    blocker = source_gate_blocker() if value["source_only_state"] == "received_absent" else None
+    return {"schema": "hpc-forest-r4b-so-state-factory-preflight-v1", "verified": False,
+        "scope_id": original.SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+        "inert_checks_passed": True, "cell": selected, "lane": lane,
+        "authorization_production_blockers": [blocker] if blocker else ["Independent derivative review and actual complete launch inputs still required"],
+        "source_only_absence_observed_by_this_code": False, "actual_census_collected": False,
+        "native_generation_admitted": False, "authorization_created": False, "transport_or_lock_started": False,
+        "factory_live_path_preserved": True, "source_guard_unchanged": True,
+        "evidence_refs": [value[k] for k in ("science", "reconciliation", "fresh_private_full_cim", "r2_main_closure", "obs4_policy", "obs3_release")]
+            + ([value["source_only_absence"]] if value["source_only_absence"] is not None else []),
+        "reader_refs": 14, "reader_expected": 11, "model_CLI_RPC_job_calls": 0}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--input-sha256", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    result = preflight(state.read({"path": str(args.input.resolve()), "sha256": args.input_sha256}))
+    state.need(args.output.resolve().parent == HERE and not args.output.exists(), "Fresh direct local preflight output required")
+    with args.output.open("x", encoding="utf-8") as stream:
+        json.dump(result, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+if __name__ == "__main__":
+    main()

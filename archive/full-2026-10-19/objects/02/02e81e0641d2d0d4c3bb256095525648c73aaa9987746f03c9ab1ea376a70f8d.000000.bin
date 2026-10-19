@@ -1,0 +1,67 @@
+"""Neutral qualifier checks; main/allocation path is never executed locally."""
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+qualifier = load('neutral_qualifier', HERE / 'qualify_stage_zero_model.py')
+base = load('neutral_base_tests', HERE.parent / 'test_launch_models.py')
+frozen_render = base.frozen_render
+
+
+def test_actual_proposed_stage_has_closed_regular_members():
+    raw = qualifier.stage_bytes(HERE.parent / 'native-interface-models-max-r2.tar.gz')
+    assert set(raw) == {'remote_stage.py', 'cell_selection.py', 'stage-manifest.json'}
+
+
+def test_changed_packet_is_rejected_before_extract(tmp_path):
+    path = tmp_path / 'wrong.tar.gz'
+    path.write_bytes((HERE.parent / 'native-interface-models-max-r2.tar.gz').read_bytes() + b'changed')
+    with pytest.raises(ValueError, match='Exact new external'):
+        qualifier.stage_bytes(path)
+
+
+def test_all_nine_pure_paths_without_native_main(frozen_render, monkeypatch):
+    monkeypatch.setattr(base.stage, 'one_contract', lambda *a, **k: pytest.fail('Native path called'))
+    pins = json.loads((HERE.parent / 'pins-source-plan.json').read_text(encoding='utf8'))
+    plan = json.loads(Path(pins['plan']['path']).read_text(encoding='utf8'))
+    def roots(value, maximum, capabilities):
+        if not 1 <= len(value['directions']) <= maximum:
+            raise ValueError('Neutral bound')
+    validators = (roots, lambda v: v, lambda *args: None)
+    rows = qualifier.pure_contract_checks(base.stage, plan, validators)
+    assert len(rows) == 9 and all(r['model_calls'] == 0 for r in rows)
+    assert {r['model'] for r in rows} == set(base.cells.MODELS)
+
+
+def test_weakened_validator_does_not_qualify(frozen_render):
+    pins = json.loads((HERE.parent / 'pins-source-plan.json').read_text(encoding='utf8'))
+    plan = json.loads(Path(pins['plan']['path']).read_text(encoding='utf8'))
+    with pytest.raises(ValueError, match='cardinality'):
+        qualifier.pure_contract_checks(base.stage, plan, (lambda *a: None, lambda v: v, lambda *a: None))
+
+
+def test_qualifier_never_calls_scientific_or_native_probes():
+    source = (HERE / 'qualify_stage_zero_model.py').read_text(encoding='utf8')
+    assert 'prepare_target_profile(' not in source and 'install_identity(' not in source
+    assert 'one_contract(' not in source and 'wait_authorization(' not in source
+    assert {'subprocess.Popen', 'socket.connect', 'os.system'} <= qualifier.DENIED_EVENTS
+
+def test_corrected_native_detection_is_part_of_pure_preflight():
+    detector = load('neutral_detector', HERE / 'native_worker_detection.py')
+    assert len(qualifier.pure_detection_checks(detector)) == 6
+
+
+def test_weak_native_detection_refuses_preflight():
+    import types
+    with pytest.raises(ValueError, match='native detector'):
+        qualifier.pure_detection_checks(types.SimpleNamespace(is_native_worker_command=lambda command: False))

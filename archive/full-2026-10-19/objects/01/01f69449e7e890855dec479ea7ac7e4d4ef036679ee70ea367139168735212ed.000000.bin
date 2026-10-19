@@ -1,0 +1,220 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+
+#define MAX_PARTS 1000u
+#define ROOT_LIMIT 65535u
+#define ODD_CAPACITY ((ROOT_LIMIT + 1u) / 2u)
+#define WHEEL_MOD 2310u
+#define RECIPROCAL_MIN_WORK 32u
+
+typedef struct {
+    uint32_t value;
+    uint32_t scale;
+} Fragment;
+
+typedef struct {
+    uint32_t inverse;
+    uint32_t quotient;
+} Divisor;
+
+static unsigned char odd_composite[(ROOT_LIMIT >> 4) + 1u];
+static unsigned char wheel[WHEEL_MOD];
+static uint16_t prime_values[ODD_CAPACITY];
+_Alignas(64) static Divisor divisor_tests[ODD_CAPACITY];
+static unsigned prime_count;
+
+static uint32_t parse_fragment(const char *text, uint32_t *scale)
+{
+    uint32_t value = 0;
+    uint32_t power = 1;
+    while (*text != '\0') {
+        value = value * 10u + (unsigned)(*text - '0');
+        power *= 10u;
+        ++text;
+    }
+    *scale = power;
+    return value;
+}
+
+static int small_prime(uint32_t value)
+{
+    return value == 2u || value == 3u || value == 5u ||
+           value == 7u || value == 11u;
+}
+
+static void initialize_wheel(void)
+{
+    static const unsigned factors[] = {2u, 3u, 5u, 7u, 11u};
+    memset(wheel, 0, sizeof wheel);
+    for (unsigned i = 0; i < 5u; ++i)
+        for (unsigned value = 0; value < WHEEL_MOD; value += factors[i])
+            wheel[value] = 1;
+}
+
+static int marked(uint32_t value)
+{
+    return (odd_composite[value >> 4] >> ((value >> 1) & 7u)) & 1u;
+}
+
+static void build_primes(uint32_t limit)
+{
+    memset(odd_composite, 0, sizeof odd_composite);
+    prime_count = 0;
+    for (uint32_t p = 3u; p <= limit / p; p += 2u) {
+        if (!marked(p)) {
+            for (uint32_t value = p * p; value <= limit; value += 2u * p)
+                odd_composite[value >> 4] |=
+                    (unsigned char)(1u << ((value >> 1) & 7u));
+        }
+    }
+    for (uint32_t p = 13u; p <= limit; p += 2u)
+        if (!marked(p))
+            prime_values[prime_count++] = (uint16_t)p;
+}
+
+static void build_inverse_tests(void)
+{
+    for (unsigned i = 0; i < prime_count; ++i) {
+        uint32_t p = prime_values[i];
+        uint32_t inverse = p;
+        /* An odd number is its own inverse modulo eight. */
+        for (unsigned step = 0; step < 4u; ++step)
+            inverse *= 2u - p * inverse;
+        divisor_tests[i].inverse = inverse;
+        divisor_tests[i].quotient = UINT32_MAX / p;
+    }
+}
+
+static uint32_t integer_sqrt(uint32_t value)
+{
+    uint32_t root = (uint32_t)sqrt((double)value);
+    while ((uint64_t)(root + 1u) * (root + 1u) <= value)
+        ++root;
+    while ((uint64_t)root * root > value)
+        --root;
+    return root;
+}
+
+static inline int divides(uint32_t value, const Divisor *test)
+{
+    return (uint32_t)(value * test->inverse) <= test->quotient;
+}
+
+static int is_prime_after_wheel(uint32_t value, int use_inverse)
+{
+    if (value < 13u)
+        return small_prime(value);
+
+    unsigned low = 0;
+    unsigned high = prime_count;
+    while (low < high) {
+        unsigned middle = low + (high - low) / 2u;
+        uint32_t p = prime_values[middle];
+        if (p * p <= value)
+            low = middle + 1u;
+        else
+            high = middle;
+    }
+    unsigned end = low;
+
+    if (!use_inverse) {
+        for (unsigned i = 0; i < end; ++i)
+            if (value % prime_values[i] == 0u)
+                return 0;
+        return 1;
+    }
+
+    unsigned i = 0;
+    for (; i + 4u <= end; i += 4u) {
+        if (divides(value, &divisor_tests[i]) |
+            divides(value, &divisor_tests[i + 1u]) |
+            divides(value, &divisor_tests[i + 2u]) |
+            divides(value, &divisor_tests[i + 3u]))
+            return 0;
+    }
+    for (; i < end; ++i)
+        if (divides(value, &divisor_tests[i]))
+            return 0;
+    return 1;
+}
+
+static int compare_values(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+    return (a > b) - (a < b);
+}
+
+int main(void)
+{
+    unsigned count = 0;
+    if (scanf("%u", &count) != 1 || count == 0u || count > MAX_PARTS)
+        return 0;
+
+    size_t pair_count = (size_t)count * count;
+    uint32_t *left = malloc((size_t)count * sizeof *left);
+    Fragment *right = malloc((size_t)count * sizeof *right);
+    uint32_t *work = malloc(pair_count * sizeof *work);
+    if (left == NULL || right == NULL || work == NULL) {
+        free(work);
+        free(right);
+        free(left);
+        return 1;
+    }
+
+    char token[50];
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t ignored_scale;
+        if (scanf("%49s", token) != 1)
+            goto cleanup;
+        left[i] = parse_fragment(token, &ignored_scale);
+    }
+    for (unsigned i = 0; i < count; ++i) {
+        if (scanf("%49s", token) != 1)
+            goto cleanup;
+        right[i].value = parse_fragment(token, &right[i].scale);
+    }
+
+    initialize_wheel();
+    size_t work_count = 0;
+    uint32_t maximum = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t prefix = left[i];
+        for (unsigned j = 0; j < count; ++j) {
+            uint32_t value = prefix * right[j].scale + right[j].value;
+            if (value < 13u) {
+                if (!small_prime(value))
+                    continue;
+            } else if (wheel[value % WHEEL_MOD]) {
+                continue;
+            }
+            work[work_count++] = value;
+            if (value > maximum)
+                maximum = value;
+        }
+    }
+
+    build_primes(integer_sqrt(maximum));
+    int use_inverse = work_count >= RECIPROCAL_MIN_WORK;
+    if (use_inverse)
+        build_inverse_tests();
+
+    size_t result_count = 0;
+    for (size_t i = 0; i < work_count; ++i) {
+        uint32_t value = work[i];
+        if (is_prime_after_wheel(value, use_inverse))
+            work[result_count++] = value;
+    }
+    qsort(work, result_count, sizeof *work, compare_values);
+    for (size_t i = 0; i < result_count; ++i)
+        printf("%u\n", (unsigned)work[i]);
+
+cleanup:
+    free(work);
+    free(right);
+    free(left);
+    return 0;
+}

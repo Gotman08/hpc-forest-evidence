@@ -1,0 +1,223 @@
+#ifndef KNN_H
+#define KNN_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <limits.h>
+#include <string.h>
+
+typedef struct {
+    float x;
+    float y;
+} Point;
+
+typedef struct {
+    char label;
+    int length;
+    Point *points;
+} Group;
+
+void on_error(void) {
+    printf("Invalid input file.\n");
+    exit(1);
+}
+
+#define KNN_INPUT_CAPACITY 65536u
+static char knn_input_buffer[KNN_INPUT_CAPACITY + 1];
+static size_t knn_input_position;
+static size_t knn_input_count;
+
+static int knn_input_peek(void) {
+    if (knn_input_position == knn_input_count) {
+        knn_input_count = fread(knn_input_buffer, 1, KNN_INPUT_CAPACITY, stdin);
+        knn_input_position = 0;
+        knn_input_buffer[knn_input_count] = '\0';
+        if (knn_input_count == 0) return EOF;
+    }
+    return (unsigned char) knn_input_buffer[knn_input_position];
+}
+
+static int knn_input_get(void) {
+    int c = knn_input_peek();
+    if (c != EOF) knn_input_position++;
+    return c;
+}
+
+static void knn_skip_space(void) {
+    int c;
+    while ((c = knn_input_peek()) != EOF && isspace((unsigned char) c))
+        knn_input_position++;
+}
+
+static void knn_expect(const char *literal) {
+    while (*literal != '\0') {
+        if (knn_input_get() != (unsigned char) *literal) on_error();
+        literal++;
+    }
+}
+
+static int knn_parse_integer(void) {
+    knn_skip_space();
+    int c = knn_input_peek();
+    int negative = 0;
+    if (c == '-' || c == '+') {
+        negative = c == '-';
+        knn_input_position++;
+        c = knn_input_peek();
+    }
+    if (c < '0' || c > '9') on_error();
+    unsigned int limit = (unsigned int) INT_MAX + (unsigned int) negative;
+    unsigned int value = 0;
+    while (c >= '0' && c <= '9') {
+        unsigned int digit = (unsigned int) (c - '0');
+        if (value > (limit - digit) / 10u) on_error();
+        value = value * 10u + digit;
+        knn_input_position++;
+        c = knn_input_peek();
+    }
+    if (negative) {
+        if (value == (unsigned int) INT_MAX + 1u) return INT_MIN;
+        return -(int) value;
+    }
+    return (int) value;
+}
+
+static size_t knn_float_token_end(size_t position, size_t *depth) {
+    while (position < knn_input_count) {
+        unsigned char c = (unsigned char) knn_input_buffer[position];
+        if (isspace(c) || c == ',' || (c == ')' && *depth == 0)) break;
+        if (c == '(') {
+            (*depth)++;
+        } else if (c == ')') {
+            (*depth)--;
+        }
+        position++;
+    }
+    return position;
+}
+
+static void knn_append_token(char **token, size_t *length, size_t *capacity,
+                              const char *part, size_t amount) {
+    if (amount > (size_t) -1 - *length - 1) on_error();
+    size_t needed = *length + amount + 1;
+    if (needed > *capacity) {
+        size_t next = *capacity != 0 ? *capacity : 64;
+        while (next < needed) {
+            if (next > ((size_t) -1) / 2) {
+                next = needed;
+                break;
+            }
+            next *= 2;
+        }
+        char *resized = (char *) realloc(*token, next);
+        if (resized == NULL) on_error();
+        *token = resized;
+        *capacity = next;
+    }
+    memcpy(*token + *length, part, amount);
+    *length += amount;
+    (*token)[*length] = '\0';
+}
+
+static float knn_parse_float(void) {
+    knn_skip_space();
+    if (knn_input_peek() == EOF) on_error();
+    size_t begin = knn_input_position;
+    char *finish;
+    float value = strtof(knn_input_buffer + begin, &finish);
+
+    if (finish != knn_input_buffer + begin &&
+        finish < knn_input_buffer + knn_input_count) {
+        unsigned char separator = (unsigned char) *finish;
+        if (separator == ',' || separator == ')' || isspace(separator)) {
+            knn_input_position = (size_t) (finish - knn_input_buffer);
+            return value;
+        }
+    }
+
+    size_t depth = 0;
+    size_t end = knn_float_token_end(begin, &depth);
+    if (end < knn_input_count) {
+        if (finish == knn_input_buffer + begin ||
+            finish != knn_input_buffer + end) on_error();
+        knn_input_position = end;
+        return value;
+    }
+
+    char *token = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    for (;;) {
+        knn_append_token(&token, &length, &capacity,
+                         knn_input_buffer + begin, end - begin);
+        knn_input_position = end;
+        if (end < knn_input_count || knn_input_peek() == EOF) break;
+        begin = knn_input_position;
+        end = knn_float_token_end(begin, &depth);
+    }
+    value = strtof(token, &finish);
+    if (finish == token || finish != token + length) on_error();
+    free(token);
+    return value;
+}
+
+int parse_number_of_groups(void) {
+    knn_skip_space();
+    knn_expect("n_groups=");
+    int n = knn_parse_integer();
+    knn_skip_space();
+    return n;
+}
+
+Point parse_point(void) {
+    knn_skip_space();
+    knn_expect("(");
+    Point point;
+    point.x = knn_parse_float();
+    knn_skip_space();
+    knn_expect(",");
+    point.y = knn_parse_float();
+    knn_skip_space();
+    knn_expect(")");
+    knn_skip_space();
+    return point;
+}
+
+Group parse_next_group(void) {
+    knn_skip_space();
+    knn_expect("label=");
+    int label = knn_input_get();
+    if (label == EOF) on_error();
+    knn_skip_space();
+    knn_expect("length=");
+    int length = knn_parse_integer();
+    knn_skip_space();
+
+    Group group;
+    group.label = (char) label;
+    group.length = length;
+    group.points = (Point *) malloc(sizeof(Point) * length);
+    for (int i = 0; i < length; i++) {
+        group.points[i] = parse_point();
+    }
+    return group;
+}
+
+int parse_k(void) {
+    knn_skip_space();
+    knn_expect("k=");
+    int k = knn_parse_integer();
+    knn_skip_space();
+    return k;
+}
+
+float euclidean_distance_no_sqrt(Point a, Point b) {
+    return ((b.x - a.x) * ((b.x - a.x))) + ((b.y - a.y) * (b.y - a.y));
+}
+
+int compare_for_sort(const void *a, const void *b) {
+    return *(const char *) a - *(const char *) b;
+}
+
+#endif

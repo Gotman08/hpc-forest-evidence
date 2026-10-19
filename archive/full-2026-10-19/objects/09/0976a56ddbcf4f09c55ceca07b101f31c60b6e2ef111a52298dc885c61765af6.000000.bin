@@ -1,0 +1,124 @@
+def validate_context_graph(graph, launch):
+    need(graph.get('schema') == 'hpc-forest-r2g-frozen-contextual-process-graph-v1'
+         and graph.get('scope_id') == SCOPE and len(graph.get('nodes', [])) == 21,
+         'Exact frozen contextual graph required')
+    cold = read_ref(graph['cold_census'])
+    need(graph['cold_census']['sha256'] == '2aaaa6c462f58788d8c566db59cf7e9daffb5891a09cbc58f58b92e6163965ff'
+         and graph['real_launch_receipt'] == {'path': str(LAUNCH_RECEIPT.resolve()), 'sha256': LAUNCH_SHA}
+         and read_ref(graph['real_launch_receipt']) == launch,
+         'Original rejected cold census and real launch must remain pinned')
+    cold_rows = {row['ProcessId']: row for row in cold['rows']}
+    need(cold.get('complete_census') is True and len(cold_rows) == cold['rows_count'] == len(cold['rows']),
+         'Frozen source census incomplete')
+    need(set(graph['worker_argv']) == {c[3] for c in CELLS}, 'Three real argv refs required')
+    q = graph['qualification']
+    need(q['source_zip_sha256'] == SOURCE
+         and q['codex_worker']['sha256'] == 'a07d231e5bec01b6402503b391afb0a164c833420ce4bc67f5957aabb8ffb3ec'
+         and q['current_ssh_constructor']['sha256'] == 'ec3619368e5a6d03cf519c93b0a80fe73d2b890fd4d3f7f7459cc9d1f32f7170'
+         and q['current_ssh_constructor']['all_three_frozen_command_lines_match_constructor'] is True
+         and q['current_ssh_constructor']['remote_shell'] == '/bin/bash -l -s'
+         and q['current_ssh_constructor']['options'] == ['-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new',
+             '-o','ConnectTimeout=20','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3'],
+         'Source-described MCP/SSH transport differs')
+    item(q['codex_worker'])
+    config = q['current_selected_mcp_declaration']
+    need(config['origin_path'].replace('\\', '/') == 'C:/Users/nicol/.codex/config.toml'
+         and config['whole_file_sha256_current_observation'] == 'a037c482d43937324833b83d9d3eab0d09365f7f10a8372ccd5beae8f27e090a'
+         and config['command'] == r'C:\Users\nicol\romeo-mcp\.venv\Scripts\python.exe'
+         and config['args'] == ['-m','romeo_mcp'] and config['startup_timeout_sec'] == 120.0
+         and config['historical_config_bytes_proven'] is False
+         and q['installed_source_equals_loaded_runtime_proven'] is False
+         and q['descendants_are_stop_targets'] is False,
+         'Current declaration classification or historical-provenance limit differs')
+    need(q['current_venv_metadata']['base_executable'] == r'C:\Users\nicol\AppData\Local\Programs\Python\Python313\python.exe',
+         'MCP environment base executable differs')
+    expected_roles = {'launcher','main','worker_console','mcp_launcher','mcp_console','mcp_python','mcp_ssh'}
+    seen = set()
+    for cell in CELLS:
+        _, _, _, session, pid, parent, _ = cell
+        nodes = [n for n in graph['nodes'] if n['session_id'] == session]
+        by_role = {n['role']: full_identity(n['identity']) for n in nodes}
+        need(len(nodes) == len(by_role) == 7 and set(by_role) == expected_roles, 'Exact seven-node contextual lane required')
+        need(by_role['main']['ProcessId'] == pid and by_role['launcher']['ProcessId'] == parent,
+             'Graph roots differ from actual launch pair')
+        edges = {'main':'launcher','worker_console':'launcher','mcp_launcher':'main',
+                 'mcp_console':'mcp_launcher','mcp_python':'mcp_launcher','mcp_ssh':'mcp_python'}
+        for role, row in by_role.items():
+            need(row['ProcessId'] not in seen and row['ProcessId'] in cold_rows
+                 and row == full_identity(cold_rows[row['ProcessId']])
+                 and row['CreationDate'] <= cold['captured_at_utc'], 'Frozen full identity differs or is future/duplicate')
+            seen.add(row['ProcessId'])
+            if role in edges:
+                owner = by_role[edges[role]]
+                need(row['ParentProcessId'] == owner['ProcessId'] and row['CreationDate'] > owner['CreationDate'],
+                     'Contextual creation/parent chain differs')
+            if role in ('worker_console','mcp_console'):
+                need(row['ExecutablePath'].casefold() == r'C:\WINDOWS\system32\conhost.exe'.casefold()
+                     and digest(row['CommandLine'].encode()) == '417222c4a0ecb4d60a457ebe8e26fddf3d5406bffb16a5c59af8eeb241beca51',
+                     'Exact frozen console identity required')
+            if role in ('mcp_launcher','mcp_python'):
+                executable = config['command'] if role == 'mcp_launcher' else q['current_venv_metadata']['base_executable']
+                need(row['ExecutablePath'] == executable
+                     and digest(row['CommandLine'].encode()) == '59d3d2cd9a614eaef79ca375c188e2bc22f33caf7b777eb8bbfd2f8c972e1cb7',
+                     'Source/config-described transport command differs')
+            if role == 'mcp_ssh':
+                need(row['ExecutablePath'].casefold() == r'C:\WINDOWS\System32\OpenSSH\ssh.exe'.casefold()
+                     and digest(row['CommandLine'].encode()) == '262cc5abad5efc18b94d3a97787b0c65589f524a99f627e3c73d9b7ccf6d903d',
+                     'Exact frozen SSH transport command differs')
+        argv = read_ref(graph['worker_argv'][session])
+        need(set(argv) == {'argv','cwd','environment','executed'}
+             and argv['argv'][argv['argv'].index('--codex-config')+1].replace('\\','/') == config['origin_path'].replace('\\','/')
+             and argv['argv'][argv['argv'].index('--session-id')+1] == session,
+             'Actual worker argv configuration/session binding differs')
+    need(len(seen) == 21, 'Exact full contextual graph required')
+
+
+def fresh_identities(census, launch, now, graph):
+    need(census.get('complete_census') is True and type(census.get('rows_count')) is int
+         and census['rows_count'] == len(census['rows']), 'Complete parent-supplied CIM required')
+    age = (now - datetime.fromisoformat(census['captured_at_utc'])).total_seconds()
+    need(0 <= age <= 45, 'Parent-supplied CIM stale/future')
+    rows = {r['ProcessId']: r for r in census['rows']}
+    need(len(rows) == len(census['rows']) and all(type(r.get('ProcessId')) is int
+         and type(r.get('ParentProcessId')) is int for r in rows.values()), 'Duplicate/untyped CIM graph')
+    need(launch.get('verified') is True and len(launch.get('workers', [])) == 3, 'Real three-worker launch receipt required')
+    expected = {n['identity']['ProcessId']: full_identity(n['identity']) for n in graph['nodes']}
+    need(len(expected) == 21 and len(graph['nodes']) == 21, 'Duplicate/missing contextual identity')
+    for pid, wanted in expected.items():
+        need(pid in rows and full_identity(rows[pid]) == wanted
+             and wanted['CreationDate'] <= census['captured_at_utc'],
+             'Contextual process missing, opaque, changed or PID reused')
+    roots = {pid for cell in CELLS for pid in (cell[4], cell[5])}
+    children = {}
+    for row in rows.values():
+        children.setdefault(row['ParentProcessId'], []).append(row)
+    reached, pending = set(), list(roots)
+    while pending:
+        parent = pending.pop()
+        need(parent not in reached, 'Process graph cycle/repeated reachability')
+        reached.add(parent)
+        owner = expected[parent]
+        for row in children.get(parent, []):
+            actual = full_identity(row)
+            need(actual['ProcessId'] in expected and actual == expected[actual['ProcessId']]
+                 and actual['CreationDate'] > owner['CreationDate'],
+                 'Unqualified descendant/CLI/host/foreign/opaque graph preserved; collection refuses')
+            # A main is already a root; visit it exactly once via its launcher.
+            if actual['ProcessId'] not in roots:
+                pending.append(actual['ProcessId'])
+    need(reached == set(expected), 'Complete recursive contextual graph differs')
+    result = {}
+    for cell in CELLS:
+        _, model, job, session, pid, parent, _ = cell
+        originals = [w for w in launch['workers'] if w['session_id'] == session]
+        need(len(originals) == 1, 'Unique historical launch worker required')
+        original = originals[0]
+        need(original['model'] == model and original['job_id'] == job
+             and {r['ProcessId'] for r in original['full_identities']} == {pid,parent},
+             'Historical launch pair differs')
+        pair = {r['ProcessId']: full_identity(r) for r in original['full_identities']}
+        need(all(pair[p] == expected[p] for p in pair) and pair[pid]['ParentProcessId'] == parent
+             and 'hpc_forest.r2max_worker' in pair[pid]['CommandLine'] and session in pair[pid]['CommandLine'],
+             'Owned main scope differs')
+        result[session] = {'main':pair[pid], 'parent':pair[parent]}
+    return result

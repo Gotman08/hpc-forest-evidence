@@ -1,0 +1,158 @@
+"""Neutral controls for passive-only source-only observer, without any RPC/process."""
+import ast
+import copy
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("passive_observer_tested", HERE / "observer-max4-r5.py")
+d = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(d)
+
+
+def process(pid=1, parent=0, session=d.SESSION):
+    return {"ProcessId": pid, "ParentProcessId": parent, "ExecutablePath": "C:/python.exe",
+            "CommandLine": "python.exe -m hpc_forest.ablation_worker --session-id " + session,
+            "CreationDate": "2026-10-17T20:00:00+00:00"}
+
+
+def pair(session=d.SESSION):
+    return [process(1, 0, session), process(2, 1, session)]
+
+
+def state():
+    return {"source_zip_sha256": d.SOURCE_SHA, "current_key": d.KEY, "queue": [
+        {"key": d.KEY, "job_id": d.JOB, "session_id": d.SESSION, "model": d.MODEL,
+         "effort": "max", "arm": "source-only", "state": "working"}]}
+
+
+def write(path, value):
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+
+class Passive(unittest.TestCase):
+    def test_status_only_bound_job(self):
+        d.check_rpc("job_status", {"job_id": d.JOB})
+        d.check_rpc("job_efficiency", {"job_id": d.JOB})
+
+    def test_no_submission_or_remote_other_operations(self):
+        for name in ("job_prepare", "job_submit", "cancel_job", "read_remote_file",
+                     "upload_to_romeo", "download_from_romeo", "romeollm_generate"):
+            with self.subTest(tool=name), self.assertRaises(RuntimeError):
+                d.check_rpc(name, {"job_id": d.JOB})
+
+    def test_no_other_job_polling(self):
+        with self.assertRaises(RuntimeError):
+            d.check_rpc("job_status", {"job_id": "751571"})
+
+    def test_no_extra_rpc_argument(self):
+        with self.assertRaises(RuntimeError):
+            d.check_rpc("job_status", {"job_id": d.JOB, "force": True})
+
+    def test_existing_group(self):
+        self.assertEqual(d.verify_cell(state())["session_id"], d.SESSION)
+
+    def test_no_switch_group(self):
+        changed = state(); changed["current_key"] = "other"
+        with self.assertRaises(RuntimeError):
+            d.verify_cell(changed)
+
+    def test_no_switch_effort(self):
+        changed = state(); changed["queue"][0]["effort"] = "xhigh"
+        with self.assertRaises(RuntimeError):
+            d.verify_cell(changed)
+
+    def test_no_false_received_state(self):
+        changed = state(); changed["queue"][0]["state"] = "received_and_audited"
+        with self.assertRaises(RuntimeError):
+            d.verify_cell(changed)
+
+    def test_pair_complete(self):
+        d.verify_pair(pair(), pair())
+
+    def test_pair_missing_child(self):
+        with self.assertRaises(RuntimeError):
+            d.verify_pair(pair(), pair()[:1])
+
+    def test_pair_pid_reused(self):
+        current = copy.deepcopy(pair()); current[1]["CreationDate"] = "2026-10-18T20:00:00+00:00"
+        with self.assertRaises(RuntimeError):
+            d.verify_pair(pair(), current)
+
+    def test_foreign_parent_not_owned(self):
+        current = copy.deepcopy(pair()); current[1]["ExecutablePath"] = "C:/foreign.exe"
+        with self.assertRaises(RuntimeError):
+            d.verify_pair(pair(), current)
+
+    def test_old_observer_alive_refused(self):
+        old = process()
+        admission = {"previous_observer_identities": [old], "previous_observer_natural_exit_confirmed": True}
+        with self.assertRaises(RuntimeError):
+            d.verify_old_observer_absent(admission, [old])
+
+    def test_old_observer_absent(self):
+        admission = {"previous_observer_identities": [process()], "previous_observer_natural_exit_confirmed": True}
+        d.verify_old_observer_absent(admission, [])
+
+    def test_natural_exit_required(self):
+        admission = {"previous_observer_identities": [process()], "previous_observer_natural_exit_confirmed": False}
+        with self.assertRaises(RuntimeError):
+            d.verify_old_observer_absent(admission, [])
+
+    def test_equivalent_old_observer_still_alive_refused(self):
+        old = process()
+        admission = {"previous_observer_identities": [old], "previous_observer_natural_exit_confirmed": True}
+        equivalent = {**old, "ProcessId": 9, "CreationDate": "2026-10-18T20:00:00+00:00"}
+        with self.assertRaises(RuntimeError):
+            d.verify_old_observer_absent(admission, [equivalent])
+
+    def test_no_secondary_route_needed_for_single_lane(self):
+        result = d.verify_secondary_route(None, {d.SESSION: pair()}, pair())
+        self.assertFalse(result["secondary_lane_occupied"])
+
+    def test_unknown_second_worker_refused(self):
+        with self.assertRaises(RuntimeError):
+            d.verify_secondary_route(None, {d.SESSION: pair(), "b" * 32: pair("b" * 32)}, [])
+
+    def test_unrouted_r2_workers_refused(self):
+        with self.assertRaises(RuntimeError):
+            d.verify_secondary_route(None, {d.SESSION: [], "b" * 32: [], "c" * 32: []}, [])
+
+    def test_partial_human_receipt_and_separate_absence(self):
+        with tempfile.TemporaryDirectory(dir=HERE) as folder:
+            root = Path(folder)
+            partial = root / "partial.json"
+            write(partial, {"job_id": "751571", "session_id": d.shared.SESSION, "human_stop": True,
+                            "verified": True, "all_started_claims_reconciled": True,
+                            "full_planned_cohort_admitted": False})
+            absence = root / "absence.json"
+            write(absence, {"job_id": "751571", "session_id": d.shared.SESSION, "after_audit": True,
+                            "after_reconciliation": True, "all_owned_process_identities_absent_after_stop": True,
+                            "partial_audit_sha256": d.digest(partial)})
+            admission = {"r1_partial_reception": {"path": str(partial), "sha256": d.digest(partial)},
+                         "r1_owned_worker_absence": {"path": str(absence), "sha256": d.digest(absence)}}
+            self.assertTrue(d.verify_partial_release(admission)["human_stop"])
+            changed = json.loads(partial.read_text()); changed["full_planned_cohort_admitted"] = True
+            write(partial, changed); admission["r1_partial_reception"]["sha256"] = d.digest(partial)
+            with self.assertRaises(RuntimeError):
+                d.verify_partial_release(admission)
+
+    def test_no_process_create_or_stop_or_generation_call(self):
+        source = (HERE / "observer-max4-r5.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        forbidden = {"Popen", "terminate", "kill", "killpg", "stop", "submit", "receive", "generate"}
+        self.assertFalse(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                             and node.func.attr in forbidden for node in ast.walk(tree)))
+        self.assertNotIn("taskkill", source.lower())
+        self.assertNotIn("coordonner-source-only.py", source)
+
+    def test_main_does_not_mutate_r1_state(self):
+        source = (HERE / "observer-max4-r5.py").read_text(encoding="utf-8")
+        self.assertNotIn('STUDY / "coordinator-state.json"', source)
+
+
+if __name__ == "__main__":
+    unittest.main()

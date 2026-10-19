@@ -1,0 +1,142 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system.  Uses a Structure-of-Arrays layout so that the outer
+ * loop over bodies can be vectorized across i (each body's inner j
+ * reduction remains scalar and preserves exact floating-point order).
+ */
+void body_force(const int n, const float dt,
+                float * restrict px, float * restrict py, float * restrict pz,
+                float * restrict vx, float * restrict vy, float * restrict vz) {
+  #pragma omp parallel
+  {
+    #pragma omp for simd schedule(static)
+    for (int i = 0; i < n; ++i) {
+      float fx = 0.0f;
+      float fy = 0.0f;
+      float fz = 0.0f;
+
+      const float xi = px[i];
+      const float yi = py[i];
+      const float zi = pz[i];
+
+      for (int j = 0; j < n; ++j) {
+        float dx = px[j] - xi;
+        float dy = py[j] - yi;
+        float dz = pz[j] - zi;
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1.0f / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+      }
+
+      vx[i] += dt*fx;
+      vy[i] += dt*fy;
+      vz[i] += dt*fz;
+    }
+  }
+}
+
+/*
+ * Read a binary dataset with initialized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /* Convert from Array-of-Structs to Struct-of-Arrays for better SIMD. */
+  float *px = (float *)malloc(nbodies * sizeof(float));
+  float *py = (float *)malloc(nbodies * sizeof(float));
+  float *pz = (float *)malloc(nbodies * sizeof(float));
+  float *vx = (float *)malloc(nbodies * sizeof(float));
+  float *vy = (float *)malloc(nbodies * sizeof(float));
+  float *vz = (float *)malloc(nbodies * sizeof(float));
+
+  for (int i = 0; i < nbodies; ++i) {
+    px[i] = bodies[i].x;
+    py[i] = bodies[i].y;
+    pz[i] = bodies[i].z;
+    vx[i] = bodies[i].vx;
+    vy[i] = bodies[i].vy;
+    vz[i] = bodies[i].vz;
+  }
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(nbodies, DT, px, py, pz, vx, vy, vz);
+
+    #pragma omp parallel
+    {
+      #pragma omp for simd schedule(static)
+      for (int i = 0; i < nbodies; ++i) {
+        px[i] += vx[i] * DT;
+        py[i] += vy[i] * DT;
+        pz[i] += vz[i] * DT;
+      }
+    }
+  }
+
+  /* Convert back to the required Array-of-Structs output format. */
+  Body *out = (Body *)malloc(nbodies * sizeof(Body));
+  for (int i = 0; i < nbodies; ++i) {
+    out[i].x = px[i];
+    out[i].y = py[i];
+    out[i].z = pz[i];
+    out[i].vx = vx[i];
+    out[i].vy = vy[i];
+    out[i].vz = vz[i];
+  }
+
+  write_dataset(nbodies, out);
+
+  free(px); free(py); free(pz); free(vx); free(vy); free(vz);
+  free(out);
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

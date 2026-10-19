@@ -1,0 +1,174 @@
+"""Pure local CURRENT reader. No census, process, lock, cache, CLI or RPC action.
+
+The parent supplies a real complete census and runs this within 120 seconds.
+This isolated reader retains identity/session/descendant guards and uses the
+reviewed command-identity correction only after independent review by the parent.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[3]
+OPS = HERE.parent
+SOURCE_READER = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2d/source-only-reader-r4/source_only_state.py"
+RECEPTION = BASE / "outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r2/operations-parent-lane-close-20261018T0542/reception-sortie-naturelle"
+COLD_REPORT_SHA = "6a0b0c2e9e2562daeb6837f517d75fc360fa5f3696bab6bf0274dc0c02d67838"
+SO_READER_SHA = "564398d676dceb6b5ba893fcbb3835c7aec31a1cbd5d5c5dcef6b361a3a23338"
+PREDECESSOR_READER_SHA = "b5f78fd1cc1b40230420df20e6466664e741a7b6ed0c405678edf1d71f7f96e0"
+OBS4_SHA = "a8903b386a2d53cb663e75d719a50c2c8c39931e91d9c3e664f0d41bd29d54a8"
+
+
+def need(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read(path):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            need(key not in value, "Duplicate JSON key")
+            value[key] = item
+        return value
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"), object_pairs_hook=unique)
+
+
+def bound(ref):
+    need(isinstance(ref, dict) and set(ref) == {"path", "sha256"}, "Closed reference required")
+    path = Path(ref["path"])
+    need(path.is_absolute() and ".." not in path.parts and path.is_file()
+         and not any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction())
+                     for p in (path, *path.parents))
+         and digest(path) == ref["sha256"], "Missing, changed or aliased evidence")
+    return path
+
+
+def reference(path):
+    return {"path": str(Path(path).absolute()), "sha256": digest(path)}
+
+
+def load(ref, name):
+    spec = importlib.util.spec_from_file_location(name, bound(ref))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def save(path, value):
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--current", required=True, type=Path)
+    parser.add_argument("--current-sha256", required=True)
+    parser.add_argument("--output-directory", required=True, type=Path)
+    args = parser.parse_args()
+    now = time.time()
+    report_path = RECEPTION / "RECEPTION-COLD-METADONNEES.json"
+    need(digest(report_path) == COLD_REPORT_SHA, "Cold metadata reception changed")
+    report = read(report_path)
+    need(report["source_only_state_reader"]["sha256"] == PREDECESSOR_READER_SHA,
+         "Cold reception must retain its actual previous reader")
+    so_ref = {"path": str(SOURCE_READER), "sha256": SO_READER_SHA}
+    obs_ref = report["exact_obs4_code_for_release"]
+    need(so_ref["sha256"] == SO_READER_SHA and obs_ref["sha256"] == OBS4_SHA,
+         "Exact reviewed reader pins required; no override")
+    so = load(so_ref, "natural_exit_frozen_so_reader")
+    # Importing OBS4 is stdlib-only; never call its guard/watch/transport/lock APIs.
+    obs = load(obs_ref, "natural_exit_frozen_obs4_release_reader")
+    current_ref = {"path": str(args.current.absolute()), "sha256": args.current_sha256}
+    current = read(bound(current_ref))
+    rows, captured = so.complete_census(current, now=now, fresh=True)
+    prior = read(bound(report["prior_full_cim"]))
+    cold = read(bound(report["cold_full_cim"]))
+    before_rows, t0 = so.complete_census(prior, now=now)
+    cold_rows, t1 = so.complete_census(cold, now=now)
+    need(t0 <= t1 <= captured, "Actual CURRENT precedes the historical cold observation")
+    all_owned = report["ownership_inventory"]
+    need(len(all_owned) == 14 and len({so.identity(r) for r in all_owned}) == 14
+         and len({r["ProcessId"] for r in all_owned}) == 14, "Closed 14-identity inventory required")
+    prior_by_pid = {r["ProcessId"]: r for r in before_rows}
+    for old in all_owned:
+        need(prior_by_pid.get(old["ProcessId"]) == old, "Owned identity not observed in actual prior census")
+    need(not so._unresolved_descendants(all_owned, (before_rows, cold_rows, rows),
+        captured_at=[prior["captured_at_utc"], cold["captured_at_utc"], current["captured_at_utc"]]),
+         "Possible descendant unresolved across prior/cold/CURRENT; never adopt or stop it")
+    # A matched reused PID must expose all five exact fields and a strictly newer
+    # birth; absence alone is never inferred from an opaque same-PID row.
+    by_pid = {r["ProcessId"]: r for r in rows}
+    for old in all_owned:
+        if old["ProcessId"] in by_pid:
+            actual = by_pid[old["ProcessId"]]
+            need(so.identity(actual) != so.identity(old)
+                 and so._creation_key(actual["CreationDate"]) > so._creation_key(old["CreationDate"]),
+                 "Owned identity still present or reused PID ambiguous")
+    proofs = {}
+    for subject in ("source-only", "observer3"):
+        proof = read(RECEPTION / f"INPUT-{subject}-ABSENCE-FROIDE-0629.json")
+        for ref in proof["evidence_refs"]:
+            bound(ref)
+        proof["fresh_full_cim"] = current_ref
+        proof["observed_at"] = captured
+        proof["verification_scope"] = "Pure proof from parent-supplied actual CURRENT census"
+        proof["current_freshness_verified"] = True
+        proof["historical_cold_cim"] = report["cold_full_cim"]
+        proof["cold_metadata_reception"] = reference(report_path)
+        proof["evidence_refs"] = proof["evidence_refs"] + [current_ref, report["cold_full_cim"], reference(report_path)]
+        proofs[subject] = proof
+    so.scientific_closure(report["scientific_reception"], report["reconciliation"])
+    failures = {}
+    try:
+        so.verify_absence(proofs["source-only"], report["source_only_pair"], current, now=now)
+    except ValueError as exc:
+        failures["source_only_reader"] = str(exc)
+    try:
+        obs.verify_cold_absence(proofs["observer3"], report["observer3_pair"], rows,
+                                "observer3", initial=True)
+    except ValueError as exc:
+        failures["obs4_previous_reader_release"] = str(exc)
+    # No output is an authorization or policy, and no output is written elsewhere.
+    out = args.output_directory.absolute()
+    need(out.parent == OPS and not out.exists(), "Exclusive new CURRENT data directory directly under parent ops required")
+    out.mkdir()
+    for subject, proof in proofs.items():
+        save(out / f"INPUT-{subject}-CURRENT.json", proof)
+    result = {
+        "schema": "hpc-forest-natural-exit-current-pure-verification-v1",
+        "verified": not failures,
+        "verification_scope": "Metadata absence/release proof only; no process or native action",
+        "current_census": current_ref,
+        "current_captured_at_utc": current["captured_at_utc"],
+        "current_age_seconds_at_validation": now - captured,
+        "cold_metadata_reception": reference(report_path),
+        "source_only_reader": so_ref,
+        "obs4_reader": obs_ref,
+        "failure_reasons": failures,
+        "all_14_original_identities_absent_or_full_later_pid_reuse": True,
+        "unresolved_possible_descendants": [],
+        "processes_stopped_or_launched": False,
+        "RPC_or_CLI_or_model_calls": 0,
+        "cache_or_lock_or_database_read": False,
+        "observer_started": False,
+        "native_generation_admitted": False,
+        "lane_authorization_created": False,
+    }
+    save(out / "VERIFICATION-CURRENT.json", result)
+    print(json.dumps({"verified": result["verified"], "report": reference(out / "VERIFICATION-CURRENT.json"),
+                      "failure_reasons": failures}))
+    return 0 if not failures else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,207 @@
+"""Neutral local tests: data, AST and command construction only; no shell/process run."""
+import ast
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('astra_preparation', ROOT / 'preparer-astra-max.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+def test_command_one_srun_and_isolated_python():
+    command = m.proposal_command()
+    assert command.count('\nsrun ') == 1
+    assert ' -I -B -u - ' in command
+    assert '--cpus-per-task=4 --mem=16G --cpu-bind=cores --time=03:00:00' in command
+    assert m.SESSION in command and 'hpc-forest-primes-native-max-r1-' not in command
+
+
+def constants():
+    tree = ast.parse((ROOT / 'allocated-preflight.py').read_text(encoding='utf8'))
+    env = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, (ast.Constant, ast.List, ast.Dict, ast.Tuple))):
+                try:
+                    env[node.targets[0].id] = ast.literal_eval(node.value)
+                except ValueError:
+                    pass
+    return tree, env
+
+
+def test_preflight_ast_actual_newlines_and_fixed_argv():
+    tree, values = constants()
+    call = next(n for n in tree.body if isinstance(n, ast.Assign)
+                and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'command')
+    parts = [n.value for n in ast.walk(call.value) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert any('\n' in value for value in parts)
+    assert all('\\n' not in value for value in parts)
+    argv = values['WAIT_ARGV']
+    assert argv[:4] == [m.PYTHON_ARM, '-I', '-B', '-u']
+    assert argv[argv.index('--root') + 1] == m.REMOTE_ROOT
+    assert argv[argv.index('--authorization') + 1] == m.ADMISSION_ROOT + '/authorization.json'
+    assert argv[-2:] == ['--wait-seconds', '600']
+    assert values['SOURCE_SHA'] == m.SOURCE and values['PLAN_SHA'] == m.PLAN
+
+
+def test_guards_before_spack_or_exec():
+    text = (ROOT / 'allocated-preflight.py').read_text(encoding='utf8')
+    assert text.index('len(affinity) == 4') < text.index('spack load ')
+    assert text.index('SLURM_RESTART_COUNT') < text.index('spack load ')
+    assert text.index('verify_runtime(source_zip)') < text.index('os.execvpe(')
+    assert 'selected-cell plan required' in text
+    assert '== 103' in text
+
+
+@pytest.mark.parametrize('key,value', [('model', 'gpt-5.6-terra'), ('effort', 'high'),
+    ('session_id', '0' * 32), ('remote_root', m.REMOTE_ROOT + '/other'),
+    ('scope_id', 'old'), ('job_id', 'NONSOUMIS')])
+def test_identity_refuses_other_cell_or_unknown_job(key, value):
+    data = {'scope_id': m.SCOPE, 'model': m.MODEL, 'effort': 'max', 'session_id': m.SESSION,
+                'job_id': '123', 'remote_root': m.REMOTE_ROOT}
+    data[key] = value
+    with pytest.raises(m.Refusal):
+        m.astra_identity(data)
+
+
+def test_identity_exact_neutral_data():
+    m.astra_identity({'scope_id': m.SCOPE, 'model': m.MODEL, 'effort': 'max', 'session_id': m.SESSION,
+                         'job_id': '123', 'remote_root': m.REMOTE_ROOT})
+
+
+@pytest.mark.parametrize('path', ['/tmp/a', m.ADMISSION_ROOT + '/../outside',
+    m.ADMISSION_ROOT + '//a', m.ADMISSION_ROOT + '/a\\b',
+    '/scratch_p/nimarano/hpc-forest-primes-native-max-r2b-admission-other/a',
+    m.ADMISSION_ROOT + '/authorization.json', m.ADMISSION_ROOT + '/authorization-ready.json'])
+def test_remote_mirror_refuses_unknown_roots_and_traversal(tmp_path, path):
+    p = tmp_path / 'proof'; p.write_bytes(b'NEUTRAL')
+    with pytest.raises(m.Refusal):
+        m.remote_resolver([{'remote_path': path, 'local': m.ref(p)}])
+
+
+def test_remote_exact_sha_and_missing_file(tmp_path):
+    p = tmp_path / 'proof'; p.write_bytes(b'NEUTRAL')
+    remote = m.ADMISSION_ROOT + '/proof.json'
+    resolver = m.remote_resolver([{'remote_path': remote, 'local': m.ref(p)}])
+    assert resolver({'path': remote, 'sha256': m.sha(p)}) == p
+    with pytest.raises(m.Refusal):
+        resolver({'path': remote, 'sha256': '0' * 64})
+    with pytest.raises(m.Refusal):
+        resolver({'path': m.ADMISSION_ROOT + '/missing', 'sha256': m.sha(p)})
+    p.unlink()
+    with pytest.raises(m.Refusal):
+        resolver({'path': remote, 'sha256': '0' * 64})
+
+
+def test_duplicate_mirror_refused(tmp_path):
+    p = tmp_path / 'proof'; p.write_bytes(b'NEUTRAL')
+    row = {'remote_path': m.ADMISSION_ROOT + '/proof', 'local': m.ref(p)}
+    with pytest.raises(m.Refusal):
+        m.remote_resolver([row, row])
+
+
+@pytest.mark.parametrize('extra', ['unknown', 'verified'])
+def test_closed_artifact_ref(tmp_path, extra):
+    p = tmp_path / 'proof'; p.write_bytes(b'NEUTRAL')
+    value = {**m.ref(p), extra: True}
+    with pytest.raises(m.Refusal):
+        m.artifact(value)
+
+
+def test_fake_qualification_never_admitted(tmp_path):
+    p = tmp_path / 'q'; p.write_text(json.dumps({'verified': True}), encoding='utf8')
+    with pytest.raises(m.Refusal, match='Exact independently received'):
+        m.qualification(None, m.ref(p), m.ref(p))
+
+
+def test_fake_closure_never_admitted(tmp_path):
+    p = tmp_path / 'closure'; p.write_text(json.dumps({'verified': True}), encoding='utf8')
+    with pytest.raises(m.Refusal, match='Exact actual bounded'):
+        m.closure_admission(m.ref(p))
+
+
+def test_exclusive_write_preserves_first_file(tmp_path):
+    m.save(tmp_path, 'proof.json', {'verified': False})
+    before = (tmp_path / 'proof.json').read_bytes()
+    with pytest.raises(FileExistsError):
+        m.save(tmp_path, 'proof.json', {'verified': True})
+    assert (tmp_path / 'proof.json').read_bytes() == before
+
+
+def test_preparer_has_no_process_network_or_execution_calls():
+    tree = ast.parse((ROOT / 'preparer-astra-max.py').read_text(encoding='utf8'))
+    forbidden = {'subprocess', 'socket', 'asyncio', 'requests', 'urllib'}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            assert not ({item.name.split('.')[0] for item in node.names} & forbidden)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            assert node.func.attr not in {'execvpe', 'Popen', 'run', 'system', 'connect'}
+
+
+def test_no_other_model_or_worker_loop_in_argv_generator():
+    text = (ROOT / 'preparer-astra-max.py').read_text(encoding='utf8')
+    assert "MODEL, EFFORT = 'gpt-6-astra', 'max'" in text
+    assert "'--max-seconds', '10800'" in text
+    assert 'transport-smoke' not in text and '--resume' not in text
+
+def test_frozen_validator_refuses_unverified_authorization_example():
+    module = m.native()
+    with pytest.raises(module.InfrastructureError):
+        module.validate_receipt(m.SEALED / 'authorization-non-verifiee.json', {m.SCOPE}, runtime=False, prepared=False)
+
+@pytest.mark.parametrize('field', ['version', 'executable_path', 'executable_sha256', 'source_execution_allowed', 'files'])
+def test_divergent_cli_proofs_refused(field):
+    left = {'version': 'NEUTRAL', 'executable_path': 'NEUTRAL', 'executable_sha256': 'NEUTRAL',
+            'source_execution_allowed': False, 'files': []}
+    right = {**left, field: 'different'}
+    with pytest.raises(m.Refusal, match='CLI identities differ'):
+        m.same_cli(left, right)
+
+
+@pytest.mark.parametrize('change', ['job', 'plan', 'unknown', 'cpu', 'partition', 'intent', 'command', 'script', 'evidence'])
+def test_submission_guard_blocks_wrong_or_incomplete_neutral_data(tmp_path, change):
+    command = tmp_path / 'command.sh'; command.write_text(m.proposal_command(), encoding='utf8')
+    script = tmp_path / 'script.sbatch'
+    script.write_text('#SBATCH --partition=short\n#SBATCH --time=03:00:00\n#SBATCH --cpus-per-task=4\n#SBATCH --mem=16G\n#SBATCH --nodes=1\n#SBATCH --ntasks-per-node=1\n' + m.proposal_command(), encoding='utf8')
+    evidence = tmp_path / 'NEUTRAL'; evidence.write_text('NEUTRAL FIXTURE ONLY', encoding='utf8')
+    intent = {'schema': 'hpc-forest-astra-max-submit-intent-v1', 'verified': True,
+        'scope_id': m.SCOPE, 'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION,
+        'source_zip_sha256': m.SOURCE, 'research_plan_sha256': m.PLAN, 'full_script_reviewed': True,
+        'one_submit_only': True, 'no_resubmit_if_unknown': True, 'normal_first_call_proved': False,
+        'allocation_max_seconds': 10800, 'maximum_native_workers': 2, 'source_only_preserved': True,
+        'plan_id': 'NEUTRAL', 'plan_sha256': 'NEUTRAL', 'command': m.ref(command), 'job_script': m.ref(script),
+        'evidence_refs': [m.ref(evidence)]}
+    submitted = {'ok': True, 'submitted': True, 'submission_observed': True, 'job_id': '123',
+        'plan_id': 'NEUTRAL', 'plan_sha256': 'NEUTRAL', 'resolved': {'arch': 'armgpu', 'partition': 'short',
+        'total_cpus': 4, 'total_gpus': 0, 'mem_gb': 16, 'time': '03:00:00', 'ntasks_per_node': 1}}
+    if change == 'job':
+        submitted['job_id'] = '124'
+    elif change == 'plan':
+        submitted['plan_id'] = 'other'
+    elif change == 'unknown':
+        submitted['submission_observed'] = False
+    elif change == 'cpu':
+        submitted['resolved']['total_cpus'] = 8
+    elif change == 'partition':
+        submitted['resolved']['partition'] = 'instant'
+    elif change == 'intent':
+        intent['full_script_reviewed'] = False
+    elif change == 'command':
+        command.write_text('NEUTRAL DIFFERENT COMMAND', encoding='utf8'); intent['command'] = m.ref(command)
+    elif change == 'script':
+        script.write_text('NEUTRAL NO SBATCH', encoding='utf8'); intent['job_script'] = m.ref(script)
+    else:
+        intent['evidence_refs'] = []
+    ip, sp = tmp_path / 'intent.json', tmp_path / 'submitted.json'
+    ip.write_text(json.dumps(intent), encoding='utf8'); sp.write_text(json.dumps({'structuredContent': submitted}), encoding='utf8')
+    with pytest.raises(m.Refusal):
+        m.submission_guard(m.ref(ip), m.ref(sp), {'job_id': '123'})
+
+def test_missing_parent_review_never_admitted(tmp_path):
+    p = tmp_path / 'review'; p.write_text(json.dumps({'verified': True}), encoding='utf8')
+    with pytest.raises(m.Refusal, match='Actual parent'):
+        m.parent_review_guard(m.ref(p), {}, {'job_id': '123'})

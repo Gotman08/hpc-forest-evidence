@@ -1,0 +1,82 @@
+"""Independent targeted cold metadata checks; no editorial pipeline or model payload."""
+import copy
+import hashlib
+import importlib.util
+import json
+from collections import Counter
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RX = HERE.parent.parent
+ED = RX.parents[2] / "HPC-Forest-Etude-2020-2024-r1/edition-professionnelle"
+script = ED / "source_only_sol_accounting.py"
+assert hashlib.sha256(script.read_bytes()).hexdigest() == "2b689d58155837ae6a35d4cca41d77dfd61581be56aa0e4569bf316f94acba04"
+spec = importlib.util.spec_from_file_location("independent_sol_accounting", script)
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+ledger_path = RX / "reconciliation-livraisons-r1/LEDGER-PAR-NONCE.json"
+assert hashlib.sha256(ledger_path.read_bytes()).hexdigest() == "e59648ab81c4ad5dd18a4332eecda57c136e7299afae501673df9b4dad913504"
+records = json.loads(ledger_path.read_text(encoding="utf8"))["records"]
+states = Counter(helper.classify(row) for row in records)
+assert states == {"exact": 111, "unmeasured": 10, "expired_before_invocation_proven": 3}
+unknown = next(row for row in records if row["known_exact_tokens"] is None)
+exact = next(row for row in records if row["usage_measured"] and row["native_invocation_observed"])
+expiry = next(row for row in records if row["not_called_before_expiry"])
+checks = [{"case": "real immutable124metadata preserve111measuredCLI+10null+3provenzero", "passed": True}]
+for label, value in (("unknown cannot become zero", {**unknown, "known_exact_tokens": 0}),
+                     ("boolean cannot impersonate exact token integer", {**exact, "known_exact_tokens": True}),
+                     ("integer cannot impersonate native-call boolean", {**exact, "native_invocation_observed": 1}),
+                     ("reasoning already included cannot be added again", {**exact, "known_exact_tokens": exact["known_exact_tokens"] + 1}),
+                     ("preexpiry cannot simultaneously be a native call", {**expiry, "native_invocation_observed": True})):
+    try:
+        helper.classify(value)
+    except ValueError:
+        checks.append({"case": label, "passed": True})
+    else:
+        raise AssertionError(label)
+artifacts = {key: {"path": str(HERE / (key + "-NEUTRAL-NOT-READ.json")), "sha256": value} for key, value in helper.PINS.items()}
+artifacts["receipt"]["sha256"] = "0" * 64
+calls = []
+
+
+def forbidden(*_a, **_k):
+    calls.append("unexpected I/O")
+    raise AssertionError("Tampered pin must refuse before any reader callback")
+
+
+try:
+    helper.closed_sol_accounting({}, {"reviewed_new_cohorts": [{"cohort": helper.COHORT, "artifacts": artifacts}]},
+                                 read=forbidden, record=forbidden, save=forbidden, sha=forbidden)
+except ValueError as error:
+    assert "scoped Sol artifact" in str(error) and not calls
+    checks.append({"case": "tampered receipt pin refuses before any evidence I/O", "passed": True})
+else:
+    raise AssertionError("Tampered pin accepted")
+closed_path = ED / "donnees/couts-source-only-sol.json"
+closed = json.loads(closed_path.read_text(encoding="utf8"))
+native = closed["native_calls"]
+assert len(native) == len({(row["session_id"], row["nonce"]) for row in native}) == 124
+assert sum(row["native_invocation_observed"] for row in native) == 121
+assert sum(row["native_invocation_observed"] and row["usage_measured"] for row in native) == 111
+assert sum(row["usage_measured"] for row in native) == 114
+assert sum(row["exact_total"] for row in native if row["exact_total"] is not None) == 2676472
+assert sum(row["exact_total"] is None for row in native) == 10
+assert all(row["native_cli_invocation_observed"] is row["native_invocation_observed"]
+           and row["backend_model_identity_independently_attested"] is False for row in native)
+roles = {}
+for role in ("mère", "enfant", "intégration"):
+    selected = [row for row in native if row["kind"] == role]
+    roles[role] = {"requests": len(selected), "native_invocations": sum(row["native_invocation_observed"] for row in selected),
+                   "known_tokens": sum(row["exact_total"] for row in selected if row["exact_total"] is not None),
+                   "unknown_native": sum(row["native_invocation_observed"] and row["exact_total"] is None for row in selected)}
+assert [roles[k]["native_invocations"] for k in ("mère", "enfant", "intégration")] == [24, 87, 10]
+assert [roles[k]["requests"] for k in ("mère", "enfant", "intégration")] == [25, 89, 10]
+assert closed["exact_consumption_tokens_total"] is None and closed["total_exact_consumption_available"] is False
+checks.append({"case": "actual new editorial cost export keepsdedup_roles_nulls_and_CLI_semantics", "passed": True})
+result = {"verified": True, "checks": checks, "count": len(checks), "cold_export_sha256": hashlib.sha256(closed_path.read_bytes()).hexdigest(),
+          "states_from_pinned_ledger": dict(states), "roles": roles, "known_exact_tokens": 2676472,
+          "global_exact_consumption_total": None, "pipeline_or_render_or_controller_run": False,
+          "live_cache_CIM_CLI_model_or_candidate_called": False}
+with (HERE / "CONTROLES-COMPTABLES.json").open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+print(json.dumps({"passed": len(checks), "roles": roles}))

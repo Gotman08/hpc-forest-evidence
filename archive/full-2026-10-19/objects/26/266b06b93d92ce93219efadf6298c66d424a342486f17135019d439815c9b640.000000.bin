@@ -1,0 +1,237 @@
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define SUM_USE_NEON 1
+#else
+#define SUM_USE_NEON 0
+#endif
+
+class BufferedInput {
+    unsigned char buffer_[1 << 16];
+    std::size_t position_ = 0;
+    std::size_t length_ = 0;
+
+    int next_char() {
+        if (position_ == length_) {
+            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (length_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    bool read_int(int& result) {
+        int c;
+        do {
+            c = next_char();
+            if (c == EOF) return false;
+        } while (c <= ' ');
+
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = next_char();
+        unsigned int value = 0;
+        while (c >= '0' && c <= '9') {
+            value = value * 10u + static_cast<unsigned int>(c - '0');
+            c = next_char();
+        }
+        const std::int64_t magnitude = static_cast<std::int64_t>(value);
+        result = static_cast<int>(negative ? -magnitude : magnitude);
+        return true;
+    }
+};
+
+static std::int64_t solve_columns(BufferedInput& input, int n, int s) {
+    const std::size_t stride = static_cast<std::size_t>(n);
+    std::unique_ptr<int[]> rows(new int[stride * static_cast<std::size_t>(s)]);
+    std::vector<std::int64_t> columns(n, 0);
+
+    for (int r = 0; r < s; ++r) {
+        int* const row = rows.get() + static_cast<std::size_t>(r) * stride;
+        for (int c = 0; c < n; ++c) {
+            int value = 0;
+            input.read_int(value);
+            row[c] = value;
+            columns[c] += value;
+        }
+    }
+
+    std::int64_t leading = 0;
+    for (int c = 0; c < s; ++c) leading += columns[c];
+    std::int64_t window = leading;
+    std::int64_t best = window;
+    for (int c = s; c < n; ++c) {
+        window += columns[c] - columns[c - s];
+        if (window > best) best = window;
+    }
+
+    int slot = 0;
+    for (int r = s; r < n; ++r) {
+        int* const row = rows.get() + static_cast<std::size_t>(slot) * stride;
+        std::int64_t change = 0;
+        for (int c = 0; c < s; ++c) {
+            int value = 0;
+            input.read_int(value);
+            const std::int64_t delta = static_cast<std::int64_t>(value) - row[c];
+            columns[c] += delta;
+            row[c] = value;
+            change += delta;
+        }
+        leading += change;
+        window = leading;
+        if (window > best) best = window;
+
+        for (int c = s; c < n; ++c) {
+            int value = 0;
+            input.read_int(value);
+            columns[c] += static_cast<std::int64_t>(value) - row[c];
+            row[c] = value;
+            window += columns[c] - columns[c - s];
+            if (window > best) best = window;
+        }
+
+        ++slot;
+        if (slot == s) slot = 0;
+    }
+    return best;
+}
+
+static void read_prefix(BufferedInput& input, std::int64_t* prefix, int n) {
+    prefix[0] = 0;
+    for (int c = 0; c < n; ++c) {
+        int value = 0;
+        input.read_int(value);
+        prefix[c + 1] = prefix[c] + value;
+    }
+}
+
+#if SUM_USE_NEON
+static inline int64x2_t max_lanes(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+static std::int64_t solve_horizontal(BufferedInput& input, int n, int s) {
+    const int width = n - s + 1;
+    const std::size_t stride = static_cast<std::size_t>(width);
+    std::vector<std::int64_t> prefix(n + 1);
+    std::vector<std::int64_t> sums(width, 0);
+    std::unique_ptr<std::int64_t[]> history(
+        new std::int64_t[static_cast<std::size_t>(s) * stride]);
+
+    for (int r = 0; r < s; ++r) {
+        read_prefix(input, prefix.data(), n);
+        std::int64_t* const saved = history.get() + static_cast<std::size_t>(r) * stride;
+        int c = 0;
+#if SUM_USE_NEON
+        for (; c + 4 <= width; c += 4) {
+            const int64x2_t h0 = vsubq_s64(
+                vld1q_s64(prefix.data() + c + s),
+                vld1q_s64(prefix.data() + c));
+            const int64x2_t h1 = vsubq_s64(
+                vld1q_s64(prefix.data() + c + s + 2),
+                vld1q_s64(prefix.data() + c + 2));
+            vst1q_s64(saved + c, h0);
+            vst1q_s64(saved + c + 2, h1);
+            vst1q_s64(sums.data() + c,
+                vaddq_s64(vld1q_s64(sums.data() + c), h0));
+            vst1q_s64(sums.data() + c + 2,
+                vaddq_s64(vld1q_s64(sums.data() + c + 2), h1));
+        }
+#endif
+        for (; c < width; ++c) {
+            const std::int64_t horizontal = prefix[c + s] - prefix[c];
+            saved[c] = horizontal;
+            sums[c] += horizontal;
+        }
+    }
+
+    std::int64_t best = std::numeric_limits<std::int64_t>::lowest();
+    int c = 0;
+#if SUM_USE_NEON
+    int64x2_t best0 = vdupq_n_s64(best);
+    int64x2_t best1 = vdupq_n_s64(best);
+    for (; c + 4 <= width; c += 4) {
+        best0 = max_lanes(best0, vld1q_s64(sums.data() + c));
+        best1 = max_lanes(best1, vld1q_s64(sums.data() + c + 2));
+    }
+#endif
+    for (; c < width; ++c) {
+        if (sums[c] > best) best = sums[c];
+    }
+
+    int slot = 0;
+    for (int r = s; r < n; ++r) {
+        read_prefix(input, prefix.data(), n);
+        std::int64_t* const saved = history.get() + static_cast<std::size_t>(slot) * stride;
+        int column = 0;
+#if SUM_USE_NEON
+        for (; column + 4 <= width; column += 4) {
+            const int64x2_t h0 = vsubq_s64(
+                vld1q_s64(prefix.data() + column + s),
+                vld1q_s64(prefix.data() + column));
+            const int64x2_t h1 = vsubq_s64(
+                vld1q_s64(prefix.data() + column + s + 2),
+                vld1q_s64(prefix.data() + column + 2));
+            const int64x2_t old0 = vld1q_s64(saved + column);
+            const int64x2_t old1 = vld1q_s64(saved + column + 2);
+            const int64x2_t current0 = vaddq_s64(
+                vld1q_s64(sums.data() + column), vsubq_s64(h0, old0));
+            const int64x2_t current1 = vaddq_s64(
+                vld1q_s64(sums.data() + column + 2), vsubq_s64(h1, old1));
+            vst1q_s64(saved + column, h0);
+            vst1q_s64(saved + column + 2, h1);
+            vst1q_s64(sums.data() + column, current0);
+            vst1q_s64(sums.data() + column + 2, current1);
+            best0 = max_lanes(best0, current0);
+            best1 = max_lanes(best1, current1);
+        }
+#endif
+        for (; column < width; ++column) {
+            const std::int64_t horizontal = prefix[column + s] - prefix[column];
+            sums[column] += horizontal - saved[column];
+            saved[column] = horizontal;
+            if (sums[column] > best) best = sums[column];
+        }
+        ++slot;
+        if (slot == s) slot = 0;
+    }
+
+#if SUM_USE_NEON
+    const int64x2_t combined = max_lanes(best0, best1);
+    const std::int64_t lane0 = vgetq_lane_s64(combined, 0);
+    const std::int64_t lane1 = vgetq_lane_s64(combined, 1);
+    if (lane0 > best) best = lane0;
+    if (lane1 > best) best = lane1;
+#endif
+    return best;
+}
+
+int main() {
+    BufferedInput input;
+    int n = 0;
+    int s = 0;
+    if (!input.read_int(n) || !input.read_int(s)) return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t raw_row_bytes = static_cast<std::size_t>(n) * sizeof(int);
+    const std::size_t horizontal_row_bytes =
+        static_cast<std::size_t>(n - s + 1) * sizeof(std::int64_t);
+    const std::int64_t best = horizontal_row_bytes < raw_row_bytes
+        ? solve_horizontal(input, n, s)
+        : solve_columns(input, n, s);
+
+    std::printf("%lld\n", static_cast<long long>(best));
+    return 0;
+}

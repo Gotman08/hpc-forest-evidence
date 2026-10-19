@@ -1,0 +1,159 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define TILE_SIZE 64 // outer loop tile size for cache reuse
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system. Uses Structure-of-Arrays layout and blocked i-loop.
+ */
+void body_force(float *restrict x, float *restrict y, float *restrict z,
+                float *restrict vx, float *restrict vy, float *restrict vz,
+                float dt, int n) {
+  for (int ii = 0; ii < n; ii += TILE_SIZE) {
+    int i_end = ii + TILE_SIZE;
+    if (i_end > n) i_end = n;
+    int tile_len = i_end - ii;
+
+    float fx[tile_len], fy[tile_len], fz[tile_len];
+    for (int ti = 0; ti < tile_len; ++ti) {
+      fx[ti] = 0.0f;
+      fy[ti] = 0.0f;
+      fz[ti] = 0.0f;
+    }
+
+    // Loop over all bodies j (sequential order preserved)
+    for (int j = 0; j < n; ++j) {
+      float xj = x[j];
+      float yj = y[j];
+      float zj = z[j];
+
+      for (int ti = 0; ti < tile_len; ++ti) {
+        int i = ii + ti;
+        if (i == j) continue; // self-interaction contributes exactly zero
+
+        float dx = xj - x[i];
+        float dy = yj - y[i];
+        float dz = zj - z[i];
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1.0f / sqrtf(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx[ti] += dx * inv_dist3;
+        fy[ti] += dy * inv_dist3;
+        fz[ti] += dz * inv_dist3;
+      }
+    }
+
+    // Update velocities for the tile
+    for (int ti = 0; ti < tile_len; ++ti) {
+      int i = ii + ti;
+      vx[i] += dt * fx[ti];
+      vy[i] += dt * fy[ti];
+      vz[i] += dt * fz[ti];
+    }
+  }
+}
+
+/*
+ * Read a binary dataset with initialized bodies.
+ * Converts from interleaved AoS to SoA layout.
+ */
+Body* read_dataset(int *nbodies,
+                   float **x, float **y, float **z,
+                   float **vx, float **vy, float **vz) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Allocate SoA arrays
+  *x = (float *)malloc(*nbodies * sizeof(float));
+  *y = (float *)malloc(*nbodies * sizeof(float));
+  *z = (float *)malloc(*nbodies * sizeof(float));
+  *vx = (float *)malloc(*nbodies * sizeof(float));
+  *vy = (float *)malloc(*nbodies * sizeof(float));
+  *vz = (float *)malloc(*nbodies * sizeof(float));
+
+  // Temporary buffer for interleaved input
+  Body *tmp = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(tmp, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Scatter into SoA
+  for (int i = 0; i < *nbodies; ++i) {
+    (*x)[i] = tmp[i].x;
+    (*y)[i] = tmp[i].y;
+    (*z)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+
+  free(tmp);
+  return NULL; // caller uses separate arrays, not a Body pointer
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ * Converts from SoA back to interleaved AoS layout.
+ */
+void write_dataset(const int nbodies,
+                   float *x, float *y, float *z,
+                   float *vx, float *vy, float *vz) {
+  // Pack into temporary array
+  Body *tmp = (Body *)malloc(nbodies * sizeof(Body));
+  for (int i = 0; i < nbodies; ++i) {
+    tmp[i].x = x[i];
+    tmp[i].y = y[i];
+    tmp[i].z = z[i];
+    tmp[i].vx = vx[i];
+    tmp[i].vy = vy[i];
+    tmp[i].vz = vz[i];
+  }
+
+  int b = fwrite(tmp, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+  free(tmp);
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  float *x, *y, *z, *vx, *vy, *vz;
+
+  read_dataset(&nbodies, &x, &y, &z, &vx, &vy, &vz);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(x, y, z, vx, vy, vz, DT, nbodies);
+
+    for (int i = 0; i < nbodies; ++i) {
+      x[i] += vx[i] * DT;
+      y[i] += vy[i] * DT;
+      z[i] += vz[i] * DT;
+    }
+  }
+
+  write_dataset(nbodies, x, y, z, vx, vy, vz);
+
+  free(x); free(y); free(z); free(vx); free(vy); free(vz);
+
+  exit(EXIT_SUCCESS);
+}

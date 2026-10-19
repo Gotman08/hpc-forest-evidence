@@ -1,0 +1,145 @@
+--- r1/preparer-arret.py
++++ r2/preparer-arret.py
+@@ -116,6 +116,20 @@
+     )
+ 
+ 
++def native_cli(row):
++    executable = Path(row.get("ExecutablePath") or "").name.casefold()
++    command = row.get("CommandLine") or ""
++    return (
++        executable in {"codex.exe", "codex"}
++        or re.search(
++            r"(?:^|[\\/\s\"'])codex\.exe(?:[\"'\s]|$)|(?:^|\s)codex(?:\s|$)",
++            command,
++            flags=re.IGNORECASE,
++        )
++        is not None
++    )
++
++
+ def classify(census, baseline, owned, preserved, operator_pid=None, now=None):
+     stamp(census["captured_at_utc"])
+     stamp(baseline["captured_at_utc"])
+@@ -178,17 +192,105 @@
+             in row["CommandLine"].casefold(),
+             "Only this exact parent PowerShell execution may be self-classified; never a stop target",
+         )
++    need(
++        not [
++            r
++            for r in rows
++            if r["ProcessId"] not in own
++            and native_cli(r)
++            and re.search(
++                r"(?:^|[\s\"'])exec(?:[\s\"']|$)",
++                r.get("CommandLine") or "",
++                flags=re.IGNORECASE,
++            )
++        ],
++        "Active native CLI generation outside exact owned identities",
++    )
+     new_foreign = [
+-        r["ProcessId"]
++        r
+         for r in rows
+         if r["ProcessId"] not in own
+         and r["ProcessId"] != operator_pid
+         and (r["ProcessId"] not in old or not generic_same(r, old[r["ProcessId"]]))
+     ]
+-    need(
+-        not new_foreign,
+-        "New/changed foreign identity since final parent baseline; explicit new baseline/review required",
+-    )
++    for row in new_foreign:
++        pid = row["ProcessId"]
++        need(
++            pid not in old,
++            "Foreign baseline PID reused/changed; no independent ancestry proved",
++        )
++        need(
++            not native_cli(row),
++            "New unknown native CLI invocation; never classify it as independent foreign",
++        )
++
++    independent = []
++    for candidate in new_foreign:
++        need(
++            stamp(baseline["captured_at_utc"])
++            <= stamp(candidate["CreationDate"])
++            <= stamp(census["captured_at_utc"]),
++            "New foreign birth outside baseline/current census interval",
++        )
++        chain = []
++        visited = set()
++        row = candidate
++        while True:
++            pid = row["ProcessId"]
++            need(pid not in visited, "Foreign ancestry cycle; independence not proved")
++            visited.add(pid)
++            need(pid not in own, "Foreign ancestry reaches an owned/preserved identity")
++            if pid in {0, 4}:
++                need(
++                    pid in old
++                    and pid in current
++                    and generic_same(current[pid], old[pid]),
++                    "System ancestry root changed or absent from baseline",
++                )
++                anchor_kind = "explicit_system_root_0_or_4"
++                anchor_pid = pid
++                break
++            identity(row)
++            if pid in old:
++                need(
++                    pid in current and generic_same(current[pid], old[pid]),
++                    "Foreign ancestor absent or baseline PID reused/changed",
++                )
++                anchor_kind = "unchanged_five_field_foreign_baseline"
++                anchor_pid = pid
++                break
++            chain.append(pid)
++            parent = row["ParentProcessId"]
++            need(
++                parent not in own,
++                "New foreign ancestry reaches an owned/preserved parent",
++            )
++            need(
++                parent in current,
++                "Foreign ancestry orphan/unknown parent; independence not proved",
++            )
++            parent_row = current[parent]
++            if parent_row.get("CreationDate") is not None:
++                need(
++                    stamp(parent_row["CreationDate"]) <= stamp(row["CreationDate"]),
++                    "Foreign parent created after child; PID reuse/ancestry ambiguity",
++                )
++            else:
++                need(
++                    parent in {0, 4},
++                    "Foreign parent creation unknown; independence not proved",
++                )
++            row = parent_row
++        independent.append(
++            {
++                "ProcessId": candidate["ProcessId"],
++                "ancestor_pids": chain,
++                "anchor_pid": anchor_pid,
++                "anchor_kind": anchor_kind,
++                "never_targeted": True,
++            }
++        )
++
+     return {
+         "present_owned": [pid for pid in OWNED_ORDER if pid in current],
+         "absent_owned": [pid for pid in OWNED_ORDER if pid not in current],
+@@ -198,7 +300,9 @@
+         "preserved_observer_transport_naturally_absent": [
+             pid for pid in PRESERVED_ORDER if pid not in current
+         ],
+-        "new_foreign_identities": [],
++        "new_independent_foreign_identities": independent,
++        "new_independent_foreign_never_targeted": True,
++        "foreign_ancestry_checked_against_private_current_and_baseline_census": True,
+         "new_native_workers_or_readers": [],
+         "new_descendants": [],
+         "operator_process_never_targeted": operator_pid,

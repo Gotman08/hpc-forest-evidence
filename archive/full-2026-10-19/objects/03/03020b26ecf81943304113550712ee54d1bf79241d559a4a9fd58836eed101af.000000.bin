@@ -1,0 +1,172 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define TILE_SIZE 64 // tile size for inner loop blocking
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system.
+ * Uses Structure-of-Arrays (SoA) layout for better spatial locality,
+ * tiled inner loop for cache reuse, and skips self-interaction.
+ */
+void body_force(float *restrict px, float *restrict py, float *restrict pz,
+                float *restrict vx, float *restrict vy, float *restrict vz,
+                float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    const float xi = px[i];
+    const float yi = py[i];
+    const float zi = pz[i];
+
+    // Tile the inner j-loop to improve cache locality for coordinate arrays
+    for (int jj = 0; jj < n; jj += TILE_SIZE) {
+      int j_end = jj + TILE_SIZE;
+      if (j_end > n) j_end = n;
+
+      for (int j = jj; j < j_end; ++j) {
+        // Skip self-interaction: contribution is zero anyway
+        if (i == j) continue;
+
+        float dx = px[j] - xi;
+        float dy = py[j] - yi;
+        float dz = pz[j] - zi;
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1.0f / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+      }
+    }
+
+    vx[i] += dt*fx;
+    vy[i] += dt*fy;
+    vz[i] += dt*fz;
+  }
+}
+
+/*
+ * Read a binary dataset with initialized bodies.
+ * Returns arrays allocated on heap; sets nbodies.
+ */
+void read_dataset(int *nbodies,
+                  float **px, float **py, float **pz,
+                  float **vx, float **vy, float **vz) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Temporary buffer to read AoS data from binary file
+  typedef struct { float x, y, z, vx, vy, vz; } Body;
+  Body *tmp = (Body *)malloc(*nbodies * sizeof(Body));
+  if (!tmp) {
+    fprintf(stderr,"\nMemory allocation error\n");
+    exit(EXIT_FAILURE);
+  }
+
+  b = fread(tmp, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    free(tmp);
+    exit(EXIT_FAILURE);
+  }
+
+  // Allocate SoA arrays
+  *px = (float *)malloc(*nbodies * sizeof(float));
+  *py = (float *)malloc(*nbodies * sizeof(float));
+  *pz = (float *)malloc(*nbodies * sizeof(float));
+  *vx = (float *)malloc(*nbodies * sizeof(float));
+  *vy = (float *)malloc(*nbodies * sizeof(float));
+  *vz = (float *)malloc(*nbodies * sizeof(float));
+
+  if (!*px || !*py || !*pz || !*vx || !*vy || !*vz) {
+    fprintf(stderr,"\nMemory allocation error\n");
+    free(tmp);
+    exit(EXIT_FAILURE);
+  }
+
+  // Scatter from AoS to SoA
+  for (int i = 0; i < *nbodies; ++i) {
+    (*px)[i] = tmp[i].x;
+    (*py)[i] = tmp[i].y;
+    (*pz)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+
+  free(tmp);
+}
+
+/*
+ * Write simulation results into a binary dataset (AoS format).
+ */
+void write_dataset(const int nbodies,
+                   const float *px, const float *py, const float *pz,
+                   const float *vx, const float *vy, const float *vz) {
+  typedef struct { float x, y, z, vx, vy, vz; } Body;
+  Body *tmp = (Body *)malloc(nbodies * sizeof(Body));
+  if (!tmp) {
+    fprintf(stderr,"\nMemory allocation error\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Gather from SoA to AoS
+  for (int i = 0; i < nbodies; ++i) {
+    tmp[i].x = px[i];
+    tmp[i].y = py[i];
+    tmp[i].z = pz[i];
+    tmp[i].vx = vx[i];
+    tmp[i].vy = vy[i];
+    tmp[i].vz = vz[i];
+  }
+
+  int b = fwrite(tmp, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    free(tmp);
+    exit(EXIT_FAILURE);
+  }
+
+  free(tmp);
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  float *px = NULL, *py = NULL, *pz = NULL;
+  float *vx = NULL, *vy = NULL, *vz = NULL;
+
+  read_dataset(&nbodies, &px, &py, &pz, &vx, &vy, &vz);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(px, py, pz, vx, vy, vz, DT, nbodies);
+
+    for (int i = 0; i < nbodies; ++i) {
+      px[i] += vx[i] * DT;
+      py[i] += vy[i] * DT;
+      pz[i] += vz[i] * DT;
+    }
+  }
+
+  write_dataset(nbodies, px, py, pz, vx, vy, vz);
+
+  free(px); free(py); free(pz);
+  free(vx); free(vy); free(vz);
+
+  exit(EXIT_SUCCESS);
+}

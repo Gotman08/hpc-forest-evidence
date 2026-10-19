@@ -1,0 +1,165 @@
+"""Pure byte staging/readback of the new R8 shared tree; no RPC or execution.
+
+Static mode copies110+ZIP/plan/runtime only. Complete mode requires the actual
+mechanical reception and adds its exact archive/qualification/audit plus a
+POSIX-path projection. Never manufactures a positive receipt while Q is absent.
+"""
+import argparse
+import hashlib
+import io
+import json
+from pathlib import Path, PurePosixPath
+import stat
+import zipfile
+
+HERE = Path(__file__).resolve().parent
+PREP = HERE.parent.parent
+CHAIN = PREP / "adaptateurs-source110-r1/revision-r8-racines-techniques-neuves"
+SHARED = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-r8-f927d37098f3"
+SOURCE = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN = "f927d37098f3fd50cc4916195da3e300bd7c29597ba7ece4b9669abd715897fe"
+RUNTIME = "66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766"
+COMPONENTS = "d7d7d240198fc487efbede15c1328a366bc0c5bd59614d5064e19d81d1cf7122"
+CONTRACT_SHA = "ba6b87e2ef571367e3b62175d639a6a2e95c3c1f3f71801d05acde6aa158753b"
+ASSEMBLER = HERE / "assembler-entrees-roots-R8.py"
+
+
+def need(ok, why):
+    if not ok:
+        raise ValueError(why)
+
+
+source_code = ASSEMBLER.read_bytes()
+need(hashlib.sha256(source_code).hexdigest() == "096540150d0686bca45bbc5ed6ac008c92b49cba447d00188fa781445834531e", "Pinned held-read provider changed")
+ns = {"__file__": str(ASSEMBLER), "__name__": "shared_R8_held_definitions"}
+exec(compile(source_code, str(ASSEMBLER), "exec"), ns)
+
+
+def save(path, value):
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, indent=2)
+        stream.write("\n")
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def raw_ref(reference, api):
+    need(isinstance(reference, dict) and set(reference) == {"path", "sha256"}, "Closed actual reference required")
+    data = api["raw"](reference["path"])
+    need(hashlib.sha256(data).hexdigest() == reference["sha256"], "Actual shared/Q input changed")
+    return data
+
+
+def inventory(root, api):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        info = path.lstat()
+        need(not path.is_symlink() and not (getattr(info, "st_file_attributes", 0) & 1024), "Shared/readback alias refused")
+        if stat.S_ISREG(info.st_mode):
+            data = api["raw"](path)
+            result[path.relative_to(root).as_posix()] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+        else:
+            need(stat.S_ISDIR(info.st_mode), "Special shared/readback file refused")
+    return result
+
+
+def static_bytes(api):
+    paths = {"project.zip": PREP / "revision-source-cli-r1/HPC-Forest-Mere-Dynamique-R4b-Lane-R3-CLI.zip",
+        "dynamic-plan.json": CHAIN / "plan-technique-neuf/dynamic-plan-r4b-lane-r3-max-r8.json",
+        "runtime-manifest.json": PREP / "revision-source-cli-r1/runtime-manifest-lane-r3.json"}
+    data = {name: api["raw"](path) for name, path in paths.items()}
+    need([hashlib.sha256(data[n]).hexdigest() for n in paths] == [SOURCE, PLAN, RUNTIME], "Exact source110/new plan/runtime required")
+    expected = api["decode"](data["runtime-manifest.json"])
+    need(isinstance(expected, dict) and len(expected) == 110, "Exact110 manifest required")
+    with zipfile.ZipFile(io.BytesIO(data["project.zip"])) as archive:
+        rows = archive.infolist()
+        need(len(rows) == 110 and len({r.filename for r in rows}) == 110, "Exact110 unique regular ZIP members required")
+        for row in rows:
+            name = row.filename.removeprefix("HPC-Forest/")
+            rel = PurePosixPath(name)
+            need(row.filename.startswith("HPC-Forest/") and not row.is_dir() and not rel.is_absolute()
+                 and name == rel.as_posix() and ".." not in rel.parts and "\\" not in name and ":" not in name
+                 and stat.S_IFMT(row.external_attr >> 16) in (0, stat.S_IFREG) and name in expected,
+                 "Safe regular source member required")
+            value = archive.read(row)
+            need(hashlib.sha256(value).hexdigest() == expected[name], "ZIP source member differs from frozen manifest")
+            data["project/" + name] = value
+    need(len(data) == 113, "Static shared inventory is exactly113 files")
+    return data
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--prepare-static", action="store_true")
+    p.add_argument("--complete-from-actual-Q", action="store_true")
+    p.add_argument("--work-directory", type=Path, required=True)
+    p.add_argument("--qualification-reception", type=Path)
+    p.add_argument("--qualification-reception-sha256")
+    args = p.parse_args()
+    need(args.prepare_static != args.complete_from_actual_Q, "Choose one pure preparation mode")
+    api = ns["held_reads"]()
+    work = api["ordinary"](args.work_directory)
+    need(work.parent == HERE, "Exact new owned work directory only")
+    group = work / SHARED.rsplit("/", 1)[1]
+    data = static_bytes(api)
+    expected = {name: {"sha256": hashlib.sha256(value).hexdigest(), "bytes": len(value)} for name, value in data.items()}
+    if args.prepare_static:
+        need(not work.exists() and not args.qualification_reception, "NEW static destination; no future Q value")
+        work.mkdir()
+        group.mkdir()
+        for name, value in data.items():
+            path = group.joinpath(*PurePosixPath(name).parts)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("xb") as stream:
+                stream.write(value)
+        need(inventory(group, api) == expected, "Static source copy differs")
+        save(work / "SHARED-113-PREPARE-INCOMPLET.json", {"prepared_static_bytes_only": True,
+            "local_group": str(group), "remote_group_proposed": SHARED, "inventory": expected,
+            "files": 113, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+            "missing_actual_Q_files": ["qualification-result.tar.gz", "qualification.json", "independent-mechanical-audit.json", "mechanical-reception-native.json"],
+            "upload_or_native_admission_ready": False, "native_generation_admitted": False})
+        print(json.dumps({"static_files_copied": 113, "actual_Q_missing": True, "native_generation_admitted": False}))
+        return
+    need(work.is_dir() and group.is_dir() and inventory(group, api) == expected,
+         "Existing exact113 static tree; no old shared or partial Q file reuse")
+    need(args.qualification_reception and args.qualification_reception_sha256, "Actual R8 composite Q required")
+    qref = {"path": str(args.qualification_reception.resolve()), "sha256": args.qualification_reception_sha256}
+    q = api["decode"](raw_ref(qref, api))
+    contract_path = CHAIN / "chain_contract.py"
+    contract_code = api["raw"](contract_path)
+    need(hashlib.sha256(contract_code).hexdigest() == CONTRACT_SHA, "Exact new R8 Q consumer required")
+    need(hashlib.sha256(api["raw"](CHAIN / "COMPONENTS.json")).hexdigest() == COMPONENTS, "Exact62 manifest required")
+    contract = {"__file__": str(contract_path), "__name__": "shared_R8_actual_Q_contract"}
+    exec(compile(contract_code, str(contract_path), "exec"), contract)
+    contract["qualification"](qref, components_manifest_sha256=COMPONENTS)
+    additions = {}
+    remote_names = {"archive": "qualification-result.tar.gz", "qualification": "qualification.json", "independent_audit": "independent-mechanical-audit.json"}
+    remote_q = dict(q)
+    for key, name in remote_names.items():
+        additions[name] = raw_ref(q[key], api)
+        remote_q[key] = {"path": SHARED + "/" + name, "sha256": q[key]["sha256"]}
+    additions["mechanical-reception-native.json"] = (json.dumps(remote_q, indent=2) + "\n").encode()
+    need(inventory(group, api) == expected, "Static113 changed before Q addition")
+    for name, value in additions.items():
+        with (group / name).open("xb") as stream:
+            stream.write(value)
+        expected[name] = {"sha256": hashlib.sha256(value).hexdigest(), "bytes": len(value)}
+    need(len(expected) == 117 and inventory(group, api) == expected, "Exact117 shared payload required")
+    stage = CHAIN / "launcher/native-interface-models-max-r3.tar.gz"
+    stage_sha = "3287f059793ef9861b4dbeacc66706611c0ca3d355b4ec990d6754e7c4d07f9b"
+    need(hashlib.sha256(api["raw"](stage)).hexdigest() == stage_sha, "Exact external stage archive required")
+    save(work / "SHARED-117-LOCAL-PRET-POUR-TRANSFERT.json", {"schema": "hpc-forest-r8-local-shared-payload-only-v1",
+        "verified_local_bytes_only": True, "local_group": str(group), "remote_group": SHARED,
+        "source_files": 110, "regular_payload_files": 117, "inventory": expected,
+        "actual_mechanical_reception": qref, "native_receipt_POSIX_projection_only": True,
+        "qualification_archive_and_qualification_and_audit_bytes_unchanged": True,
+        "stage_archive_outside_shared": {"local_path": str(stage), "remote_path": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-native-interface-lane-r3-r8-f927d37098f3.tar.gz", "sha256": stage_sha},
+        "directory_upload_proposed": {"local_path": str(group), "remote_path": "/scratch_p/nimarano", "verify": False},
+        "directory_readback_proposed": {"remote_path": SHARED, "local_path": str(work / "readback-117"), "recursive": True, "verify": False},
+        "four_actual_remote_SHA_checks_required_before_publication": [SHARED + "/" + name for name in ("project.zip", "dynamic-plan.json", "qualification-result.tar.gz", "qualification.json")],
+        "all117_filewise_readback_required": True, "directory_tool_hash_flag_is_not_SHA_proof": True,
+        "remote_verified": False, "native_generation_admitted": False})
+    print(json.dumps({"local_payload_files": 117, "actual_Q_bound": True, "remote_verified": False, "native_generation_admitted": False}))
+
+
+if __name__ == "__main__":
+    main()

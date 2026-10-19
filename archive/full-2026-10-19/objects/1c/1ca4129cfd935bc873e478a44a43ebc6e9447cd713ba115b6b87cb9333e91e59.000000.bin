@@ -1,0 +1,47 @@
+set -euo pipefail
+[[ ${SLURM_JOB_ID:-} =~ ^[0-9]+$ ]]
+test "$(uname -m)" = aarch64
+test "${SLURM_CPUS_PER_TASK:-}" = 4
+test "${SLURM_NTASKS:-1}" = 1
+test "${SLURM_JOB_NUM_NODES:-1}" = 1
+test "${SLURM_MEM_PER_NODE:-}" = 16384
+test -z "${SLURM_JOB_GPUS:-}${SLURM_STEP_GPUS:-}"
+test "${SLURM_GPUS:-0}" = 0
+test "${SLURM_GPUS_ON_NODE:-0}" = 0
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+shared=/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r2-qualification-20261018-60db53fb69e0
+stage_archive=/scratch_p/nimarano/hpc-forest-dynamic-r4b-native-interface-lane-r2-60db53fb69e0.tar.gz
+driver=/scratch_p/nimarano/hpc-forest-dynamic-r4b-stage-lane-r2-roots-bd2b3153a7544c909afbc19fe69902b4
+native_root=/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-bd2b3153a7544c909afbc19fe69902b4
+admission_root=/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-bd2b3153a7544c909afbc19fe69902b4
+test -x "$py"
+test -d "$shared"
+test ! -e "$driver"
+test ! -e "$native_root"
+test ! -e "$admission_root"
+printf '%s  %s\n' b4affdbca37f237e80556c18b42978cedb950febe9408232d9b1c9ff0dc15ff8 "$stage_archive" | sha256sum -c -
+printf '%s  %s\n' 60db53fb69e014133a9c77ebaea9ae09ae7891c1433070a9af4eae30b0d05e6d "$shared/project.zip" | sha256sum -c -
+printf '%s  %s\n' b1b39b999cb89374a17191c5b3aef2b4eee255287a4cdbb80ed9c8b5d2ac1e1c "$shared/dynamic-plan.json" | sha256sum -c -
+test -f "$shared/mechanical-reception-native.json"
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
+"$py" -I -B - "$stage_archive" "$driver" "$shared" <<'STAGE'
+import hashlib,json,sys,tarfile
+from pathlib import Path
+archive,driver,shared=map(Path,sys.argv[1:])
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+expected=json.loads((shared/'runtime-manifest.json').read_text())
+paths=list((shared/'project').rglob('*'));assert not any(p.is_symlink() for p in paths)
+actual={p.relative_to(shared/'project').as_posix():sha(p) for p in paths if p.is_file()}
+assert actual==expected and len(actual)==105
+driver.mkdir(parents=True,exist_ok=False)
+with tarfile.open(archive) as t:
+ members=t.getmembers();assert len(members)==3 and {m.name for m in members}=={'remote_stage.py','cell_selection.py','stage-manifest.json'}
+ assert all(m.isfile() for m in members)
+ for m in members:(driver/m.name).write_bytes(t.extractfile(m).read())
+assert json.loads((driver/'stage-manifest.json').read_text())=={name:sha(driver/name) for name in ('remote_stage.py','cell_selection.py')}
+STAGE
+romeo_load_armgpu_env
+spack load /zrtbeqke25s2vbqo4yrhsowjz7mg3pjf
+export OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=TRUE OPENBLAS_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=
+ulimit -s unlimited
+exec srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores "$py" -I -B -u "$driver/remote_stage.py" --shared "$shared" --qualification-reception "$shared/mechanical-reception-native.json" --model gpt-5.6-terra --effort max --phase roots --root "$native_root" --admission-root "$admission_root"

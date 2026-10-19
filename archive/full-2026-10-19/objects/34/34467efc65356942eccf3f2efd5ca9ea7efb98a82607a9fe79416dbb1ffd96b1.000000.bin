@@ -1,0 +1,76 @@
+"""P1 closure on invented fixtures only; no historical receipt or live cache read."""
+
+import ast
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+R3 = HERE.parent / "lecture-native-integree-r3"
+R4 = HERE.parent / "lecture-native-integree-r4"
+
+
+def ref(path):
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+delivery = json.loads((R4 / "LIVRAISON-LECTEUR-INTEGRE-R4.json").read_text(encoding="utf8"))
+assert ref(R4 / "LIVRAISON-LECTEUR-INTEGRE-R4.json")["sha256"] == "165b3e32f8d7906bc5deb677d0c220bb2962de451566dc377743421ff186d7f3"
+for item in delivery["components"].values():
+    assert ref(Path(item["path"])) == item
+for name in ("receipt_native.py", "normalisation_native.py", "pins-source-plan.json"):
+    assert (R4 / name).read_bytes() == (R3 / name).read_bytes()
+old = ast.parse((R3 / "receive_phase.py").read_text(encoding="utf8"))
+new = ast.parse((R4 / "receive_phase.py").read_text(encoding="utf8"))
+assert len(old.body) == len(new.body)
+changed = [getattr(a, "name", type(a).__name__) for a, b in zip(old.body, new.body) if ast.dump(a) != ast.dump(b)]
+assert changed == ["receive"]
+sys.path.insert(0, str(R4))
+spec = importlib.util.spec_from_file_location("review_neutral_reader_r4_fixtures", R4 / "test_lecture_integree_neutre.py")
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+original = fixtures.audit._verify_cli_bytes
+fixtures.audit._verify_cli_bytes = lambda *args: None  # Explicit test-only fake CLI bytes; never production.
+cases = []
+try:
+    for name in ("valid_control", "null_creation", "null_executable", "boolean_parent_pid", "missing_prior", "altered_prior_sha", "ready_names_launcher"):
+        root = HERE / ("NEUTRAL-r4-" + name)
+        root.mkdir(exist_ok=False)
+        refs, expected, cold, exit_proof = fixtures.fixture(root)
+        field = {"null_creation": "CreationDate", "null_executable": "ExecutablePath", "boolean_parent_pid": "ParentProcessId"}.get(name)
+        if field:
+            for row in exit_proof["owned_full_identities"]:
+                row[field] = True if name == "boolean_parent_pid" else None
+        elif name == "missing_prior":
+            del exit_proof["prior_full_cim"]
+        elif name == "altered_prior_sha":
+            exit_proof["prior_full_cim"]["sha256"] = "0" * 64
+        elif name == "ready_names_launcher":
+            fixtures.update(refs, "worker_ready", lambda obj: obj.update(pid=999991))
+        before = fixtures.receiver.inventory(cold)
+        try:
+            outcome = fixtures.receiver.receive(refs, expected, cold, exit_proof)
+        except ValueError as exc:
+            assert name != "valid_control"
+            cases.append({"case": name, "rejected": True, "exception_class": type(exc).__name__})
+        else:
+            assert name == "valid_control" and outcome["verified"] is True and outcome["global_admission_verified"] is False
+            cases.append({"case": name, "rejected": False, "neutral_scoped_control_valid": True, "global_admission": False})
+        assert fixtures.receiver.inventory(cold) == before
+finally:
+    fixtures.audit._verify_cli_bytes = original
+assert all(case["rejected"] for case in cases[1:])
+report = {"schema": "hpc-forest-neutral-owned-identity-r4-closure-checks-v1", "verified": True,
+          "scope": "seven invented fixtures plus exact AST/component delta only; no native admission",
+          "delivery": ref(R4 / "LIVRAISON-LECTEUR-INTEGRE-R4.json"), "only_changed_function": changed,
+          "other_three_components_byte_identical_to_r3": True, "cases": cases,
+          "explicit_neutral_fake_CLI_byte_stub_used": True, "production_positive_receipts_saved": False,
+          "historical_receipts_or_live_cache_read": False, "CLI_or_model_or_C_or_remote_executions": 0}
+output = HERE / "CONTROLES-IDENTITES-SORTIE-R4.json"
+with output.open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    stream.write("\n")
+print(json.dumps(ref(output)))

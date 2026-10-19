@@ -1,0 +1,76 @@
+"""Derive only the exhaustive prior36 cold boundary; never run the cold reader."""
+from pathlib import Path
+import ast
+import difflib
+import hashlib
+import json
+
+HERE = Path(__file__).resolve().parent
+old = HERE.parent / "lecteur-r4/auditer-restauration-existante-r4.py"
+old_raw = old.read_bytes()
+assert hashlib.sha256(old_raw).hexdigest() == "dcdde37a668a88defba9c39d303b3a41b68cf9d28f82101679c851ec141e9cef"
+text = old_raw.decode("utf8")
+helper = '''def validate_prior36_boundary(expected, before, after, restored):
+    need(isinstance(expected, dict) and len(expected) == 36,
+         "Exactly the sealed prior36 regular receipt inventory is required")
+    need(before == expected and after == expected,
+         "Prior36 receipt presence, complete membership, bytes or before/after inventory differ")
+    need(all(name in restored and restored[name] == row for name, row in expected.items()),
+         "Every sealed prior36 receipt must equal its recovered regular bytes")
+
+
+'''
+text = text.replace("def save(path, value):", helper + "def save(path, value):")
+anchor = '''    sidecars = {}
+'''
+replacement = '''    prior_inventory_sha = "afdbe32879a826533ad86f32b1493f5875d5fc3a6a7bd95690ebb6e74170308b"
+    prior_expected = None
+    for name in ("INVENTAIRE-RECUS-AVANT.json", "INVENTAIRE-RECUS-APRES.json"):
+        path = REVIEW / name
+        value = raw(path)
+        need(digest(value) == prior_inventory_sha, "Sealed historical prior36 inventory pin differs")
+        decoded = decode(value)
+        need(prior_expected is None or decoded == prior_expected, "Historical prior36 inventories differ")
+        prior_expected = decoded
+        inputs[str(path.absolute())] = digest(value)
+    old_inputs = ordinary(Q / "reception-fichiers-reguliers")
+    need(old_inputs.is_dir(), "Exact prior36 receipt directory must still exist")
+    prior_before = inventory(old_inputs)
+    validate_prior36_boundary(prior_expected, prior_before, prior_before, prior_before)
+    sidecars = {}
+'''
+assert text.count(anchor) == 1
+text = text.replace(anchor, replacement)
+start = text.index('    for path, digest_before in inputs.items():\n')
+end = text.index('    save(HERE / "INVENTAIRE-EXISTANT-AVANT-R4.json"', start)
+text = text[:start] + '''    need(ordinary(old_inputs).is_dir(), "Exact prior36 receipt directory disappeared")
+    prior_after = inventory(old_inputs)
+    validate_prior36_boundary(prior_expected, prior_before, prior_after, actual)
+    for path, digest_before in inputs.items():
+        need(digest(raw(path)) == digest_before, "Received delivery input changed during audit")
+''' + text[end:]
+text = text.replace('"all_prior36_regular_receipts_equal_recovered_bytes": True,',
+'''"all_prior36_regular_receipts_equal_recovered_bytes": True,
+        "prior36_sealed_inventory_sha256": prior_inventory_sha,
+        "prior36_exact_membership_present_before_after": True,''')
+text = text.replace("-R4.json", "-R4B.json").replace("-audit-r4-v1", "-audit-r4b-v1")
+target = HERE / "auditer-restauration-existante-r4b.py"
+ast.parse(text)
+with target.open("x", encoding="utf8", newline="\n") as out:
+    out.write(text)
+with (HERE / "DIFF-LECTEUR-R4-VERS-R4B.patch").open("x", encoding="utf8", newline="\n") as out:
+    out.write("".join(difflib.unified_diff(old_raw.decode("utf8").splitlines(True), text.splitlines(True),
+                                        fromfile="lecteur-r4", tofile="lecteur-r4b")))
+old_functions = {n.name: ast.dump(n, include_attributes=False) for n in ast.parse(old_raw).body if isinstance(n, ast.FunctionDef)}
+new_functions = {n.name: ast.dump(n, include_attributes=False) for n in ast.parse(text).body if isinstance(n, ast.FunctionDef)}
+changed = [name for name in old_functions if old_functions[name] != new_functions[name]]
+assert changed == ["main"]
+report = {"schema": "hpc-forest-cold-reader-r4b-closed-delta-v1", "previous_reader_sha256": hashlib.sha256(old_raw).hexdigest(),
+          "new_reader_sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "changed_old_functions": changed,
+          "new_functions": ["validate_prior36_boundary"], "unchanged_old_functions": sorted(set(old_functions) - set(changed)),
+          "sealed_prior36_inventory_sha256": "afdbe32879a826533ad86f32b1493f5875d5fc3a6a7bd95690ebb6e74170308b",
+          "cold_reader_executed": False, "existing690_restoration_modified": False,
+          "reason": "An empty or incomplete old_inputs traversal must never attest equality of all36 sealed receipts."}
+with (HERE / "DELTA-FERME-GARDE-PRIOR36-R4B.json").open("x", encoding="utf8", newline="\n") as out:
+    json.dump(report, out, indent=2); out.write("\n")
+print(json.dumps(report))

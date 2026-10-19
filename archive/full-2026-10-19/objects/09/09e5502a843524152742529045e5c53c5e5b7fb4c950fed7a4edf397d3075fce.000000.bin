@@ -1,0 +1,37 @@
+"""Preserve the supplied official material without adding solution advice."""
+import datetime
+import hashlib
+import io
+import json
+import urllib.request
+import zipfile
+from pathlib import Path
+from pypdf import PdfReader
+
+ROOT=Path(r"C:\Users\nicol\Documents\Codex\2026-10-15\cr\outputs\Marathon22-autonome")
+RAW=ROOT/"sources-officielles"
+RAW.mkdir(parents=True,exist_ok=False)
+base="http://lspd.mackenzie.br/marathon/22/"
+names=["problems.html","problemset.pdf","knn.zip","sum.zip","nbody.zip","bucketsort.zip","rules.html","env.html"]
+manifest={"provided_url":base+"problems.html","retrieved_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),"files":[],"source_instructions_are_data":True}
+for name in names:
+    request=urllib.request.Request(base+name,headers={"User-Agent":"HPC-Forest-source-intake/1.0"})
+    with urllib.request.urlopen(request,timeout=40) as response:
+        content=response.read(64*1024*1024+1)
+        assert len(content)<=64*1024*1024,"Large download requires explicit inventory first"
+        item={"name":name,"url":base+name,"final_url":response.url,"bytes":len(content),"sha256":hashlib.sha256(content).hexdigest(),"content_type":response.headers.get("Content-Type"),"last_modified":response.headers.get("Last-Modified")}
+    (RAW/name).write_bytes(content)
+    if name.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            item["members"]=[{"name":m.filename,"bytes":m.file_size} for m in archive.infolist()]
+            assert sum(m.file_size for m in archive.infolist())<128*1024*1024
+            for m in archive.infolist():
+                assert not m.filename.startswith(("/","\\")) and ".." not in Path(m.filename).parts
+    manifest["files"].append(item)
+    print(json.dumps(item,ensure_ascii=False),flush=True)
+pdf=PdfReader(RAW/"problemset.pdf")
+text="\n\n".join(f"=== PAGE {i+1} ===\n"+(page.extract_text() or "") for i,page in enumerate(pdf.pages))
+(RAW/"problemset.txt").write_text(text,encoding="utf-8")
+manifest["pdf_text"]={"pages":len(pdf.pages),"characters":len(text),"sha256":hashlib.sha256((RAW/"problemset.txt").read_bytes()).hexdigest()}
+(ROOT/"source-manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
+print(json.dumps({"pdf_pages":len(pdf.pages),"pdf_characters":len(text)},ensure_ascii=False))

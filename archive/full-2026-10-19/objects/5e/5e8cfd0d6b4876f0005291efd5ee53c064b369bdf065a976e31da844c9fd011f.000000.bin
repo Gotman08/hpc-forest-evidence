@@ -1,0 +1,260 @@
+"""Read-only exact-three terminal R2d stop gate, derived from reviewed R2c gate.
+
+This module never captures processes, stops processes or opens worker.lock contents.
+Only the parent may call it with a freshly captured complete CIM and execute the
+separately reviewed PowerShell wrapper. Metadata closure is no scientific admission.
+"""
+import argparse
+import hashlib
+import json
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[2]
+REL = HERE.parent
+LAUNCH = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2d'
+OPS = REL / 'operations-parent-attempt2'
+FACTORY = LAUNCH / 'revision-r3-attempt2'
+SCOPE = 'hpc-forest-primes-native-max-r2d'
+SOURCE = '13ccaf7c74d13db246d1127a25c511bc03d7989ba9097eb6ad7b4f681c0a0a46'
+PLAN = '5e052db689fc423720be60dab97fbca70c82b64487d02d3d8fe2d0f796d9c96c'
+FIELDS = ('ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate')
+CELLS = (
+    ('astra', '752650', 'gpt-6-astra', '26d58fc2d88f423d9b5fd241ade3d185', 11900, 55836, 6,
+     '937d83aad2611bd815a98b6549232a277a91663a2629d1c351f9a3e800614286',
+     '7edd5eda53dcf4526a0b35443ec23af118014a24c73bfc834a3a39a4c0b9e377'),
+    ('terra', '752651', 'gpt-5.6-terra', 'fee3bd8ba5fc4e6eafa1167ef279f9fa', 48156, 41416, 2,
+     '4a922b9a169d72818fa1d772f86258c5cd8b2fd08e06a7fbcc7ff7101a6ae2b6',
+     '8107707101c28cac7035784fe192578e821471ce38958c3d09538b1ba0ad4b62'),
+    ('sol', '752652', 'gpt-6.1-sol', '182500fef7c546af87f14498de353581', 61412, 38744, 6,
+     'ede9686b2907e7e81a94ab64e5b519030eceea4a15e62cb4b67177cd3bc80bce',
+     'c8e072d4a843c39e448b9be3f64db754094a0eebd27c7485b0aa923b8548de86'),
+)
+TARGET_IDS = [11900, 48156, 61412]
+REVIEW_REFS = (
+    (REL / 'revue-terminale-r2d/REVUE-INDEPENDANTE-TERMINALE-ASTRA-SOL.json',
+     'a37cfb582c46fffbff4892e4ffe6a6e89b339e3214233b919df92b01291c0117'),
+    (REL / 'revue-etat-relance-0918/revue-terra-metadata/REVUE-INDEPENDANTE-TERRA-METADATA.json',
+     'b48c3d0b117397a8d0760fcf3dddc308584339ac2351c6dabd966971a9b69178'),
+)
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
+
+
+def ref(path):
+    return {'path': str(Path(path).resolve()), 'sha256': sha(path)}
+
+
+def artifact(value, root=BASE):
+    need(isinstance(value, dict) and set(value) == {'path', 'sha256'}, 'Closed artifact reference required')
+    path = Path(value['path'])
+    need(path.resolve().is_relative_to(root.resolve()) and path.is_file() and not path.is_symlink()
+         and sha(path) == value['sha256'], 'Changed or escaped frozen proof')
+    return path
+
+
+def pinned(path, expected):
+    need(sha(path) == expected, 'Pinned closure proof changed: ' + Path(path).name)
+    return read(path)
+
+
+def full_identity(row):
+    need(isinstance(row, dict) and all(key in row for key in FIELDS), 'Incomplete process identity')
+    need(type(row['ProcessId']) is int and row['ProcessId'] > 0 and type(row['ParentProcessId']) is int,
+         'Untyped process identity')
+    need(all(isinstance(row[k], str) and row[k] for k in ('ExecutablePath', 'CommandLine', 'CreationDate')),
+         'Opaque process identity; preserve and refuse')
+    need(re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z', row['CreationDate']) is not None,
+         'Full seven-digit creation instant required')
+    datetime.fromisoformat(row['CreationDate'])
+    return row
+
+
+def current_rows(fresh, now):
+    need(fresh.get('complete_census') is True and type(fresh.get('rows_count')) is int
+         and len(fresh['rows']) == fresh['rows_count'], 'Incomplete fresh process census')
+    age = (now - datetime.fromisoformat(fresh['captured_at_utc'])).total_seconds()
+    need(0 <= age <= 45, 'Current full process census is stale/future')
+    need(all(type(r.get('ProcessId')) is int and type(r.get('ParentProcessId')) is int for r in fresh['rows']),
+         'Untyped current process graph')
+    rows = {row['ProcessId']: row for row in fresh['rows']}
+    need(len(rows) == len(fresh['rows']), 'Duplicate process IDs in full census')
+    need(not any('hpc_forest.ablation_worker' in (r.get('CommandLine') or '') for r in rows.values()),
+         'Source-only unexpectedly active; preserve and refuse')
+    return rows
+
+
+def check_descendants(rows, expected):
+    """Observe only. An opaque possible child or any live Codex descendant blocks."""
+    graph = {expected['ProcessId']: expected}
+    while True:
+        additions = {}
+        for row in rows.values():
+            if row['ProcessId'] in graph or row['ParentProcessId'] not in graph:
+                continue
+            parent = graph[row['ParentProcessId']]
+            # An older full birth cannot descend from this newer owned identity.
+            birth = row.get('CreationDate')
+            if (isinstance(birth, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z', birth)
+                    and birth < parent['CreationDate']):
+                continue
+            full_identity(row)
+            need(row['CreationDate'] >= parent['CreationDate'], 'Ambiguous descendant creation ordering')
+            exe = row['ExecutablePath'].replace('/', '\\').casefold()
+            need(not exe.endswith('\\codex.exe') and not exe.endswith('\\codex'),
+                 'A native CLI generation is still active; no stop')
+            additions[row['ProcessId']] = row
+        if not additions:
+            return
+        graph.update(additions)
+
+
+def opaque_inventory(cache, exclude_root_lock):
+    """Hashes bytes only, never interprets C/SQLite/bodies; exact live root lock skipped."""
+    need(cache.is_dir() and not cache.is_symlink(), 'Cache root missing/link')
+    result = {}
+    for path in sorted(cache.rglob('*')):
+        need(not path.is_symlink() and path.resolve().is_relative_to(cache.resolve()), 'Cache link/escape refused')
+        relative = path.relative_to(cache).as_posix()
+        if exclude_root_lock and relative.rstrip(' .').casefold() == 'worker.lock':
+            need(path.is_file() and path.stat().st_size == 1, 'Exact owned one-byte root lock metadata differs')
+            continue
+        if path.is_file():
+            result[relative] = {'bytes': path.stat().st_size, 'sha256': sha(path)}
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--fresh-cim', type=Path, required=True)
+    parser.add_argument('--plan-out', type=Path)
+    args = parser.parse_args()
+    launch_path = LAUNCH / 'lancement-possede-attempt2/execution_reelle/LANCEMENTS-POSSEDES-RECUS.json'
+    launch = pinned(launch_path, '5e515f64214c918b860d245938bb142103dd15b772e28f4f7c4825ee9190b723')
+    need(launch['verified'] is True and len(launch['workers']) == 3, 'Original owned three-worker launch absent')
+    initial_path = Path(launch['after_census'])
+    initial = pinned(initial_path, '5f7fd4e98d2f96e4f9fbfc744f78093dcb6a44c295f4f0d63c7d203895984c2d')
+    need(initial['complete_census'] is True and len(initial['rows']) == initial['rows_count'], 'Original complete census absent')
+    old_rows = {row['ProcessId']: row for row in initial['rows']}
+    need(len(old_rows) == len(initial['rows']), 'Duplicate original process graph')
+    rows = current_rows(read(args.fresh_cim), datetime.now(UTC))
+    reviews = []
+    for path, digest in REVIEW_REFS:
+        reviewed = pinned(path, digest)
+        need(reviewed['verified'] is True and reviewed['blocking_findings_within_metadata_scope'] == [], 'Independent bounded review missing')
+        reviews.append(ref(path))
+    preservation_path = OPS / 'preservation-caches-avant-arret/PRESERVATION-CACHES-AVANT-ARRET.json'
+    preservation = pinned(preservation_path, '4f99997683e0410689112696ed4ccd3d9357095256ec4a1a18ed84a59bd807d1')
+    need(preservation['verified'] is False and preservation['opaque_regular_cache_files_preserved_except_live_lock'] is True
+         and preservation['source_cache_unchanged'] is True and len(preservation['workers']) == 3,
+         'Partial opaque cache preservation required')
+    targets = []
+    for slug, job, model, session, pid, launcher, call_count, receipt_sha, recon_sha in CELLS:
+        identity = {'scope_id': SCOPE, 'job_id': job, 'model': model, 'effort': 'max', 'session_id': session,
+                    'source_zip_sha256': SOURCE, 'plan_sha256': PLAN}
+        received = REL / f'reception-{slug}-{job}/audit-metadata-r1'
+        receipt_path, recon_path = received / 'RECEPTION-METADATA-BORNEE.json', received / 'RECONCILIATION-METADATA-BORNEE.json'
+        receipt, recon = pinned(receipt_path, receipt_sha), pinned(recon_path, recon_sha)
+        need(all(receipt.get(k) == recon.get(k) == v for k, v in identity.items()), 'Selected terminal metadata cell differs')
+        need(receipt['verified'] is False and receipt['terminal_state'] == 'FAILED' and receipt['exit_code'] == '1:0'
+             and receipt['archive_sha_equal'] is True and receipt['fresh_opaque_inventory_before_after_identical'] is True
+             and receipt['source105_count'] == 105, 'Terminal archive/source105 bounded receipt missing')
+        need(all(receipt.get(k) is False for k in ('research_admission', 'first_clean_NORMAL_admitted',
+             'RAW_scientific_or_Git_oracle_or_performance_audit', 'source_worker_or_cache_modified')), 'Bounded receipt overclaims')
+        for item in read(received / 'PIECES-EPINGLEES.json')['files']:
+            artifact(item)
+        need(recon['verified'] is True and recon['all_archive_requests_delivered'] is True
+             and recon['all_named_claim_request_invocation_response_ready_delivery_hashes_reconciled'] is True
+             and recon['archive_request_count'] == recon['CLI_process_invocations_received'] == len(recon['calls']) == call_count,
+             'Not all started terminal calls are delivered/reconciled')
+        calls = recon['calls']; nonces = {c['nonce'] for c in calls}
+        need(len(nonces) == call_count and all(re.fullmatch('[0-9a-f]{32}', n) for n in nonces), 'Duplicate/invalid started call nonce')
+        for call in calls:
+            need(type(call['process_returncode']) is int and type(call['process_timed_out']) is bool,
+                 'Unfinished invocation process metadata')
+            for key in ('generation_claim', 'request', 'response', 'ready', 'invocation', 'process', 'delivered', 'codex_log'):
+                artifact(call[key], received)
+        auth_path = FACTORY / f'admissions-attempt2-{slug}-max-reelles/authorization-remote.json'
+        auth = read(auth_path)
+        need(all(auth.get(k) == v for k, v in identity.items() if k not in {'source_zip_sha256', 'plan_sha256'}), 'Original admission differs')
+        lane_ref = auth['artifacts']['worker_lane_admission']
+        lane_path = FACTORY / f'admissions-attempt2-{slug}-max-reelles/publication-locale/readback/worker_lane_admission.json'
+        lane = pinned(lane_path, lane_ref['sha256'])
+        need(lane['verified'] is True and lane['source_zip_sha256'] == SOURCE and lane['plan_sha256'] == PLAN
+             and lane['lane_v2']['source_only_state'] == 'received_absent'
+             and lane['lane_v2']['source_only_active_workers'] == 0, 'Source-only received-absent0 admission lost')
+        original = next(w for w in launch['workers'] if w['session_id'] == session)
+        need(original['job_id'] == job and original['model'] == model
+             and {r['ProcessId'] for r in original['full_identities']} == {pid, launcher}, 'Original exact pair differs')
+        expected = full_identity(old_rows[pid]); old_launcher = full_identity(old_rows[launcher])
+        need(expected == next(r for r in original['full_identities'] if r['ProcessId'] == pid)
+             and old_launcher == next(r for r in original['full_identities'] if r['ProcessId'] == launcher)
+             and expected['ParentProcessId'] == launcher and 'hpc_forest.r2max_worker' in expected['CommandLine']
+             and session in expected['CommandLine'], 'Initial five-field main ownership differs')
+        if pid in rows:
+            need(all(rows[pid].get(k) == expected[k] for k in FIELDS), 'Owned PID reused/identity changed; no stop')
+        if launcher in rows:
+            need(all(rows[launcher].get(k) == old_launcher[k] for k in FIELDS), 'Launcher identity reused; preserve and refuse')
+        check_descendants(rows, expected)
+        pres = next(w for w in preservation['workers'] if w['session_id'] == session)
+        cache = LAUNCH / ('worker-' + session)
+        copy = OPS / 'preservation-caches-avant-arret' / slug / 'copie-opaque'
+        need(pres['job_id'] == job and pres['source_cache'] == str(cache) and pres['opaque_copy'] == str(copy)
+             and pres['before_after_copy_equal'] is True and pres['excluded_live_lock_paths'] == ['worker.lock']
+             and pres['live_lock_content_read'] is False, 'Exact cache preservation binding differs')
+        inventories = [read(artifact(item, OPS / 'preservation-caches-avant-arret')) for item in pres['evidence_refs']]
+        need(len(inventories) == 2 and inventories[0] == inventories[1], 'Preservation before/after hashes differ')
+        before = inventories[0]
+        need('worker.lock' not in before and len(before) == pres['regular_files_preserved']
+             and sum(v['bytes'] for v in before.values()) == pres['bytes'], 'Readable preservation coverage differs')
+        need(opaque_inventory(cache, True) == opaque_inventory(copy, False) == before, 'Current/copy/cache data changed after reconciliation')
+        lock = cache / 'worker.lock'
+        need(lock.is_file() and not lock.is_symlink() and lock.stat().st_size == 1, 'Exact unread operational root lock differs')
+        snapshots = read(artifact(recon['named_snapshot_inventory'], received))
+        named = {}
+        for row in snapshots['files']:
+            source_path = Path(row['source_path'])
+            need(source_path.is_relative_to(cache), 'Named snapshot escapes exact cache')
+            relative = source_path.relative_to(cache).as_posix()
+            need(relative not in named and row['source']['sha256'] == row['received']['sha256'], 'Named cache proof duplicate/hash mismatch')
+            artifact(row['received'], received)
+            named[relative] = {'sha256': row['source']['sha256'], 'bytes': row['source']['bytes']}
+        need(named == before, 'Full preserved cache contains unreviewed or missing started-call artifacts')
+        need({Path(name).parts[0] for name in before if '/' in name} == nonces, 'Preserved cache nonce set differs from exhaustive terminal metadata')
+        ready = read(copy / 'worker-ready.json')
+        need(ready['pid'] == pid and all(ready.get(k) == v for k, v in identity.items()), 'Preserved ready full binding differs')
+        targets.append({'job_id': job, 'session_id': session, 'model': model, 'identity': expected,
+                        'launcher_identity_observation_only': old_launcher, 'present': pid in rows,
+                        'metadata_pre_stop': ref(receipt_path), 'bounded_terminal_receipt': ref(recon_path),
+                        'cache_files_preserved_in_situ_and_copy': len(before), 'cache_preservation': ref(preservation_path),
+                        'readable_cache_inventory': pres['evidence_refs'][0]})
+    result = {'schema': 'hpc-forest-r2d-terminal-owned-main-only-stop-plan-v1', 'verified': True,
+              'scope': 'Exact-three individual main closure after exhaustive terminal metadata only',
+              'native_research_admitted': False, 'complete_cache_snapshot_received_including_lock': False,
+              'targets': targets, 'preserve_source_only': {'state': 'received_absent', 'active_workers': 0},
+              'initial_full_cim': ref(initial_path), 'launch_receipt': ref(launch_path), 'fresh_full_cim': ref(args.fresh_cim),
+              'independent_bounded_reviews': reviews, 'target_process_ids': TARGET_IDS,
+              'stop_only_owned_main_python': True, 'stop_mcp_ssh_or_wrappers': False, 'recursive_stop': False,
+              'stop_by_name': False, 'worker_lock_read': False, 'all_readable_cache_data_preserved': True}
+    if args.plan_out:
+        with args.plan_out.open('x', encoding='utf8') as stream:
+            json.dump(result, stream, indent=2); stream.write('\n')
+    print(json.dumps(result))
+
+
+if __name__ == '__main__':
+    main()

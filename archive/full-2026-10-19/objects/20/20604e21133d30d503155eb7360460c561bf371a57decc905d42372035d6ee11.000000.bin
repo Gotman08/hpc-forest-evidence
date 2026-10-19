@@ -1,0 +1,154 @@
+param([switch]$Execute)
+$ErrorActionPreference = 'Stop'
+$taskRoot = $PSScriptRoot
+$taskBase = (Resolve-Path -LiteralPath (Join-Path $taskRoot '../../..')).Path
+$taskPython = Join-Path $taskBase 'work/.venv/Scripts/python.exe'
+$taskGate = Join-Path $taskRoot 'preparer-fermeture-r2g.py'
+$taskPinsPath = Join-Path $taskRoot 'PINS-FINAUX-NON-ADMIS.json'
+$taskPlanPath = Join-Path $taskRoot 'plan-fermeture-r2g.json'
+$taskReviewPath = Join-Path $taskRoot 'REVUE-ARRET-EXACT3.json'
+$taskExactIds = '27596,50984,44728'
+
+# Preparation delivered deliberately closed. No CIM/process lookup precedes these guards.
+$taskPins = Get-Content -LiteralPath $taskPinsPath -Raw | ConvertFrom-Json -DateKind String
+$taskSlots = @('terminal_receipt','reconciliation','independent_final_review','named_snapshots','cache_preservation','frozen_evidence_inventory')
+if ($taskPins.schema -cne 'hpc-forest-r2g-final-closure-pins-v1' -or $taskPins.scope_id -cne 'hpc-forest-primes-native-max-r2g' -or (@($taskPins.proofs.PSObject.Properties.Name | Sort-Object) -join ',') -cne (($taskSlots | Sort-Object) -join ',')) {throw 'Wrong exact G final-proof slots'}
+foreach ($taskSlot in $taskSlots) {
+    $taskProof = $taskPins.proofs.$taskSlot
+    if ($taskProof.status -cne 'ADMIS' -or -not $taskProof.path -or $taskProof.sha256 -cnotmatch '^[0-9a-f]{64}$') {throw ('Final proof NON_ADMIS/unpinned; no observation/effect: ' + $taskSlot)}
+}
+if ($taskPins.preparation_only -ne $false -or $taskPins.effect_admitted -ne $true) {throw 'Parent finalization/effect admission absent; preparation remains closed'}
+$taskPlan = Get-Content -LiteralPath $taskPlanPath -Raw | ConvertFrom-Json -DateKind String
+if ($taskPlan.schema -cne 'hpc-forest-r2g-terminal-owned-main-only-stop-plan-v1' -or $taskPlan.verified -ne $true -or $taskPlan.stop_only_owned_main_python -ne $true -or $taskPlan.stop_mcp_ssh_or_wrappers -ne $false -or $taskPlan.recursive_stop -ne $false -or $taskPlan.stop_by_name -ne $false -or ($taskPlan.target_process_ids -join ',') -cne $taskExactIds) {throw 'Wrong exact G main-only plan'}
+if (@($taskPlan.targets).Count -ne 3 -or (@($taskPlan.targets | ForEach-Object {[int]$_.identity.ProcessId}) -join ',') -cne $taskExactIds) {throw 'Plan targets must contain exactly the three owned G main identities in fixed order'}
+$taskReview = Get-Content -LiteralPath $taskReviewPath -Raw | ConvertFrom-Json -DateKind String
+if ($taskReview.schema -cne 'hpc-forest-r2g-independent-exact-three-stop-review-v1' -or $taskReview.verified -ne $true -or $taskReview.stop_executed_by_reviewer -ne $false -or @($taskReview.blocking_findings).Count -ne 0) {throw 'Independent exact-three G helper review missing/refused'}
+foreach ($taskEntry in @(@{name='preparer-fermeture-r2g.py';path=$taskGate},@{name='fermer-trois-python-r2g.ps1';path=$PSCommandPath},@{name='PINS-FINAUX-NON-ADMIS.json';path=$taskPinsPath},@{name='plan-fermeture-r2g.json';path=$taskPlanPath})) {
+    $taskPin = $taskReview.reviewed_files.($taskEntry.name).sha256
+    if ($taskPin -cnotmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $taskEntry.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $taskPin) {throw ('Reviewed G helper/configuration/plan bytes changed: ' + $taskEntry.name)}
+}
+if ($taskPlan.pins.sha256 -cne (Get-FileHash -LiteralPath $taskPinsPath -Algorithm SHA256).Hash.ToLowerInvariant()) {throw 'Final pins changed since reviewed plan'}
+
+function Write-NewTaskJson($value, [string]$path) {
+    $taskBytes = [Text.UTF8Encoding]::new($false).GetBytes(($value | ConvertTo-Json -Depth 60) + "`n")
+    $taskStream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {$taskStream.Write($taskBytes, 0, $taskBytes.Length); $taskStream.Flush($true)} finally {$taskStream.Dispose()}
+}
+function New-TaskCensus {
+    $taskRows = @(Get-CimInstance Win32_Process | ForEach-Object {
+        [ordered]@{ProcessId=[int]$_.ProcessId; ParentProcessId=[int]$_.ParentProcessId; ExecutablePath=$_.ExecutablePath; CommandLine=$_.CommandLine; CreationDate=$(if ($_.CreationDate) {$_.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')} else {$null})}
+    })
+    $taskPath = Join-Path $taskRoot ('cim-fermeture-r2g-' + [guid]::NewGuid().ToString('N') + '.json')
+    Write-NewTaskJson @{schema='hpc-forest-primes-r2max-fresh-full-cim-v1';complete_census=$true;captured_at_utc=[DateTime]::UtcNow.ToString('o');rows_count=$taskRows.Count;rows=$taskRows} $taskPath
+    return $taskPath
+}
+function Test-TaskGate {
+    # Actual pinned final contracts must pass BEFORE collecting the next live census.
+    $taskProofText = & $taskPython -B $taskGate --check-final-proofs-only
+    if ($LASTEXITCODE -ne 0) {throw 'Pinned final G proofs refused before process observation'}
+    $taskProofCheck = $taskProofText | ConvertFrom-Json -DateKind String
+    if ($taskProofCheck.final_metadata_contract_verified -ne $true -or $taskProofCheck.pins.sha256 -cne $taskPlan.pins.sha256) {throw 'Final proof check differs from reviewed G plan'}
+    $taskCensus = New-TaskCensus
+    $taskText = & $taskPython -B $taskGate --fresh-cim $taskCensus
+    if ($LASTEXITCODE -ne 0) {throw 'Fresh complete G metadata/cache/identity gate refused; no next effect'}
+    $taskCurrent = $taskText | ConvertFrom-Json -DateKind String
+    if (($taskCurrent.target_process_ids -join ',') -cne $taskExactIds -or $taskCurrent.verified -ne $true -or @($taskCurrent.targets).Count -ne 3 -or $taskCurrent.pins.sha256 -cne $taskPlan.pins.sha256) {throw 'Fresh selected G scope/proofs differ'}
+    for ($taskIndex=0; $taskIndex -lt 3; $taskIndex++) {
+        foreach ($taskKey in @('ProcessId','ParentProcessId','ExecutablePath','CommandLine','CreationDate')) {
+            if ([string]$taskPlan.targets[$taskIndex].identity.$taskKey -cne [string]$taskCurrent.targets[$taskIndex].identity.$taskKey) {throw 'Selected five-field identity changed from reviewed plan'}
+            if ([string]$taskPlan.targets[$taskIndex].launcher_identity_observation_only.$taskKey -cne [string]$taskCurrent.targets[$taskIndex].launcher_identity_observation_only.$taskKey) {throw 'Observed parent identity changed from reviewed plan'}
+        }
+    }
+    foreach ($taskSlot in $taskSlots) {
+        if ($taskPlan.final_proofs.$taskSlot.sha256 -cne $taskCurrent.final_proofs.$taskSlot.sha256 -or $taskPlan.final_proofs.$taskSlot.path -cne $taskCurrent.final_proofs.$taskSlot.path) {throw 'Final G proof binding changed from reviewed plan'}
+    }
+    return $taskCurrent
+}
+function Test-TaskIdentity($actual, $expected) {
+    if ($null -eq $actual) {return $false}
+    return ([int]$actual.ProcessId -eq [int]$expected.ProcessId -and [int]$actual.ParentProcessId -eq [int]$expected.ParentProcessId -and [string]$actual.ExecutablePath -ceq [string]$expected.ExecutablePath -and [string]$actual.CommandLine -ceq [string]$expected.CommandLine -and $actual.CreationDate.ToUniversalTime().Ticks -eq ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+}
+function Get-TaskOne([int]$targetId) {
+    return Get-CimInstance Win32_Process -Filter "ProcessId=$targetId"
+}
+function New-TaskNaturalAction($target, [string]$boundary) {
+    return @{job_id=$target.job_id;identity=$target.identity;action='already_exited_naturally';boundary=$boundary;stop_issued=$false;at_utc=[DateTime]::UtcNow.ToString('o')}
+}
+
+$taskFresh = Test-TaskGate
+$taskInitial = @{schema='hpc-forest-r2g-main-only-stop-preflight-v1';verified=$true;executed=$false;at_utc=[DateTime]::UtcNow.ToString('o');plan_sha256=(Get-FileHash -LiteralPath $taskPlanPath -Algorithm SHA256).Hash.ToLowerInvariant();code_review_sha256=(Get-FileHash -LiteralPath $taskReviewPath -Algorithm SHA256).Hash.ToLowerInvariant();fresh_cim=$taskFresh.fresh_full_cim;targets=$taskPlan.targets;native_research_admitted=$false;complete_cache_including_lock_received=$false;all_readable_cache_preserved_in_situ_and_copy=$true;worker_lock_read=$false;source_only_state='received_absent';source_only_active_workers=0;no_mcp_ssh_or_wrapper_targets=$true;recursive_stop=$false;stop_by_name=$false}
+Write-NewTaskJson $taskInitial (Join-Path $taskRoot ('prevol-r2g-main-only-' + [guid]::NewGuid().ToString('N') + '.json'))
+if (-not $Execute) {Write-Output 'Fresh G main-only preflight passed; no process stopped'; return}
+
+# CreateNew + FileShare.None + Flush(true): durable exclusive intent BEFORE any effect.
+# An interrupted/failed execution leaves this file in place and cannot be retried automatically.
+$taskIntent = Join-Path $taskRoot 'fermeture-r2g-intention-exclusive.json'
+Write-NewTaskJson $taskInitial $taskIntent
+$taskActions = @()
+try {
+    foreach ($taskTarget in $taskPlan.targets) {
+        $taskCurrentGate = Test-TaskGate
+        $taskExpected = $taskTarget.identity
+        $taskProcessRow = Get-TaskOne ([int]$taskExpected.ProcessId)
+        $taskAction = $null
+        if ($null -eq $taskProcessRow) {
+            $taskAction = New-TaskNaturalAction $taskTarget 'before_handle'
+        } else {
+            if (-not (Test-TaskIdentity $taskProcessRow $taskExpected)) {throw 'Reused/changed G PID preserved; effect refused'}
+            $taskOwnedProcess = Get-Process -Id ([int]$taskExpected.ProcessId) -ErrorAction SilentlyContinue
+            if ($null -eq $taskOwnedProcess) {
+                if ($null -ne (Get-TaskOne ([int]$taskExpected.ProcessId))) {throw 'Ambiguous G PID after process-open failure'}
+                $taskAction = New-TaskNaturalAction $taskTarget 'before_process_open'
+            } else {
+                try {
+                    try {
+                        $taskStableHandle = $taskOwnedProcess.Handle
+                        $taskBirthTicks = $taskOwnedProcess.StartTime.ToUniversalTime().Ticks
+                    } catch {
+                        if ($null -ne (Get-TaskOne ([int]$taskExpected.ProcessId))) {throw 'Ambiguous G PID while acquiring stable handle'}
+                        $taskAction = New-TaskNaturalAction $taskTarget 'during_handle_open'
+                    }
+                    if ($null -eq $taskAction) {
+                        $taskDelta = [math]::Abs($taskBirthTicks - ([datetime]$taskExpected.CreationDate).ToUniversalTime().Ticks)
+                        if ($taskDelta -ge 10) {throw 'Stable handle birth instant differs from seven-digit historical G identity'}
+                        # Revalidate the ENTIRE fresh parent/descendant graph and all proofs while holding the handle.
+                        $taskStableGate = Test-TaskGate
+                        $taskNow = Get-TaskOne ([int]$taskExpected.ProcessId)
+                        if ($null -eq $taskNow -and $taskOwnedProcess.HasExited) {
+                            $taskAction = New-TaskNaturalAction $taskTarget 'after_handle_open'
+                        } else {
+                            if (-not (Test-TaskIdentity $taskNow $taskExpected)) {throw 'Full G identity changed after stable handle acquisition'}
+                            if ($taskOwnedProcess.Handle -ne $taskStableHandle -or $taskOwnedProcess.StartTime.ToUniversalTime().Ticks -ne $taskBirthTicks) {throw 'Stable handle/native birth ticks changed'}
+                            $taskBeforeEffect = @{schema='hpc-forest-r2g-individual-main-intent-v1';job_id=$taskTarget.job_id;identity=$taskExpected;observed_parent=$taskTarget.launcher_identity_observation_only;native_birth_ticks=$taskBirthTicks;start_delta_ticks=$taskDelta;stable_handle_opened=$true;fresh_cim=$taskStableGate.fresh_full_cim;at_utc=[DateTime]::UtcNow.ToString('o')}
+                            Write-NewTaskJson $taskBeforeEffect (Join-Path $taskRoot ('intention-main-' + $taskExpected.ProcessId + '.json'))
+                            # Process.Kill() acts on this Process instance with its already-held native handle.
+                            # No name lookup, tree kill, parent stop, MCP, SSH, wrapper or recursive stop.
+                            if ($taskOwnedProcess.HasExited) {
+                                $taskAction = New-TaskNaturalAction $taskTarget 'immediately_before_effect'
+                            } else {
+                                $taskKillReturned = $false
+                                try {$taskOwnedProcess.Kill(); $taskKillReturned = $true} catch {
+                                    if (-not $taskOwnedProcess.HasExited) {throw}
+                                    $taskAction = New-TaskNaturalAction $taskTarget 'natural_exit_race_at_effect'
+                                }
+                                if ($taskKillReturned) {
+                                    if (-not $taskOwnedProcess.WaitForExit(5000)) {throw 'Owned G process did not exit after individual effect'}
+                                    $taskAction = @{job_id=$taskTarget.job_id;identity=$taskExpected;action='owned_main_individual_termination_issued';stop_issued=$true;stable_handle_opened=$true;native_birth_ticks=$taskBirthTicks;start_delta_ticks=$taskDelta;exit_causality_not_inferred=$true;at_utc=[DateTime]::UtcNow.ToString('o')}
+                                }
+                            }
+                        }
+                    }
+                } finally {$taskOwnedProcess.Dispose()}
+            }
+        }
+        $taskActions += $taskAction
+        Write-NewTaskJson @{actions=$taskActions} (Join-Path $taskRoot ('actions-main-only-' + [guid]::NewGuid().ToString('N') + '.json'))
+    }
+    $taskAfter = Test-TaskGate
+    if (@($taskAfter.targets | Where-Object {$_.present}).Count -ne 0) {throw 'An original owned G main identity remains; no closure receipt'}
+    Write-NewTaskJson @{schema='hpc-forest-r2g-owned-main-only-stop-receipt-v1';verified=$true;actions=$taskActions;all_three_main_identities_absent=$true;source_only=$taskAfter.preserve_source_only;final_full_cim=$taskAfter.fresh_full_cim;no_mcp_ssh_or_wrapper_targeted=$true;recursive_stop=$false;stop_by_name=$false;all_readable_cache_preserved_in_situ_and_copy=$true;worker_lock_read=$false;complete_cache_including_lock_received=$false;native_research_admitted=$false;complete_cohort_or_raw_or_performance_verified=$false;at_utc=[DateTime]::UtcNow.ToString('o')} (Join-Path $taskRoot 'fermeture-r2g-main-only-verifiee.json')
+    Write-Output 'Three owned G main identities absent; readable cache unchanged; exact lock bytes unreceived; no scientific admission'
+} catch {
+    Write-NewTaskJson @{verified=$false;actions=$taskActions;error=$_.Exception.Message;no_retry_without_reconciliation=$true} (Join-Path $taskRoot ('fermeture-r2g-refusee-' + [guid]::NewGuid().ToString('N') + '.json'))
+    throw
+}

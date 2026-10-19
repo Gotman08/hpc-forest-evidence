@@ -1,0 +1,313 @@
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+#ifdef _OPENMP
+#include <omp.h>
+#include <vector>
+#endif
+
+namespace
+{
+const std::size_t kBufferBytes = 64u * 1024u;
+
+struct IsWhitespace
+{
+    bool operator()(char c) const
+    {
+        return c == ' ' || c == '\n' || c == '\r'
+            || c == '\t' || c == '\f' || c == '\v';
+    }
+};
+
+void append_line(std::string& output, const std::string& text)
+{
+    const std::size_t start = output.size();
+    output.resize(start + 2 * text.size() + 4);
+    char* destination = &output[start];
+    *destination++ = '[';
+    *destination++ = ' ';
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        *destination++ = text[i];
+        *destination++ = ' ';
+    }
+    *destination++ = ']';
+    *destination = '\n';
+}
+
+class BufferedPrinter
+{
+public:
+    BufferedPrinter()
+    {
+        buffer_.reserve(kBufferBytes);
+    }
+
+    void print(const std::string& text)
+    {
+        if (text.size() <= (kBufferBytes - 4) / 2) {
+            const std::size_t line_bytes = 2 * text.size() + 4;
+            if (line_bytes > kBufferBytes - buffer_.size())
+                flush();
+            append_line(buffer_, text);
+        } else {
+            put('[');
+            put(' ');
+            for (std::size_t i = 0; i < text.size(); ++i) {
+                put(text[i]);
+                put(' ');
+            }
+            put(']');
+            put('\n');
+        }
+    }
+
+    void flush()
+    {
+        if (!buffer_.empty()) {
+            std::cout.write(buffer_.data(),
+                            static_cast<std::streamsize>(buffer_.size()));
+            buffer_.clear();
+        }
+    }
+
+private:
+    void put(char c)
+    {
+        if (buffer_.size() == kBufferBytes)
+            flush();
+        buffer_.push_back(c);
+    }
+
+    std::string buffer_;
+};
+
+void emit_serial(std::string& text)
+{
+    if (text.empty())
+        return;
+    BufferedPrinter printer;
+    do {
+        printer.print(text);
+    } while (std::next_permutation(text.begin(), text.end()));
+    printer.flush();
+}
+
+#ifdef _OPENMP
+struct Symbol
+{
+    char value;
+    std::size_t remaining;
+};
+
+std::size_t greatest_common_divisor(std::size_t a, std::size_t b)
+{
+    while (b != 0) {
+        const std::size_t remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return a;
+}
+
+std::size_t capped_binomial(std::size_t n, std::size_t k,
+                            std::size_t cap)
+{
+    if (cap <= 1)
+        return cap;
+    k = std::min(k, n - k);
+    std::size_t value = 1;
+    for (std::size_t i = 1; i <= k; ++i) {
+        std::size_t numerator = n - k + i;
+        std::size_t denominator = i;
+        const std::size_t divisor =
+            greatest_common_divisor(numerator, denominator);
+        numerator /= divisor;
+        denominator /= divisor;
+        // After cancellation, the denominator divides the previous value.
+        value /= denominator;
+        if (numerator > cap / value)
+            return cap;
+        value *= numerator;
+        if (value >= cap)
+            return cap;
+    }
+    return value;
+}
+
+std::size_t capped_permutations(const std::vector<Symbol>& symbols,
+                               std::size_t cap)
+{
+    if (cap <= 1)
+        return cap;
+    std::size_t value = 1;
+    std::size_t used = 0;
+    for (std::size_t i = 0; i < symbols.size(); ++i) {
+        const std::size_t count = symbols[i].remaining;
+        if (count == 0)
+            continue;
+        used += count;
+        const std::size_t factor = capped_binomial(used, count, cap);
+        if (factor >= cap || value > (cap - 1) / factor)
+            return cap;
+        value *= factor;
+    }
+    return value;
+}
+
+std::vector<Symbol> make_symbols(const std::string& text)
+{
+    std::vector<Symbol> symbols;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (symbols.empty() || symbols.back().value != text[i]) {
+            Symbol symbol = {text[i], 1};
+            symbols.push_back(symbol);
+        } else {
+            ++symbols.back().remaining;
+        }
+    }
+    return symbols;
+}
+
+struct PrefixJob
+{
+    std::string text;
+    std::size_t prefix_length;
+};
+
+class PrefixFrontier
+{
+public:
+    PrefixFrontier(const std::vector<Symbol>& symbols,
+                   std::size_t length, std::size_t limit)
+        : symbols_(symbols), limit_(limit), done_(false)
+    {
+        prefix_.reserve(length);
+        path_.reserve(length);
+    }
+
+    bool next(PrefixJob& job)
+    {
+        if (done_)
+            return false;
+        while (capped_permutations(symbols_, limit_ + 1) > limit_) {
+            std::size_t symbol = 0;
+            while (symbols_[symbol].remaining == 0)
+                ++symbol;
+            --symbols_[symbol].remaining;
+            path_.push_back(symbol);
+            prefix_.push_back(symbols_[symbol].value);
+        }
+        job.prefix_length = prefix_.size();
+        job.text = prefix_;
+        for (std::size_t i = 0; i < symbols_.size(); ++i)
+            job.text.append(symbols_[i].remaining, symbols_[i].value);
+        done_ = !advance();
+        return true;
+    }
+
+private:
+    bool advance()
+    {
+        while (!path_.empty()) {
+            const std::size_t previous = path_.back();
+            path_.pop_back();
+            prefix_.pop_back();
+            ++symbols_[previous].remaining;
+            for (std::size_t next = previous + 1;
+                 next < symbols_.size(); ++next) {
+                if (symbols_[next].remaining != 0) {
+                    --symbols_[next].remaining;
+                    path_.push_back(next);
+                    prefix_.push_back(symbols_[next].value);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    std::vector<Symbol> symbols_;
+    std::string prefix_;
+    std::vector<std::size_t> path_;
+    std::size_t limit_;
+    bool done_;
+};
+
+bool emit_parallel(std::string& text)
+{
+    const int threads = std::min(4, omp_get_max_threads());
+    if (threads < 2 || text.size() > (kBufferBytes - 4) / 2)
+        return false;
+    const std::size_t line_bytes = 2 * text.size() + 4;
+    const std::size_t leaf_limit = kBufferBytes / line_bytes;
+    if (leaf_limit < 32)
+        return false;
+    const std::size_t minimum_permutations = std::max<std::size_t>(
+        4096u, (256u * 1024u + line_bytes - 1) / line_bytes);
+    const std::vector<Symbol> symbols = make_symbols(text);
+    if (capped_permutations(symbols, minimum_permutations)
+        < minimum_permutations)
+        return false;
+
+    PrefixFrontier frontier(symbols, text.size(), leaf_limit);
+    const int batch_capacity = 4 * threads;
+    std::vector<PrefixJob> jobs(batch_capacity);
+    int work_count = 0;
+
+#pragma omp parallel num_threads(threads) shared(frontier, jobs, work_count)
+    {
+        std::string output;
+        output.reserve(kBufferBytes);
+        while (true) {
+#pragma omp single
+            {
+                work_count = 0;
+                while (work_count < batch_capacity
+                       && frontier.next(jobs[work_count]))
+                    ++work_count;
+            }
+            if (work_count == 0)
+                break;
+#pragma omp for ordered schedule(dynamic, 1)
+            for (int index = 0; index < work_count; ++index) {
+                PrefixJob& job = jobs[index];
+                output.clear();
+                do {
+                    append_line(output, job.text);
+                } while (std::next_permutation(
+                    job.text.begin() + job.prefix_length, job.text.end()));
+#pragma omp ordered
+                {
+                    std::cout.write(
+                        output.data(),
+                        static_cast<std::streamsize>(output.size()));
+                }
+            }
+        }
+    }
+    return true;
+}
+#endif
+}
+
+int main()
+{
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    std::istreambuf_iterator<char> begin(std::cin), end;
+    std::string text(begin, end);
+    text.erase(std::remove_if(text.begin(), text.end(), IsWhitespace()),
+               text.end());
+    if (text.empty())
+        return 0;
+    std::sort(text.begin(), text.end());
+#ifdef _OPENMP
+    if (emit_parallel(text))
+        return 0;
+#endif
+    emit_serial(text);
+    return 0;
+}

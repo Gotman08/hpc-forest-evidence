@@ -1,0 +1,180 @@
+/*
+    Solve Laplace's equation using synchronous Jacobi iteration.
+    Two-sweep row pipelining keeps intermediate values in a small row cache.
+*/
+#include <stdio.h>
+#include <stdlib.h>
+
+#define CONV_THRESHOLD 1.0e-5f
+
+// Contiguous current and destination grids.
+double *grid;
+double *new_grid;
+static double *row_cache;
+
+int size;
+int iter_max_num;
+
+double absolute(double num){
+    if(num < 0)
+        return -1.0 * num;
+    return num;
+}
+
+void allocate_memory(void){
+    size_t n = (size_t)size;
+    if(n != 0 && n > ((size_t)-1) / sizeof(*grid) / n)
+        exit(EXIT_FAILURE);
+
+    grid = malloc(n * n * sizeof(*grid));
+    new_grid = malloc(n * n * sizeof(*new_grid));
+    row_cache = malloc(3 * n * sizeof(*row_cache));
+    if(n != 0 && (!grid || !new_grid || !row_cache)){
+        free(grid);
+        free(new_grid);
+        free(row_cache);
+        exit(EXIT_FAILURE);
+    }
+}
+
+void initialize_grid(void){
+    int center = size / 2;
+    int linf = center - (size / 10);
+    int lsup = center + (size / 10);
+    size_t n = (size_t)size;
+
+    for(int i = 0; i < size; i++){
+        for(int j = 0; j < size; j++){
+            double value = 0.0;
+            if(i >= linf && i <= lsup && j >= linf && j <= lsup)
+                value = 100.0;
+            grid[(size_t)i * n + j] = value;
+            // Both buffers must retain the original frozen boundaries.
+            new_grid[(size_t)i * n + j] = value;
+        }
+    }
+}
+
+void save_grid(void){
+    size_t n = (size_t)size;
+    for(int i = 0; i < size; i++){
+        const double *row = grid + (size_t)i * n;
+        for(int j = 0; j < size; j++){
+            fprintf(stdout, "%lf ", row[j]);
+        }
+        fprintf(stdout, "\n");
+    }
+}
+
+static inline int update_row(const double *restrict above,
+                             const double *restrict current,
+                             const double *restrict below,
+                             double *restrict output,
+                             int width){
+    int changed = 0;
+    for(int j = 1; j < width - 1; j++){
+        double value = 0.25 * (current[j+1] + current[j-1] +
+                              above[j] + below[j]);
+        output[j] = value;
+        changed |= absolute(value - current[j]) > CONV_THRESHOLD;
+    }
+    return changed;
+}
+
+static int single_sweep(const double *restrict source,
+                        double *restrict destination){
+    size_t n = (size_t)size;
+    int changed = 0;
+    for(int i = 1; i < size - 1; i++){
+        size_t offset = (size_t)i * n;
+        const double *row = source + offset;
+        changed |= update_row(row - n, row, row + n,
+                              destination + offset, size);
+    }
+    return changed;
+}
+
+// Bit zero records first-sweep changes; bit one records second-sweep changes.
+// Called only for grids with an interior and at least two remaining sweeps.
+static unsigned int two_sweeps(const double *restrict source,
+                               double *restrict destination,
+                               double *restrict cache){
+    size_t n = (size_t)size;
+    double *previous = cache;
+    double *current = cache + n;
+    double *next = cache + 2 * n;
+
+    // The first intermediate row is the unchanged top boundary.
+    for(int j = 0; j < size; j++)
+        previous[j] = source[j];
+
+    const double *first = source + n;
+    current[0] = first[0];
+    current[size-1] = first[size-1];
+    unsigned int changed = (unsigned int)update_row(source, first,
+                                                   first + n, current, size);
+
+    for(int i = 1; i < size - 2; i++){
+        const double *row = source + (size_t)(i + 1) * n;
+        next[0] = row[0];
+        next[size-1] = row[size-1];
+
+        // Produce the next intermediate row, then immediately consume it.
+        changed |= (unsigned int)update_row(row - n, row, row + n,
+                                            next, size);
+        changed |= (unsigned int)update_row(previous, current, next,
+                                            destination + (size_t)i * n,
+                                            size) << 1;
+
+        double *old_previous = previous;
+        previous = current;
+        current = next;
+        next = old_previous;
+    }
+
+    // The final intermediate neighbor is the unchanged bottom boundary.
+    changed |= (unsigned int)update_row(previous, current,
+                                        source + (n - 1) * n,
+                                        destination + (n - 2) * n,
+                                        size) << 1;
+    return changed;
+}
+
+int main(int argc, char *argv[]){
+    fscanf(stdin, "%d", &size);
+    fscanf(stdin, "%d", &iter_max_num);
+
+    allocate_memory();
+    initialize_grid();
+
+    int hasError = 1;
+    int iter = 0;
+    while(hasError && iter < iter_max_num){
+        if(size > 2 && iter_max_num - iter >= 2){
+            unsigned int changed = two_sweeps(grid, new_grid, row_cache);
+            if((changed & 1u) == 0){
+                // The reference stops after the first converged sweep.
+                // Its input is intact, so recover that exact first result.
+                single_sweep(grid, new_grid);
+                hasError = 0;
+                iter++;
+            } else {
+                hasError = (changed & 2u) != 0;
+                iter += 2;
+            }
+        } else {
+            hasError = single_sweep(grid, new_grid);
+            iter++;
+        }
+
+        double *old_grid = grid;
+        grid = new_grid;
+        new_grid = old_grid;
+    }
+
+    save_grid();
+    free(row_cache);
+    free(new_grid);
+    free(grid);
+    return 0;
+}

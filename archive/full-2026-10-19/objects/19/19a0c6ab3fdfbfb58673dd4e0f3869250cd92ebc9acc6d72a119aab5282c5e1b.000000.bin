@@ -1,0 +1,147 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define IBLOCK 4
+#define JBLOCK 128
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+void body_force(float *restrict px, float *restrict py, float *restrict pz,
+                float *restrict vx, float *restrict vy, float *restrict vz,
+                float dt, int n) {
+    #pragma omp parallel for schedule(dynamic,64)
+    for (int ib = 0; ib < n; ib += IBLOCK) {
+        int imax = ib + IBLOCK;
+        if (imax > n) imax = n;
+
+        float fx[IBLOCK];
+        float fy[IBLOCK];
+        float fz[IBLOCK];
+        for (int i = 0; i < imax - ib; ++i) {
+            fx[i] = 0.0f;
+            fy[i] = 0.0f;
+            fz[i] = 0.0f;
+        }
+
+        for (int jb = 0; jb < n; jb += JBLOCK) {
+            int jmax = jb + JBLOCK;
+            if (jmax > n) jmax = n;
+
+            for (int i = ib; i < imax; ++i) {
+                float xi = px[i];
+                float yi = py[i];
+                float zi = pz[i];
+                int li = i - ib;
+                float fxi = fx[li];
+                float fyi = fy[li];
+                float fzi = fz[li];
+
+                #pragma omp simd reduction(+:fxi,fyi,fzi) aligned(px,py,pz:16)
+                for (int j = jb; j < jmax; ++j) {
+                    float dx = px[j] - xi;
+                    float dy = py[j] - yi;
+                    float dz = pz[j] - zi;
+                    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+                    float inv_dist = 1.0f / sqrt(sqrd_dist);
+                    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+                    fxi += dx * inv_dist3;
+                    fyi += dy * inv_dist3;
+                    fzi += dz * inv_dist3;
+                }
+
+                fx[li] = fxi;
+                fy[li] = fyi;
+                fz[li] = fzi;
+            }
+        }
+
+        for (int i = ib; i < imax; ++i) {
+            int li = i - ib;
+            vx[i] += dt * fx[li];
+            vy[i] += dt * fy[li];
+            vz[i] += dt * fz[li];
+        }
+    }
+}
+
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  float *px, *py, *pz, *vx, *vy, *vz;
+  posix_memalign((void**)&px,  16, nbodies * sizeof(float));
+  posix_memalign((void**)&py,  16, nbodies * sizeof(float));
+  posix_memalign((void**)&pz,  16, nbodies * sizeof(float));
+  posix_memalign((void**)&vx,  16, nbodies * sizeof(float));
+  posix_memalign((void**)&vy,  16, nbodies * sizeof(float));
+  posix_memalign((void**)&vz,  16, nbodies * sizeof(float));
+
+  for (int i = 0; i < nbodies; ++i) {
+    px[i] = bodies[i].x;
+    py[i] = bodies[i].y;
+    pz[i] = bodies[i].z;
+    vx[i] = bodies[i].vx;
+    vy[i] = bodies[i].vy;
+    vz[i] = bodies[i].vz;
+  }
+
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(px, py, pz, vx, vy, vz, DT, nbodies);
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < nbodies; ++i) {
+      px[i] += vx[i] * DT;
+      py[i] += vy[i] * DT;
+      pz[i] += vz[i] * DT;
+    }
+  }
+
+  for (int i = 0; i < nbodies; ++i) {
+    bodies[i].x = px[i];
+    bodies[i].y = py[i];
+    bodies[i].z = pz[i];
+    bodies[i].vx = vx[i];
+    bodies[i].vy = vy[i];
+    bodies[i].vz = vz[i];
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(px); free(py); free(pz); free(vx); free(vy); free(vz);
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,262 @@
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+#ifdef _OPENMP
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <omp.h>
+#include <utility>
+#include <vector>
+#endif
+
+template <typename Iter> auto
+format_permutation (Iter first, Iter last) -> std::string
+{
+    std::string line ;
+    line += "[ " ;
+    while (first != last) {
+        line.push_back (*first) ;
+        line.push_back (' ') ;
+        ++ first ;
+    }
+    line += "]\n" ;
+    return line ;
+}
+
+struct PrintPermutation
+{
+    template <typename Iter> auto
+    operator () (Iter first, Iter last) const -> void
+    {
+        std::string line = format_permutation (first, last) ;
+        std::cout.write (line.data (), static_cast <std::streamsize> (line.size ())) ;
+    }
+} ;
+
+struct IsWhitespace
+{
+    template <typename Char> auto
+    operator () (Char c) const -> bool
+    {
+        return (c == ' ' )
+            || (c == '\n')
+            || (c == '\r')
+            || (c == '\t')
+            || (c == '\f')
+            || (c == '\v') ;
+    }
+} ;
+
+template <typename String> inline auto
+remove_whitespaces (String text) -> String
+{
+    text.erase
+        ( std::remove_if
+            ( text.begin ()
+            , text.end ()
+            , IsWhitespace () )
+        , text.end () ) ;
+    return text ;
+}
+
+template <typename Iter> auto
+find_longest_non_increasing_suffix (Iter first, Iter last) -> Iter
+{
+    if (first == last) return last ;
+    Iter back = std::prev (last) ;
+    if (back == first) return last ;
+    do {
+        -- last ;
+        -- back ;
+    } while ((first != last) && (*back >= *last)) ;
+    return last ;
+}
+
+template <typename Iter> auto
+find_rightmost_successor (Iter first, Iter second, Iter last) -> Iter
+{
+    if (second == last) return last ;
+    do {
+        -- last ;
+    } while ((second != last) && (*last <= *first)) ;
+    return last ;
+}
+
+template <typename Iter> auto
+next_permutation (Iter first, Iter last) -> bool
+{
+    if (first == last) return false ;
+    Iter suffix = find_longest_non_increasing_suffix (first, last) ;
+    if (suffix == first) return false ;
+    if (suffix == last)  return false ;
+    Iter pivot = std::prev (suffix) ;
+    Iter successor = find_rightmost_successor (pivot, suffix, last) ;
+    std::iter_swap (pivot, successor) ;
+    std::reverse (suffix, last) ;
+    return true ;
+}
+
+template <typename Iter, typename Function> inline auto
+permutations_iter (Iter first, Iter last, Function driver) -> void
+{
+    if (first == last) return ;
+    std::sort (first, last) ;
+    do {
+        driver (first, last) ;
+    } while (::next_permutation (first, last)) ;
+    return ;
+}
+
+template <typename String, typename Function> inline auto
+permutations (String text, Function driver) -> void
+{
+    permutations_iter (std::begin (text), std::end (text), driver) ;
+}
+
+template <typename String, typename InStream> inline auto
+read_text_from_stdin (InStream& in) -> String
+{
+    std::istreambuf_iterator <char> begin (in), end ;
+    std::string text (begin, end) ;
+    text = remove_whitespaces (text) ;
+    return text ;
+}
+
+#ifdef _OPENMP
+struct PermutationPipe
+{
+    std::mutex mutex ;
+    std::condition_variable not_empty ;
+    std::condition_variable not_full ;
+    std::deque <std::string> lines ;
+    bool done ;
+
+    PermutationPipe () : done (false) {}
+} ;
+
+static const std::size_t pipe_capacity = 2 ;
+
+auto produce_prefix_group
+    ( const std::string& sorted_text
+    , std::size_t prefix_index
+    , PermutationPipe& pipe ) -> void
+{
+    std::string permutation ;
+    permutation.reserve (sorted_text.size ()) ;
+    permutation.push_back (sorted_text [prefix_index]) ;
+    permutation.append (sorted_text.data (), prefix_index) ;
+    const std::size_t suffix_start = prefix_index + 1 ;
+    permutation.append
+        ( sorted_text.data () + suffix_start
+        , sorted_text.size () - suffix_start ) ;
+
+    auto suffix = std::next (permutation.begin ()) ;
+    do {
+        std::string line = format_permutation (permutation.begin (), permutation.end ()) ;
+        {
+            std::unique_lock <std::mutex> lock (pipe.mutex) ;
+            pipe.not_full.wait (lock, [&pipe] {
+                return pipe.lines.size () < pipe_capacity ;
+            }) ;
+            pipe.lines.push_back (std::move (line)) ;
+        }
+        pipe.not_empty.notify_one () ;
+    } while (::next_permutation (suffix, permutation.end ())) ;
+
+    {
+        std::lock_guard <std::mutex> lock (pipe.mutex) ;
+        pipe.done = true ;
+    }
+    pipe.not_empty.notify_one () ;
+}
+
+auto consume_prefix_groups
+    ( const std::vector <std::unique_ptr <PermutationPipe>>& pipes ) -> void
+{
+    for (std::size_t group = 0 ; group < pipes.size () ; ++ group) {
+        PermutationPipe& pipe = *pipes [group] ;
+        while (true) {
+            std::string line ;
+            {
+                std::unique_lock <std::mutex> lock (pipe.mutex) ;
+                pipe.not_empty.wait (lock, [&pipe] {
+                    return !pipe.lines.empty () || pipe.done ;
+                }) ;
+                if (pipe.lines.empty ()) break ;
+                line = std::move (pipe.lines.front ()) ;
+                pipe.lines.pop_front () ;
+            }
+            pipe.not_full.notify_one () ;
+            std::cout.write
+                ( line.data ()
+                , static_cast <std::streamsize> (line.size ()) ) ;
+        }
+    }
+}
+
+auto parallel_prefix_permutations
+    ( const std::string& sorted_text
+    , const std::vector <std::size_t>& prefix_indices ) -> void
+{
+    std::vector <std::unique_ptr <PermutationPipe>> pipes ;
+    for (std::size_t group = 0 ; group < prefix_indices.size () ; ++ group) {
+        pipes.push_back (std::unique_ptr <PermutationPipe> (new PermutationPipe)) ;
+    }
+
+    bool use_parallel = false ;
+#pragma omp parallel num_threads(4) shared(use_parallel, pipes, sorted_text, prefix_indices)
+    {
+#pragma omp single
+        {
+            use_parallel = omp_get_num_threads () > 1 ;
+        }
+
+        if (use_parallel) {
+#pragma omp master
+            {
+                consume_prefix_groups (pipes) ;
+            }
+#pragma omp for schedule(dynamic, 1)
+            for (int group = 0 ; group < static_cast <int> (prefix_indices.size ()) ; ++ group) {
+                produce_prefix_group
+                    ( sorted_text
+                    , prefix_indices [static_cast <std::size_t> (group)]
+                    , *pipes [static_cast <std::size_t> (group)] ) ;
+            }
+        } else {
+#pragma omp master
+            {
+                permutations (sorted_text, PrintPermutation ()) ;
+            }
+        }
+    }
+}
+#endif
+
+int main (int argc, char const *argv [])
+{
+    std::string text = read_text_from_stdin <std::string> (std::cin) ;
+#ifdef _OPENMP
+    std::string sorted_text = text ;
+    std::sort (sorted_text.begin (), sorted_text.end ()) ;
+
+    std::vector <std::size_t> prefix_indices ;
+    for (std::size_t i = 0 ; i < sorted_text.size () ; ++ i) {
+        if (i == 0 || sorted_text [i] != sorted_text [i - 1]) {
+            prefix_indices.push_back (i) ;
+        }
+    }
+
+    if (prefix_indices.size () > 1) {
+        parallel_prefix_permutations (sorted_text, prefix_indices) ;
+        return 0 ;
+    }
+#endif
+    permutations (text, PrintPermutation ()) ;
+    return 0 ;
+}

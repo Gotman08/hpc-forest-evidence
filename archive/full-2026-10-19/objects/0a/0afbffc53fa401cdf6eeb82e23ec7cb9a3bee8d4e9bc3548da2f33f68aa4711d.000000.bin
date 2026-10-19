@@ -1,0 +1,166 @@
+"""Seal local source-bound MAX plan/payload; no qualification, CLI or submission."""
+
+import gzip
+import hashlib
+import io
+import json
+import tarfile
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+BASE = Path(__file__).resolve().parents[4]
+HERE = Path(__file__).resolve().parent
+REL = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2e"
+CANDIDATE = REL / "correction-cli/candidats/revision-r1"
+PACKAGE = REL / "qualification-zero-modele-r1/paquet-source-lie-r1"
+SOURCE_SHA = "f15b840cca876a4c465775f5553a0eaa539a9b98e56fe942136a1fcbde9b86b9"
+RUNTIME_SHA = "a4a9418edb8ea86aeb720259eca1a7ac246952d280648115be4c93cd0364800b"
+PARENT_PAYLOAD = BASE / "outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2d/hpc-forest-primes-native-max-r2d-proposition.tar.gz"
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def ref(path):
+    return {"path": str(path), "sha256": digest(path.read_bytes())}
+
+
+def data(value):
+    return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def write(path, raw):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as stream:
+        stream.write(raw)
+
+
+def main():
+    if PACKAGE.exists():
+        raise RuntimeError("Preserve any previous source-bound payload")
+    runtime_raw = (CANDIDATE / "runtime-manifest-r2max.json").read_bytes()
+    source_raw = (CANDIDATE / "HPC-Forest-Primes-Natif-MAX-r2e.zip").read_bytes()
+    assert digest(runtime_raw) == RUNTIME_SHA and digest(source_raw) == SOURCE_SHA
+    runtime = json.loads(runtime_raw)
+    assert len(runtime) == 108
+    sources = {}
+    with zipfile.ZipFile(io.BytesIO(source_raw)) as archive:
+        for member in archive.infolist():
+            name = PurePosixPath(member.filename)
+            assert member.filename == str(name) and name.parts[0] == "HPC-Forest" and len(name.parts) > 1
+            assert ".." not in name.parts and not member.is_dir()
+            key = name.relative_to("HPC-Forest").as_posix()
+            assert key not in sources
+            sources[key] = archive.read(member)
+    assert {key: digest(raw) for key, raw in sources.items()} == runtime
+    project = BASE / "work/hpc-forest-primes-natif-relance-r2e/project"
+    assert all(digest((project / name).read_bytes()) == checksum for name, checksum in runtime.items())
+    assert digest(PARENT_PAYLOAD.read_bytes()) == "afef88fa43a3c48597f4326c8dd214d9c0aba87ff3c82a552405aac899f3c3a3"
+    preserved = {}
+    with tarfile.open(PARENT_PAYLOAD, "r:gz") as archive:
+        for member in archive:
+            assert member.isfile() and not member.issym() and not member.islnk()
+            if member.name.startswith("certified-preparation/") or member.name == "preparation-review-original.json":
+                assert member.name not in preserved
+                preserved[member.name] = archive.extractfile(member).read()
+    assert digest(preserved["certified-preparation/prototype-manifest.json"]) == "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+    assert digest(preserved["preparation-review-original.json"]) == "af703fd382e2065eb966cebfd3eb201ee6286826dbc28802185c22c5932269ab"
+    prototype = json.loads(preserved["certified-preparation/prototype-manifest.json"])
+    assert {name.removeprefix("certified-preparation/") for name in preserved if name.startswith("certified-preparation/")} == set(prototype) | {"prototype-manifest.json"}
+    assert all(digest(preserved["certified-preparation/" + name]) == info["sha256"]
+               and len(preserved["certified-preparation/" + name]) == info["bytes"] for name, info in prototype.items())
+    original_plan = HERE.parent / "PLAN-R2E-PREPARE-NON-ADMIS.json"
+    plan = json.loads(original_plan.read_text(encoding="utf-8"))
+    plan.update(source_zip_sha256=SOURCE_SHA,
+                preparation_manifest_sha256="d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd",
+                preparation_review_sha256="af703fd382e2065eb966cebfd3eb201ee6286826dbc28802185c22c5932269ab",
+                created_utc=datetime.now(UTC).isoformat(),
+                status="local_source108_plan_sealed_independent_review_and_new_allocated_Q_required",
+                source_pins_pending_are_not_positive_admissions=False)
+    del plan["exact_new_CLI_argv_compatibility_requires_separate_received_proof"]
+    plan.update({
+        "candidate_CLI_options_and_task_policy_mechanically_reviewed_before_initial_normal_batch": True,
+        "effective_clean_NORMAL_and_real_evaluation_required_before_extension": True,
+        "separate_diagnostic_model_call_required_or_authorized": False,
+        "historical_first_start_before_other_models_means_received_Luna_only": True,
+        "first_batch_gate": {
+            "initial_slice": "existing first A/B/C batch, unchanged order and shared attempt budget",
+            "no_pause_after_one_response_that_would_prevent_batch_evaluation": True,
+            "existing_controller_max_batches": 1,
+            "boundary": "after batch reconciliation and actual first_start_receipt, before next controller.run",
+            "paused_snapshot_filename": "premier-batch-en-attente.json",
+            "paused_snapshot_schema": "hpc-forest-r2e-first-batch-paused-v1",
+            "release_filename": "autorisation-apres-premier-batch.json",
+            "release_schema": "hpc-forest-r2e-first-batch-release-v1",
+            "private_cli_audit_schema": "hpc-forest-r2e-private-cli-audit-digest-projection-v1",
+            "exact_cell_source_plan_job_first_receipt_evaluation_and_private_call_hashes_required": True,
+            "pending_or_unknown_or_diagnostic_does_not_release": True,
+            "pause_included_in_existing_1800_seconds_no_budget_recredit": True,
+            "deadline_rechecked_after_release_validation": True,
+            "expiration_creates_model_error_or_response": False,
+            "algorithmic_negatives_require_no_gain_and_stay_negative": True,
+        },
+        "private_CLI_policy": {
+            "local_only": True, "worker_arguments": ["--cli-policy", "--cli-policy-sha256"],
+            "basename": "cli-policy-SESSION.json", "schema": "hpc-forest-r2e-local-cli-policy-v1",
+            "per_cell_binding_required": True, "digest_in_cli_identity": "task_cli_policy_sha256",
+            "raw_skill_directory_list_in_source_or_ARM_payload": False,
+            "public_metadata_schema": "hpc-forest-r2e-private-cli-metadata-projection-v1",
+            "projected_metadata_are_executable_or_private_argv_verified": False,
+            "root_private_raw_audit_before_release_required": True,
+        },
+        "source_candidate": ref(CANDIDATE / "LIVRAISON-SOURCE-CANDIDATE-POUR-REVUE.json"),
+        "new_source_member_count": 108,
+    })
+    plan_raw = data(plan)
+    write(HERE / "native-max-plan.json", plan_raw)
+    material = {**preserved, **{"HPC-Forest/" + key: raw for key, raw in sources.items()},
+                "HPC-Forest-Primes-Natif-MAX-r2e.zip": source_raw,
+                "native-max-plan.json": plan_raw, "runtime-manifest-r2max.json": runtime_raw}
+    design = {"schema": "hpc-forest-r2e-closed-external-interface-v1", "scope_id": plan["scope_id"],
+              "cells": plan["cells"], "source_files": 108, "source_zip_sha256": SOURCE_SHA,
+              "plan_sha256": digest(plan_raw), "required_admission_artifacts": plan["required_admission_artifacts"],
+              "first_batch_gate": plan["first_batch_gate"], "private_CLI_policy": plan["private_CLI_policy"],
+              "new_allocated_qualification_required": True, "native_research_admitted": False}
+    material["DESIGN-INTERFACE.json"] = data(design)
+    manifest = {"schema": "hpc-forest-r2max-proposal-bundle-manifest-v3",
+                "scope_id": plan["scope_id"], "source_zip_sha256": SOURCE_SHA,
+                "plan_sha256": digest(plan_raw), "source_member_count": 108,
+                "files": {name: digest(raw) for name, raw in sorted(material.items())}}
+    material["proposal-bundle-manifest.json"] = data(manifest)
+    PACKAGE.mkdir()
+    for name, raw in material.items():
+        if not name.startswith("HPC-Forest/"):
+            write(PACKAGE.joinpath(*PurePosixPath(name).parts), raw)
+    bundle = PACKAGE / "hpc-forest-primes-native-max-r2e-proposition.tar.gz"
+    with bundle.open("xb") as raw_archive, gzip.GzipFile(fileobj=raw_archive, mode="wb", mtime=0) as compressed, tarfile.open(fileobj=compressed, mode="w") as archive:
+        for name, raw in sorted(material.items()):
+            info = tarfile.TarInfo(name)
+            info.size, info.mtime, info.mode = len(raw), 0, 0o644
+            archive.addfile(info, io.BytesIO(raw))
+    with tarfile.open(bundle, "r:gz") as archive:
+        restored = {member.name: archive.extractfile(member).read() for member in archive}
+    assert restored == material
+    delivery = {"schema": "hpc-forest-primes-r2e-local-source-bound-proposal-delivery-v1",
+                "status": "local_sealed_source108_and_plan_not_ARM64_or_native_admitted",
+                "source_zip": ref(PACKAGE / "HPC-Forest-Primes-Natif-MAX-r2e.zip"),
+                "plan": ref(PACKAGE / "native-max-plan.json"), "plan_origin": ref(HERE / "native-max-plan.json"),
+                "runtime_manifest": ref(PACKAGE / "runtime-manifest-r2max.json"),
+                "bundle": ref(bundle), "bundle_manifest": ref(PACKAGE / "proposal-bundle-manifest.json"),
+                "design": ref(PACKAGE / "DESIGN-INTERFACE.json"),
+                "source_files": 108, "source_files_verified": 108, "bundle_regular_members_verified": len(material),
+                "all_certified_preparation_members_byte_identical": True,
+                "preparation_parent_payload": ref(PARENT_PAYLOAD), "source_candidate": ref(CANDIDATE / "LIVRAISON-SOURCE-CANDIDATE-POUR-REVUE.json"),
+                "native_research_admitted": False, "arm64_qualification_admitted": False,
+                "independent_source_bundle_review_required": True, "new_allocated_qualification_required": True,
+                "native_model_calls": 0, "jobs_submitted": 0}
+    write(PACKAGE / "LIVRAISON-LOCALE-FINALE.json", data(delivery))
+    print(json.dumps({"delivery": ref(PACKAGE / "LIVRAISON-LOCALE-FINALE.json"), "bundle": ref(bundle),
+                      "plan": ref(PACKAGE / "native-max-plan.json"), "source_members": 108,
+                      "bundle_members": len(material)}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

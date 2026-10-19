@@ -1,0 +1,163 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+enum { TARGET_LANES = 8 };
+
+/*
+ * SIMD lanes represent independent targets, not partial force sums.
+ * Every target still accumulates sources in increasing j order.
+ * errno is not observed by the simulation; all other math options remain
+ * unchanged, including the double-precision sqrt and division.
+ */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, optimize("no-math-errno")))
+#endif
+static void body_force_tile(Body *p, float dt, int n, int base) {
+  float x[TARGET_LANES] __attribute__((aligned(16)));
+  float y[TARGET_LANES] __attribute__((aligned(16)));
+  float z[TARGET_LANES] __attribute__((aligned(16)));
+  float fx[TARGET_LANES] __attribute__((aligned(16)));
+  float fy[TARGET_LANES] __attribute__((aligned(16)));
+  float fz[TARGET_LANES] __attribute__((aligned(16)));
+
+  #pragma omp simd simdlen(4) aligned(x,y,z,fx,fy,fz:16)
+  for (int lane = 0; lane < TARGET_LANES; ++lane) {
+    x[lane] = p[base + lane].x;
+    y[lane] = p[base + lane].y;
+    z[lane] = p[base + lane].z;
+    fx[lane] = 0.0f;
+    fy[lane] = 0.0f;
+    fz[lane] = 0.0f;
+  }
+
+  for (int j = 0; j < n; ++j) {
+    const float sx = p[j].x;
+    const float sy = p[j].y;
+    const float sz = p[j].z;
+
+    #pragma omp simd simdlen(4) aligned(x,y,z,fx,fy,fz:16)
+    for (int lane = 0; lane < TARGET_LANES; ++lane) {
+      float dx = sx - x[lane];
+      float dy = sy - y[lane];
+      float dz = sz - z[lane];
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx[lane] += dx * inv_dist3;
+      fy[lane] += dy * inv_dist3;
+      fz[lane] += dz * inv_dist3;
+    }
+  }
+
+  #pragma omp simd simdlen(4) aligned(fx,fy,fz:16)
+  for (int lane = 0; lane < TARGET_LANES; ++lane) {
+    p[base + lane].vx += dt*fx[lane];
+    p[base + lane].vy += dt*fy[lane];
+    p[base + lane].vz += dt*fz[lane];
+  }
+}
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in
+ * the system. Positions remain read-only throughout this phase.
+ */
+void body_force(Body *p, float dt, int n) {
+  const int full_tiles = n / TARGET_LANES;
+
+  #pragma omp parallel for schedule(static)
+  for (int tile = 0; tile < full_tiles; ++tile) {
+    body_force_tile(p, dt, n, tile * TARGET_LANES);
+  }
+
+  for (int i = full_tiles * TARGET_LANES; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; j++) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

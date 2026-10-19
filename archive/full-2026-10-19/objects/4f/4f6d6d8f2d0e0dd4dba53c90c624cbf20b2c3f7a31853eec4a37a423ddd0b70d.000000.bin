@@ -1,0 +1,166 @@
+#include <bits/stdc++.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using namespace std;
+
+int A[1000][1000];
+int ps[1010][1010];
+
+typedef long long ll;
+
+class PrefixFrequencyWorkspace {
+  vector<int> keys_;
+  vector<uint32_t> counts_;
+  size_t mask_;
+
+  static uint32_t hash_key(int key) {
+    uint32_t x = static_cast<uint32_t>(key);
+    x ^= x >> 16;
+    x *= UINT32_C(0x7feb352d);
+    x ^= x >> 15;
+    x *= UINT32_C(0x846ca68b);
+    x ^= x >> 16;
+    return x;
+  }
+
+  size_t find_slot(int key) const {
+    size_t slot = static_cast<size_t>(hash_key(key)) & mask_;
+    while (counts_[slot] != 0 && keys_[slot] != key)
+      slot = (slot + 1) & mask_;
+    return slot;
+  }
+
+public:
+  explicit PrefixFrequencyWorkspace(size_t max_prefixes) {
+    size_t capacity = 1;
+    while (capacity < 2 * max_prefixes)
+      capacity <<= 1;
+    keys_.resize(capacity);
+    counts_.resize(capacity);
+    mask_ = capacity - 1;
+  }
+
+  void reset() {
+    fill(counts_.begin(), counts_.end(), uint32_t(0));
+    increment(0);
+  }
+
+  uint32_t count(int key) const {
+    // An unsuccessful lookup never inserts a key.
+    return counts_[find_slot(key)];
+  }
+
+  void increment(int key) {
+    const size_t slot = find_slot(key);
+    if (counts_[slot] == 0)
+      keys_[slot] = key;
+    ++counts_[slot];
+  }
+};
+
+static ll count_start_column(int j, int m, int n, int k,
+                            PrefixFrequencyWorkspace& h) {
+  ll ans = 0;
+  for (int l = j; l <= n; l++) {
+    h.reset();
+    int s = 0;
+    for (int i = 1; i <= m; i++) {
+      s += ps[i][l] - ps[i][j - 1];
+      // Query before insertion, including when k is zero.
+      ans += h.count(s - k);
+      h.increment(s);
+    }
+  }
+  return ans;
+}
+
+static ll count_paired_starts(int task, int m, int n, int k,
+                             PrefixFrequencyWorkspace& h) {
+  const int first = task + 1;
+  const int second = n - task;
+  ll ans = count_start_column(first, m, n, k, h);
+  if (first != second)
+    ans += count_start_column(second, m, n, k, h);
+  return ans;
+}
+
+ll solve(int m, int n, int k) {
+  for (int i = 1; i <= m; i++) {
+    ps[i][0] = 0;
+    for (int j = 1; j <= n; j++) {
+      ps[i][j] = A[i - 1][j - 1] + ps[i][j - 1];
+    }
+  }
+
+  // Opposite starting columns together contain n + 1 bands.
+  // For odd n, process the central starting column only once.
+  const int tasks = (n + 1) / 2;
+  const ll row_visits = static_cast<ll>(m) * n * (n + 1) / 2;
+  const ll minimum_visits_per_worker = 32768;
+  int workers = 1;
+  if (tasks >= 2 && row_visits >= 2 * minimum_visits_per_worker)
+    workers = 2;
+  if (tasks >= 4 && row_visits >= 4 * minimum_visits_per_worker)
+    workers = 4;
+#ifdef _OPENMP
+  workers = min(workers, omp_get_max_threads());
+#endif
+
+  ll ans = 0;
+  if (workers == 1) {
+    PrefixFrequencyWorkspace h(static_cast<size_t>(m) + 1);
+    for (int task = 0; task < tasks; task++)
+      ans += count_paired_starts(task, m, n, k, h);
+    return ans;
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(workers) reduction(+:ans)
+  {
+    PrefixFrequencyWorkspace h(static_cast<size_t>(m) + 1);
+#pragma omp for schedule(dynamic, 1) nowait
+    for (int task = 0; task < tasks; task++)
+      ans += count_paired_starts(task, m, n, k, h);
+  }
+#else
+  atomic<int> next_task{0};
+  array<ll, 4> subtotals{};
+  auto run_worker = [&](int worker) {
+    PrefixFrequencyWorkspace h(static_cast<size_t>(m) + 1);
+    ll subtotal = 0;
+    for (;;) {
+      const int task = next_task.fetch_add(1, memory_order_relaxed);
+      if (task >= tasks)
+        break;
+      subtotal += count_paired_starts(task, m, n, k, h);
+    }
+    subtotals[worker] = subtotal;
+  };
+
+  array<thread, 3> threads;
+  for (int worker = 1; worker < workers; worker++)
+    threads[worker - 1] = thread(run_worker, worker);
+  run_worker(0);
+  for (int worker = 1; worker < workers; worker++)
+    threads[worker - 1].join();
+  for (int worker = 0; worker < workers; worker++)
+    ans += subtotals[worker];
+#endif
+  return ans;
+}
+
+int main() {
+  int k, m, n;
+  cin >> k >> m >> n;
+  memset(A, 0, sizeof A);
+  memset(ps, 0, sizeof ps);
+
+  for (int i = 0; i < m; i++)
+    for (int j = 0; j < n; j++)
+      cin >> A[i][j];
+
+  cout << solve(m, n, k) << endl;
+  return 0;
+}

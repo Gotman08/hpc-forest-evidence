@@ -1,0 +1,167 @@
+param(
+    [Parameter(Mandatory=$true)][string]$PreparationReview,
+    [Parameter(Mandatory=$true)][string]$PreparationReviewSha256,
+    [Parameter(Mandatory=$true)][string]$OutputDirectory,
+    [switch]$Execute
+)
+$ErrorActionPreference='Stop'
+if($PSVersionTable.PSVersion -lt [version]'7.5'){throw 'PowerShell7.5+ required for exact JSON identity dates; no census or effect'}
+$taskRoot=$PSScriptRoot
+$taskBase='C:\Users\nicol\Documents\Codex\2026-10-15\cr'
+$taskPython='C:\Users\nicol\AppData\Local\Programs\Python\Python313\python.exe'
+if((Get-FileHash -LiteralPath $taskPython -Algorithm SHA256).Hash.ToLowerInvariant() -cne '5ef72c30ca3b82df7c7e186c9220bde665be9a335edbd4a371a4b19d0ac76644'){throw 'Pinned ROOT Python5ef differs; no Python call/census/effect'}
+$taskGate=Join-Path $PSScriptRoot 'garder-fermeture-passive-R8.py'
+$taskGateSha='9530ca13166cd9afbaa0b9fc3b5b93cd53b471bffe264bcec705befcebd77c16'
+if((Get-FileHash -LiteralPath $taskGate -Algorithm SHA256).Hash.ToLowerInvariant() -cne $taskGateSha){throw 'Pinned gate differs; no census or effect'}
+$taskReviewArgs=@('--review',$PreparationReview,'--review-sha256',$PreparationReviewSha256)
+$taskReviewText=& $taskPython -I -B $taskGate --mode review-check @taskReviewArgs
+if($LASTEXITCODE -ne 0){throw 'Independent preparation review NON_ADMIS; no census or effect'}
+$taskReviewCheck=$taskReviewText|ConvertFrom-Json
+if($taskReviewCheck.verified_preparation_review -ne $true -or ($taskReviewCheck.permitted_effect_ids -join ',') -cne '19968'){throw 'Wrong sole observer-main scope'}
+if($OutputDirectory -match '(^|[\\/])\.\.([\\/]|$)' -or $OutputDirectory.StartsWith('\\') -or $OutputDirectory -match '[\\/][^\\/]*[. ]([\\/]|$)'){throw 'Literal ordinary output only'}
+$taskOut=[IO.Path]::GetFullPath($OutputDirectory)
+if([IO.Path]::GetDirectoryName($taskOut) -cne $taskRoot -or (Test-Path -LiteralPath $taskOut)){throw 'A new direct owned execution directory is required'}
+function Assert-TaskParents([string]$path){
+    $taskPart=$path
+    while($taskPart){
+        if(Test-Path -LiteralPath $taskPart){$taskInfo=Get-Item -LiteralPath $taskPart -Force;if(($taskInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Reparse output parent refused'}}
+        $taskParent=[IO.Path]::GetDirectoryName($taskPart)
+        if($taskParent -ceq $taskPart){break};$taskPart=$taskParent
+    }
+}
+Assert-TaskParents $taskOut
+[IO.Directory]::CreateDirectory($taskOut)|Out-Null
+function Save-TaskNew([string]$path,$value){
+    Assert-TaskParents $path
+    $taskBytes=[Text.UTF8Encoding]::new($false,$true).GetBytes(($value|ConvertTo-Json -Depth 70)+"`n")
+    $taskStream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try{$taskStream.Write($taskBytes,0,$taskBytes.Length);$taskStream.Flush($true)}finally{$taskStream.Dispose()}
+}
+function Ref-Task([string]$path){return @{path=$path;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}}
+function Capture-TaskFullCim {
+    # ROOT-only unfiltered metadata capture. No CLI/auth/MCP/network/model/cache.
+    $taskRows=@(Get-CimInstance Win32_Process -OperationTimeoutSec 10 -ErrorAction Stop|ForEach-Object {
+        [ordered]@{ProcessId=[int]$_.ProcessId;ParentProcessId=[int]$_.ParentProcessId;ExecutablePath=$_.ExecutablePath;CommandLine=$_.CommandLine;CreationDate=$(if($null -eq $_.CreationDate){$null}else{$_.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')})}
+    })
+    $taskNow=[DateTimeOffset]::UtcNow
+    $taskCensus=[ordered]@{schema='hpc-forest-dynamic-r4b-full-cim-v1';observed_at=$taskNow.ToUnixTimeMilliseconds()/1000.0;captured_at_utc=$taskNow.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ');complete_census=$true;strict_utf8_decoding=$true;rows_count=$taskRows.Count;rows=$taskRows}
+    $taskPath=Join-Path $taskOut ('CIM-COMPLET-'+[guid]::NewGuid().ToString('N')+'.json')
+    Save-TaskNew $taskPath $taskCensus
+    return Ref-Task $taskPath
+}
+function Invoke-TaskGate([string]$mode,$census,$plan=$null,$action=$null){
+    $taskArgs=@('--mode',$mode)+$taskReviewArgs+@('--cim',$census.path,'--cim-sha256',$census.sha256,'--output-directory',$taskOut)
+    if($null -ne $plan){$taskArgs+=@('--plan',$plan.path,'--plan-sha256',$plan.sha256)}
+    if($null -ne $action){$taskArgs+=@('--action',$action.path,'--action-sha256',$action.sha256)}
+    $taskText=& $taskPython -I -B $taskGate @taskArgs
+    if($LASTEXITCODE -ne 0){throw ('Fresh metadata/native0/cache/graph gate refused: '+$mode)}
+    return $taskText|ConvertFrom-Json
+}
+function Load-TaskJson([string]$path){
+    # Identity dates are strings in Python JSON and are compared by UTC ticks below.
+    return Get-Content -LiteralPath $path -Raw|ConvertFrom-Json -DateKind String
+}
+function Assert-TaskMainImage($expected){
+    if([string]$expected.ExecutablePath -cne 'C:\Users\nicol\AppData\Local\Programs\Python\Python313\python.exe' -or (Get-FileHash -LiteralPath $expected.ExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne '5ef72c30ca3b82df7c7e186c9220bde665be9a335edbd4a371a4b19d0ac76644'){throw 'Exact original main image path/file SHA differs; no effect'}
+}
+function Match-TaskCim($actual,$expected){
+    if($null -eq $actual){return $false}
+    return [int]$actual.ProcessId -eq [int]$expected.ProcessId -and [int]$actual.ParentProcessId -eq [int]$expected.ParentProcessId -and [string]$actual.ExecutablePath -ceq [string]$expected.ExecutablePath -and [string]$actual.CommandLine -ceq [string]$expected.CommandLine -and $actual.CreationDate.ToUniversalTime().Ticks -eq ([datetime]$expected.CreationDate).ToUniversalTime().Ticks
+}
+$taskPlan=$null
+$taskAction=$null
+$taskHandle=[IntPtr]::Zero
+$taskNativeAttempted=$false
+try{
+    $taskBefore=Capture-TaskFullCim
+    $taskPlan=Invoke-TaskGate 'prepare' $taskBefore
+    if(-not $Execute){Write-Output ($taskPlan|ConvertTo-Json -Compress);return}
+    $taskIntentPath=Join-Path $taskRoot 'INTENTION-UNIQUE-OBS4-R8-19968.json'
+    if(Test-Path -LiteralPath $taskIntentPath){throw 'Prior durable intent exists; no repeat native effect in any new output'}
+    $taskPlanBody=Load-TaskJson $taskPlan.path
+    $taskExpected=$taskPlanBody.main_identity
+    if([int]$taskExpected.ProcessId -ne 19968 -or [int]$taskExpected.ParentProcessId -ne 9192){throw 'Only original passive observer main is permitted'}
+    Assert-TaskMainImage $taskExpected
+    if('OwnedR8Obs4Native' -as [type]){throw 'Native scope already initialized in this PowerShell; automatic repeat forbidden'}
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class OwnedR8Obs4Native {
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool CloseHandle(IntPtr handle);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern uint GetProcessId(IntPtr handle);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetProcessTimes(IntPtr handle,out long creation,out long exit,out long kernel,out long user);
+ [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr handle,uint flags,StringBuilder text,ref uint size);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr handle,uint millis);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateProcess(IntPtr handle,uint code);
+ public static long BirthTicks(IntPtr handle){long c,e,k,u;if(!GetProcessTimes(handle,out c,out e,out k,out u))throw new Win32Exception(Marshal.GetLastWin32Error());return DateTime.FromFileTimeUtc(c).Ticks;}
+ public static long CimCreationTicks(long exactNativeBirthTicks){return exactNativeBirthTicks-(exactNativeBirthTicks%10);}
+ public static string Image(IntPtr handle){uint count=32768;var text=new StringBuilder((int)count);if(!QueryFullProcessImageName(handle,0,text,ref count))throw new Win32Exception(Marshal.GetLastWin32Error());return text.ToString();}
+}
+'@
+    $taskRow=Get-CimInstance Win32_Process -Filter 'ProcessId=19968' -OperationTimeoutSec 10 -ErrorAction Stop
+    if($null -eq $taskRow){
+        $taskOutcome='natural_exit_observed'
+    }else{
+        if(-not (Match-TaskCim $taskRow $taskExpected)){throw 'Changed/reused/foreign PID preserved before handle'}
+        # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE.
+        $taskHandle=[OwnedR8Obs4Native]::OpenProcess(0x101001,$false,19968)
+        if($taskHandle -eq [IntPtr]::Zero){
+            $taskError=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $taskRow=Get-CimInstance Win32_Process -Filter 'ProcessId=19968' -OperationTimeoutSec 10 -ErrorAction Stop
+            if($null -eq $taskRow -and $taskError -eq 87){$taskOutcome='natural_exit_observed'}else{throw ('Handle open refused/ambiguous; no fallback: '+$taskError)}
+        }else{
+            $taskBirth=[OwnedR8Obs4Native]::BirthTicks($taskHandle)
+            if([OwnedR8Obs4Native]::GetProcessId($taskHandle) -ne 19968 -or [OwnedR8Obs4Native]::CimCreationTicks($taskBirth) -ne ([datetime]$taskExpected.CreationDate).ToUniversalTime().Ticks -or -not [string]::Equals([OwnedR8Obs4Native]::Image($taskHandle),$taskExpected.ExecutablePath,[StringComparison]::OrdinalIgnoreCase)){throw 'Stable native handle PID/image/exact projected birth mismatch'}
+            # Hold the same native instance while the complete double-zero graph/cache gate runs again.
+            $taskHeldCensus=Capture-TaskFullCim
+            $taskHeldGate=Invoke-TaskGate 'recheck' $taskHeldCensus $taskPlan
+            $taskRow=Get-CimInstance Win32_Process -Filter 'ProcessId=19968' -OperationTimeoutSec 10 -ErrorAction Stop
+            $taskSignal=[OwnedR8Obs4Native]::WaitForSingleObject($taskHandle,0)
+            if($taskSignal -eq 0){$taskOutcome='natural_exit_observed'}else{
+                if($taskSignal -ne 258 -or -not (Match-TaskCim $taskRow $taskExpected) -or [OwnedR8Obs4Native]::BirthTicks($taskHandle) -ne $taskBirth){throw 'Held instance/current identity changed before intent'}
+                $taskIntent=@{schema='hpc-forest-r8-obs4-main-only-durable-effect-intent-v1';plan=$taskPlan;identity=$taskExpected;effect_targets=@(19968);review=(Ref-Task $PreparationReview);fresh_gate=$taskHeldGate;stable_native_handle_verified=$true;native_birth_ticks=$taskBirth;cim_creation_quantum_100ns_ticks=10;cim_birth_projection_ticks=[OwnedR8Obs4Native]::CimCreationTicks($taskBirth);recursive_or_name_stop=$false;services_or_foreign_stop_permitted=$false;automatic_retry_allowed=$false;at_utc=[datetime]::UtcNow.ToString('o')}
+                Save-TaskNew $taskIntentPath $taskIntent
+                $taskIntentRef=Ref-Task $taskIntentPath
+                # Final exact target/native check after durable intent; natural exit remains natural.
+                $taskSignal=[OwnedR8Obs4Native]::WaitForSingleObject($taskHandle,0)
+                if($taskSignal -eq 0){$taskOutcome='natural_exit_observed'}else{
+                    $taskRow=Get-CimInstance Win32_Process -Filter 'ProcessId=19968' -OperationTimeoutSec 10 -ErrorAction Stop
+                    $taskHeldBody=Load-TaskJson $taskHeldGate.path
+                    $taskCimBody=Load-TaskJson $taskHeldCensus.path
+                    $taskAge=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0-[double]$taskCimBody.observed_at
+                    if($taskSignal -ne 258 -or $taskAge -lt 0 -or $taskAge -gt 45 -or -not (Match-TaskCim $taskRow $taskExpected) -or [OwnedR8Obs4Native]::GetProcessId($taskHandle) -ne 19968 -or [OwnedR8Obs4Native]::BirthTicks($taskHandle) -ne $taskBirth -or -not [string]::Equals([OwnedR8Obs4Native]::Image($taskHandle),$taskExpected.ExecutablePath,[StringComparison]::OrdinalIgnoreCase)){throw 'Final current identity/held birth/fresh45 gate refused'}
+                    Assert-TaskMainImage $taskExpected
+                    $taskNativeAttempted=$true
+                    if(-not [OwnedR8Obs4Native]::TerminateProcess($taskHandle,1)){
+                        $taskNativeError=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        Save-TaskNew (Join-Path $taskOut 'EFFET-UNKNOWN.json') @{schema='hpc-forest-r8-obs4-main-only-effect-unknown-v1';identity=$taskExpected;intent=$taskIntentRef;native_call_attempted=$true;win32_error=$taskNativeError;automatic_retry_allowed=$false;next_effect_forbidden=$true}
+                        throw 'Native outcome UNKNOWN; preserve intent and all processes, no retry'
+                    }
+                    if([OwnedR8Obs4Native]::WaitForSingleObject($taskHandle,5000) -ne 0){
+                        Save-TaskNew (Join-Path $taskOut 'EFFET-UNKNOWN.json') @{schema='hpc-forest-r8-obs4-main-only-effect-unknown-v1';identity=$taskExpected;intent=$taskIntentRef;native_call_returned=$true;exit_observed=$false;automatic_retry_allowed=$false;next_effect_forbidden=$true}
+                        throw 'Exit outcome UNKNOWN; no retry or next effect'
+                    }
+                    $taskOutcome='single_held_handle_termination_returned_and_exit_observed'
+                }
+            }
+        }
+    }
+    $taskAction=@{schema='hpc-forest-r8-obs4-main-only-action-v1';plan=$taskPlan;identity=$taskExpected;outcome=$taskOutcome;termination_issued=$taskNativeAttempted;native_call_count=$(if($taskNativeAttempted){1}else{0});held_handle_identity_verified=($taskHandle -ne [IntPtr]::Zero);automatic_retry_allowed=$false;image_file_sha256='5ef72c30ca3b82df7c7e186c9220bde665be9a335edbd4a371a4b19d0ac76644';exit_causality_not_inferred=$true;at_utc=[datetime]::UtcNow.ToString('o')}
+    if($taskNativeAttempted){$taskAction.intent=$taskIntentRef;$taskAction.native_birth_ticks=$taskBirth}
+    $taskActionPath=Join-Path $taskOut 'ACTION-MAIN-SEUL.json'
+    Save-TaskNew $taskActionPath $taskAction
+    if($taskHandle -ne [IntPtr]::Zero){[OwnedR8Obs4Native]::CloseHandle($taskHandle)|Out-Null;$taskHandle=[IntPtr]::Zero}
+    # Only natural grace; never a service/name/tree stop or an automatic followup effect.
+    Start-Sleep -Seconds 10
+    $taskAfter=Capture-TaskFullCim
+    $taskFinal=Invoke-TaskGate 'finalize' $taskAfter $taskPlan (Ref-Task $taskActionPath)
+    Write-Output ($taskFinal|ConvertTo-Json -Compress)
+}catch{
+    Save-TaskNew (Join-Path $taskOut ('REFUS-PRESERVE-'+[guid]::NewGuid().ToString('N')+'.json')) @{schema='hpc-forest-r8-obs4-main-only-refusal-v1';plan=$taskPlan;completed_action=$taskAction;error=$_.Exception.Message;native_call_attempted=$taskNativeAttempted;automatic_retry_or_next_effect_allowed=$false;old_metadata_and_foreign_processes_preserved=$true}
+    throw
+}finally{
+    if($taskHandle -ne [IntPtr]::Zero){[OwnedR8Obs4Native]::CloseHandle($taskHandle)|Out-Null}
+}

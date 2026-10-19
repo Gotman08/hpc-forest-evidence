@@ -1,0 +1,61 @@
+param([switch]$Execute)
+$ErrorActionPreference = 'Stop'
+$receiptRoot = $PSScriptRoot
+$planPath = Join-Path $receiptRoot 'plan-arret-individuel.json'
+$plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
+function Same-Identity($actual, $expected) {
+    if ($null -eq $actual) { return $false }
+    return ([int]$actual.ProcessId -eq [int]$expected.ProcessId -and
+        [int]$actual.ParentProcessId -eq [int]$expected.ParentProcessId -and
+        [string]$actual.ExecutablePath -ieq [string]$expected.ExecutablePath -and
+        [string]$actual.CommandLine -ceq [string]$expected.CommandLine -and
+        ([datetime]$actual.CreationDate).ToUniversalTime().Ticks -eq ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+}
+function Fresh-One([int]$targetPid) {
+    return Get-CimInstance Win32_Process -Filter "ProcessId=$targetPid" | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine
+}
+function Save-Json($value,[string]$name) {
+    $value | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $receiptRoot $name) -Encoding utf8
+}
+if ($plan.schema -ne 'hpc-forest-specific-owned-individual-stop-plan-v1' -or $plan.job_id -ne '751571' -or $plan.human_authorized -ne $true) { throw 'Wrong stop plan' }
+if ((Get-FileHash -LiteralPath $plan.partial_audit_path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $plan.partial_audit_sha256) { throw 'Changed partial audit' }
+$audit = Get-Content -LiteralPath $plan.partial_audit_path -Raw | ConvertFrom-Json -AsHashtable
+if ($audit.verified -ne $true -or $audit.all_started_claims_reconciled -ne $true -or $audit.full_planned_cohort_admitted -ne $false -or $audit.pending_nonces.Count -ne 0) { throw 'No positive reconciled human partial audit' }
+foreach ($expected in @($plan.owned_targets_in_stop_order) + @($plan.preserve_source_only_relay_identities)) {
+    if (-not (Same-Identity (Fresh-One ([int]$expected.ProcessId)) $expected)) { throw "Identity changed before scoped action: $($expected.ProcessId)" }
+}
+$preflight = [ordered]@{verified=$true; at_utc=[DateTime]::UtcNow.ToString('o'); executed=$false; job_id='751571'; plan_sha256=(Get-FileHash -LiteralPath $planPath -Algorithm SHA256).Hash.ToLowerInvariant(); partial_audit_sha256=$plan.partial_audit_sha256; targets=@($plan.owned_targets_in_stop_order.ProcessId); all_full_identities_match=$true; source_only_preserved=@($plan.preserve_source_only_relay_identities.ProcessId); recursive=$false; stop_by_name=$false}
+if (-not $Execute) { Save-Json $preflight 'arret-prevol-verifie.json'; $preflight | ConvertTo-Json -Depth 10; return }
+if (Test-Path -LiteralPath (Join-Path $receiptRoot 'arret-individuel-intention.json')) { throw 'Existing stop intent: reconcile before any repeated action' }
+Save-Json $preflight 'arret-individuel-intention.json'
+$actions = @()
+foreach ($expected in $plan.owned_targets_in_stop_order) {
+    $current = Fresh-One ([int]$expected.ProcessId)
+    if ($null -eq $current) {
+        $actions += [pscustomobject]@{ProcessId=$expected.ProcessId; action='exited_naturally_before_individual_stop'; at_utc=[DateTime]::UtcNow.ToString('o')}
+    } else {
+        if (-not (Same-Identity $current $expected)) { throw "Changed identity preserved: $($expected.ProcessId)" }
+        $ownedProcess = Get-Process -Id ([int]$expected.ProcessId)
+        $openedStableHandle = $ownedProcess.Handle
+        $deltaTicks = [math]::Abs($ownedProcess.StartTime.ToUniversalTime().Ticks - ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+        if ($deltaTicks -ge 10) { throw 'Opened process handle start instant differs from full CIM identity' }
+        if (-not (Same-Identity (Fresh-One ([int]$expected.ProcessId)) $expected)) { throw 'Identity changed after opening stable process handle' }
+        Stop-Process -InputObject $ownedProcess -Force
+        $actions += [pscustomobject]@{ProcessId=$expected.ProcessId; action='stopped_individually_after_full_identity_and_handle_verification'; at_utc=[DateTime]::UtcNow.ToString('o'); creation_date=$expected.CreationDate; executable=$expected.ExecutablePath; command=$expected.CommandLine; parent=$expected.ParentProcessId}
+    }
+    Save-Json $actions 'arret-individuel-actions.json'
+}
+Start-Sleep -Milliseconds 500
+$after = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine
+Save-Json $after 'cim-apres-arret-individuel.json'
+foreach ($expected in $plan.owned_targets_in_stop_order) {
+    $current = $after | Where-Object { $_.ProcessId -eq $expected.ProcessId }
+    if (Same-Identity $current $expected) { throw "Owned process still present: $($expected.ProcessId)" }
+}
+foreach ($expected in $plan.preserve_source_only_relay_identities) {
+    $current = $after | Where-Object { $_.ProcessId -eq $expected.ProcessId }
+    if (-not (Same-Identity $current $expected)) { throw "Source-only identity not preserved: $($expected.ProcessId)" }
+}
+$result = [ordered]@{schema='hpc-forest-human-partial-owned-stop-v1'; verified=$true; job_id='751571'; session_id=$plan.session_id; completed_utc=[DateTime]::UtcNow.ToString('o'); after_audit=$true; after_reconciliation=$true; partial_audit_sha256=$plan.partial_audit_sha256; all_owned_process_identities_absent_after_stop=$true; observed_identities=$plan.owned_targets_in_stop_order; actions=$actions; recursive_stop=$false; stop_by_name=$false; source_only_relay_identities_preserved=$true; source_only_job_id='751592'; foreign_processes_targeted=$false; new_model_calls=0; full_planned_cohort_admitted=$false}
+Save-Json $result 'owned-worker-stopped.json'
+$result | Select-Object verified,job_id,completed_utc,all_owned_process_identities_absent_after_stop,source_only_relay_identities_preserved,recursive_stop,stop_by_name | ConvertTo-Json

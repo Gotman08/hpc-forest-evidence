@@ -1,0 +1,401 @@
+"""Root-only, cold metadata capacity gate; no census, transport or native launch."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[3]
+PREP = BASE / 'outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3'
+OP = PREP / 'operations-parent-premier-roots-source110-r1'
+CHAIN = PREP / 'adaptateurs-source110-r1/revision-r5-G-recu-avant-Q'
+SCOPE = 'hpc-forest-dynamic-independent-roots-r4b-max'
+SOURCE = 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48'
+PLAN = 'd08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27'
+SESSIONS = ['3b1de5658e4641149b15a3bea4850239', '7b6c29c0e329400bb2be145b0e2dbe0a',
+            'bd2b3153a7544c909afbc19fe69902b4']
+FIELDS = ('ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate')
+OBSERVER = CHAIN / 'observer/observer-mixte.py'
+OBSERVER_SHA = 'db24bef9282b510642dbc23d527c32f1a5515df9791d255f920d7e326db32180'
+DETECTOR = CHAIN / 'launcher/native_worker_detection.py'
+DETECTOR_SHA = '07fb437746064f20d0be33fcef748d1f9b0f0028214f02a042540d97e4c51766'
+SOURCE_PATH = PREP / 'revision-source-cli-r1/HPC-Forest-Mere-Dynamique-R4b-Lane-R3-CLI.zip'
+PLAN_PATH = PREP / 'revision-source-cli-r1/dynamic-plan-r4b-lane-r3-max.json'
+G_CLOSURE = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2g/RECEPTION-FINALE-ET-CLOTURE-VERIFIEE.json'
+G_SHA = 'd4c74352d28555ba3a476273af51b1d7791c328fa37addcee580318aedbc6df4'
+SO_CLOSURE = BASE / 'outputs/HPC-Forest-Harnais-Comparaison-r1/receptions/source-only-sol-max-751592/reception-verifiee.json'
+SO_SHA = '6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7'
+LOCAL_CACHES = [PREP / ('lancement-modeles-max-r3/worker-' + session) for session in SESSIONS]
+REMOTE_ROOTS = {('/scratch_p/nimarano/' + prefix + session) for session in SESSIONS for prefix in
+                ('hpc-forest-dynamic-r4b-admission-', 'hpc-forest-dynamic-r4b-max-',
+                 'hpc-forest-dynamic-r4b-stage-lane-r3-roots-')}
+IO_PATHS = set()
+
+def ordinary(path):
+    original = Path(path)
+    need(".." not in original.parts, "Parent traversal refused BEFORE filesystem access")
+    path = Path(os.path.abspath(original))
+    boundary = BASE
+    need(path.is_relative_to(boundary) and path in IO_PATHS, "Only exact typed capacity evidence/output paths")
+    need(not path.anchor.startswith("\\\\") and all(":" not in x for x in path.parts[1:]), "UNC/ADS refused")
+    for part in (path, *path.parents):
+        if part.exists() or part.is_symlink():
+            info = part.lstat()
+            need(not stat.S_ISLNK(info.st_mode) and not
+                 (getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 1024)),
+                 "Existing symlink/reparse path refused")
+    need(path.resolve(strict=False) == path and path.resolve(strict=False).is_relative_to(boundary.resolve(strict=True)),
+         "Canonical boundary or parent alias changed")
+    return path
+
+
+def need(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def metadata(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, getattr(info, "st_file_attributes", None))
+
+
+def open_nofollow_read(path):
+    """One regular-file handle only; never follow a leaf reparse point."""
+    if os.name != "nt":
+        need(hasattr(os, "O_NOFOLLOW"), "No no-follow read API available")
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    import ctypes  # noqa: I001 -- copied proven R4b primitive import AST is retained.
+    from ctypes import wintypes
+    import msvcrt
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    info = kernel.GetFileInformationByHandleEx
+    info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    info.restype = wintypes.BOOL
+    class AttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+    # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, OPEN_REPARSE_POINT|SEQUENTIAL_SCAN.
+    handle = create(str(path), 0x80000000, 0x1, None, 3, 0x00200000 | 0x08000000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        tag = AttributeTagInfo()
+        if not info(handle, 9, ctypes.byref(tag), ctypes.sizeof(tag)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        need(not tag.FileAttributes & (0x400 | 0x10), "Opened reparse point/directory refused BEFORE read")
+        fd = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | os.O_BINARY)
+        handle = None  # fd now exclusively owns this same native handle.
+        return fd
+    finally:
+        if handle is not None:
+            close(handle)
+
+
+def cross_identity(info):
+    if os.name != "nt":
+        return metadata(info)  # Never normalize Unix mode or ctime.
+    # Full mode is separately required to equal its exact native/name-derived view.
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_mode & 0o666,
+            info.st_nlink, info.st_size, info.st_mtime_ns, getattr(info, "st_file_attributes", None))
+
+
+def validate_windows_mode_views(path, path_info, held_info, native):
+    attributes = native[3]
+    base = stat.S_IFREG | (0o444 if attributes & 0x1 else 0o666)
+    execute_from_proven_name = 0o111 if Path(path).suffix.casefold() == ".exe" else 0
+    need(stat.S_IFMT(path_info.st_mode) == stat.S_IFMT(held_info.st_mode) == stat.S_IFREG
+         and path_info.st_mode == base | execute_from_proven_name and held_info.st_mode == base,
+         "Exact native readonly/name-derived Windows mode differs; no other extension or bit is normalized")
+
+
+def native_basic_info(fd):
+    if os.name != "nt":
+        return None
+    import ctypes  # noqa: I001 -- copied proven R4b primitive import AST is retained.
+    from ctypes import wintypes
+    import msvcrt
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [("CreationTime", ctypes.c_longlong), ("LastAccessTime", ctypes.c_longlong),
+                    ("LastWriteTime", ctypes.c_longlong), ("ChangeTime", ctypes.c_longlong),
+                    ("FileAttributes", wintypes.DWORD)]
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_info = kernel.GetFileInformationByHandleEx
+    get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+    value = BasicInfo()
+    if not get_info(msvcrt.get_osfhandle(fd), 0, ctypes.byref(value), ctypes.sizeof(value)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return tuple(getattr(value, name) for name in
+                 ("CreationTime", "LastWriteTime", "ChangeTime", "FileAttributes"))
+
+
+def raw(path):
+    p = ordinary(path)
+    before = p.lstat()
+    path_baseline = metadata(before)  # Complete path API baseline, including its creation ctime.
+    need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= 2 * 1024**3,
+         "Bounded regular evidence required")
+    fd = open_nofollow_read(p)
+    try:
+        held = os.fstat(fd)
+        held_baseline = metadata(held)  # Complete fd API baseline, including its change ctime.
+        native_baseline = native_basic_info(fd)
+        need(cross_identity(held) == cross_identity(before), "Held input object differs BEFORE read")
+        if os.name == "nt":
+            creation, write, change, attributes = native_baseline
+            need(before.st_ctime_ns == (creation - 116444736000000000) * 100
+                 and held.st_ctime_ns == (change - 116444736000000000) * 100
+                 and before.st_mtime_ns == (write - 116444736000000000) * 100
+                 and attributes == getattr(before, "st_file_attributes", None),
+                 "Measured native/path/fd time semantics differ; never guess a tolerance")
+            validate_windows_mode_views(p, before, held, native_baseline)
+        ordinary(p)
+        with os.fdopen(fd, "rb") as stream:
+            fd = None
+            need(metadata(os.fstat(stream.fileno())) == held_baseline
+                 and native_basic_info(stream.fileno()) == native_baseline,
+                 "Held full fd/native baseline changed BEFORE read")
+            value = stream.read(before.st_size + 1)
+            need(metadata(os.fstat(stream.fileno())) == held_baseline
+                 and native_basic_info(stream.fileno()) == native_baseline
+                 and len(value) == before.st_size,
+                 "Held full fd/native bytes or baseline changed during read")
+            need(metadata(p.lstat()) == path_baseline, "Full input path baseline changed after read")
+            ordinary(p)
+            need(metadata(os.fstat(stream.fileno())) == held_baseline
+                 and native_basic_info(stream.fileno()) == native_baseline,
+                 "Held full fd/native baseline changed during parent recheck")
+        need(metadata(p.lstat()) == path_baseline, "Full input path baseline changed after handle close")
+        ordinary(p)
+        return value
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def decode(value):
+    def pairs(items):
+        out = {}
+        for key, child in items:
+            need(key not in out, "Duplicate JSON member")
+            out[key] = child
+        return out
+    return json.loads(value.decode("utf-8-sig"), object_pairs_hook=pairs,
+                      parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def reference(path, value=None):
+    return {'path': str(path), 'sha256': digest(raw(path) if value is None else value)}
+
+
+def pinned(path, expected):
+    need(isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected), 'Exact SHA256 required')
+    value = raw(path)
+    need(digest(value) == expected, 'Pinned evidence bytes changed: ' + path.name)
+    return value
+
+
+def timestamp_z(value):
+    need(isinstance(value, str) and re.fullmatch(
+        r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z', value), 'Strict UTC Z timestamp required')
+    return datetime.fromisoformat(value).timestamp()
+
+
+def complete_cim(value, now):
+    need(isinstance(value, dict) and set(value) == {'schema', 'observed_at', 'captured_at_utc',
+         'complete_census', 'strict_utf8_decoding', 'rows_count', 'rows'}, 'Closed full CIM schema required')
+    need(value['schema'] == 'hpc-forest-dynamic-r4b-full-cim-v1'
+         and value['complete_census'] is True and value['strict_utf8_decoding'] is True, 'Unfiltered strict full census required')
+    observed = value['observed_at']; captured = timestamp_z(value['captured_at_utc'])
+    need(type(observed) in (int, float) and math.isfinite(observed) and 0 <= now-observed <= 120
+         and 0 <= now-captured <= 120 and abs(observed-captured) <= 1, 'Fresh <=120 second coherent full census required')
+    rows = value['rows']
+    need(isinstance(rows, list) and rows and type(value['rows_count']) is int
+         and len(rows) == value['rows_count'], 'Full nonempty census count required')
+    ids = set()
+    for row in rows:
+        need(isinstance(row, dict) and set(row) == set(FIELDS), 'Exact five-field census rows required')
+        need(all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2]), 'Invalid census PID')
+        need(row['ProcessId'] not in ids, 'Duplicate census PID')
+        ids.add(row['ProcessId'])
+        need(all(row[k] is None or isinstance(row[k], str) for k in FIELDS[2:]), 'Invalid census text type')
+        if row['CreationDate'] is not None:
+            need(timestamp_z(row['CreationDate']) <= captured, 'Process creation after census')
+    return rows
+
+
+def native_definitions(observer_bytes, detector_bytes):
+    """Only pinned pure function definitions; never the observer module or main."""
+    need(digest(observer_bytes) == OBSERVER_SHA and digest(detector_bytes) == DETECTOR_SHA, 'Qualified classifiers changed')
+    names = ['require', 'utc_creation', 'identity', 'same_identity', 'windows_argv',
+             'flag', 'worker_entry', 'native_sessions', 'verify_pair']
+    tree = ast.parse(observer_bytes.decode('utf8'))
+    definitions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    need(all(name in definitions for name in names), 'Qualified pure observer API missing')
+    namespace = {'re': re, 'Path': Path, 'datetime': datetime, 'UTC': UTC, 'time': time, 'FIELDS': FIELDS, 'CAP': 4}
+    selected = ast.Module(body=[definitions[name] for name in names], type_ignores=[])
+    exec(compile(selected, str(OBSERVER), 'exec'), namespace)  # noqa: S102 -- exact pinned pure definitions only.
+    tree = ast.parse(detector_bytes.decode('utf8'))
+    selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'is_native_worker_command']
+    need(len(selected) == 1, 'Qualified conservative API missing')
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(DETECTOR), 'exec'), namespace)  # noqa: S102 -- exact pinned pure definition.
+    return namespace
+
+
+def classify_zero(rows, api):
+    groups = api['native_sessions'](rows)
+    candidates = {row['ProcessId'] for row in rows if api['is_native_worker_command'](row['CommandLine'])}
+    classified = {row['ProcessId'] for pair in groups.values() for row in pair}
+    opaque = {row['ProcessId'] for row in rows if Path(row.get('ExecutablePath') or '').name.casefold()
+              in {'python.exe', 'pythonw.exe'} and not row.get('CommandLine')}
+    need(not opaque, 'Opaque Python command prevents zero-native certification')
+    need(candidates == classified, 'Conservative native candidates are not all explicitly classified')
+    need(not groups and not candidates, 'This three-root pre-submit gate requires exactly zero current native workers')
+    return [], [], []
+
+
+def remote_absence(value, now):
+    need(isinstance(value, dict) and set(value) == {'observed_at_utc', 'tool_result'}, 'Actual dated MCP receipt required')
+    need(timestamp_z(value['observed_at_utc']) <= now, 'Future remote absence receipt')
+    result = value['tool_result']
+    need(isinstance(result, dict) and result.get('isError') is False, 'Actual successful remote literal check required')
+    checked = result.get('structuredContent')
+    need(isinstance(checked, dict) and checked.get('ok') is True and checked.get('scope') == 'remote_literal_paths'
+         and checked.get('unchecked') == [] and checked.get('dynamic_paths') == [], 'Unfiltered literal remote absence result required')
+    paths = checked.get('paths')
+    need(isinstance(paths, list) and len(paths) == 9 and all(isinstance(p, dict) and set(p) == {'path', 'exists'}
+         and isinstance(p['path'], str) and p['exists'] is False for p in paths)
+         and {p['path'] for p in paths} == REMOTE_ROOTS, 'All nine exact remote roots must be absent')
+    text = [block.get('text') for block in result.get('content', []) if isinstance(block, dict) and block.get('type') == 'text']
+    need(len(text) == 1 and decode(text[0].encode('utf8')) == checked, 'MCP text and structured remote results disagree')
+    return value['observed_at_utc']
+
+
+def ordinary_absence(path):
+    """lstat ordinary ancestor metadata only; never list/read a cache or lock."""
+    need(path in LOCAL_CACHES and path.is_absolute() and '..' not in path.parts, 'Only three literal local cache paths')
+    existing = []
+    for part in reversed((path, *path.parents)):
+        try:
+            facts = part.lstat()
+        except FileNotFoundError:
+            for ancestor, baseline in existing:
+                need(metadata(ancestor.lstat()) == baseline, 'Local absence ancestor changed')
+            return {'path': str(path), 'exists': False, 'observation': 'ordinary_ancestor_lstat_only'}
+        need(stat.S_ISDIR(facts.st_mode) and not stat.S_ISLNK(facts.st_mode)
+             and not (getattr(facts, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 1024)),
+             'Local cache ancestor is not an ordinary directory')
+        existing.append((part, metadata(facts)))
+    raise ValueError('Proposed local cache already exists')
+
+
+def safe_output(value):
+    path = Path(value)
+    need(path.is_absolute() and '..' not in path.parts and path.parent == HERE
+         and path.name not in {'', '.', '..'} and all(x == x.rstrip(' .') and ':' not in x for x in path.parts[1:]),
+         'New output must be an ordinary direct child of this helper directory')
+    need(not path.exists() and not path.is_symlink(), 'Existing output is preserved')
+    for parent in (path.parent, *path.parent.parents):
+        facts = parent.lstat()
+        need(stat.S_ISDIR(facts.st_mode) and not stat.S_ISLNK(facts.st_mode)
+             and not (getattr(facts, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 1024)), 'Output parent alias refused')
+    need(path.parent.resolve() == HERE, 'Output parent alias refused')
+    return path
+
+
+def historical_closures(g, so):
+    need(g.get('schema') == 'hpc-forest-r2g-final-metadata-and-owned-closure-v1'
+         and all(g.get(k) is True for k in ('verified_metadata_only', 'all_started_calls_delivery_reconciled',
+         'all_three_terminal_jobs_received', 'owned_native_worker_interfaces_closed', 'all_21_owned_identities_absent',
+         'complete_cache_bytes_preserved_after_owned_stop')) and g.get('native_research_admitted') is False,
+         'Exact historical G closure required, without scientific promotion')
+    need(so.get('job_id') == '751592' and so.get('session_id') == '665743a02b824021a697b6a4884a667c'
+         and all(so.get(k) is True for k in ('verified', 'deliveries_reconciled', 'all_started_calls_reconciled',
+         'scientific_reception_verified', 'independent_audit_verified')), 'Actual reconciled historical SO final receipt required')
+
+
+def write_new(path, value):
+    ordinary(path)
+    encoded = (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode('utf8')
+    with path.open('xb') as stream:
+        stream.write(encoded); stream.flush(); os.fsync(stream.fileno())
+    return reference(path, encoded)
+
+
+def run(args):
+    full, remote = Path(args.full_cim), Path(args.remote_absence)
+    need(all(all(x == x.rstrip(' .') and ':' not in x for x in path.parts[1:])
+             and not path.anchor.startswith('\\\\') for path in (full, remote)), 'Input aliases/ADS/UNC refused BEFORE read')
+    need(full.is_absolute() and '..' not in full.parts and full.is_relative_to(OP) and full.name == 'CIM-PRIVE-FRAIS.json', 'Exact root capture CIM input required BEFORE read')
+    need(remote.is_absolute() and remote.parent == OP and re.fullmatch(r'ABSENCE-DISTANTE-NEUF-RACINES-REELLE-\d\d.json', remote.name), 'Exact root remote absence input required BEFORE read')
+    out = safe_output(args.output)
+    outputs = [out / name for name in ('ABSENCE-LOCALE-TROIS-CACHES.json', 'FERMETURES-HISTORIQUES-CONTROLEES.json',
+                                       'CLASSIFICATION-NATIVE-PRIVEE.json', 'CAPACITE-PRERACINES.json')]
+    IO_PATHS.update([full, remote, OBSERVER, DETECTOR, SOURCE_PATH, PLAN_PATH, G_CLOSURE, SO_CLOSURE, out, *outputs])
+    now = time.time()
+    need(now + 3600 + 10800 < 1793487600, 'Exclusive deadline and three-hour audit reserve')
+    full_bytes = pinned(full, args.full_cim_sha256); full_value = decode(full_bytes)
+    rows = complete_cim(full_value, now)
+    remote_bytes = pinned(remote, args.remote_absence_sha256)
+    remote_time = remote_absence(decode(remote_bytes), now)
+    observer = pinned(OBSERVER, OBSERVER_SHA); detector = pinned(DETECTOR, DETECTOR_SHA)
+    pinned(SOURCE_PATH, SOURCE); pinned(PLAN_PATH, PLAN)
+    g = decode(pinned(G_CLOSURE, G_SHA)); so = decode(pinned(SO_CLOSURE, SO_SHA))
+    historical_closures(g, so)
+    groups, candidates, unclassified = classify_zero(rows, native_definitions(observer, detector))
+    local = [ordinary_absence(path) for path in LOCAL_CACHES]
+    complete_cim(full_value, time.time())  # Refuse stale preparation before output; never recapture.
+    out.mkdir()
+    local_ref = write_new(outputs[0], {'schema': 'hpc-forest-root-local-three-cache-absence-v1', 'verified': True,
+        'observed_at': time.time(), 'paths': local, 'only_absence_observed': True, 'cache_or_lock_bytes_read': False})
+    history_ref = write_new(outputs[1], {'schema': 'hpc-forest-source110-historical-closed-anchors-v1', 'verified': True,
+        'latest_g_closure': {'path': str(G_CLOSURE), 'sha256': G_SHA}, 'source_only_final_reception': {'path': str(SO_CLOSURE), 'sha256': SO_SHA},
+        'historical_anchors_only': True, 'current_absence_inferred_from_history': False, 'native_research_admitted': False})
+    refs = [reference(full, full_bytes), reference(remote, remote_bytes), local_ref, history_ref,
+            {'path': str(OBSERVER), 'sha256': OBSERVER_SHA}, {'path': str(DETECTOR), 'sha256': DETECTOR_SHA}]
+    classification_ref = write_new(outputs[2], {'schema': 'hpc-forest-source110-private-native-capacity-classification-v1',
+        'verified': True, 'scope_id': SCOPE, 'source_zip_sha256': SOURCE, 'plan_sha256': PLAN,
+        'observed_at': full_value['observed_at'], 'full_cim': reference(full, full_bytes), 'active_native_groups': groups,
+        'active_native_workers': 0, 'all_full_census_rows_checked': True, 'rows_count': len(rows),
+        'conservative_candidate_process_ids': candidates, 'unclassified_native_process_ids': unclassified,
+        'foreign_processes_preserved': True, 'evidence_refs': refs})
+    result = {'schema': 'hpc-forest-r4b-parent-pre-submit-capacity-v1', 'verified': True, 'scope_id': SCOPE,
+        'source_zip_sha256': SOURCE, 'plan_sha256': PLAN, 'observed_at': full_value['observed_at'],
+        'active_native_workers': 0, 'maximum_native_workers_total': 4, 'proposed_roots_sessions': SESSIONS,
+        'full_census_locally_reviewed': True, 'no_unclassified_research_processes': True,
+        'all_three_proposed_sessions_cache_registry_absent': True, 'requests_or_claims_started_for_proposed_sessions': 0,
+        'private_native_classification': classification_ref, 'remote_absence_observed_at_utc': remote_time,
+        'no_calls_claims_in_literal_reserved_roots_only': True, 'generation_or_worker_start_admitted': False,
+        'native_research_admitted': False, 'evidence_refs': [*refs, classification_ref]}
+    return write_new(outputs[3], result)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ('full-cim', 'full-cim-sha256', 'remote-absence', 'remote-absence-sha256', 'output'):
+        parser.add_argument('--' + name, required=True)
+    args = parser.parse_args()
+    print(json.dumps(run(args)))
+
+
+if __name__ == '__main__':
+    main()

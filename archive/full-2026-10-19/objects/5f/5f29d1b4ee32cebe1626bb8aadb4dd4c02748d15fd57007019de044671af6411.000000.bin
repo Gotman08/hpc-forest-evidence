@@ -1,0 +1,97 @@
+#include <cstdio>
+#include <vector>
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <arm_neon.h>
+#include <omp.h>
+
+static int read_int() {
+    int x = 0;
+    char c = getchar_unlocked();
+    while (c < '0' || c > '9') {
+        if (c == '-') {
+            c = getchar_unlocked();
+            while (c >= '0' && c <= '9') {
+                x = x * 10 - (c - '0');
+                c = getchar_unlocked();
+            }
+            return x;
+        }
+        c = getchar_unlocked();
+    }
+    do {
+        x = x * 10 + (c - '0');
+        c = getchar_unlocked();
+    } while (c >= '0' && c <= '9');
+    return x;
+}
+
+int main() {
+    int n = read_int();
+    int s = read_int();
+
+    const int stride = n + 1;
+    std::vector<int64_t> pref(static_cast<std::size_t>(stride) * static_cast<std::size_t>(stride), 0);
+
+    // Read input and compute horizontal prefix sums row by row (source A)
+    for (int i = 0; i < n; ++i) {
+        int64_t row_sum = 0;
+        const int base_i = (i + 1) * stride;
+        for (int j = 0; j < n; ++j) {
+            int val = read_int();
+            row_sum += val;
+            pref[base_i + (j + 1)] = row_sum;
+        }
+    }
+
+    // Vertical accumulation pass, parallel over columns (source C)
+#pragma omp parallel for schedule(static)
+    for (int j = 0; j < n; ++j) {
+        int64_t sum = 0;
+        for (int i = 0; i < n; ++i) {
+            const int idx = (i + 1) * stride + (j + 1);
+            sum += pref[idx];
+            pref[idx] = sum;
+        }
+    }
+
+    // Search phase: parallel over rows, NEON SIMD inside each row (source B)
+    int64_t mxSum = LLONG_MIN;
+
+#pragma omp parallel for reduction(max:mxSum)
+    for (int i = 0; i <= n - s; ++i) {
+        const int base_i_ps = i * stride;
+        const int base_is_ps = (i + s) * stride;
+
+        // Process two columns at a time using NEON
+        int j = 0;
+        for (; j + 1 <= n - s; j += 2) {
+            int64x2_t v_a = vld1q_s64(&pref[base_is_ps + j + s]);
+            int64x2_t v_b = vld1q_s64(&pref[base_i_ps + j + s]);
+            int64x2_t v_c = vld1q_s64(&pref[base_is_ps + j]);
+            int64x2_t v_d = vld1q_s64(&pref[base_i_ps + j]);
+
+            int64x2_t v_sum = vsubq_s64(v_a, v_b);
+            v_sum = vsubq_s64(v_sum, v_c);
+            v_sum = vaddq_s64(v_sum, v_d);
+
+            const int64_t sum0 = vgetq_lane_s64(v_sum, 0);
+            const int64_t sum1 = vgetq_lane_s64(v_sum, 1);
+            if (sum0 > mxSum) mxSum = sum0;
+            if (sum1 > mxSum) mxSum = sum1;
+        }
+
+        // Handle remaining column if odd number of columns
+        for (; j <= n - s; ++j) {
+            const int64_t sub_sum = pref[base_is_ps + j + s]
+                                  - pref[base_i_ps + j + s]
+                                  - pref[base_is_ps + j]
+                                  + pref[base_i_ps + j];
+            if (sub_sum > mxSum) mxSum = sub_sum;
+        }
+    }
+
+    printf("%lld\n", static_cast<long long>(mxSum));
+    return 0;
+}

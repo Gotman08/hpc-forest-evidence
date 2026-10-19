@@ -1,0 +1,128 @@
+"""Read-only R1 reconciliation, retaining published requests with no reply as unknown."""
+from __future__ import annotations
+
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+sys.path.insert(0, str(STUDY.parent / "HPC-Forest-Harnais-Comparaison-r1"))
+from comparison_reception import exact_usage, load, require, sha, verify_archive, verify_invocation, verify_request
+
+
+def reconcile(root, worker, group):
+    requests = {p.name.removesuffix(".request.json"): p
+                for p in (root / "mailbox/requests").glob("*.request.json")}
+    caches = {p.name for p in worker.iterdir() if p.is_dir() and re.fullmatch(r"[0-9a-f]{32}", p.name)}
+    require(caches <= requests.keys(), "Unrelated local cache")
+    references = {}
+    for p in root.glob("*/logs/*/codex-request.json"):
+        request = load(p)
+        references.setdefault(request["nonce"], []).append(p)
+    records, files = [], {}
+    for nonce, archived in sorted(requests.items()):
+        request = load(archived)
+        verify_request(request, group, nonce)
+        require(nonce in references and all(load(p) == request for p in references[nonce]),
+                "Published request is not bound to the received campaign log")
+        folder = worker / nonce
+        local_request = folder / "downloaded-request.json"
+        archived_response = root / "mailbox/responses" / (nonce + ".response.json")
+        archived_invocation = root / "mailbox/logs" / (nonce + ".invocation.json")
+        record = {"nonce": nonce, "session_id": group["session_id"],
+                  "request_sha256": sha(archived), "request_references": [p.relative_to(root).as_posix() for p in references[nonce]],
+                  "native_invocation_observed": False, "known_exact_tokens": 0, "usage_measured": False,
+                  "delivery_verified": False}
+        if not local_request.exists():
+            require(not folder.exists() and not archived_response.exists() and not archived_invocation.exists(),
+                    "Missing local request conflicts with invocation/response evidence")
+            require(type(request.get("expires_at")) in (int, float) and request["expires_at"] <= time.time(),
+                    "An unanswered request has not expired")
+            record.update(status="expired_unanswered_no_local_invocation_evidence", consumption="unknown",
+                          no_response_synthesized=True, no_generation_or_evaluation_replayed=True)
+            records.append(record)
+            continue
+        require(sha(local_request) == sha(archived), "Cached request differs from archive")
+        response_file = folder / "response.json"
+        response = load(response_file)
+        delivered = load(folder / "delivered.json")
+        ready = load(folder / "response-ready.json")
+        verify_request({**response, "kind": request["kind"]}, group, nonce)
+        require(response["request_sha256"] == sha(archived)
+                and delivered["request_sha256"] == sha(archived)
+                and delivered["response_sha256"] == sha(response_file)
+                and ready == {"sha256": sha(response_file), "bytes": response_file.stat().st_size},
+                "Invalid delivered response binding")
+        if archived_response.exists():
+            require(sha(archived_response) == sha(response_file), "Response changed after archive")
+        claim = folder / "generation-claimed.json"
+        invocation_file = folder / "invocation.json"
+        if claim.exists():
+            require(load(claim)["request_sha256"] == sha(archived), "Claim changed")
+        if invocation_file.exists():
+            require(claim.exists(), "Invocation has no preserved claim")
+            invocation = load(invocation_file)
+            verify_invocation(invocation, group, sha(archived))
+            require(load(folder / "request.json") == request, "Wrong native request")
+            instructions = folder / "instructions.txt"
+            require(instructions.read_text(encoding="utf8") == request["messages"][0]["content"],
+                    "Native instructions differ from the bound request")
+            configured = next(arg.split("=", 1)[1] for arg in invocation["argv"]
+                              if arg.startswith("model_instructions_file="))
+            require(Path(json.loads(configured)).resolve() == instructions.resolve(), "Wrong instruction path")
+            if archived_invocation.exists():
+                require(sha(archived_invocation) == sha(invocation_file), "Invocation changed after archive")
+            events = folder / "codex.jsonl"
+            archived_events = root / "mailbox/logs" / (nonce + ".codex.jsonl")
+            if archived_events.exists():
+                require(events.read_bytes().startswith(archived_events.read_bytes()), "Rewritten native journal")
+            record.update(native_invocation_observed=True, **exact_usage(events))
+            usage = response.get("usage", {})
+            require(usage.get("codex_jsonl_sha256") == sha(events), "Response journal hash differs")
+            if usage.get("token_accounting") == "exact":
+                require(record["usage_measured"] and usage.get("tokens") == record["known_exact_tokens"],
+                        "Exact response counter differs")
+        elif (response.get("error") == "Request expired before generation"
+              and response.get("usage", {}).get("llm_calls") == 0
+              and response["usage"].get("tokens") == 0
+              and response["usage"].get("token_accounting") == "exact"):
+            record.update(usage_measured=True, not_called_before_expiry=True)
+        else:
+            record["started_claim_without_measurable_invocation"] = claim.exists()
+        record.update(delivery_verified=True, response_sha256=sha(response_file), status="delivered")
+        for p in folder.iterdir():
+            require(not p.is_symlink(), "Linked cache evidence")
+            if p.is_file():
+                files[p.relative_to(worker).as_posix()] = sha(p)
+        records.append(record)
+    return {"schema": "hpc-forest-r1-delivery-reconciliation-v1", "job_id": str(group["job_id"]),
+            "session_id": group["session_id"], "all_published_requests_accounted_for": len(records) == len(requests),
+            "all_published_requests_delivered": all(r["delivery_verified"] for r in records),
+            "published_requests": len(records), "verified_deliveries": sum(r["delivery_verified"] for r in records),
+            "expired_unanswered_requests": sum(r["status"] != "delivered" for r in records),
+            "native_invocations_observed": sum(r["native_invocation_observed"] for r in records),
+            "known_exact_tokens": sum(r["known_exact_tokens"] for r in records),
+            "unmeasured_native_invocations": sum(r["native_invocation_observed"] and not r["usage_measured"] for r in records),
+            "requests_with_unknown_consumption": sum(not r["usage_measured"] for r in records),
+            "total_exact_consumption_available": all(r["usage_measured"] for r in records),
+            "reservations_are_not_consumption": True, "records": records,
+            "local_delivery_attachment_sha256": files, "archive_changed": False}
+
+
+def main():
+    root = HERE / "restauration-neuve/results-748782"
+    group = next(g for g in load(STUDY / "coordinator-state.json")["queue"]
+                 if g["key"] == "coverage-gpt-5.6-terra-max")
+    archive = STUDY / "runs" / group["key"] / "results-748782.tar.gz"
+    before = verify_archive(archive, root)
+    proof = reconcile(root, STUDY / "runs" / group["key"] / "worker", group)
+    require(verify_archive(archive, root) == before, "Received evidence changed")
+    (HERE / "reconciliation-livraisons.json").write_text(json.dumps(proof, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    print(json.dumps({k: v for k, v in proof.items() if k not in {"records", "local_delivery_attachment_sha256"}}))
+
+
+if __name__ == "__main__":
+    main()

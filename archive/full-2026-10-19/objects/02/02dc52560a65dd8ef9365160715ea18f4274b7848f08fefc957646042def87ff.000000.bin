@@ -1,0 +1,160 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in 
+ * the system using Structure-of-Arrays layout for SIMD efficiency.
+ */
+void body_force(float *restrict x, float *restrict y, float *restrict z,
+                float *restrict vx, float *restrict vy, float *restrict vz,
+                float dt, int n) {
+  #pragma omp parallel for
+  for (int i = 0; i < n; ++i) {
+    float xi = x[i];
+    float yi = y[i];
+    float zi = z[i];
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    #pragma omp simd reduction(+:fx,fy,fz) aligned(x,y,z:64)
+    for (int j = 0; j < n; ++j) {
+      float dx = x[j] - xi;
+      float dy = y[j] - yi;
+      float dz = z[j] - zi;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1.0f / sqrtf(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    vx[i] += dt*fx;
+    vy[i] += dt*fy;
+    vz[i] += dt*fz;
+  }
+}
+
+/*
+ * Read a binary dataset with initialized bodies and convert to SoA.
+ */
+void read_dataset(float **x, float **y, float **z,
+                  float **vx, float **vy, float **vz,
+                  int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+
+  int n = *nbodies;
+  // Allocate aligned memory for each coordinate array
+  size_t alignment = 64;
+  if (posix_memalign((void**)x, alignment, n * sizeof(float)) != 0 ||
+      posix_memalign((void**)y, alignment, n * sizeof(float)) != 0 ||
+      posix_memalign((void**)z, alignment, n * sizeof(float)) != 0 ||
+      posix_memalign((void**)vx, alignment, n * sizeof(float)) != 0 ||
+      posix_memalign((void**)vy, alignment, n * sizeof(float)) != 0 ||
+      posix_memalign((void**)vz, alignment, n * sizeof(float)) != 0) {
+    fprintf(stderr,"\nError allocating aligned memory\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Temporary buffer for reading the AoS input
+  typedef struct { float x, y, z, vx, vy, vz; } Body;
+  Body *tmp = (Body *)malloc(n * sizeof(Body));
+  if (!tmp) {
+    fprintf(stderr,"\nError allocating temporary buffer\n");
+    exit(EXIT_FAILURE);
+  }
+
+  b = fread(tmp, n * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    free(tmp);
+    exit(EXIT_FAILURE);
+  }
+
+  // Transpose AoS to SoA
+  for (int i = 0; i < n; ++i) {
+    (*x)[i] = tmp[i].x;
+    (*y)[i] = tmp[i].y;
+    (*z)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+
+  free(tmp);
+}
+
+/*
+ * Write simulation results from SoA back to binary AoS format.
+ */
+void write_dataset(const int nbodies,
+                   const float *x, const float *y, const float *z,
+                   const float *vx, const float *vy, const float *vz) {
+  typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+  // Build AoS buffer for output
+  Body *out = (Body *)malloc(nbodies * sizeof(Body));
+  if (!out) {
+    fprintf(stderr,"\nError allocating output buffer\n");
+    exit(EXIT_FAILURE);
+  }
+
+  for (int i = 0; i < nbodies; ++i) {
+    out[i].x = x[i];
+    out[i].y = y[i];
+    out[i].z = z[i];
+    out[i].vx = vx[i];
+    out[i].vy = vy[i];
+    out[i].vz = vz[i];
+  }
+
+  int b = fwrite(out, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    free(out);
+    exit(EXIT_FAILURE);
+  }
+
+  free(out);
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  float *x, *y, *z, *vx, *vy, *vz;
+
+  read_dataset(&x, &y, &z, &vx, &vy, &vz, &nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(x, y, z, vx, vy, vz, DT, nbodies);
+
+    #pragma omp parallel for
+    for (int i = 0; i < nbodies; ++i) {
+      x[i] += vx[i] * DT;
+      y[i] += vy[i] * DT;
+      z[i] += vz[i] * DT;
+    }
+  }
+
+  write_dataset(nbodies, x, y, z, vx, vy, vz);
+
+  free(x); free(y); free(z); free(vx); free(vy); free(vz);
+
+  exit(EXIT_SUCCESS);
+}

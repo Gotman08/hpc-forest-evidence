@@ -1,0 +1,103 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+const uint32_t MOD = 1000000007U;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline uint32x4_t neon_add_mod(uint32x4_t a, uint32x4_t b,
+                                     uint32x4_t modulus) {
+    const uint32x4_t sum = vaddq_u32(a, b);
+    // sum < 2*MOD. An underflowed unsigned subtraction exceeds sum.
+    return vminq_u32(sum, vsubq_u32(sum, modulus));
+}
+#endif
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n, m;
+    cin >> n >> m;
+
+    vector<vector<int>> blockedDiagonals(2 * n - 1);
+    for (int c = 0; c < m; ++c) {
+        int i, j;
+        cin >> i >> j;
+        blockedDiagonals[i + j].push_back(i + 1);
+    }
+
+    // Index r represents matrix row r - 1; index zero is padding.
+    vector<uint32_t> buffer(n + 1, 0);
+    uint32_t* const paths = buffer.data();
+    paths[1] = 1;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const uint32x4_t modulus = vdupq_n_u32(MOD);
+#endif
+
+    for (int diagonal = 0; diagonal < 2 * n - 1; ++diagonal) {
+        const int first = max(1, diagonal - n + 2);
+        const int last = min(n, diagonal + 1);
+        int r = last;
+
+        // Descending updates preserve both preceding-diagonal inputs.
+        // The rolling vectors retain original values, never new outputs.
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        const int vectorLimit = max(first + 3, 7);
+        if (r >= vectorLimit) {
+            uint32x4_t high = vld1q_u32(paths + r - 3);
+            const int unrolledLimit = max(first + 15, 19);
+
+            for (; r >= unrolledLimit; r -= 16) {
+                const uint32x4_t lower0 = vld1q_u32(paths + r - 7);
+                const uint32x4_t lower1 = vld1q_u32(paths + r - 11);
+                const uint32x4_t lower2 = vld1q_u32(paths + r - 15);
+                const uint32x4_t lower3 = vld1q_u32(paths + r - 19);
+
+                const uint32x4_t out0 = neon_add_mod(
+                    high, vextq_u32(lower0, high, 3), modulus);
+                const uint32x4_t out1 = neon_add_mod(
+                    lower0, vextq_u32(lower1, lower0, 3), modulus);
+                const uint32x4_t out2 = neon_add_mod(
+                    lower1, vextq_u32(lower2, lower1, 3), modulus);
+                const uint32x4_t out3 = neon_add_mod(
+                    lower2, vextq_u32(lower3, lower2, 3), modulus);
+
+                vst1q_u32(paths + r - 3, out0);
+                vst1q_u32(paths + r - 7, out1);
+                vst1q_u32(paths + r - 11, out2);
+                vst1q_u32(paths + r - 15, out3);
+                high = lower3;
+            }
+
+            for (; r >= vectorLimit; r -= 4) {
+                const uint32x4_t lower = vld1q_u32(paths + r - 7);
+                const uint32x4_t above = vextq_u32(lower, high, 3);
+                vst1q_u32(paths + r - 3,
+                          neon_add_mod(high, above, modulus));
+                high = lower;
+            }
+        }
+#endif
+        for (; r >= first; --r) {
+            const uint32_t sum = paths[r - 1] + paths[r];
+            paths[r] = sum >= MOD ? sum - MOD : sum;
+        }
+
+        // Clear obstacles before any subsequent diagonal consumes them.
+        // Repeated obstacle coordinates are harmless.
+        for (int blockedRow : blockedDiagonals[diagonal]) {
+            paths[blockedRow] = 0;
+        }
+    }
+
+    cout << paths[n] << endl;
+}

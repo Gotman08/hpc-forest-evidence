@@ -1,0 +1,118 @@
+"""Seal a delivery-only proposal. Never transfer, prepare a real job or execute it."""
+import hashlib
+import json
+import shlex
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PREP = HERE.parents[1]
+ROOT = '/scratch_p/nimarano/hpc-forest-r4b-source110-completeQ-20261018-1e60da6d5b51'
+OUTPUT = ROOT + '-delivery-only-Q753709-r1'
+HELPER_REMOTE = ROOT + '-delivery-only-helper-r1.py'
+QUALIFICATION = '520573e89fb4505e791a0b70a4a97ee6d59db149af5d79f6af535aabd747724f'
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {'path': str(path), 'sha256': sha(path)}
+
+
+def save(path, value):
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+
+
+def main():
+    received = []
+    for name, count in [('TESTS-INERTES-PREMIER.xml', 16), ('TESTS-ALLOCATION-COMPLEMENT.xml', 7)]:
+        cases = list(ET.parse(HERE / name).iter('testcase'))
+        assert len(cases) == count and all(all(c.find(k) is None for k in ('failure', 'error', 'skipped')) for c in cases)
+        identities = {(c.get('classname'), c.get('name')) for c in cases}
+        assert len(identities) == count and not set(received).intersection(identities)
+        received.extend(identities)
+    assert len(received) == 23
+    assert json.loads((HERE / 'RUFF-FINAL.json').read_text(encoding='utf-8-sig')) == []
+    helper = HERE / 'livrer-qualification-existante.py'
+    command = f'''set -euo pipefail
+[[ ${{SLURM_JOB_ID:-}} =~ ^[0-9]+$ ]]
+test "${{SLURM_JOB_ID}}" != 753709
+test "$(uname -m)" = aarch64
+test "${{SLURM_CPUS_PER_TASK:-}}" = 4
+test "${{SLURM_NTASKS:-}}" = 1
+test "${{SLURM_JOB_NUM_NODES:-}}" = 1
+test "${{SLURM_MEM_PER_NODE:-}}" = 16384
+test -z "${{SLURM_JOB_GPUS:-}}${{SLURM_STEP_GPUS:-}}"
+test "${{SLURM_GPUS:-0}}" = 0
+test "${{SLURM_GPUS_ON_NODE:-0}}" = 0
+test "$(( $(date -u +%s) + 600 + 10800 ))" -lt 1793487600
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+helper={HELPER_REMOTE}
+test -x "$py"
+test -f "$helper"
+test -d {ROOT}
+test ! -e {OUTPUT}
+printf '%s  %s\\n' {sha(helper)} "$helper" | sha256sum -c -
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1 CUDA_VISIBLE_DEVICES=
+exec srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores "$py" -I -S -B "$helper" --source-root {ROOT} --output-root {OUTPUT} --qualification-sha256 {QUALIFICATION}
+'''
+    with (HERE / 'commande-livraison-seulement.sh').open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(command)
+    job = {'name': 'forest-Q753709-livraison-seule-r1', 'command': 'bash -lc ' + shlex.quote(command),
+        'arch': 'armgpu', 'cpus_per_task': 4, 'mem_gb': 16, 'gpus_per_node': 0,
+        'time_limit': '00:10:00', 'workdir': '/scratch_p/nimarano', 'spack_packages': [], 'data_files': []}
+    save(HERE / 'job-prepare-PROPOSITION-NON-SOUMISE.json', job)
+    save(HERE / 'CONTRAT-ARCHIVE-ET-METADONNEES.json', {
+        'schema': 'hpc-forest-Q753709-delivery-archive-interface-v1',
+        'source_root_exact': ROOT, 'output_root_exact_and_new': OUTPUT,
+        'source_archive_member_layout': 'All regular original Q-root files at their exact relative names; no directory/symlink/hardlink/special tar headers',
+        'archive_name': 'qualification-existing-Q753709-delivery-DELIVERY_JOB_ID.tar.gz',
+        'prior_failed_archive': 'Preserved and hashed as opaque original bytes; never opened as archive, changed or promoted complete',
+        'sidecars_to_receive_separately_under_receipt_SHA': [
+            'source-entire-inventory-before.json', 'source-entire-inventory-after.json',
+            'archive-regular-members.json', 'inert-symlink-metadata-only.json', 'EXISTING-QUALIFICATION-VERIFIED.json'],
+        'inventory_layout': {'key': 'exact source-relative path', 'regular': ['kind', 'metadata', 'sha256', 'bytes', 'tar_member'],
+            'directory': ['kind', 'metadata', 'tar_member'],
+            'symlink': ['kind', 'metadata', 'link_target', 'target_followed', 'tar_member', 'bytes_read']},
+        'metadata_exact_fields': ['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime_ns', 'ctime_ns'],
+        'link_metadata_only': {'kind': 'symlink', 'target_followed': False, 'tar_member': False, 'bytes_read': False},
+        'receipt_name': 'DELIVERY-RECEIPT.json', 'receipt_schema': 'hpc-forest-Q753709-existing-byte-delivery-only-v1',
+        'receipt_sidecar_refs_include_exact_path_sha256_bytes': True,
+        'consumer_must_never_recreate_or_follow_recorded_links': True,
+        'received_tests_or_source_or_models_executed': False, 'native_research_or_scientific_admission': False})
+    save(HERE / 'PROPOSITION-LIVRAISON-SEULE-NON-ADMISE.json', {
+        'schema': 'hpc-forest-Q753709-delivery-only-proposal-v1', 'prepared_only': True,
+        'source_test_job_status': 'FAILED 1:0 after completed neutral tests; failed archive retained',
+        'already_completed_testcases': 265, 'test_or_model_replay_permitted': False,
+        'helper': ref(helper), 'helper_remote_proposed': HELPER_REMOTE,
+        'command': ref(HERE / 'commande-livraison-seulement.sh'), 'job_proposal': ref(HERE / 'job-prepare-PROPOSITION-NON-SOUMISE.json'),
+        'archive_interface': ref(HERE / 'CONTRAT-ARCHIVE-ET-METADONNEES.json'),
+        'local_metadata_review': ref(HERE / 'revue-metadata-Q753709/RELEVE-METADATA-LOCALES-Q753709.json'),
+        'expected_qualification_sha256': QUALIFICATION,
+        'expected_hash_prior_provenance': 'Complete UTF8 text received from remote report, not a prior remote SHA observation; helper must establish matching actual raw file',
+        'source110_sha256': 'eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48',
+        'component62_manifest_sha256': '1e60da6d5b51afaf3c857b1ba215927e7e1201c297241afd6390212a89d5e449',
+        'allocation': {'architecture': 'ARM64', 'nodes': 1, 'tasks': 1, 'cpu_cores': 4, 'memory_mib': 16384,
+            'gpus': 0, 'maximum_seconds': 600, 'audit_reserve_seconds': 10800},
+        'new_neutral_cases': 23, 'test_receipts': [ref(HERE / name) for name in ('TESTS-INERTES-PREMIER.xml', 'TESTS-ALLOCATION-COMPLEMENT.xml')],
+        'source265_cases_not_reexecuted': True, 'Ruff_actual_receipt': ref(HERE / 'RUFF-FINAL.json'),
+        'link_targets_never_followed_or_tarred': True, 'other_special_types_or_identity_races_refused': True,
+        'original_Q_root_or_prior_packets_modified': False, 'separate_new_delivery_root_only': True,
+        'transfer_or_job_preparation_submission_execution_performed': False,
+        'independent_review_required_before_actual_delivery': True,
+        'new_Q_or_native_or_scientific_admission_claimed': False})
+    names = ['livrer-qualification-existante.py', 'test_livraison_inerte.py', 'preparer-proposition-livraison.py',
+        'commande-livraison-seulement.sh', 'job-prepare-PROPOSITION-NON-SOUMISE.json',
+        'CONTRAT-ARCHIVE-ET-METADONNEES.json', 'PROPOSITION-LIVRAISON-SEULE-NON-ADMISE.json',
+        'TESTS-INERTES-PREMIER.xml', 'TESTS-ALLOCATION-COMPLEMENT.xml', 'RUFF-PREMIER.json', 'RUFF-FINAL.json']
+    save(HERE / 'MANIFESTE-PREPARATION-LIVRAISON.json', {'schema': 'hpc-forest-Q753709-delivery-only-preparation-manifest-v1',
+        'files': {name: sha(HERE / name) for name in names}, 'new_models_or_jobs': 0})
+    print(json.dumps({'proposal': ref(HERE / 'PROPOSITION-LIVRAISON-SEULE-NON-ADMISE.json'),
+        'helper': ref(helper), 'manifest': ref(HERE / 'MANIFESTE-PREPARATION-LIVRAISON.json'), 'effects': 0}))
+
+
+if __name__ == '__main__':
+    main()

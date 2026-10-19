@@ -1,0 +1,160 @@
+#include "knn.h"
+
+#define KNN_CHUNKS 4
+
+static void insert_candidate(float *distances, char *labels, long *seqs,
+                             int k, float d, char label, long seq) {
+    int x;
+    for (x = 0; x < k; ++x) {
+        if (distances[x] == -1.0f || d < distances[x]) break;
+    }
+    if (x >= k) return;
+
+    for (int y = k - 1; y > x; --y) {
+        distances[y] = distances[y - 1];
+        labels[y] = labels[y - 1];
+        seqs[y] = seqs[y - 1];
+    }
+
+    distances[x] = d;
+    labels[x] = label;
+    seqs[x] = seq;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    long total_points = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        total_points += groups[i].length;
+    }
+
+    float *xs = (float *) malloc((total_points > 0 ? total_points : 1) * sizeof(float));
+    float *ys = (float *) malloc((total_points > 0 ? total_points : 1) * sizeof(float));
+    char *point_labels = (char *) malloc(total_points > 0 ? total_points : 1);
+
+    long idx = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ++j) {
+            xs[idx] = g.points[j].x;
+            ys[idx] = g.points[j].y;
+            point_labels[idx] = g.label;
+            ++idx;
+        }
+    }
+
+    float *distances_all = (float *) malloc((total_points > 0 ? total_points : 1) * sizeof(float));
+
+    #pragma omp parallel for simd schedule(static)
+    for (long i = 0; i < total_points; ++i) {
+        float dx = xs[i] - to_evaluate.x;
+        float dy = ys[i] - to_evaluate.y;
+        distances_all[i] = dx * dx + dy * dy;
+    }
+
+    enum { NCHUNKS = KNN_CHUNKS };
+    float *local_dist[NCHUNKS];
+    char *local_label[NCHUNKS];
+    long *local_seq[NCHUNKS];
+
+    for (int c = 0; c < NCHUNKS; ++c) {
+        local_dist[c] = (float *) malloc((k > 0 ? k : 1) * sizeof(float));
+        local_label[c] = (char *) malloc(k > 0 ? k : 1);
+        local_seq[c] = (long *) malloc((k > 0 ? k : 1) * sizeof(long));
+
+        for (int i = 0; i < k; ++i) {
+            local_dist[c][i] = -1.0f;
+            local_label[c][i] = (char) -1;
+            local_seq[c][i] = -1;
+        }
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < NCHUNKS; ++c) {
+        long start = (total_points * (long) c) / NCHUNKS;
+        long end = (total_points * (long) (c + 1)) / NCHUNKS;
+
+        float *ld = local_dist[c];
+        char *ll = local_label[c];
+        long *ls = local_seq[c];
+
+        for (long i = start; i < end; ++i) {
+            insert_candidate(ld, ll, ls, k, distances_all[i], point_labels[i], i);
+        }
+    }
+
+    char *labels = (char *) malloc(k > 0 ? k : 1);
+
+    int heads[NCHUNKS];
+    for (int c = 0; c < NCHUNKS; ++c) heads[c] = 0;
+
+    int count = 0;
+    while (count < k) {
+        int best_chunk = -1;
+        float best_dist = 0.0f;
+        long best_seq = 0;
+
+        for (int c = 0; c < NCHUNKS; ++c) {
+            if (heads[c] < k && local_dist[c][heads[c]] != -1.0f) {
+                float d = local_dist[c][heads[c]];
+                long s = local_seq[c][heads[c]];
+                if (best_chunk == -1 || d < best_dist ||
+                    (d == best_dist && s < best_seq)) {
+                    best_chunk = c;
+                    best_dist = d;
+                    best_seq = s;
+                }
+            }
+        }
+
+        if (best_chunk == -1) break;
+
+        labels[count] = local_label[best_chunk][heads[best_chunk]];
+        ++heads[best_chunk];
+        ++count;
+    }
+
+    for (; count < k; ++count) {
+        labels[count] = (char) -1;
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; ++i) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            ++current_frequency;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

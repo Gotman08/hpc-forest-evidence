@@ -1,0 +1,324 @@
+"""Allocated Python-neutral qualification only. Never invoke C, CLI or a model."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import tarfile
+import time
+import traceback
+import xml.etree.ElementTree as ET
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+SOURCE = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN = "d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27"
+RUNTIME = "66de9eb1090eae8d8d8a3fc78279b3d5a82b7d4f12521424acdf647185020766"
+BUNDLE = "033a4625e70bf4430c73f337cabf988afff2c927986379e9007356552dac271e"
+OLD_SOURCE = "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3"
+OLD_PLAN = "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b"
+DEADLINE = datetime(2026, 10, 31, 23, tzinfo=UTC).timestamp()
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+
+
+def need(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read(path):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, "Duplicate JSON member")
+            result[key] = value
+        return result
+    return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=pairs)
+
+
+def save(path, value):
+    with Path(path).open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def allocation_guard(*, now=None):
+    now = time.time() if now is None else now
+    need(now + 600 + 10800 < DEADLINE, "10min maximum plus 3h audit must precede exclusive deadline")
+    need(platform.machine().lower() == "aarch64", "ARM64 allocation required")
+    values = {"SLURM_CPUS_PER_TASK": "4", "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
+              "SLURM_MEM_PER_NODE": "16384"}
+    need(all(os.environ.get(key) == value for key, value in values.items()), "Exact 1node/1task/4CPU/16GiB allocation required")
+    job = os.environ.get("SLURM_JOB_ID", "")
+    need(re.fullmatch(r"[0-9]+", job) is not None, "Actual SLURM job required")
+    need(not os.environ.get("SLURM_JOB_GPUS", "") and not os.environ.get("SLURM_STEP_GPUS", "")
+         and os.environ.get("SLURM_GPUS", "0") == "0"
+         and os.environ.get("SLURM_GPUS_ON_NODE", "0") == "0", "Zero GPU allocation required")
+    affinity = sorted(os.sched_getaffinity(0))
+    need(len(affinity) == 4, "The unique srun step must bind exactly four CPUs")
+    return {"architecture": "ARM64", "cpu_cores": 4, "tasks": 1, "nodes": 1,
+            "allocated_memory_mib": 16384, "allocated_gpus": 0, "slurm_job_id": job,
+            "affinity_cpu_ids": affinity, "affinity_cpu_count": len(affinity)}
+
+
+def safe_members(archive, *, expected_count=None):
+    members = archive.getmembers()
+    need(bool(members) and (expected_count is None or len(members) == expected_count), "Exact archive member count required")
+    names, total = set(), 0
+    for member in members:
+        name = member.name
+        rel = PurePosixPath(name)
+        need(member.isfile() and not member.issym() and not member.islnk()
+             and name and "\\" not in name and "\0" not in name and not rel.is_absolute()
+             and rel.as_posix() == name and all(part not in {".", "..", ""} for part in rel.parts)
+             and not re.match(r"^[A-Za-z]:", name) and name not in names,
+             "Regular unique safe relative archive members required")
+        need(0 <= member.size <= 32 * 1024 * 1024, "Archive member exceeds neutral packet bound")
+        total += member.size
+        need(total <= 128 * 1024 * 1024, "Neutral packet expanded size exceeds bound")
+        names.add(name)
+    return members
+
+
+def extract_new(path, root, *, expected_count=None):
+    root.mkdir(parents=False, exist_ok=False)
+    with tarfile.open(path, "r:gz") as archive:
+        members = safe_members(archive, expected_count=expected_count)
+        for member in members:
+            target = root.joinpath(*PurePosixPath(member.name).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            need(target.resolve().is_relative_to(root.resolve()) and not target.exists(), "Extraction target escaped or repeated")
+            data = archive.extractfile(member).read()
+            need(len(data) == member.size, "Short archive member")
+            with target.open("xb") as stream:
+                stream.write(data)
+    return {member.name for member in members}
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        need(not path.is_symlink(), "Symlinks are not admissible evidence")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = sha(path)
+    return result
+
+
+def verify_source(root):
+    need(sha(root / "project.zip") == SOURCE and sha(root / "dynamic-plan.json") == PLAN
+         and sha(root / "runtime-manifest.json") == RUNTIME, "Derived source/plan/runtime changed")
+    expected = read(root / "runtime-manifest.json")
+    actual = inventory(root / "project")
+    need(isinstance(expected, dict) and len(expected) == 110 and actual == expected, "Exact110 source files required")
+    with zipfile.ZipFile(root / "project.zip") as archive:
+        entries = archive.infolist()
+        need(len(entries) == 110 and len({i.filename for i in entries}) == 110, "Exact unique source ZIP inventory required")
+        for info in entries:
+            need(not info.is_dir() and info.filename.startswith("HPC-Forest/"), "Unexpected source ZIP member")
+            rel = info.filename.removeprefix("HPC-Forest/")
+            need(rel in expected and hashlib.sha256(archive.read(info)).hexdigest() == expected[rel], "Source ZIP differs from runtime")
+    need(sha(root / "predecessor/project.zip") == OLD_SOURCE
+         and sha(root / "predecessor/plan.json") == OLD_PLAN, "Predecessor data for refusal test changed")
+    plan = read(root / "dynamic-plan.json")
+    need(plan["scope_id"] == SCOPE and plan["source_zip_sha256"] == SOURCE, "Exact derived scope/source plan required")
+    return actual
+
+
+def junit_counts(path):
+    tree = ET.parse(path)
+    cases = list(tree.iter("testcase"))
+    need(bool(cases), "JUnit must contain actual test cases")
+    failed = sum(case.find("failure") is not None or case.find("error") is not None for case in cases)
+    skipped = sum(case.find("skipped") is not None for case in cases)
+    return {"passed": len(cases) - failed - skipped, "failed": failed}, {
+        "testcases": len(cases), "skipped": skipped, "junit_sha256": sha(path)}
+
+
+def run_suite(label, test, cutoff, output, root, started):
+    junit = output / f"{label}-junit.xml"
+    targets=[str(item) for item in test] if isinstance(test,list) else [str(test)]
+    runner=("import sys;from pathlib import Path;src=Path(sys.argv.pop(1));sys.path.insert(0,str(src));"
+            "import hpc_forest;assert Path(hpc_forest.__file__).resolve().is_relative_to(src);"
+            "import pytest;raise SystemExit(pytest.main(sys.argv[1:]))")
+    argv=[sys.executable,"-I","-B","-c",runner,str(root/"source/project/src"),*targets,
+        "--confcutdir",str(cutoff),"-q","-p","no:cacheprovider","--basetemp",
+        str(output/f"{label}-NEUTRAL-fixtures"),"--junitxml",str(junit)]
+    timeout = min(180, int(600 - (time.monotonic() - started) - 60))
+    need(timeout > 0, "No reserved time remains for the one permitted suite run")
+    environment = os.environ.copy()
+    environment.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", CUDA_VISIBLE_DEVICES="",
+                       OMP_NUM_THREADS="4", OPENBLAS_NUM_THREADS="1",
+                       R6_REVIEW_PAYLOAD=str(root / "review-payload"), R6_ADAPTER_ROOT=str(root / "adapters"))
+    save(output / f"{label}-intention.json", {"argv": argv, "timeout_seconds": timeout,
+         "maximum_run_count": 1, "model_calls": 0})
+    # These are two explicit Python pytest runs, each at most once. No model,
+    # Codex CLI, compiler, C candidate, installation or transport is invoked.
+    try:
+        with (output/f"{label}-stdout.log").open("xb") as stdout,(output/f"{label}-stderr.log").open("xb") as stderr:
+            result=subprocess.run(argv,cwd=root,env=environment,stdout=stdout,stderr=stderr,timeout=timeout,check=False)
+    except subprocess.TimeoutExpired:
+        save(output/f"{label}-execution.json",{"argv":argv,"returncode":124,"timed_out":True,
+            "timeout_seconds":timeout,"run_count":1,"model_calls":0,"stdout_stderr_preserved":True})
+        raise
+    counts, details = junit_counts(junit)
+    save(output / f"{label}-execution.json", {"argv": argv, "returncode": result.returncode,
+         "timeout_seconds": timeout, "run_count": 1, "model_calls": 0, **details})
+    return result.returncode, counts, details
+
+
+def verify_review_payload(root, bindings):
+    expected = bindings["review_payload_files"]
+    need(inventory(root / "review-payload") == expected, "All and only exact review payload bytes required")
+    actual = read(root / "review-payload/actual-review.json")
+    need(actual.get("verified_source_preparation_only") is True and actual.get("blocking_findings") == []
+         and actual.get("source_state_reader_sha256") == "564398d676dceb6b5ba893fcbb3835c7aec31a1cbd5d5c5dcef6b361a3a23338"
+         and actual.get("reviewed_files", {}).get("verifier-current.py") == "ed888a9ab9c35e4e1a6c227525e9578281ed57c6961ccd9c9928eb397f62e450",
+         "Actual independent code-only review fields required")
+    need(sha(root / "review-payload/actual-review.json") == "1a65d2c23b12a14768bc9367d09f519623a7d6ed0c8bb27cfef8d3d7bfb9712a"
+         and sha(root / "review-payload/source_only_state.py") == actual["source_state_reader_sha256"]
+         and sha(root / "review-payload/verifier-current.py") == actual["reviewed_files"]["verifier-current.py"],
+         "Actual review/reader/verifier data bytes changed")
+    return expected
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path)
+    args = parser.parse_args()
+    started = time.monotonic()
+    # This guard precedes extraction, test imports and all scientific work.
+    allocation = allocation_guard()
+    root = args.root.resolve(strict=True)
+    need(Path(sys.executable).resolve(strict=True) == Path(PYTHON).resolve(strict=True), "Existing allocated Python only")
+    bindings = read(root / "bindings.json")
+    need(bindings["scope_id"] == SCOPE and bindings["source_zip_sha256"] == SOURCE
+         and bindings["plan_sha256"] == PLAN and bindings["source_bundle_sha256"] == BUNDLE,
+         "Exact derivative bindings required")
+    need(root == Path(bindings["remote_root"]).resolve(strict=True), "Dedicated fresh qualification root differs")
+    output = root / "qualification-output"
+    output.mkdir(exist_ok=False)
+    record = {"schema": "hpc-forest-lane-r2-zero-model-allocated-qualification-v1", "verified": False,
+              "scope_id": SCOPE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+              "adapter_revision": "r4b-source110-external-adapters-r2", "native_model_calls": 0,
+              "source_file_count": None, "allocation": allocation,
+              "allocated_contract_tests_returncode": None,
+              "source_lane_contract_tests": None, "adapter_portable_tests": None,
+              "adapter_components_manifest_sha256": None, "native_generation_admitted": False,
+              "normal_first_start_verified": False, "independent_performance_audit_verified": False,
+              "started_at_utc": datetime.now(UTC).isoformat(), "qualification_attempt": 1}
+    save(output / "qualification-started.json", record)
+    source_before = adapter_before = review_before = None
+    exitcode = 1
+    try:
+        need(sha(root / "source-bundle.tar.gz") == BUNDLE
+             and sha(root / "adapter-bundle.tar.gz") == bindings["adapter_bundle_sha256"], "Exact source/adapter bundle required")
+        names = extract_new(root / "source-bundle.tar.gz", root / "source", expected_count=116)
+        expected_names = {"project/" + name for name in read(root / "source/runtime-manifest.json")}
+        expected_names |= {"project.zip", "dynamic-plan.json", "runtime-manifest.json", "DESIGN-INTERFACE.json",
+                           "predecessor/project.zip", "predecessor/plan.json"}
+        need(names == expected_names, "Exact116 source bundle members required")
+        source_before = verify_source(root / "source")
+        record["source_file_count"] = len(source_before)
+        save(output / "source-before.json", source_before)
+        extract_new(root / "adapter-bundle.tar.gz", root / "adapters",
+                    expected_count=bindings["adapter_bundle_member_count"])
+        components = root / "adapters/COMPONENTS.json"
+        need(sha(components) == bindings["adapter_components_manifest_sha256"], "Exact integration components required")
+        record["adapter_components_manifest_sha256"] = sha(components)
+        code_pins = read(components)["code_pins"]
+        need(isinstance(code_pins, dict) and code_pins, "Closed adapter code inventory required")
+        for name, expected in code_pins.items():
+            rel = PurePosixPath(name)
+            need(not rel.is_absolute() and ".." not in rel.parts and "\\" not in name
+                 and sha(root / "adapters" / name) == expected, "Adapter component changed")
+        need(sha(root / "review-payload.tar.gz") == bindings["review_payload_bundle_sha256"]
+             and sha(root / "archive_regular_only.py") == bindings["archive_helper_sha256"], "Review payload/archive helper changed")
+        extract_new(root / "review-payload.tar.gz", root / "review-payload", expected_count=bindings["review_payload_member_count"])
+        review_before = verify_review_payload(root, bindings)
+        save(output / "review-payload-before.json", review_before)
+        adapter_before = inventory(root / "adapters")
+        save(output / "adapter-before.json", adapter_before)
+        suites={
+            "source-lane":([root/"source/project/tests/test_lane_contract.py"],26),
+            "source-cli-privacy":([root/"source/project/tests"/name for name in
+                ("test_cli_contract_lane_r3.py","test_owned_timeout_lane_r3.py","test_matrix_worker_cli_lane_r3.py","test_dynamic_runtime_gate_lane_r3.py")],152),
+            "source-prior-privacy":([str(root/"source/project/tests/test_r4b_privacy.py")+"::"+name for name in
+                ("test_max_identity_requires_receipt_and_never_installs_default_generation",
+                 "test_false_admission_and_generic_native_request_are_refused",
+                 "test_cli_verifier_checks_actual_argument_and_all_companion_bytes",
+                 "test_first_start_receiving_flag_never_overrides_missing_verification",
+                 "test_contract_session_must_be_the_exact_declared_phase_cell")],9),
+            "adapter-portable":([root/"adapters/test_portable_chain110.py",root/"adapters/test_contrat_source110.py",root/"adapters/test_facades_closure110.py"],73),
+            "observer-neutral":([root/"adapters/observer/test_obs4_neutre.py"],5),
+            "source-state-review":([root/"review-payload/test_source_state_review_portable.py"],9)}
+        suite_results={}
+        for label,(targets,expected_count) in suites.items():
+            cutoff = root / "review-payload" if label == "source-state-review" else root / (
+                "adapters" if label in ("adapter-portable", "observer-neutral") else "source/project/tests")
+            rc,counts,details=run_suite(label,targets,cutoff,output,root,started)
+            suite_results[label]={"returncode":rc,"counts":counts,"details":details}
+            need(type(rc) is int and rc==0 and counts=={"passed":expected_count,"failed":0}
+                 and details["skipped"]==0,"Exact single-execution suite failed/refused: "+label)
+        record.update(source_lane_contract_tests=suite_results["source-lane"]["counts"],
+            source_cli_privacy_tests=suite_results["source-cli-privacy"]["counts"],
+            source_prior_privacy_tests=suite_results["source-prior-privacy"]["counts"],
+            adapter_portable_tests=suite_results["adapter-portable"]["counts"],
+            observer_neutral_tests=suite_results["observer-neutral"]["counts"],
+            source_state_review_portable_tests=suite_results["source-state-review"]["counts"],
+            source_state_review_portable_unique_count=9, total_neutral_unique_count=274,
+            source_state_review_fixture_scope="Computed ARM fixture paths; no actual Windows state or admission",
+            reader_and_verifier_payload_executed_or_imported=False,
+            source_neutral_unique_count=187,adapter_neutral_unique_count=73,observer_neutral_unique_count=5,
+            allocated_contract_tests_returncode=0,suite_results=suite_results)
+        review_after = verify_review_payload(root, bindings)
+        save(output / "review-payload-after.json", review_after)
+        need(review_before == review_after, "Read-only review data changed during tests")
+        source_after=verify_source(root/"source")
+        adapter_after=inventory(root/"adapters")
+        save(output/"source-after.json",source_after)
+        save(output/"adapter-after.json",adapter_after)
+        need(source_after==source_before and adapter_after==adapter_before,"Source/adapter bytes changed during neutral tests")
+        record.update(verified=True, source_files_before_after_identical=True, adapter_files_before_after_identical=True)
+        exitcode = 0
+    except Exception as exc:  # noqa: BLE001 -- preserve every first qualifier failure; never retry it.
+        record.update(failure_type=type(exc).__name__, failure_reason=str(exc))
+        with (output / "first-failure.txt").open("x", encoding="utf-8") as stream:
+            traceback.print_exc(file=stream)
+    finally:
+        record.update(finished_at_utc=datetime.now(UTC).isoformat(), elapsed_seconds=time.monotonic() - started)
+        save(output / "qualification.json", record)
+        archive = root / f"qualification-results-{allocation['slurm_job_id']}.tar.gz"
+        helper = root / "archive_regular_only.py"
+        need(sha(helper) == bindings["archive_helper_sha256"], "Exact archive helper changed before import")
+        spec = importlib.util.spec_from_file_location("r6_regular_result_archive", helper)
+        archiver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(archiver)
+        archive_receipt = archiver.archive_results(root, archive)
+        need(archive_receipt.get("verified_archive_only") is True
+             and archive_receipt.get("symlinks_followed_or_archived") is False, "Regular-only stable archive required")
+        envelope = {"schema": "hpc-forest-lane-r2-zero-model-envelope-v1", "verified": exitcode == 0,
+                    "native_model_calls": 0, "slurm_job_id": allocation["slurm_job_id"],
+                    "archive": {"path": str(archive), "sha256": sha(archive), "bytes": archive.stat().st_size},
+                    "qualification": {"path": str(output / "qualification.json"), "sha256": sha(output / "qualification.json")},
+                    "archive_regular_receipt": {"path": str(root / "archive-metadata/archive-regular-receipt.json"),
+                        "sha256": sha(root / "archive-metadata/archive-regular-receipt.json")},
+                    "adapter_components_manifest_sha256": record["adapter_components_manifest_sha256"],
+                    "fixture_links_inert_metadata_only": True}
+        save(root / "qualification-envelope.json", envelope)
+        print(json.dumps(envelope), flush=True)
+    return exitcode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

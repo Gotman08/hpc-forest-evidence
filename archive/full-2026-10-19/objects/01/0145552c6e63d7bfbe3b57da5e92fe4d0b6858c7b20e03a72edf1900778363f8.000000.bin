@@ -1,0 +1,207 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <string.h>
+#include <stdint.h>
+
+static void merge_runs(const char *strings, size_t stride,
+                       const long int *restrict src,
+                       long int *restrict dst,
+                       long int begin, long int middle, long int end) {
+   long int left = begin;
+   long int right = middle;
+   long int out = begin;
+
+   if (middle == end ||
+       strcmp(strings + (size_t)src[middle - 1] * stride,
+              strings + (size_t)src[middle] * stride) <= 0) {
+      memcpy(dst + begin, src + begin,
+             (size_t)(end - begin) * sizeof(*dst));
+      return;
+   }
+
+   /* Selection is dependent; only separate merge jobs are parallel. */
+   while (left < middle && right < end) {
+      long int li = src[left];
+      long int ri = src[right];
+      if (strcmp(strings + (size_t)li * stride,
+                 strings + (size_t)ri * stride) <= 0) {
+         dst[out++] = li;
+         ++left;
+      } else {
+         dst[out++] = ri;
+         ++right;
+      }
+   }
+
+   if (left < middle) {
+      memcpy(dst + out, src + left,
+             (size_t)(middle - left) * sizeof(*dst));
+   } else if (right < end) {
+      memcpy(dst + out, src + right,
+             (size_t)(end - right) * sizeof(*dst));
+   }
+}
+
+long int* bucket_sort(char *a, int length, long int size, int offset, int nbuckets) {
+   long int *result;
+   long int *workspace;
+   size_t bytes;
+
+   (void)offset;
+   (void)nbuckets;
+
+   if (size <= 0)
+      return NULL;
+   if ((size_t)size > SIZE_MAX / sizeof(*result))
+      exit(EXIT_FAILURE);
+
+   bytes = (size_t)size * sizeof(*result);
+   result = (long int *)malloc(bytes);
+   if (result == NULL)
+      exit(EXIT_FAILURE);
+   if (size == 1) {
+      result[0] = 0;
+      return result;
+   }
+
+   workspace = (long int *)malloc(bytes);
+   if (workspace == NULL) {
+      free(result);
+      exit(EXIT_FAILURE);
+   }
+
+#ifdef _OPENMP
+#pragma omp parallel if (size >= 32768)
+#endif
+   {
+      long int *src = result;
+      long int *dst = workspace;
+
+#if defined(_OPENMP) && _OPENMP >= 201307
+#pragma omp for simd schedule(static)
+#elif defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+      for (long int i = 0; i < size; ++i)
+         src[i] = i;
+
+      for (long int width = 1; width < size; ) {
+         /* Saturating the final step avoids signed doubling overflow. */
+         long int step = width > size - width ? size : width + width;
+         long int jobs = size / step + (size % step != 0);
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+         for (long int job = 0; job < jobs; ++job) {
+            long int begin = job * step;
+            long int remaining = size - begin;
+            long int middle = begin + (width < remaining ? width : remaining);
+            long int end = begin + (step < remaining ? step : remaining);
+            merge_runs(a, (size_t)length, src, dst, begin, middle, end);
+         }
+
+         /* The worksharing barrier publishes the complete next pass. */
+         long int *tmp = src;
+         src = dst;
+         dst = tmp;
+         width = step;
+      }
+
+#ifdef _OPENMP
+#pragma omp single
+#endif
+      {
+         result = src;
+         workspace = dst;
+      }
+   }
+
+   free(workspace);
+   return result;
+}
+
+void load(char **vString, long int *N, int *l, int *os, int *nb){
+   char *strings = NULL;
+   int      len,
+            offset,
+            nbucket;
+   long int n;
+
+   if (!fscanf(stdin, "%d", &len)) {
+      printf ("ERROR len\n");
+      exit (1);
+   }
+
+   if (!fscanf(stdin, "%ld", &n)) {
+      printf ("ERROR n\n");
+      exit (1);
+   }
+
+   if (!fscanf(stdin, "%d", &offset)) {
+      printf ("ERROR offset\n");
+      exit (1);
+   }
+
+   if (!fscanf(stdin, "%d", &nbucket)) {
+      printf ("ERROR nbucket\n");
+      exit (1);
+   }
+
+   nbucket = nbucket + 1;
+   len = len + 1;
+
+   strings = (char*) malloc(n * len);
+
+   for (long int i = 0; i < n; i++){
+      if (!fscanf(stdin, "%s", strings + (i * len))) {
+      printf ("ERROR %ld\n",i);
+      exit (1);
+      }
+   }
+
+   *vString = strings;
+   *N = n;
+   *l = len;
+   *os = offset;
+   *nb = nbucket;
+}
+
+void print(char *strings, long int *index, long int n, int len){
+
+   for (long int i = 0; i < n; i++){
+      printf("%ld -> %s\n", i, strings + (index[i] * len));
+   }
+}
+
+void save(char *strings, long int *index, long int n, int len){
+   for (long int i = 0; i < n; i++){
+      printf("%s\n", strings + (index[i] * len));
+   }
+}
+
+int main(int ac, char **av) {
+
+   char     *strings = NULL;
+   long int N        = 0;
+   long int *index   = NULL;
+   int      len      = 0,
+            save2File = 0,
+            offset,
+            nbuckets;
+
+   load(&strings, &N, &len, &offset, &nbuckets);
+
+   index = bucket_sort(strings, len, N, offset, nbuckets);
+
+   save(strings, index, N, len);
+
+   if (strings != NULL)
+      free(strings);
+
+   if (index != NULL)
+      free(index);
+
+   return EXIT_SUCCESS;
+}

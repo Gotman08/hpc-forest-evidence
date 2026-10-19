@@ -1,0 +1,137 @@
+"""Keep the existing official-program campaign flow; replace only generation transport."""
+from pathlib import Path
+
+root = Path(__file__).resolve().parent / 'project'
+source = (root / 'examples/marathon22/romeo_marathon.py').read_text(encoding='utf8')
+body = source[source.index('def campaign('):source.index('\ndef positive_integer(')]
+start = body.index('        pulled = (')
+end = body.index('        statement = ', start)
+body = body[:start] + '''        result["identity"] = {
+            "model": MODEL, "reasoning_effort": EFFORT,
+            "transport": "codex-mailbox", "hosted_inference": True,
+            "weight_digest_available": False,
+        }
+''' + body[end:]
+body = body.replace('with AutonomousController(root, statement)', 'with CodexController(root, statement)')
+body = body.replace('ROOT / "romeo_marathon.py",', 'ROOT / "romeo_codex.py",')
+body = body.replace('ROOT / "neutral_backend.py",', 'Path(codex_mailbox.__file__),')
+body = body.replace('"neutral_adapter",', '"neutral_codex_mailbox_adapter",')
+prefix = '''"""ROMEO owns TreeQuest and evaluations; the local authenticated Codex worker proposes source."""
+from __future__ import annotations
+
+import argparse
+import importlib.metadata
+import json
+import os
+import platform
+import socket
+import time
+import traceback
+from pathlib import Path
+
+import evidence_pack
+import romeo_base as base
+import romeo_marathon as reference
+from hpc_forest import codex_mailbox
+from hpc_forest.codex_mailbox import EFFORT, MODEL, TOKEN_CEILING, CodexMailboxBackend, initialize_channel
+from hpc_forest.controller import create_workspace
+from hpc_forest.core import atomic_json
+from hpc_forest.knowledge import Knowledge
+from hpc_forest.reporting import package, report
+from prepare_problem import prepare_problem
+
+ROOT = Path(__file__).resolve().parent
+CHANNEL = None
+SESSION_ID = None
+extract_official = reference.extract_official
+
+
+def config_for(url, slug, target, prepared):
+    c = reference.config_for(url, slug, target, prepared)
+    c["backend"] = "codex"
+    c.pop("ollama", None)
+    c["codex"] = {"model": MODEL, "reasoning_effort": EFFORT,
+                  "transport": "codex-mailbox", "mailbox_dir": str(CHANNEL),
+                  "session_id": SESSION_ID}
+    c["budget"]["mission_tokens"] = TOKEN_CEILING
+    return c
+
+
+class CodexController(reference.AutonomousController):
+    def __init__(self, root, statement):
+        super().__init__(root, statement)
+        self.backend = CodexMailboxBackend()
+
+
+'''
+suffix = '''
+
+def main():
+    global ROOT, CHANNEL, SESSION_ID
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--problems", nargs="+", choices=["knn", "sum", "nbody"], default=["knn", "sum", "nbody"])
+    parser.add_argument("--worker-wait-seconds", type=int, default=180)
+    args = parser.parse_args()
+    job = os.environ.get("SLURM_JOB_ID", "")
+    if not job.isdigit() or platform.machine().lower() not in {"aarch64", "arm64"}:
+        parser.error("This campaign requires its own ARM64 Slurm CPU allocation")
+    ROOT = args.root.resolve(strict=True)
+    reference.ROOT = ROOT
+    reference.SCHEDULE.update(cycles=4, trials_per_role_per_cycle=6, integrations_per_cycle=6)
+    reference.LIMITS.update(wall_seconds=21600, tokens=4000000, generation_seconds=600)
+    SESSION_ID = args.session_id
+    output = ROOT / f"results-{job}"
+    output.mkdir(exist_ok=False)
+    CHANNEL = output / "mailbox"
+    initialize_channel(CHANNEL, SESSION_ID, job)
+    atomic_json(output / "channel.json", {"channel": str(CHANNEL), "session_id": SESSION_ID,
+                "job_id": job, "model": MODEL, "reasoning_effort": EFFORT})
+    base.emit("codex_mailbox_ready", channel=str(CHANNEL), session_id=SESSION_ID, job_id=job)
+    result = {"format": "hpc-forest-marathon22-gpt61sol-max-v1", "job_id": job,
+              "model": MODEL, "reasoning_effort": EFFORT, "complete": False, "problems": []}
+    try:
+        if importlib.metadata.version("treequest") != "0.3.2":
+            raise RuntimeError("Unexpected TreeQuest version")
+        baseline = json.loads((ROOT / "runtime-baseline.json").read_text(encoding="utf8"))
+        package_root = Path(codex_mailbox.__file__).parent
+        for name, digest in baseline.items():
+            if base.sha256(package_root / name) != digest:
+                raise RuntimeError("Original controller/runtime changed: " + name)
+        ready = CHANNEL / "worker-ready.json"
+        deadline = time.monotonic() + args.worker_wait_seconds
+        while not ready.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("No local authenticated Codex worker connected")
+            time.sleep(0.5)
+        worker = codex_mailbox.bounded_json(ready, 16384)
+        if any(worker.get(k) != value for k, value in {
+            "model": MODEL, "reasoning_effort": EFFORT, "session_id": SESSION_ID, "mode": "codex",
+        }.items()):
+            raise RuntimeError("Wrong model worker or transport-smoke worker")
+        atomic_json(output / "model-identity.json", {**worker, "weight_digest_available": False})
+        target = f"romeo:{socket.gethostname()}:slurm-{job}:cpu-marathon22"
+        for slug in args.problems:
+            result["problems"].append(campaign("codex-mailbox", slug, output, target))
+            atomic_json(output / "results.json", result)
+        result["complete"] = all(p["complete"] for p in result["problems"])
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["traceback"] = traceback.format_exc()
+        base.emit("runner_error", error=result["error"])
+    finally:
+        atomic_json(output / "results.json", result)
+        atomic_json(output / "cleanup.json", {"no_model_weights_on_romeo": True,
+                    "no_local_process_started_by_remote_runner": True})
+        archive = ROOT / f"results-{job}.tar.gz"
+        evidence_pack.make(output, ROOT / "sources-officielles", archive)
+        base.emit("runner_end", complete=result["complete"], archive=str(archive), sha256=base.sha256(archive))
+    return 0 if result["complete"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+(root / 'examples/marathon22/romeo_codex.py').write_text(prefix + body + suffix, encoding='utf8')
+print('Created dedicated runner without Ollama or GPU-model preparation.')

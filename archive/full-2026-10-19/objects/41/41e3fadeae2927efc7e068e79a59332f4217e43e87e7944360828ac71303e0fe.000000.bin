@@ -1,0 +1,56 @@
+"""Verify an observation-only recovery without touching the live relay."""
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def main():
+    legacy = load_module("verify_observer_legacy", ROOT / "coordonner-matrice.py")
+    observer = load_module("verify_recovered_observer", HERE / "observer-courant.py")
+    state = json.loads((ROOT / "coordinator-state.json").read_text())
+    pair = json.loads((HERE / "relais-attendu.json").read_text())
+    observer.verify_relay_pair(pair, legacy.process_identity)
+    observer.verify_cell(state, legacy.process_identity(pair[0]["ProcessId"]))
+    saved = state["strict_coordinator_identity"]
+    assert legacy.same_process(saved) and str(HERE / "observer-courant.py") in saved["CommandLine"]
+    assert state["stage"] == "running_current_group_observation_recovered" and state.get("error") is None
+    assert not legacy.same_process(json.loads((HERE / "avant/coordinator-state.json").read_text())["strict_coordinator_identity"])
+    frozen = load_module("verify_frozen_r1_observer", ROOT / "reprises/incident-liaison-20261016T1656/reprendre-relais-r1.py")
+    count = frozen.frozen_source(ROOT / "HPC-Forest-Archives-Modele-Mere-r1.zip", legacy.PROJECT, observer.SOURCE)
+    assert count == 90
+    stop_path = ROOT.parent / "HPC-Forest-Harnais-Comparaison-r1/runs/source-only-gpt-6-luna-max/owned-worker-stopped.json"
+    stop = json.loads(stop_path.read_text())
+    assert all(not legacy.same_process(p) for p in stop["verified_process_tree_before_stop"])
+    errors = [json.loads(line) for line in (HERE / "avant/erreurs-prochain.jsonl").read_text().splitlines()]
+    assert len(errors) == 3 and all("capacity or identity" in e["error"] for e in errors)
+    assert all(e["observed_at"] > stop["observed_at"] for e in errors)
+    assert all(not e["submission_replayed"] and not e["worker_restarted"] for e in errors)
+    result = {"verified": True, "job_id": observer.JOB, "session_id": observer.SESSION,
+        "same_relay_launcher_and_real_python": pair, "observer": saved,
+        "observer_launcher": legacy.process_identity(saved["ParentProcessId"]),
+        "frozen_source_files_unchanged": count, "source_zip_sha256": observer.SOURCE,
+        "old_dispatcher_refused_after_audited_source_only_relay_stop": True,
+        "source_only_stop_owned_identities_still_absent": True,
+        "observer_only": True, "submission_replayed": False, "worker_restarted": False,
+        "generation_replayed": False, "no_receipt_stop_or_generation_api_permitted": True,
+        "neutral_tests": 15, "ruff_passed": True,
+        "terminal_stage_requires_audited_reception": "awaiting_audited_reception_after_strict_dispatch"}
+    legacy.atomic_json(HERE / "verification-reprise.json", result)
+    print(json.dumps({"verified": True, "observer_pair": [saved["ParentProcessId"], saved["ProcessId"]],
+                      "same_relay": [p["ProcessId"] for p in pair], "sources": count}))
+
+
+if __name__ == "__main__":
+    main()

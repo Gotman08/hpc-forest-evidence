@@ -1,0 +1,60 @@
+"""Create a fresh isolated source copy after exact opaque original/ZIP comparison."""
+import hashlib
+import json
+import shutil
+import zipfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[2]
+DELIVERY = BASE / "outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2d/LIVRAISON-LOCALE-FINALE.json"
+OLD = BASE / "work/hpc-forest-primes-native-max-r2d/project"
+NEW_PARENT = BASE / "work/hpc-forest-primes-natif-relance-r2e"
+NEW = NEW_PARENT / "project"
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+delivery = json.loads(DELIVERY.read_text("utf8"))
+archive = Path(delivery["source_zip"]["path"])
+assert sha(archive) == delivery["source_zip"]["sha256"] == "13ccaf7c74d13db246d1127a25c511bc03d7989ba9097eb6ad7b4f681c0a0a46"
+assert not NEW_PARENT.exists()
+paths = list(OLD.rglob("*"))
+assert not any(path.is_symlink() or getattr(path, "is_junction", lambda: False)() for path in (OLD, *paths))
+original_all = {path.relative_to(OLD).as_posix(): sha(path) for path in paths if path.is_file()}
+with zipfile.ZipFile(archive) as source_zip:
+    files = [entry for entry in source_zip.infolist() if not entry.is_dir()]
+    assert all(entry.filename.startswith("HPC-Forest/") and ".." not in Path(entry.filename).parts for entry in files)
+    zipped = {entry.filename.removeprefix("HPC-Forest/"): hashlib.sha256(source_zip.read(entry)).hexdigest()
+              for entry in files}
+allowed_extra_names = {
+    ".pytest_cache/.gitignore", ".pytest_cache/CACHEDIR.TAG", ".pytest_cache/README.md",
+    ".pytest_cache/v/cache/nodeids", ".ruff_cache/.gitignore", ".ruff_cache/CACHEDIR.TAG",
+    ".ruff_cache/0.17.0/2876313625683039069", ".ruff_cache/0.17.0/5436452139319108419",
+    ".ruff_cache/0.17.0/8990771984257486248",
+}
+assert set(original_all) - set(zipped) == allowed_extra_names
+assert set(zipped) <= set(original_all)
+original = {name: original_all[name] for name in zipped}
+assert original == zipped and len(original) == len(files) == 105
+NEW_PARENT.mkdir()
+NEW.mkdir()
+for name in original:
+    destination = NEW / name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    assert not destination.exists()
+    shutil.copyfile(OLD / name, destination)
+copied = {path.relative_to(NEW).as_posix(): sha(path) for path in NEW.rglob("*") if path.is_file()}
+after = {path.relative_to(OLD).as_posix(): sha(path) for path in OLD.rglob("*") if path.is_file()}
+assert after == original_all and copied == original
+receipt = {"schema": "hpc-forest-r2e-isolated-exact-source105-copy-v1", "verified": True,
+           "old_project": str(OLD), "new_project": str(NEW), "source_zip": delivery["source_zip"],
+           "source_files": 105, "original_before_equals_after_equals_copy": True,
+           "files": original, "old_all_114_files_preserved": after == original_all,
+           "old_non_source_caches_not_copied": sorted(allowed_extra_names), "old_source_changed": False,
+           "CLI_model_MCP_job_or_installation_calls": 0, "native_admission": False}
+with (HERE / "COPIE-SOURCE105-VERIFIEE.json").open("x", encoding="utf8") as output:
+    output.write(json.dumps(receipt, indent=2) + "\n")
+print(json.dumps({"new_project": str(NEW), "files": len(copied), "receipt_sha256": sha(HERE / "COPIE-SOURCE105-VERIFIEE.json")}))

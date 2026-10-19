@@ -1,0 +1,101 @@
+"""Pure prototype tests: no source import, filesystem evidence or effects."""
+import copy
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('new_r4b_contract', HERE / 'contrat_source110.py')
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+
+
+def authorization():
+    model = 'gpt-6-astra'
+    session = c.SESSIONS[model]['roots']
+    return {'scope_id':c.SCOPE,'model':model,'effort':'max','session_id':session,'job_id':'999999',
+        'remote_root':'/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-'+session,
+        'purpose':'technical-contract','technical_phase':'roots',
+        'artifacts':{name:({'sha256':c.SOURCE} if name=='source_zip' else
+                         {'sha256':c.PLAN} if name=='plan' else None) for name in c.ARTIFACTS}}
+
+
+def qualification():
+    base = {'scope_id':c.SCOPE,'source_zip_sha256':c.SOURCE,'plan_sha256':c.PLAN,
+            'adapter_components_manifest_sha256':'a'*64,'verified':True,'native_model_calls':0}
+    actual = {**base,'adapter_revision':c.Q_REVISION,'source_file_count':110,
+        'source_lane_contract_tests':{'passed':26,'failed':0},'adapter_portable_tests':{'passed':1,'failed':0}}
+    return actual, base
+
+
+def test_exact_eight_fields_not_an_admission():
+    binding = c.policy_binding(authorization())
+    assert set(binding) == set(c.BINDING_FIELDS) and len(binding) == 8
+    assert 'verified' not in binding
+
+
+@pytest.mark.parametrize('field,value', [('effort','medium'),('purpose','pilot'),('session_id','0'*32),('model','gpt-6-luna')])
+def test_wrong_technical_binding(field,value):
+    a=authorization();a[field]=value
+    with pytest.raises(ValueError): c.policy_binding(a)
+
+
+def test_policy_must_not_be_tenth_artifact():
+    a=authorization();a['artifacts']['task_cli_policy']={}
+    with pytest.raises(ValueError): c.policy_binding(a)
+
+
+def policy():
+    binding=c.policy_binding(authorization())
+    return binding, {**binding,'schema':'hpc-forest-r2g-local-cli-policy-v1',
+        'cli_executable_sha256':c.CLI,'code_mode_host_executable_sha256':c.HOST,
+        'cli_feature_overrides':dict(c.FEATURES)}
+
+
+def test_public_policy_is_candidate_only():
+    binding,p=policy();assert c.policy_public_binding(p,binding)['runtime_no_tools_proven'] is False
+
+
+@pytest.mark.parametrize('key,value',[('code_mode_host',False),('code_mode',True),('shell_tool',True),('code_mode_host',1),('code_mode',0)])
+def test_feature_mutation_or_bool_alias_refused(key,value):
+    binding,p=policy();p['cli_feature_overrides'][key]=value
+    with pytest.raises(ValueError):c.policy_public_binding(p,binding)
+
+
+def test_worker_argv_preserves_every_shared_value():
+    argv=['--session-id','abc','--output','X:/private','--max-seconds','900','--once']
+    assert c.inherited_worker_argv(argv,'X:/policy.json','b'*64) == argv+['--cli-policy','X:/policy.json','--cli-policy-sha256','b'*64]
+    assert argv[-1]=='--once'
+
+
+@pytest.mark.parametrize('token',['--cli-policy','--cli-policy=x','--cli-policy-sha256=x'])
+def test_duplicate_private_flag_refused(token):
+    with pytest.raises(ValueError):c.inherited_worker_argv([token],'X:/p.json','a'*64)
+
+
+def test_six_field_owner_matches_job_and_preserves_scope():
+    a=authorization();o=c.proposed_owner(a['job_id'],a['session_id'],a['model'])
+    assert len(o)==6 and o['owner']==o['job_id']==a['job_id']
+
+
+def test_new_component_claim_identity_only_has_no_admission_return():
+    a,b=qualification();assert c.qualification_claim_bindings(a,b,components_sha256='a'*64) is None
+
+
+@pytest.mark.parametrize('field,value',[('source_zip_sha256','60db53fb69e014133a9c77ebaea9ae09ae7891c1433070a9af4eae30b0d05e6d'),
+    ('source_file_count',105),('adapter_revision','lane-r2-integration'),('adapter_components_manifest_sha256','d18259c0017f0273522a54c638aaf14da9f5db8c32b12618852157f879323977')])
+def test_old_qualification_cannot_be_promoted(field,value):
+    a,b=qualification();a[field]=value
+    with pytest.raises(ValueError):c.qualification_claim_bindings(a,b,components_sha256='a'*64)
+
+
+def test_187_is_not_26_lane():
+    a,b=qualification();a['source_lane_contract_tests']['passed']=187
+    with pytest.raises(ValueError):c.qualification_claim_bindings(a,b,components_sha256='a'*64)
+
+
+def test_qualification_not_mutated_by_check():
+    a,b=qualification();before=copy.deepcopy((a,b))
+    c.qualification_claim_bindings(a,b,components_sha256='a'*64)
+    assert (a,b)==before

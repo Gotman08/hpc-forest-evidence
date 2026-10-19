@@ -1,0 +1,261 @@
+"""One-shot independent artifact reader. No received Python/code is executed."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import io
+import json
+import re
+import tarfile
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+AUDIT = Path(__file__).resolve().parent
+RX = AUDIT.parent
+RESTORE = RX / 'restauration-independante-02'
+OPS = RX.parent
+PREP = OPS.parent
+SCOPE = 'hpc-forest-dynamic-independent-roots-r4b-max'
+JOB = '752369'
+SOURCE = 'ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3'
+PLAN = '9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b'
+STAGE = 'bdb27e9611d5e53048521a48563b0abd4bf55256ac4169d49d46941f1d2ba73a'
+PACKET = 'f4474313599f571b7ad41f92a3cf1c9a1d6db220254b85ac83590536eb8cd430'
+ARCHIVE = '76cfe5cedcf00a00a1ea53f9fa6fd6cf124fa898b1874e4b91844da3d5c63e21'
+REPORT = '856b06914b96c8686df42ac5f49fd9de99aa0314fb319be7f7657abaf59fc1c8'
+RAW_NAMES = ('archive-download.json', 'efficiency.json', 'logs-announcement.json',
+             'preflight-results-752369.tar.gz', 'preflight.json', 'report-download.json', 'status-terminal.json')
+REMOTE = '/scratch_p/nimarano/hpc-forest-dynamic-r4b-stage-preflight-20261018-r1-bdb27e9611d5'
+Q = PREP / 'lancement-modeles-max-r2/qualification-stage-r1'
+SRC = PREP / 'revision-source-r4b/revision-r2'
+
+
+def need(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def sha(path):
+    path = Path(path)
+    need(path.is_file() and not path.is_symlink() and not getattr(path, 'is_junction', lambda: False)(), 'Regular immutable evidence required')
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {'path': str(path.resolve(strict=True)), 'sha256': sha(path)}
+
+
+def decode(raw):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            need(key not in value, 'Duplicate JSON key')
+            value[key] = item
+        return value
+    return json.loads(raw.decode('utf8', errors='strict'), object_pairs_hook=pairs,
+                      parse_constant=lambda value: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+
+
+def read(path):
+    sha(path)
+    return decode(path.read_bytes())
+
+
+def save(name, value):
+    path = AUDIT / name
+    with path.open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    return ref(path)
+
+
+def inventory(paths):
+    return {str(path.resolve(strict=True)): {'sha256': sha(path), 'bytes': path.stat().st_size} for path in paths}
+
+
+def restored_inventory():
+    paths = list(RESTORE.rglob('*'))
+    need(not any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)() for p in paths), 'Restored aliases refused')
+    return {p.relative_to(RESTORE).as_posix(): {'sha256': sha(p), 'bytes': p.stat().st_size}
+            for p in paths if p.is_file()}
+
+
+def transfer(value, filename, remote, expected_sha):
+    local = RX / filename
+    need(value.get('ok') is True and value.get('verifie') is True
+         and value.get('downloaded') == remote and Path(value['to']) == local
+         and type(value.get('bytes')) is int and value['bytes'] == local.stat().st_size
+         and all(value.get(k) == expected_sha for k in ('remote_sha256', 'empreinte_locale', 'empreinte_distante'))
+         and sha(local) == expected_sha, 'Actual transfer SHA/bytes/path mismatch')
+
+
+def tar_payload(archive, expected_names, *, maximum=1024 * 1024):
+    members = archive.getmembers()
+    need(len(members) == len(expected_names) and {m.name for m in members} == set(expected_names), 'Closed archive member set required')
+    need(len({m.name.casefold() for m in members}) == len(members), 'Duplicate/colliding archive member')
+    need(sum(m.size for m in members) <= maximum, 'Bounded archive only')
+    payload, metadata = {}, []
+    for member in members:
+        posix = PurePosixPath(member.name)
+        need(not posix.is_absolute() and '..' not in posix.parts and '\\' not in member.name and ':' not in member.name
+             and not member.linkname and (member.isdir() if expected_names[member.name] == 'directory' else member.isfile()),
+             'Unexpected file type/path/link refused')
+        metadata.append({'name': member.name, 'kind': expected_names[member.name], 'bytes': member.size,
+                         'mode': member.mode, 'pax_headers': member.pax_headers})
+        if member.isfile():
+            payload[member.name] = archive.extractfile(member).read()
+            need(len(payload[member.name]) == member.size, 'Archive member truncated')
+    return payload, metadata
+
+
+def main():
+    raw_paths = [RX / name for name in RAW_NAMES]
+    evidence_paths = raw_paths + [Q / name for name in ('qualification-stage-zero-model-r1.tar.gz', 'PROPOSITION-PREFLIGHT.json',
+        'commande-allouee-zero-modele.sh', 'job-prepare-propose.json', 'qualify_stage_zero_model.py', 'native_worker_detection.py')]
+    evidence_paths += [SRC / 'HPC-Forest-Mere-Dynamique-R4b-MAX.zip', SRC / 'dynamic-plan-r4b-max.json']
+    evidence_paths += [OPS / name for name in ('packet-upload.json', 'submission-observed.json', 'intention-pre-submit-exclusive.json', 'plan-readback.json')]
+    before = inventory(evidence_paths)
+    before_ref = save('inventaire-entrees-avant.json', before)
+    need(sha(RX / RAW_NAMES[3]) == ARCHIVE and sha(RX / 'preflight.json') == REPORT, 'Received archive/report SHA differs')
+    transfer(read(RX / 'archive-download.json'), RAW_NAMES[3], REMOTE + '/preflight-results-752369.tar.gz', ARCHIVE)
+    transfer(read(RX / 'report-download.json'), 'preflight.json', REMOTE + '/results-752369/preflight.json', REPORT)
+    logs, terminal, efficiency = [read(RX / name) for name in ('logs-announcement.json', 'status-terminal.json', 'efficiency.json')]
+    need(logs.get('ok') is True and logs.get('job_id') == JOB and logs.get('truncated') is False
+         and logs.get('files_limited') is False and logs.get('has_stderr_content') is False, 'Actual complete producer announcement required')
+    announcements = re.findall(r'(?m)^([0-9a-f]{64})  (\S+)$', logs['content'])
+    need(announcements == [(ARCHIVE, REMOTE + '/preflight-results-752369.tar.gz')], 'Single producer archive announcement must match remote and local SHA')
+    need(terminal.get('job_id') == JOB and terminal.get('state') == 'COMPLETED' and terminal.get('exit_code') == '0:0'
+         and terminal.get('finished') is True and terminal.get('scheduler_success_observed') is True
+         and terminal.get('result_validated') is False, 'Real terminal scheduler status required, raw validation flag preserved')
+    need(efficiency.get('ok') is True and efficiency.get('job_id') == JOB and efficiency.get('state') == 'COMPLETED'
+         and efficiency.get('exit_code') == '0:0' and efficiency.get('alloc_cpus') == 4
+         and efficiency.get('alloc_gpus') == 0 and efficiency.get('req_mem_mb') == 16384
+         and efficiency.get('elapsed_seconds') == 2, 'Real efficiency/allocation record differs')
+    proposal = read(Q / 'PROPOSITION-PREFLIGHT.json')
+    packet = Q / 'qualification-stage-zero-model-r1.tar.gz'
+    need(sha(packet) == PACKET == proposal['packet']['sha256'], 'Exact reviewed preflight packet required')
+    upload = read(OPS / 'packet-upload.json')
+    need(upload.get('ok') is True and upload.get('verifie') is True and upload.get('to') == REMOTE + '.tar.gz'
+         and all(upload.get(k) == PACKET for k in ('remote_sha256', 'empreinte_locale', 'empreinte_distante')),
+         'Actual exact packet upload/readback proof differs')
+    intent, submission, readback = [read(OPS / name) for name in ('intention-pre-submit-exclusive.json', 'submission-observed.json', 'plan-readback.json')]
+    need(intent.get('one_submit_only') is True and intent.get('job_id') is None and intent.get('native_model_calls') == 0
+         and submission.get('ok') is True and submission.get('submission_observed') is True and submission.get('job_id') == JOB
+         and intent['plan_id'] == submission['plan_id'] == readback['plan_id']
+         and intent['scheduler_plan_sha256'] == submission['plan_sha256'] == readback['plan_sha256'], 'Single actual submission binding differs')
+    command_spec = readback['plan']['entries'][0]['plan']['spec']
+    need(command_spec['command'] == read(Q / 'job-prepare-propose.json')['command'], 'Actual scheduler workload differs from reviewed command')
+    names = {'results-752369': 'directory', 'results-752369/driver': 'directory',
+        **{'results-752369/driver/' + n: 'file' for n in ('remote_stage.py', 'cell_selection.py', 'stage-manifest.json')},
+        'results-752369/preflight.json': 'file'}
+    with tarfile.open(RX / RAW_NAMES[3]) as archive:
+        payload, metadata = tar_payload(archive, names)
+    need(not RESTORE.exists() and not RESTORE.is_symlink(), 'Restoration must be genuinely new')
+    RESTORE.mkdir()
+    for name, kind in sorted(names.items(), key=lambda item: len(PurePosixPath(item[0]).parts)):
+        path = RESTORE.joinpath(*PurePosixPath(name).parts)
+        need(path.resolve(strict=False).is_relative_to(RESTORE.resolve()), 'Restoration escaped exact owned root')
+        if kind == 'directory':
+            path.mkdir(exist_ok=False)
+        else:
+            with path.open('xb') as stream:
+                stream.write(payload[name])
+    need(len(payload) == 4 and sum(kind == 'directory' for kind in names.values()) == 2, 'Expected four files/two directories')
+    restore_before = restored_inventory()
+    restored_before_ref = save('inventaire-restauration-avant.json', restore_before)
+    need(payload['results-752369/preflight.json'] == (RX / 'preflight.json').read_bytes(), 'Standalone/archive report bytes differ')
+    with tarfile.open(packet) as archive:
+        packet_raw, _ = tar_payload(archive, {name: 'file' for name in (
+            'qualify_stage_zero_model.py', 'native_worker_detection.py', 'native-interface-models-max-r2.tar.gz', 'packet-manifest.json')})
+    packet_manifest = decode(packet_raw['packet-manifest.json'])
+    need(packet_manifest == {n: hashlib.sha256(b).hexdigest() for n, b in packet_raw.items() if n != 'packet-manifest.json'}, 'Packet closed manifest differs')
+    for name in ('qualify_stage_zero_model.py', 'native_worker_detection.py'):
+        need(packet_raw[name] == (Q / name).read_bytes(), 'Proposed qualifier/detector bytes differ')
+    stage_raw = packet_raw['native-interface-models-max-r2.tar.gz']
+    need(hashlib.sha256(stage_raw).hexdigest() == STAGE, 'Exact external stage BDB required')
+    with tarfile.open(fileobj=io.BytesIO(stage_raw)) as archive:
+        stage, _ = tar_payload(archive, {name: 'file' for name in ('remote_stage.py', 'cell_selection.py', 'stage-manifest.json')})
+    need(decode(stage['stage-manifest.json']) == {n: hashlib.sha256(stage[n]).hexdigest() for n in ('remote_stage.py', 'cell_selection.py')}, 'Stage manifest mismatch')
+    for name, raw in stage.items():
+        need(payload['results-752369/driver/' + name] == raw, 'Restored executed driver differs from exact staged packet')
+    report = read(RX / 'preflight.json')
+    need(report.get('schema') == 'hpc-forest-dynamic-r4b-external-stage-zero-model-preflight-v1'
+         and report.get('verified') is True and report.get('source_zip_sha256') == SOURCE
+         and report.get('plan_sha256') == PLAN and report.get('stage_archive_sha256') == STAGE and report.get('error_class') is None,
+         'Closed stage-only report identity failed')
+    for key in ('native_model_calls', 'C_compilations', 'CLI_or_RPC_calls'):
+        need(type(report.get(key)) is int and report[key] == 0, 'Only zero calls/C permitted')
+    for key in ('native_generation_admitted', 'normal_first_start_verified', 'performance_verified', 'hardware_isolation_verified', 'native_contracts_verified'):
+        need(report.get(key) is False, 'A native/scientific/performance admission must remain false')
+    need(report.get('blocked_events') == [] and report.get('actual_frozen_roots_bounds') == [1, 8]
+         and report.get('stage_interface_only') is True and report.get('source_103_unchanged') is True,
+         'Pure interface boundaries must remain explicit')
+    allocation = report['allocation']
+    need(all(allocation.get(k) == v for k, v in {'slurm_job_id': JOB, 'architecture': 'ARM64', 'cpu_cores': 4,
+         'tasks': 1, 'nodes': 1, 'allocated_memory_mib': 16384, 'allocated_gpus': 0}.items())
+         and len(report['cpu_affinity']) == len(set(report['cpu_affinity'])) == 4
+         and all(type(v) is int for v in report['cpu_affinity']), 'Exact ARM64/4CPU affinity/16Gi/0GPU required')
+    source_zip = SRC / 'HPC-Forest-Mere-Dynamique-R4b-MAX.zip'
+    plan_path = SRC / 'dynamic-plan-r4b-max.json'
+    need(sha(source_zip) == SOURCE and sha(plan_path) == PLAN, 'Real source ZIP/plan hashes differ')
+    with zipfile.ZipFile(source_zip) as archive:
+        members = [m for m in archive.infolist() if not m.is_dir()]
+        expected = {m.filename.removeprefix('HPC-Forest/'): hashlib.sha256(archive.read(m)).hexdigest() for m in members}
+        need(len(members) == len(expected) == 103 and all(m.filename.startswith('HPC-Forest/') for m in members), 'Frozen103 ZIP unique files required')
+    need(report['source_inventory_before'] == report['source_inventory_after'] == expected, 'Source inventories before/after must equal all103 ZIP bytes')
+    plan = read(plan_path)
+    models, phases = ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-terra'), ('roots', 'advice', 'harvest')
+    rows = report['cases']
+    need(len(rows) == 9 and len({(row['model'], row['phase']) for row in rows}) == 9, 'Exactly nine unique separate cells required')
+    need({(r['model'], r['phase'], r['session_id']) for r in rows} == {
+        (m, ph, plan['contract_cells'][m][ph]) for m in models for ph in phases}, 'Cases differ from exact sealed nine-cell plan')
+    for row in rows:
+        need(set(row) == {'model', 'phase', 'session_id', 'request_schema_equal_to_frozen', 'synthetic_target_only_no_compiler_capability_claim', 'model_calls'}
+             and row['request_schema_equal_to_frozen'] is True and row['synthetic_target_only_no_compiler_capability_claim'] is True
+             and type(row['model_calls']) is int and row['model_calls'] == 0, 'Closed pure per-cell record required')
+    # Parse only; never import/execute the received driver or the producer.
+    tree = ast.parse(stage['remote_stage.py'].decode('utf8'))
+    make = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'make_request')
+    returned = next(n for n in ast.walk(make) if isinstance(n, ast.Return)).value
+    effort = next(v for k, v in zip(returned.keys, returned.values) if isinstance(k, ast.Constant) and k.value == 'reasoning_effort')
+    need(isinstance(effort, ast.Constant) and effort.value == 'max', 'MAX must be literal in frozen stage request')
+    need(report['detection_cases'] == ['unknown-module', 'uppercase-bootstrap', 'quoted-uppercase-module', 'unknown-module-file', 'foreign-command', 'system-null'],
+         'All six corrected detector fixtures required')
+    after, restore_after = inventory(evidence_paths), restored_inventory()
+    need(before == after and restore_before == restore_after, 'Inputs or restored bytes changed during independent audit')
+    after_ref = save('inventaire-entrees-apres.json', after)
+    restored_after_ref = save('inventaire-restauration-apres.json', restore_after)
+    archive_members = save('membres-archive.json', metadata)
+    receipt = {'schema': 'hpc-forest-dynamic-r4b-external-stage-independent-reception-v1', 'verified': True,
+        'verification_scope': 'independent read-only artifact restoration and mechanical stage-only byte reconciliation',
+        'scope_id': SCOPE, 'job_id': JOB, 'source_zip_sha256': SOURCE, 'plan_sha256': PLAN,
+        'stage_archive_sha256': STAGE, 'packet_sha256': PACKET, 'archive_sha256': ARCHIVE, 'report_sha256': REPORT,
+        'created_at_utc': datetime.now(timezone.utc).isoformat(), 'terminal_state': 'COMPLETED', 'exit_code': '0:0',
+        'elapsed_seconds': 2, 'allocation': allocation, 'cpu_affinity': report['cpu_affinity'],
+        'announced_remote_local_archive_sha256_identical': True, 'standalone_and_archive_report_bytes_identical': True,
+        'fresh_independent_restoration': str(RESTORE), 'regular_files': 4, 'directories': 2,
+        'restored_bytes': sum(v['bytes'] for v in restore_before.values()), 'no_links_or_special_members': True,
+        'driver_bytes_equal_exact_stage_packet': True, 'source_files_exact_to_zip': 103,
+        'source_inventories_before_after_equal_zip': True, 'exact_nine_MAX_cells': rows,
+        'MAX_effort_literal_in_driver_verified': True, 'cardinality_bounds': [1, 8], 'conservative_detector_fixture_count': 6,
+        'blocked_events': [], 'evidence_inventory_before_after_identical': True, 'restoration_inventory_before_after_identical': True,
+        'mechanical_stage_preflight_verified': True, 'source_C_qualification_repeated': False,
+        'native_model_calls': 0, 'C_compilations': 0, 'CLI_or_RPC_calls_in_workload': 0,
+        'received_code_executed_by_auditor': False, 'native_generation_admitted': False, 'native_contracts_verified': False,
+        'normal_first_start_verified': False, 'first_normal_candidate_evaluation_verified': False,
+        'global_admission_verified': False, 'independent_performance_verified': False, 'hardware_isolation_verified': False,
+        'input_inventory_before': before_ref, 'input_inventory_after': after_ref,
+        'restoration_inventory_before': restored_before_ref, 'restoration_inventory_after': restored_after_ref,
+        'archive_members': archive_members, 'archive': ref(RX / RAW_NAMES[3]), 'report': ref(RX / 'preflight.json'),
+        'evidence_refs': [ref(path) for path in evidence_paths],
+        'limitations': ['Mechanical pure-stage proof only: no native model, CLI/RPC, C, candidate or scientific evaluation was rerun.',
+          'Zero counters and denied-event log refer to the reviewed Python workload; neutral scheduler provenance wrapper is outside its audit hook.',
+          'No native admission, observer policy/transition, three real model contracts or first NORMAL/evaluation follows from this receipt.',
+          'The per-case report lacks a separate effort field; MAX is checked against the staged driver literal and the pinned producer assertion, without any backend-inference attestation.',
+          'Allocation counts and affinity do not prove hardware/process isolation or independent performance.']}
+    result = save('RECEPTION-INDEPENDANTE.json', receipt)
+    print(json.dumps({'receipt': result, 'verified': True, 'regular_files': 4, 'directories': 2, 'native_generation_admitted': False}, indent=2))
+
+
+if __name__ == '__main__':
+    main()

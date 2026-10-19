@@ -1,0 +1,187 @@
+"""Metadata/AST-only review seal; never imports or runs factory, worker, CLI or shell."""
+import ast
+import hashlib
+import json
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[3]
+FACTORY = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2e/revision-r1"
+REL = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2e"
+observed = {}
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+def read(path, expected=None):
+    assert path.is_file() and not path.is_symlink()
+    raw = path.read_bytes()
+    checksum = digest(raw)
+    assert expected is None or checksum == expected, "Changed input: " + str(path)
+    observed[path] = checksum
+    return raw
+
+def load(path, expected=None):
+    return json.loads(read(path, expected))
+
+def referenced(value):
+    path = Path(value["path"])
+    assert path.is_absolute() and path.resolve().is_relative_to(BASE)
+    return read(path, value["sha256"])
+
+delivery_sha = "7f1e465fa66504b262def2a358f5535673ac802974a6af7095da13dff3d46041"
+manifest_sha = "4e13bf0d171f9f414b6e0af88f453817b9efa39a30cc65b3cb6f4c825717ed23"
+binding_sha = "e73737a5f7182f35a5418f2a1ac11e33b07151569161f65ef3091271751cefb2"
+delivery = load(FACTORY / "LIVRAISON-FACTORY-R2E-POUR-REVUE.json", delivery_sha)
+manifest = load(FACTORY / "MANIFESTE-FACTORY-LOCALE.json", manifest_sha)
+assert delivery["manifest"]["sha256"] == manifest_sha
+for group in ("components", "owned_launch_helpers", "neutral_tests"):
+    for name, checksum in manifest[group].items():
+        read(FACTORY / name, checksum)
+assert len(manifest["components"]) == 8 and len(manifest["owned_launch_helpers"]) == 3
+assert manifest["components"]["assembler-admissions-cellule.py"] == "9449b360ed8608e3858d0e332db150cffc2e27b22421c412d3005fcc4c849715"
+assert manifest["components"]["preparer-cellule-max.py"] == "f985e2b827ffbeb7ec56169eef70f76b9529a054c3b39ae18f35371ea4720239"
+assert manifest["components"]["publication-locale.py"] == "01dbd6e3af4bbc826a4f775482329d8c7cf7efae7e2b04b49f15e1a53c74a176"
+assert manifest["owned_launch_helpers"]["helper-lancement-possedes/valider-lancement.py"] == "e745f47722f920d55cd629c86e98b4340d2bb299225c604bd9c0f35fdf82c3ff"
+binding = load(FACTORY / "liaison-Q-reelle/source-bindings-reels-Q.json", binding_sha)
+assert delivery["actual_Q_source_binding"]["sha256"] == binding_sha
+source = "f15b840cca876a4c465775f5553a0eaa539a9b98e56fe942136a1fcbde9b86b9"
+plan_sha = "4b430e181948e55e463dfd1e60bdce96308a9190534734feb22354e4116ebde9"
+runtime_sha = "a4a9418edb8ea86aeb720259eca1a7ac246952d280648115be4c93cd0364800b"
+scope = "hpc-forest-primes-native-max-r2e"
+cells = {"gpt-6-astra": "f81b76a9bc484f669a210c476ae6f9b0",
+         "gpt-5.6-terra": "e3678f243ba54a9fadb57440641c0599",
+         "gpt-6.1-sol": "515db6fd166e4b68875f34cf2fe733fa"}
+assert binding["verified"] is True and binding["scope_id"] == scope and binding["cells"] == cells
+assert binding["source_member_count"] == 108 and binding["maximum_native_workers"] == 4
+assert binding["source_zip"]["sha256"] == source and binding["plan"]["sha256"] == plan_sha
+assert binding["runtime_manifest"]["sha256"] == runtime_sha
+for key in ("source_zip", "plan", "runtime_manifest", "qualification", "qualification_reception", "source_review"):
+    referenced(binding[key])
+plan = json.loads(referenced(binding["plan"]))
+runtime = json.loads(referenced(binding["runtime_manifest"]))
+assert len(runtime) == 108 and plan["cells"] == cells and plan["scope_id"] == scope
+assert plan["automatic_extension"] is False and plan["maximum_native_workers_total"] == 4 and plan["maximum_cells_per_authorization"] == 1
+assert plan["first_batch_gate"]["no_pause_after_one_response_that_would_prevent_batch_evaluation"] is True
+assert plan["first_batch_gate"]["boundary"] == "after batch reconciliation and actual first_start_receipt, before next controller.run"
+project = Path(binding["project_path"])
+for name, checksum in runtime.items():
+    read(project / name, checksum)
+qualification = json.loads(referenced(binding["qualification"]))
+reception = json.loads(referenced(binding["qualification_reception"]))
+assert qualification["allocation"]["job_id"] == delivery["mechanical_Q_job_id"] == "753285"
+assert binding["qualification"]["sha256"] == "d8dd1cc172f411fef5a87be4af6d8e52c17586782a90cb7e14e115ba9a9aae00"
+assert reception["verified"] is True and reception["scope_id"] == scope and reception["source_zip_sha256"] == source and reception["plan_sha256"] == plan_sha
+assert reception["qualification_sha256"] == binding["qualification"]["sha256"]
+assert reception["archive"]["sha256"] == "a567f1de7878b23b168785d6eccef4c89cc5163831d51679e263b855a03f1b92"
+assert reception["audit"]["sha256"] == "0684b6483047b5e53fcf7cb5195e84a2a06379cea38b90cbdd3a4636530ba4ff"
+referenced(reception["archive"])
+referenced(reception["audit"])
+cold_review_path = REL / "qualification-zero-modele-r1/revue-independante/reception-Q753285/REVUE-FROIDE-INDEPENDANTE-Q753285.json"
+cold_review = load(cold_review_path, "7162ca0dbf2b8fc6536cb76c6c1152a2078b6566cc2b8f962e4fc7505b5754f7")
+assert cold_review["verified"] is True and cold_review["job_id"] == "753285" and cold_review["source_files_verified"] == 108
+template = read(FACTORY / "allocated-preflight-template.py").decode("utf-8")
+prefix = ("set -euo pipefail\n"
+          "[[ ${SLURM_JOB_ID:-} =~ ^[0-9]+$ ]] || exit 70\n"
+          "[[ ${SLURM_JOB_NUM_NODES:-} == 1 && ${SLURM_NTASKS:-} == 1 && ${SLURM_CPUS_PER_TASK:-} == 4 && ${SLURM_MEM_PER_NODE:-} == 16384 ]] || exit 71\n"
+          "[[ ${SLURM_RESTART_COUNT:-0} == 0 ]] || exit 72\n"
+          "export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4\n"
+          "srun --nodes=1 --ntasks=1 --cpus-per-task=4 --mem=16G --cpu-bind=cores --time=03:00:00 /scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python -I -B -u - <<'ONE_SELECTED_MAX_CELL_PREFLIGHT'\n")
+commands = {}
+for model, session in cells.items():
+    payload = {"scope_id": scope, "model": model, "effort": "max", "session_id": session,
+               "source_sha256": source, "plan_sha256": plan_sha, "runtime_sha256": runtime_sha, "source_members": 108,
+               "remote_extraction": binding["remote_extraction"], "remote_root": "/scratch_p/nimarano/" + scope + "-" + session,
+               "admission_root": "/scratch_p/nimarano/" + scope + "-admission-" + session,
+               "source_zip_name": "HPC-Forest-Primes-Natif-MAX-r2e.zip", "cells": cells, "maximum_native_workers": 4}
+    command_raw = referenced(delivery["commands_by_model"][model])
+    command = command_raw.decode("utf-8")
+    assert command == prefix + template.replace("__CELL_BINDINGS_LITERAL__", repr(payload)) + "\nONE_SELECTED_MAX_CELL_PREFLIGHT\n"
+    assert command.count("\nsrun ") == 1
+    commands[model] = digest(command_raw)
+    path = Path(delivery["commands_by_model"][model]["path"])
+    proposal = load(path.parent / "job-prepare-arguments-proposes.json")
+    assert proposal["command"] == command
+    assert all(proposal[key] == value for key, value in {"arch": "armgpu", "partition": "short", "nodes": 1,
+               "ntasks_per_node": 1, "cpus_per_task": 4, "mem_gb": 16, "gpus_per_node": 0, "time_limit": "03:00:00", "cpu_bind": "cores"}.items())
+# Reconcile existing XML results by testcase identity; do not rerun any test.
+latest, xml_summary = {}, []
+for reference in delivery["neutral_evidence"]:
+    raw = referenced(reference)
+    if not reference["path"].endswith(".xml"):
+        continue
+    root = ET.fromstring(raw)
+    cases = root.findall(".//testcase")
+    failures = 0
+    for case in cases:
+        passed = not any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+        latest[(case.get("classname", ""), case.get("name", ""))] = passed
+        failures += not passed
+    xml_summary.append({"path": reference["path"], "sha256": reference["sha256"], "cases": len(cases), "nonpassing": failures})
+assert len(latest) == 97 and all(latest.values())
+assert [(row["cases"], row["nonpassing"]) for row in xml_summary] == [(76, 4), (25, 1), (1, 0)]
+effect_path = REL / "operations-parent/ROLE-EXCEPTION-EFFET.json"
+role_review_path = REL / "operations-parent/revue-role-autorise/REVUE-EFFET-ROLE-AUTORISE.json"
+effect_sha = "bb5044e46f6d0d04d262fd1141f5e0538b0b07dd0b80ab003a87254ff4461853"
+role_review_sha = "9a9303fd5e92323aee6870aa3ce023cb149840e50cd929c17d37e543532802e3"
+effect = load(effect_path, effect_sha)
+role_review = load(role_review_path, role_review_sha)
+assert effect["verified"] is True and effect["global_move_executed"] is True and effect["original_absent"] is True and effect["backup_verified"] is True
+assert effect["backup_sha256"] == effect["quarantine_sha256"] == effect["expected_sha256"]
+assert role_review["verified"] is True and role_review["blocking_findings"] == []
+assert role_review["reviewed_pins"]["ROLE-EXCEPTION-EFFET.json"] == effect_sha
+assert role_review["new_direct_precise_human_approval_verified"] is True
+derivation = load(FACTORY / "DERIVATION-INITIALE.json")
+assert derivation["old_before_sha256"] == derivation["old_after_sha256"]
+old = Path(derivation["old_directory"])
+for name, checksum in derivation["old_before_sha256"].items():
+    read(old / name, checksum)
+delta = {}
+for name in manifest["components"]:
+    if not name.endswith(".py"):
+        continue
+    def functions(path):
+        return {node.name: ast.dump(node, include_attributes=False) for node in ast.parse(read(path).decode("utf-8")).body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    previous, current = functions(old / name), functions(FACTORY / name)
+    delta[name] = {"added_functions": sorted(set(current) - set(previous)),
+                   "changed_functions": sorted(key for key in current.keys() & previous.keys() if current[key] != previous[key]),
+                   "removed_functions": sorted(set(previous) - set(current))}
+assert all(digest(path.read_bytes()) == checksum for path, checksum in observed.items())
+report = {
+    "schema": "hpc-forest-max-cell-launch-factory-independent-review-v1",
+    "verified": True, "blocking_findings": [], "verdict": "GO_EXACT_FACTORY_WITH_EXPLICIT_PARENT_ROLE_PREFLIGHT",
+    "reviewer": "/root/cli_task_scope_options/revue_q_zero_r2e", "scope_id": scope,
+    "review_scope": "Bounded external R2d-to-R2e delta, exact source/Q links, three commands, local CLI policy, publication ordering and owned launcher gates only",
+    "source_zip_sha256": source, "plan_sha256": plan_sha, "runtime_manifest_sha256": runtime_sha,
+    "bundle_sha256": delivery["bundle_sha256"], "source_member_count": 108, "mechanical_qualification_job": "753285",
+    "factory_delivery_sha256": delivery_sha, "factory_manifest_sha256": manifest_sha, "actual_source_bindings_sha256": binding_sha,
+    "reviewed_files": manifest["components"], "owned_launch_helpers_reviewed": manifest["owned_launch_helpers"],
+    "command_sha256_by_model": commands, "cells": cells, "bounded_AST_function_delta": delta,
+    "local_policy_and_sha_in_worker_argv_bound_to_cli_identity": True,
+    "raw_policy_selector_table_not_in_ARM_uploads": True,
+    "cap4_and_SO_received_absent_zero_false_gates_preserved": True,
+    "all_three_readbacks_before_every_ready_and_owned_launch": True,
+    "no_first_NORMAL_proof_required_before_initial_ABC_batch": True,
+    "first_batch_pause_real_private_audit_before_extension_retained_in_exact_source_plan": True,
+    "old_Q_not_promoted_and_historical_closure_not_used_as_CURRENT": True,
+    "existing_XML_only_no_test_rerun": {"unique_cases_with_later_passing_result": 97, "records": xml_summary},
+    "parent_role_preflight": {
+        "mechanically_enforced_by_owned_launcher": False,
+        "parent_explicitly_confirmed_this_manual_prestart_boundary": True,
+        "effect_receipt_sha256": effect_sha, "independent_effect_review_sha256": role_review_sha,
+        "mandatory_before_departure": "Parent freshly checks the literal global source remains absent and backup/quarantine SHA still match the approved role receipt.",
+        "fresh_global_role_state_checked_by_this_reviewer": False,
+        "no_new_global_change_or_circular_model_diagnostic_gate_authorized": True
+    },
+    "native_research_admitted": False,
+    "CLI_key_semantics_or_clean_NORMAL_or_private_argv_or_performance_proved_by_review": False,
+    "factory_helper_worker_CLI_process_socket_job_transport_or_global_action_executed_by_review": False,
+    "production_files_edited_by_review": False,
+    "all_observed_inputs_still_match_before_seal": True,
+    "input_file_sha256": {str(path): checksum for path, checksum in sorted(observed.items())}
+}
+out = HERE / "REVUE-FACTORY-R2E-SCELLEE.json"
+with out.open("x", encoding="utf-8", newline="\n") as stream:
+    stream.write(json.dumps(report, indent=2, ensure_ascii=True) + "\n")
+print(json.dumps({"verdict": report["verdict"], "report_sha256": digest(out.read_bytes()), "existing_XML_unique_passed": len(latest)}))

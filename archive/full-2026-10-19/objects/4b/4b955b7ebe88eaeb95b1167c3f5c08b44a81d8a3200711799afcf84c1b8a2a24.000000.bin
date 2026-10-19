@@ -1,0 +1,60 @@
+"""Freeze a model-free ARM64 software/overhead payload from the sealed R5 source."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import tarfile
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+SOURCE = ROOT.parent / "HPC-Forest-Evolution-r5"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--revision", choices=["r1", "r2"], default="r1")
+    args = parser.parse_args()
+    receipt = json.loads((SOURCE / "integration-verifiee.json").read_bytes())
+    archive = SOURCE / "HPC-Forest-Evolution-r5-source.zip"
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != receipt["sha256"]:
+        raise RuntimeError("Sealed R5 source changed")
+    payload_root = ROOT / ("payload" if args.revision == "r1" else "payload-" + args.revision)
+    payload_root.mkdir(exist_ok=False)
+    project = payload_root / "project"
+    with zipfile.ZipFile(archive) as bundle:
+        for name in bundle.namelist():
+            path = project / name
+            if not path.resolve().is_relative_to(project.resolve()):
+                raise RuntimeError("Unsafe source path")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(bundle.read(name))
+    (payload_root / "source-manifest.json").write_bytes((SOURCE / "manifeste-source-r5.json").read_bytes())
+    (payload_root / "benchmarks").mkdir()
+    for path in (ROOT / "benchmarks").glob("*.py"):
+        (payload_root / "benchmarks" / path.name).write_bytes(path.read_bytes())
+    inventory = {p.relative_to(payload_root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in sorted(payload_root.rglob("*")) if p.is_file()}
+    (ROOT / ("payload-manifest-" + args.revision + ".json")).write_text(json.dumps(inventory, indent=2) + "\n", encoding="utf-8")
+    payload = ROOT / ("r5-prevol-perf-" + args.revision + ".tar.gz")
+    with tarfile.open(payload, "w:gz") as bundle:
+        for name in inventory:
+            bundle.add(payload_root / name, arcname=name, recursive=False)
+    result = {"payload_revision": args.revision, "payload_archive": str(payload),
+              "source_sha256": receipt["sha256"], "payload_sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+              "files": len(inventory), "model_calls": 0, "native_workers_started": 0,
+              "objective": "ARM64 software preflight and controller overhead on synthetic fixed response traces",
+              "candidate_speedup_claim_allowed": False}
+    pointer = ROOT / "prevol-source.json"
+    if pointer.exists():
+        previous = ROOT / "prevol-source-r1.json"
+        if not previous.exists():
+            previous.write_bytes(pointer.read_bytes())
+    (ROOT / ("prevol-source-" + args.revision + ".json")).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    pointer.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

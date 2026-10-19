@@ -1,0 +1,158 @@
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#ifdef _OPENMP
+#include <atomic>
+#include <omp.h>
+#endif
+
+static const int MOD = 1000000007;
+
+static inline int update_run(int* dp, int first, int last, int left) {
+    for (int col = first; col < last; ++col) {
+        int value = dp[col] + left;
+        if (value >= MOD) value -= MOD;
+        dp[col] = value;
+        left = value;
+    }
+    return left;
+}
+
+static inline int update_row(int* dp, int first_col, int last_col,
+                             int left, int row,
+                             const std::vector<int>& offsets,
+                             const std::vector<int>& blocked) {
+    int col = first_col;
+    const int first = offsets[row];
+    const int last = offsets[row + 1];
+    if (first != last) {
+        const auto finish = blocked.begin() + last;
+        auto it = std::lower_bound(blocked.begin() + first, finish, first_col);
+        for (; it != finish && *it < last_col; ++it) {
+            const int obstacle = *it;
+            left = update_run(dp, col, obstacle, left);
+            dp[obstacle] = 0;
+            left = 0;
+            col = obstacle + 1;
+        }
+    }
+    return update_run(dp, col, last_col, left);
+}
+
+static inline void sort_row(int row, const std::vector<int>& offsets,
+                            std::vector<int>& blocked) {
+    if (offsets[row + 1] - offsets[row] > 1) {
+        std::sort(blocked.begin() + offsets[row],
+                  blocked.begin() + offsets[row + 1]);
+    }
+}
+
+#ifdef _OPENMP
+struct alignas(128) Progress {
+    std::atomic<int> rows;
+    Progress() : rows(0) {}
+};
+#endif
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n, m;
+    if (!(std::cin >> n >> m)) return 0;
+
+    std::vector<int> offsets(static_cast<std::size_t>(n) + 1, 0);
+    std::vector<int> blocked(static_cast<std::size_t>(m));
+    {
+        std::vector<std::pair<int, int>> cells(static_cast<std::size_t>(m));
+        for (int k = 0; k < m; ++k) {
+            int row, col;
+            std::cin >> row >> col;
+            cells[k] = std::make_pair(row, col);
+            ++offsets[row + 1];
+        }
+        for (int row = 0; row < n; ++row) {
+            offsets[row + 1] += offsets[row];
+        }
+        std::vector<int> next(offsets);
+        for (int k = 0; k < m; ++k) {
+            blocked[next[cells[k].first]++] = cells[k].second;
+        }
+    }
+
+    int requested_threads = 1;
+#ifdef _OPENMP
+    if (n >= 1024) {
+        requested_threads = std::min(4, std::min(omp_get_max_threads(), n / 512));
+    }
+#endif
+
+    // Align both column partitions and boundary segments to 128 bytes.
+    const int column_chunks = (n + 31) / 32;
+    const int stride = column_chunks * 32;
+    const std::size_t words = static_cast<std::size_t>(stride) * requested_threads;
+    std::vector<int> storage(words + 32, 0);
+    void* aligned = storage.data();
+    std::size_t available = storage.size() * sizeof(int);
+    int* const dp = static_cast<int*>(
+        std::align(128, words * sizeof(int), aligned, available));
+    dp[0] = 1;
+
+    if (requested_threads == 1) {
+        for (int row = 0; row < n; ++row) {
+            sort_row(row, offsets, blocked);
+            update_row(dp, 0, n, 0, row, offsets, blocked);
+        }
+    }
+#ifdef _OPENMP
+    else {
+        Progress progress[4];
+        const int batch_rows = 32;
+
+        #pragma omp parallel num_threads(requested_threads)
+        {
+            #pragma omp for schedule(static)
+            for (int row = 0; row < n; ++row) {
+                sort_row(row, offsets, blocked);
+            }
+
+            const int tid = omp_get_thread_num();
+            const int workers = omp_get_num_threads();
+            const int first_col = std::min(n, (column_chunks * tid / workers) * 32);
+            const int last_col = std::min(n, (column_chunks * (tid + 1) / workers) * 32);
+            const int* const incoming = tid == 0 ? nullptr
+                : dp + static_cast<std::size_t>(stride) * tid;
+            int* const outgoing = tid + 1 == workers ? nullptr
+                : dp + static_cast<std::size_t>(stride) * (tid + 1);
+
+            for (int first_row = 0; first_row < n; first_row += batch_rows) {
+                const int last_row = std::min(n, first_row + batch_rows);
+                if (tid != 0) {
+                    while (progress[tid - 1].rows.load(std::memory_order_acquire)
+                           < last_row) {
+                    }
+                }
+
+                for (int row = first_row; row < last_row; ++row) {
+                    const int left = incoming == nullptr ? 0 : incoming[row];
+                    const int right = update_row(dp, first_col, last_col, left,
+                                                 row, offsets, blocked);
+                    if (outgoing != nullptr) outgoing[row] = right;
+                }
+
+                // Published boundary entries are never subsequently overwritten.
+                if (outgoing != nullptr) {
+                    progress[tid].rows.store(last_row, std::memory_order_release);
+                }
+            }
+        }
+    }
+#endif
+
+    std::cout << dp[n - 1] << '\n';
+    return 0;
+}

@@ -1,0 +1,180 @@
+This page requires JavaScript. Please enable it to view the website.
+UnMaskFork: Test-Time Scaling for Masked Diffusion via Deterministic Action Branching
+tl;dr
+We propose
+UnMaskFork (UMF)
+, a Test-Time Scaling (TTS) method for Masked Diffusion Language Models (MDLMs). We first show that sampling many answers at a high temperature, a common TTS approach for conventional LLMs, does not work well for MDLMs like Dream-Coder. UMF instead achieves collaborative unmasking by using Monte Carlo Tree Search (MCTS) to search over how multiple MDLMs share the generation of a single answer. UMF consistently outperforms other TTS methods on coding tasks and also scales effectively on math.
+Kou Misaki
+Sakana AI
+Takuya Akiba
+Sakana AI
+JULY
+2026
+arXiv
+OpenReview
+UnMaskFork
+Two Heads Are Better Than One
+Dream-Coder
+LLaDA
+masked
+Multi-model collaboration via UMF: Dream-Coder and LLaDA construct a single answer together by sharing the generation process.
+Test-Time Scaling in Masked Diffusion Language Models
+Test-Time Scaling (TTS)
+is a well-established approach to enhancing the capabilities of LLMs on tasks requiring reasoning, such as coding and mathematics, without the need for additional training. There are various TTS methods, such as allocating more test-time compute for the LLM to think longer or scaling up the number of generated candidate answers. Among these, Best-of-N
+is a simple yet effective method widely adopted for autoregressive LLMs (AR-LLMs). Best-of-N is applicable to tasks where the correctness of the answer can be verified, such as coding.
+prompt
+✗
+✗
+correct ★
+more test-time compute (N ↑)
+token sampled by the AR-LLM (left → right)
+✗
+incorrect sample
+TTS via Best-of-N: The AR-LLM generates N candidate answers, and the best one is selected. Scaling up N increases the likelihood of reaching the correct answer.
+Best-of-N leverages the property that increasing the temperature parameter
+Temperature
+T
+T
+T
+is a parameter that smooths the token probability distribution output by the model. As
+T
+T
+T
+increases, the distribution becomes flatter, making low-probability tokens more likely to be sampled. Conversely, in the limit of
+T
+→
+0
+T \to 0
+T
+→
+0
+, generation becomes deterministic, always selecting the highest-probability token.
+allows LLMs to generate diverse answers without significantly compromising quality. The model generates N answers for the same problem at a high temperature, the outputs are scored with a verifier, and the highest-scoring candidate is selected. This seemingly simple method has been empirically shown to be highly effective for AR-LLMs.
+So, is Best-of-N also effective for Masked Diffusion Language Models (MDLMs), which, unlike AR-LLMs, do not generate text from left to right? We tested this with Dream-Coder, an MDLM with strong coding performance. In addition to temperature, MDLMs have a second natural source of diversity: injecting randomness into the unmasking order
+In standard MDLM decoding, the model's prediction confidence at each mask position is measured using metrics such as the entropy of the predicted distribution or the probability assigned to the proposed token, and masked positions are unmasked starting from those with the highest confidence.
+. As shown below, Best-of-N built on either source of randomness failed to surpass the single answer obtained by standard deterministic decoding.
+Best-of-N with an MDLM (Dream-Coder-7B-Instruct). The y-axis shows the percentage of problems solved: for each problem, one answer is selected from the N samples using the benchmark's test-case reward, and it counts as correct if it passes the held-out evaluation tests. At a low temperature (T=0.1), decoding is nearly deterministic, yielding the same answer almost every time, so increasing N does not improve performance (lack of diversity). Increasing the temperature (T=1.0) introduces diversity but severely degrades answer quality, failing to reach the performance of a single low-temperature answer even at N=16. When the unmasking order is randomized (random order), performance scales with N but still cannot surpass standard decoding (confidence order, T=0.1).
+Observation:
+In Dream-Coder, raising the temperature or randomizing the unmasking order sharply degrades answer quality, and Best-of-N built on this randomness fails to surpass a single deterministically decoded answer.
+How can we achieve TTS in MDLMs without relying on temperature or unmasking order? To answer this question, we developed
+UnMaskFork (UMF)
+.
+The Idea Behind UnMaskFork
+The idea behind UnMaskFork is as follows: rather than relying on randomness from temperature or unmasking order to produce diverse answers, it creates diversity by having multiple MDLMs share the generation of an answer and by varying how that generation is divided among them.
+To understand how multiple MDLMs can collaboratively generate text, let us first consider an intermediate state during generation. In this state, mask tokens and tokens already filled with text coexist. When a single MDLM generates text, masked positions are unmasked in descending order of the model's prediction confidence. An important point here is that this intermediate representation has the same structure regardless of which MDLM is used.
+When two MDLMs use different tokenizers, the already-generated text is converted between them by decoding it with the source tokenizer and re-encoding it with the target tokenizer; special tokens such as masks are mapped directly between the models.
+Because of this shared structure, it is possible to hand the sequence to another MDLM, which then continues generating the answer.
+From that point on, since different MDLMs have different predicted tokens and prediction confidences, the generated text will generally differ from what a single model would have produced. Since MDLMs acquire the ability to generate text from partially filled states during their training process, they can take over text partially generated by another MDLM and continue generating. This enables multiple MDLMs to share the generation process.
+✗ diversity from randomness
+random unmask order
+✗
+high-T token sampling
+✗
+✗ relying on randomness degrades answer quality
+✓ diversity from deterministic branching (UnMaskFork)
+partially unmasked
+Dream-Coder unmasks next
+✗
+LLaDA unmasks next
+correct ★
+✓ diverse answers without sacrificing quality
+Top: Two randomization techniques to introduce diversity in MDLM answers. For Dream-Coder, both severely degrade answer quality. Bottom: Deterministic branching via UnMaskFork. Since it branches based on the choice of "which model unmasks next," diverse answers can be obtained without injecting randomness, while each branch retains the generation quality of deterministic decoding. Token colors represent the model that filled them (orange: Dream-Coder, green: LLaDA), and each answer is verified to select the correct one (★).
+Core idea:
+By having multiple MDLMs
+share the generation of a single answer and varying how this generation is shared
+, diverse answers can be generated without compromising quality, thereby enabling TTS for MDLMs.
+Exploring Effective Generation-Sharing Strategies for MDLMs
+In UMF, rather than simply generating a large number of answers randomly as in Best-of-N, we achieve efficient TTS by using Monte Carlo Tree Search (MCTS) to preferentially explore promising sharing strategies. Below, we explain how this search is conducted.
+How UMF works
+Searching for the Best Model-Switch Path
+UMF uses MCTS to search for the path of model switches that leads to the highest-scoring answer.
+For example, consider the case of two MDLMs, Dream-Coder and LLaDA. First, starting from a fully masked sequence, we fix in advance the checkpoints at which the model in charge can be switched. Suppose we set two checkpoints, at mask ratios of 66% and 33%. In this case, various unmasking sequence patterns can be considered, such as D→D→L or L→D→L, and these patterns can be represented as a tree structure as shown in the figure above. The state of each node is a token sequence in which some of the masks have been filled in with text, and the actions selectable from a node correspond to the choice of MDLM. An action advances the unmasking of the token sequence by the chosen MDLM and transitions to a new node.
+TTS via UMF is achieved by starting from a tree containing only the root node and building this tree using MCTS. Each MCTS iteration consists of three steps: (1)
+Select
+: walking down the tree, guided by a rule called UCT that prioritizes promising directions, to a node with unexplored actions, (2)
+Expand
+: applying one of those actions to add a new child node, immediately rolling the unmasking out to a complete answer, and evaluating it, and (3)
+Backup
+: propagating the resulting score up the tree to inform subsequent selections.
+Interactive demo
+How the Search Tree Grows
+← Prev
+Next →
+⏸ Pause
+↺ Replay
+tokens still masked
+Step 1 / 5
+state
+Dream-Coder action
+LLaDA action
+tree edge
+rollout to a full answer
+★ final answer
+Each step expands the tree: a model unmasks the answer one stage further, finishes it, and the score decides where to search next.
+Furthermore, an important feature of UMF is that each action uses near-deterministic decoding at near-zero temperature: repeating a rollout from the same state with the same action reproduces essentially the same text. Thanks to this determinism, the partially masked intermediate states traversed during the rollout stage can be cached and reused, allowing subsequent MCTS steps to skip redundant computation.
+UMF Consistently Outperforms Other TTS Methods
+We experimentally confirmed that UMF indeed outperforms other TTS approaches. When comparing different TTS methods, we evaluate the performance achieved on a given task under the same inference budget. For diffusion models, this budget is commonly measured by the Number of Function Evaluations (NFE). NFE is defined as the number of times the MDLM predicts token probabilities for the entire token sequence, meaning a higher NFE corresponds to a larger computational cost.
+Pass@1 as a function of the NFE budget (x-axis "NFE" = model calls). UMF climbs steadily while stochastic baselines fluctuate or saturate; on LiveCodeBench, extending the budget to NFE=24,576 lifts UMF to 30.0.
+The figure above illustrates the performance of UMF across three coding tasks. We can see that UMF consistently outperforms other standard TTS methods. While other TTS approaches that require raising the temperature suffer from a significant performance drop in the low-NFE regime, UMF avoids increasing the temperature, allowing it to maintain consistently high performance even in that regime. Furthermore, by leveraging the diversity originating from multiple MDLMs, UMF continues to improve its performance as NFE increases.
+UMF Is More Than a Simple Model Ensemble
+To understand the gains from UMF, we compared UMF against other TTS methods that incorporate model ensembling. A simple model ensemble effect works as follows: if, say on LiveCodeBench, some problems can only be solved by Dream-Coder and others only by LLaDA, performance improves just by letting the two models solve each problem independently and keeping the better-scoring of the two answers. The table below compares UMF against non-UMF TTS methods augmented with this ensemble effect.
+Method (Dream-Coder + LLaDA)
+LiveCodeBench
+HumanEval+
+MBPP+
+Best-of-N Pair
+19.0
+75.0
+66.0
+DTS* Pair
+18.0
+75.0
+68.0
+Multi-model AB-MCTS
+21.0
+81.0
+68.0
+UMF
+28.0
+88.0
+72.0
+Every method gets the same budget (12,288 model calls) and the same 768-token generation window. Baselines use their best temperature; scores are Pass@1 on 100-problem subsets, judged on held-out tests.
+"Best-of-N Pair" and "DTS* Pair" incorporate the aforementioned model ensemble effect into TTS methods like Best-of-N and DTS*
+. Since UMF outperforms these methods, we can see that the performance improvement is not driven merely by the effect of independently ensembling models. Instead, having multiple models share the generation process creates structural diversity in the answers, and leveraging this diversity is what improves performance.
+Furthermore, UMF substantially outperforms
+AB-MCTS
+, which also uses multiple models. This indicates that even among TTS methods utilizing structural diversity, UMF can explore answers more efficiently by restricting branching to a small set of deterministic actions and by skipping redundant computation through caching.
+Increasing the Number of Models Can Further Improve Performance
+The diversity introduced by sharing the generation process in UMF can be further expanded by increasing the number of participating MDLMs. The table below shows the performance when DiffuCoder-cpGRPO
+is added as a third model to the action set of the two-model UMF consisting of Dream-Coder and LLaDA.
+Method
+LiveCodeBench
+HumanEval+
+MBPP+
+UMF (2 models)
+28.0
+88.0
+72.0
+UMF (3 models)
+32.0
+87.0
+76.0
+Same total budget (12,288 model calls) for every row; scores are Pass@1. The 3-model UMF adds DiffuCoder-cpGRPO to Dream-Coder and LLaDA.
+In the three-model UMF with DiffuCoder-cpGRPO added, LiveCodeBench improves from 28.0 to 32.0 and MBPP+ from 72.0 to 76.0 (with HumanEval+ remaining mostly flat), raising the average across the three tasks from 62.7 to 65.0. This suggests that as the number of available models increases, the sharing patterns that can be explored become richer, which can further boost the performance of UMF.
+Each MDLM Contributes Where It Is Confident
+A real UMF search tree (LiveCodeBench). D = Dream-Coder, L = LLaDA; the starred node marks the trajectory used for the final answer, which is correct. Its path interleaves both models.
+The solution as unmasked up to the starred node, colored by author (blue = Dream-Coder, orange = LLaDA; darker = unmasked earlier). Note the palette differs from the interactive figures above, where orange denotes Dream-Coder. Dream-Coder sketches the steps, LLaDA starts the core logic, and Dream-Coder completes it.
+The figures above show an example of the search tree and the generated text when a problem is successfully solved by UMF on LiveCodeBench. As can be seen from the search tree, the problem is solved by following a complex sharing path of D→L→L→L→D, while every other explored branch reaches a much lower reward. Such difficult problems become solvable not by relying on either model alone, but by having each model generate the parts it is most confident about and performing TTS using structural diversity. Looking at the generated text in the second figure, we can see that the answer is not simply written from beginning to end. Instead, Dream-Coder initiates the solution by outlining the implementation steps in the first stage; LLaDA then continues that outline, fills in the explanation at the end of the code, and begins the implementation; and Dream-Coder finally takes over and completes the remaining code.
+Conclusion and Future Work
+Because MDLMs behave differently from autoregressive LLMs, they call for TTS methods that exploit those differences, and UMF is one such method. UMF opens up a new direction for TTS in MDLMs by showing that we can leverage the structural diversity achieved by having multiple MDLMs share the answer generation process. This takes advantage of the fact that the intermediate states of MDLM generation share the same structure across models and can be handed from one model to another. Furthermore, the paper shows that UMF also applies to block diffusion, with experiments confirming substantial gains (19.0 → 31.0 on LiveCodeBench), establishing it as a highly versatile method.
+Moreover, UMF requires no additional training or internal modifications to the models; it only needs pre-trained MDLMs and a way to score candidate answers at inference time, such as test cases or a reward model. Differences between models trained on different data or with different methods directly translate into a richer diversity of sharing patterns that can be explored. Therefore, we believe the value of UMF will continue to grow as a wider variety of MDLMs emerge. To further advance the multi-model collaboration demonstrated by UMF, a potential future direction is to reduce the computational cost required for the search, for instance, by learning which model should be responsible for which part.
+This work is part of our broader research pursuing the "collective intelligence of AI," much like
+AB-MCTS
+and
+Sakana Fugu
+, which coordinate multiple LLMs. UMF shows that this philosophy is effective not only for AR-LLMs but also within the new paradigm of MDLMs. We will continue to advance research that transforms model diversity into strength.
+Additional Details
+This demo page is based on the paper:
+UnMaskFork: Test-Time Scaling for Masked Diffusion via Deterministic Action Branching
+.
+The full paper includes formal definitions of partially masked states, the UMF algorithm, tokenizer-switching details for heterogeneous MDLMs, additional scaling plots, block diffusion experiments, runtime/memory tables, and comparisons with ReMDM and TReASURe.

@@ -1,0 +1,84 @@
+"""Local evidence only; never reads an account or consumes a reset."""
+from pathlib import Path
+import hashlib
+import json
+import sys
+import tomllib
+from datetime import datetime, timezone
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+AUTO = Path('C:/Users/nicol/.codex/automations/terminer-les-essais-deepseek-sur-romeo/automation.toml')
+PINS = {
+    'quota_guard.py': 'f0fe9948e998072d9fcf232fa0e3d2cdda4e0067a5b6b6187d58457f3bb23e82',
+    'LIVRAISON-LOCALE.json': 'a1cf64a4c692189efe76d651d4520eece50fdbec9653d40f21dc7f5223f9835c',
+    'revue-independante/REVUE-INDEPENDANTE.json': '813db12729b34e528c40b02e1be50b1f0e496ba0d662e7fa8a406ea129c16ded',
+}
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def new(path, value):
+    with path.open('x', encoding='utf-8', newline='\n') as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.write('\n')
+
+assert sys.argv[1] in ('prepare', 'finalize')
+for name, expected in PINS.items():
+    assert sha(ROOT / name) == expected, name
+expected_args = json.loads((HERE / 'automation-attendue.json').read_text(encoding='utf-8'))
+if sys.argv[1] == 'prepare':
+    assert not (ROOT / 'intent.json').exists()
+    assert not (ROOT / 'consume-response.json').exists()
+    assert not (ROOT / 'unknown-effect.json').exists()
+    receipts = list(ROOT.glob('receipt-*.json'))
+    assert len(receipts) == 1
+    result = json.loads(receipts[0].read_text(encoding='utf-8'))
+    assert result['outcome'] == 'checked'
+    assert result['consume_attempted'] is False
+    assert result['reset_verified'] is False
+    assert result['owned_stdio_closed'] is True
+    assert result['existing_intent'] is False
+    assert result['weekly']['used_percent'] == '29'
+    assert result['weekly']['remaining_percent'] == '71'
+    assert result['available_credits'] == 3
+    new(HERE / 'REGLE-PREPAREE.json', {
+        'schema': 'codex-weekly-single-reset-human-rule-v1',
+        'status': 'prepared',
+        'created_at_utc': datetime.now(timezone.utc).isoformat(),
+        'weekly_window_minutes': 10080,
+        'exact_used_percent': '99',
+        'exact_remaining_percent': '1',
+        'maximum_consumptions_for_this_authorization': 1,
+        'polling_minutes': 15,
+        'zero_or_above_one_remaining_refused': True,
+        'no_retry_after_intent': True,
+        'no_purchases_or_new_authentication': True,
+        'helper': str(ROOT / 'quota_guard.py'),
+        'pins': PINS,
+        'initial_read_only_receipt': {'path': str(receipts[0]), 'sha256': sha(receipts[0]), 'result': result},
+        'expected_automation_sha256': sha(HERE / 'automation-attendue.json'),
+    })
+    print(json.dumps({'prepared': True, 'reset_consumed': False}))
+else:
+    raw = AUTO.read_bytes()
+    actual = tomllib.loads(raw.decode('utf-8-sig'))
+    for key in ('id', 'kind', 'name', 'prompt', 'status', 'rrule'):
+        assert actual[key] == expected_args[key], key
+    assert actual['target_thread_id'] == expected_args['targetThreadId']
+    assert actual['status'] == 'ACTIVE'
+    assert not (ROOT / 'intent.json').exists()
+    saved = HERE / 'automation-active-verifiee.toml'
+    with saved.open('xb') as handle:
+        handle.write(raw)
+    prepared = json.loads((HERE / 'REGLE-PREPAREE.json').read_text(encoding='utf-8'))
+    prepared.update({
+        'status': 'active',
+        'armed_at_utc': datetime.now(timezone.utc).isoformat(),
+        'automation_id': actual['id'],
+        'automation_snapshot': {'path': str(saved), 'sha256': sha(saved)},
+        'operator_guide_sha256': sha(HERE / 'REPRISE.md'),
+        'reset_consumed_during_setup': False,
+    })
+    new(HERE / 'REGLE-ACTIVE.json', prepared)
+    print(json.dumps({'armed': True, 'automation_active': True, 'reset_consumed': False, 'policy_sha256': sha(HERE / 'REGLE-ACTIVE.json')}))

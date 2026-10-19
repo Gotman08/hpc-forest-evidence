@@ -1,0 +1,145 @@
+"""Fresh restoration and read-only audit; never execute received code or pickle."""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import statistics
+import tarfile
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): sha(p) for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def save(name, value):
+    (ROOT / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    receipt = json.loads((ROOT / "prevol-reception-749209.json").read_bytes())
+    archive = ROOT / "prevol-recu-749209.tar.gz"
+    digest = sha(archive)
+    log = json.loads((ROOT / "prevol-journal-749209.json").read_bytes())["content"]
+    assert receipt["verifie"] is True and digest == receipt["remote_sha256"]
+    assert digest in log
+    restored = ROOT / "reception-neuve-749209"
+    restored.mkdir(exist_ok=False)
+    with tarfile.open(archive) as stream:
+        members = stream.getmembers()
+        assert sum(m.size for m in members) < 2_000_000_000
+        for member in members:
+            target = restored / member.name
+            assert target.resolve().is_relative_to(restored.resolve())
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                assert member.isfile() and not member.issym() and not member.islnk()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with stream.extractfile(member) as source, target.open("xb") as output:
+                    while block := source.read(1024 * 1024):
+                        output.write(block)
+    before = inventory(restored)
+    expected = json.loads((ROOT / "payload-manifest-r2.json").read_bytes())
+    assert all(before.get(name) == digest for name, digest in expected.items())
+    first = json.loads((restored / "proofs/source-before.json").read_bytes())
+    last = json.loads((restored / "proofs/source-after.json").read_bytes())
+    assert first["files"] == last["files"] and first["count"] == last["count"] == 541
+    assert first["architecture"] == last["architecture"] == "aarch64"
+    for name, expected_sha in first["files"].items():
+        assert before["project/" + name] == expected_sha
+    assert (restored / "proofs/exit-code.txt").read_text().strip() == "0"
+    tests = {}
+    for name in ("project", "benchmarks"):
+        cases = list(ET.parse(restored / f"proofs/tests-{name}.xml").getroot().iter("testcase"))
+        counts = {"cases": len(cases), "skipped": sum(c.find("skipped") is not None for c in cases),
+                  "failed": sum(c.find("failure") is not None or c.find("error") is not None for c in cases)}
+        counts["passed"] = counts["cases"] - counts["skipped"] - counts["failed"]
+        assert counts["failed"] == 0
+        tests[name] = counts
+    assert "All checks passed!" in (restored / "proofs/ruff-project.log").read_text()
+    assert "All checks passed!" in (restored / "proofs/ruff-benchmarks.log").read_text()
+    result = json.loads((restored / "overhead/result.json").read_bytes())
+    raw_path = restored / "overhead/raw.jsonl"
+    assert sha(raw_path) == result["raw_sha256"]
+    rows = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    assert len(rows) == 144
+    arms = {"legacy-ab", "r5-ab", "r5-engine-ab", "r5-engine-population"}
+    observed = set()
+    traces, measurements = defaultdict(set), defaultdict(list)
+    for row in rows:
+        n, seed, repetition, arm = row["trials"], row["seed"], row["repetition"], row["arm"]
+        key = n, seed, repetition, arm
+        assert key not in observed and arm in arms and n in (8, 32) and seed in (23, 29, 31)
+        assert repetition in range(-1, 5)
+        observed.add(key)
+        assert len(row["cycles_wall_ns"]) == len(row["cycles_cpu_ns"]) == n
+        assert sum(row["cycles_wall_ns"]) == row["wall_ns"] > 0
+        assert sum(row["cycles_cpu_ns"]) == row["cpu_ns"] >= 0
+        assert all(type(value) is int and value > 0 for value in row["cycles_wall_ns"])
+        trace = result["traces"][f"{n}:{seed}"]
+        assert hashlib.sha256(json.dumps(trace["scores"]).encode()).hexdigest() == row["trace_sha256"] == trace["sha256"]
+        traces[n, seed].add(row["trace_sha256"])
+        if row["phase"] == "measurement":
+            assert repetition >= 0
+            measurements[arm, n].append(row)
+        else:
+            assert row["phase"] == "warmup" and repetition == -1
+    assert all(len(value) == 1 for value in traces.values())
+    assert all(len(value) == 15 for value in measurements.values())
+    recalculated = {}
+    for key, group in measurements.items():
+        values = [row["wall_ns"] / row["trials"] / 1e6 for row in group]
+        recalculated[key] = {"mean": statistics.mean(values), "stdev": statistics.stdev(values),
+                            "cpu": statistics.mean(row["cpu_ns"] / row["trials"] / 1e6 for row in group)}
+    for summary in result["summary"]:
+        values = recalculated[summary["arm"], summary["trials"]]
+        assert math.isclose(values["mean"], summary["wall_ms_per_cycle_mean"], rel_tol=1e-12)
+        assert math.isclose(values["stdev"], summary["wall_ms_per_cycle_stdev"], rel_tol=1e-12)
+        assert math.isclose(values["cpu"], summary["cpu_ms_per_cycle_mean"], rel_tol=1e-12)
+        assert summary["independent_model_searches"] == 0
+    for comparison in result["comparisons"]:
+        n = comparison["trials"]
+        a, b = (recalculated[comparison[key], n]["mean"] for key in ("reference", "candidate"))
+        assert math.isclose(comparison["wall_ratio_reference_over_candidate"], a / b, rel_tol=1e-12)
+        assert math.isclose(comparison["candidate_minus_reference_ms_per_cycle"], b - a, rel_tol=1e-12)
+        assert comparison["program_speedup_demonstrated"] is False
+    assert result["model_calls"] == result["contest_programs_executed"] == 0
+    assert result["search_quality_gain_demonstrated"] is False
+    after = inventory(restored)
+    assert before == after
+    save("inventaires-reception-749209.json", {"before": before, "after": after})
+    first_archive = ROOT / "prevol-echec-749206.tar.gz"
+    assert sha(first_archive) == "343ed8076af8f28ccd9acb3a3d64698b7832a1002b61da786e593e2c459f74f4"
+    with tarfile.open(first_archive) as failed:
+        names = {str(Path(m.name).as_posix()).removeprefix("./"): m for m in failed.getmembers()}
+        assert "proofs/tests-project.xml" not in names and "overhead/result.json" not in names
+        failure = failed.extractfile(names["proofs/ruff-install.log"]).read().decode()
+        assert "not a valid wheel filename" in failure
+    audit = {"schema": "hpc-forest-r5-arm64-overhead-audit-v1", "utc": datetime.now(UTC).isoformat(),
+             "job_id": "749209", "announced_remote_local_sha256": digest,
+             "files_restored_and_reverified": len(before), "payload_files_verified": len(expected),
+             "project_source_files_unchanged": 541, "tests": tests,
+             "raw_series": len(rows), "series_phases": dict(Counter(r["phase"] for r in rows)),
+             "measured_cycles": sum(r["trials"] for r in rows if r["phase"] == "measurement"),
+             "summary": result["summary"], "comparisons": result["comparisons"],
+             "original_failure_preserved": "749206", "original_checks_had_not_started": True,
+             "corrective_payload_identical": True, "model_calls": 0, "contest_programs_measured": 0,
+             "controller_overhead_measured": True, "native_runtime_admitted": False,
+             "llm_optimization_gain_established": False, "learning_gain_established": False}
+    save("audit-prevol-arm64.json", audit)
+    print(json.dumps(audit, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

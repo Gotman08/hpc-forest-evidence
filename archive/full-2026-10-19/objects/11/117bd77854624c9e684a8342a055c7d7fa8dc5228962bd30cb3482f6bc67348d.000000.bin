@@ -1,0 +1,267 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include <stdint.h>
+
+typedef struct {
+    const char *strings;
+    size_t stride;
+    unsigned int index_bits;
+    unsigned int prefix_bytes;
+    unsigned long index_mask;
+} radix_context;
+
+static unsigned long pack_entry(const char *string, unsigned int bytes,
+                                unsigned int index_bits, unsigned long index) {
+    const unsigned char *p = (const unsigned char *)string;
+    unsigned long prefix = 0;
+
+    for (unsigned int k = 0; k < bytes; ++k) {
+        unsigned long c = *p++;
+        prefix = (prefix << 8) | c;
+        if (c == 0) {
+            prefix <<= 8U * (bytes - k - 1U);
+            break;
+        }
+    }
+    return (prefix << index_bits) | index;
+}
+
+static inline int entry_greater(unsigned long left, unsigned long right,
+                                const radix_context *ctx) {
+    unsigned long lp = left >> ctx->index_bits;
+    unsigned long rp = right >> ctx->index_bits;
+
+    if (lp != rp)
+        return lp > rp;
+    if (ctx->prefix_bytes != 0 && (lp & 255UL) == 0)
+        return 0;
+
+    return strcmp(ctx->strings + (size_t)(left & ctx->index_mask) * ctx->stride
+                               + ctx->prefix_bytes,
+                  ctx->strings + (size_t)(right & ctx->index_mask) * ctx->stride
+                               + ctx->prefix_bytes) > 0;
+}
+
+static void radix_sort_entries(unsigned long *entries, unsigned long *scratch,
+                               size_t count, size_t depth,
+                               const radix_context *ctx) {
+    enum { INSERTION_CUTOFF = 24 };
+    const unsigned char *strings = (const unsigned char *)ctx->strings;
+
+    while (count > INSERTION_CUTOFF) {
+        size_t counts[256] = {0};
+        size_t next[256];
+        size_t total = 0;
+        size_t largest_count = 0;
+        unsigned int largest = 0;
+        unsigned int nonempty = 0;
+        unsigned int only = 0;
+        int cached = depth < ctx->prefix_bytes;
+        unsigned int shift = 0;
+
+        if (cached) {
+            shift = ctx->index_bits
+                  + 8U * (ctx->prefix_bytes - 1U - (unsigned int)depth);
+            for (size_t i = 0; i < count; ++i)
+                ++counts[(entries[i] >> shift) & 255UL];
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                size_t index = (size_t)(entries[i] & ctx->index_mask);
+                ++counts[strings[index * ctx->stride + depth]];
+            }
+        }
+
+        for (unsigned int c = 0; c < 256; ++c) {
+            if (counts[c] != 0) {
+                ++nonempty;
+                only = c;
+            }
+        }
+
+        if (nonempty == 1) {
+            if (only == 0)
+                return;
+            ++depth;
+            continue;
+        }
+
+        for (unsigned int c = 0; c < 256; ++c) {
+            next[c] = total;
+            total += counts[c];
+            if (c != 0 && counts[c] > largest_count) {
+                largest_count = counts[c];
+                largest = c;
+            }
+        }
+
+        if (cached) {
+            for (size_t i = 0; i < count; ++i) {
+                unsigned long entry = entries[i];
+                unsigned int c = (unsigned int)((entry >> shift) & 255UL);
+                scratch[next[c]++] = entry;
+            }
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                unsigned long entry = entries[i];
+                size_t index = (size_t)(entry & ctx->index_mask);
+                unsigned int c = strings[index * ctx->stride + depth];
+                scratch[next[c]++] = entry;
+            }
+        }
+        memcpy(entries, scratch, count * sizeof(*entries));
+
+        /* Bucket zero contains terminated strings and is already sorted. */
+        for (unsigned int c = 1; c < 256; ++c) {
+            if (c != largest && counts[c] > 1) {
+                size_t start = next[c] - counts[c];
+                radix_sort_entries(entries + start, scratch + start,
+                                   counts[c], depth + 1, ctx);
+            }
+        }
+
+        /* Iterate over the largest child to bound recursion depth. */
+        if (largest_count <= 1)
+            return;
+        size_t start = next[largest] - largest_count;
+        entries += start;
+        scratch += start;
+        count = largest_count;
+        ++depth;
+    }
+
+    for (size_t i = 1; i < count; ++i) {
+        unsigned long key = entries[i];
+        size_t j = i;
+        while (j > 0 && entry_greater(entries[j - 1], key, ctx)) {
+            entries[j] = entries[j - 1];
+            --j;
+        }
+        entries[j] = key;
+    }
+}
+
+long int *bucket_sort(char *a, int length, long int size, int offset, int nbuckets) {
+    radix_context ctx;
+    unsigned long max_index;
+    unsigned long *entries;
+    unsigned long *scratch;
+    long int *result;
+    size_t n;
+
+    (void)offset;
+    (void)nbuckets;
+    if (size <= 0)
+        return NULL;
+
+    n = (size_t)size;
+    if (n > SIZE_MAX / sizeof(*result))
+        exit(EXIT_FAILURE);
+    result = (long int *)malloc(n * sizeof(*result));
+    if (result == NULL)
+        exit(EXIT_FAILURE);
+    if (n == 1) {
+        result[0] = 0;
+        return result;
+    }
+
+    scratch = (unsigned long *)malloc(n * sizeof(*scratch));
+    if (scratch == NULL) {
+        free(result);
+        exit(EXIT_FAILURE);
+    }
+
+    ctx.strings = a;
+    ctx.stride = (size_t)length;
+    ctx.index_bits = 0;
+    max_index = (unsigned long)(size - 1);
+    while (max_index != 0) {
+        ++ctx.index_bits;
+        max_index >>= 1;
+    }
+    ctx.prefix_bytes = ((unsigned int)(sizeof(unsigned long) * CHAR_BIT)
+                        - ctx.index_bits) / 8U;
+    ctx.index_mask = (1UL << ctx.index_bits) - 1UL;
+
+    /* Corresponding signed and unsigned types may alias this allocation. */
+    entries = (unsigned long *)result;
+    for (size_t i = 0; i < n; ++i)
+        entries[i] = pack_entry(a + i * ctx.stride, ctx.prefix_bytes,
+                                ctx.index_bits, (unsigned long)i);
+
+    radix_sort_entries(entries, scratch, n, 0, &ctx);
+    for (size_t i = 0; i < n; ++i)
+        result[i] = (long int)(entries[i] & ctx.index_mask);
+
+    free(scratch);
+    return result;
+}
+
+void load(char **vString, long int *N, int *l, int *os, int *nb) {
+    char *strings = NULL;
+    int len, offset, nbucket;
+    long int n;
+
+    if (!fscanf(stdin, "%d", &len)) {
+        printf("ERROR len\n");
+        exit(1);
+    }
+    if (!fscanf(stdin, "%ld", &n)) {
+        printf("ERROR n\n");
+        exit(1);
+    }
+    if (!fscanf(stdin, "%d", &offset)) {
+        printf("ERROR offset\n");
+        exit(1);
+    }
+    if (!fscanf(stdin, "%d", &nbucket)) {
+        printf("ERROR nbucket\n");
+        exit(1);
+    }
+
+    nbucket = nbucket + 1;
+    len = len + 1;
+    strings = (char *)malloc((size_t)n * (size_t)len);
+
+    for (long int i = 0; i < n; ++i) {
+        if (!fscanf(stdin, "%s", strings + (size_t)i * (size_t)len)) {
+            printf("ERROR %ld\n", i);
+            exit(1);
+        }
+    }
+
+    *vString = strings;
+    *N = n;
+    *l = len;
+    *os = offset;
+    *nb = nbucket;
+}
+
+void print(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; ++i)
+        printf("%ld -> %s\n", i,
+               strings + (size_t)index[i] * (size_t)len);
+}
+
+void save(char *strings, long int *index, long int n, int len) {
+    for (long int i = 0; i < n; ++i)
+        printf("%s\n", strings + (size_t)index[i] * (size_t)len);
+}
+
+int main(int ac, char **av) {
+    char *strings = NULL;
+    long int N = 0;
+    long int *index = NULL;
+    int len = 0, offset, nbuckets;
+
+    (void)ac;
+    (void)av;
+    load(&strings, &N, &len, &offset, &nbuckets);
+    index = bucket_sort(strings, len, N, offset, nbuckets);
+    save(strings, index, N, len);
+
+    free(strings);
+    free(index);
+    return EXIT_SUCCESS;
+}

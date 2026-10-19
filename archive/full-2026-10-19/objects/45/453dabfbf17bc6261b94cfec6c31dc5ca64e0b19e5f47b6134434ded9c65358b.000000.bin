@@ -1,0 +1,427 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+
+typedef struct {
+  int id;
+  float value;
+  size_t neighbor_offset;
+  int next;
+  float cost;
+  unsigned char next_ready;
+  unsigned char state;
+} Node;
+
+typedef struct {
+  char *data;
+  size_t size;
+  size_t capacity;
+} TextList;
+
+typedef struct {
+  char *text;
+  int id;
+} Query;
+
+typedef struct {
+  Query *data;
+  size_t size;
+  size_t capacity;
+  char *storage;
+} QueryList;
+
+typedef struct {
+  int key;
+  int index;
+} IdSlot;
+
+typedef struct {
+  IdSlot *slots;
+  size_t mask;
+} IdMap;
+
+static void fail(void) {
+  fprintf(stderr, "Error!%c", 10);
+  exit(1);
+}
+
+static void *allocate(size_t count, size_t item_size) {
+  void *result;
+
+  if (item_size != 0 && count > ((size_t)-1) / item_size)
+    fail();
+  result = malloc(count * item_size);
+  if (result == NULL)
+    fail();
+  return result;
+}
+
+static void *allocate_zero(size_t count, size_t item_size) {
+  void *result;
+
+  if (item_size != 0 && count > ((size_t)-1) / item_size)
+    fail();
+  result = calloc(count, item_size);
+  if (result == NULL)
+    fail();
+  return result;
+}
+
+static void *resize_array(void *pointer, size_t count, size_t item_size) {
+  void *result;
+
+  if (item_size != 0 && count > ((size_t)-1) / item_size)
+    fail();
+  result = realloc(pointer, count * item_size);
+  if (result == NULL)
+    fail();
+  return result;
+}
+
+static char *copy_string(const char *source) {
+  size_t length;
+  char *copy;
+
+  length = strlen(source);
+  if (length == (size_t)-1)
+    fail();
+  copy = allocate(length + 1, sizeof(*copy));
+  memcpy(copy, source, length + 1);
+  return copy;
+}
+
+static size_t next_capacity(size_t current, size_t minimum) {
+  size_t capacity;
+
+  capacity = current == 0 ? 64 : current;
+  while (capacity < minimum) {
+    if (capacity > ((size_t)-1) / 2) {
+      capacity = minimum;
+      break;
+    }
+    capacity *= 2;
+  }
+  return capacity;
+}
+
+static size_t text_list_append(TextList *list, const char *text) {
+  size_t length;
+  size_t required;
+  size_t offset;
+  size_t capacity;
+
+  length = strlen(text);
+  if (length == (size_t)-1 ||
+      list->size > ((size_t)-1) - length - 1)
+    fail();
+
+  required = list->size + length + 1;
+  if (required > list->capacity) {
+    capacity = next_capacity(list->capacity, required);
+    list->data = resize_array(list->data, capacity, sizeof(*list->data));
+    list->capacity = capacity;
+  }
+
+  offset = list->size;
+  memcpy(list->data + offset, text, length + 1);
+  list->size = required;
+  return offset;
+}
+
+static void query_list_push(QueryList *list, char *text, int id) {
+  size_t capacity;
+
+  if (list->size == list->capacity) {
+    if (list->size == (size_t)-1)
+      fail();
+    capacity = next_capacity(list->capacity, list->size + 1);
+    list->data = resize_array(list->data, capacity, sizeof(*list->data));
+    list->capacity = capacity;
+  }
+
+  list->data[list->size].text = text;
+  list->data[list->size].id = id;
+  ++list->size;
+}
+
+static const char *skip_space(const char *text) {
+  while (*text != 0 && isspace((unsigned char)*text))
+    ++text;
+  return text;
+}
+
+static const char *read_int(const char *text, int *value) {
+  char *end;
+  long parsed;
+
+  text = skip_space(text);
+  if (*text == 0)
+    return NULL;
+  parsed = strtol(text, &end, 10);
+  if (end == text)
+    return NULL;
+  *value = (int)parsed;
+  return end;
+}
+
+static const char *read_float(const char *text, float *value) {
+  char *end;
+
+  text = skip_space(text);
+  if (*text == 0)
+    return NULL;
+  *value = strtof(text, &end);
+  if (end == text)
+    return NULL;
+  return end;
+}
+
+static void read_input(Node **out_nodes, int *out_count,
+                       TextList *neighbors, QueryList *queries) {
+  char *line;
+  size_t line_capacity;
+  char *header;
+  const char *cursor;
+  const char *after;
+  Node *nodes;
+  char *text;
+  int count;
+  int id;
+  int i;
+
+  line = NULL;
+  line_capacity = 0;
+  if (getline(&line, &line_capacity, stdin) < 0)
+    fail();
+
+  header = copy_string(line);
+  cursor = header;
+  cursor = read_int(cursor, &count);
+  if (cursor == NULL || count < 0)
+    fail();
+
+  queries->storage = header;
+  for (;;) {
+    cursor = skip_space(cursor);
+    if (*cursor == 0)
+      break;
+
+    text = (char *)cursor;
+    after = read_int(cursor, &id);
+    if (after == NULL)
+      fail();
+    if (*after != 0) {
+      *((char *)after) = 0;
+      cursor = after + 1;
+    } else {
+      cursor = after;
+    }
+    query_list_push(queries, text, id);
+  }
+
+  nodes = NULL;
+  if (count > 0)
+    nodes = allocate_zero((size_t)count, sizeof(*nodes));
+
+  for (i = 0; i < count; ++i) {
+    if (getline(&line, &line_capacity, stdin) < 0)
+      fail();
+
+    cursor = line;
+    after = read_int(cursor, &nodes[i].id);
+    if (after == NULL)
+      fail();
+    after = read_float(after, &nodes[i].value);
+    if (after == NULL)
+      fail();
+
+    cursor = skip_space(after);
+    nodes[i].neighbor_offset = text_list_append(neighbors, cursor);
+  }
+
+  free(line);
+  *out_nodes = nodes;
+  *out_count = count;
+}
+
+static size_t hash_id(int id) {
+  uint32_t value;
+
+  value = (uint32_t)id;
+  value ^= value >> 16;
+  value *= UINT32_C(0x7feb352d);
+  value ^= value >> 15;
+  value *= UINT32_C(0x846ca68b);
+  value ^= value >> 16;
+  return (size_t)value;
+}
+
+static void map_insert_first(IdMap *map, int key, int index) {
+  size_t position;
+
+  position = hash_id(key) & map->mask;
+  while (map->slots[position].index >= 0) {
+    if (map->slots[position].key == key)
+      return;
+    position = (position + 1) & map->mask;
+  }
+
+  map->slots[position].key = key;
+  map->slots[position].index = index;
+}
+
+static int map_find(const IdMap *map, int key) {
+  size_t position;
+
+  position = hash_id(key) & map->mask;
+  while (map->slots[position].index >= 0) {
+    if (map->slots[position].key == key)
+      return map->slots[position].index;
+    position = (position + 1) & map->mask;
+  }
+  return -1;
+}
+
+static IdMap make_id_map(const Node *nodes, int count) {
+  IdMap map;
+  size_t capacity;
+  size_t required;
+  size_t i;
+
+  if (count < 0 || (size_t)count > ((size_t)-1) / 2)
+    fail();
+
+  required = (size_t)count * 2;
+  capacity = 16;
+  while (capacity < required) {
+    if (capacity > ((size_t)-1) / 2)
+      fail();
+    capacity *= 2;
+  }
+
+  map.slots = allocate(capacity, sizeof(*map.slots));
+  map.mask = capacity - 1;
+  for (i = 0; i < capacity; ++i)
+    map.slots[i].index = -1;
+
+  for (i = 0; i < (size_t)count; ++i)
+    map_insert_first(&map, nodes[i].id, (int)i);
+
+  return map;
+}
+
+static void free_id_map(IdMap *map) {
+  free(map->slots);
+}
+
+static int choose_successor(Node *nodes, const TextList *neighbors,
+                            const IdMap *map, int index) {
+  Node *node;
+  const char *cursor;
+  const char *after;
+  float maximum;
+  int selected_id;
+  int selected_index;
+  int neighbor_id;
+  int candidate;
+
+  node = &nodes[index];
+  if (node->next_ready)
+    return node->next;
+
+  maximum = 0.0f;
+  selected_id = -1;
+  selected_index = -1;
+  cursor = neighbors->data + node->neighbor_offset;
+
+  for (;;) {
+    after = read_int(cursor, &neighbor_id);
+    if (after == NULL)
+      break;
+
+    candidate = map_find(map, neighbor_id);
+    if (candidate >= 0 && maximum < nodes[candidate].value) {
+      maximum = nodes[candidate].value;
+      selected_id = neighbor_id;
+      selected_index = candidate;
+    }
+    cursor = after;
+  }
+
+  node->next = selected_id == -1 ? -1 : selected_index;
+  node->next_ready = 1;
+  return node->next;
+}
+
+static float get_cost(Node *nodes, const TextList *neighbors,
+                      const IdMap *map, int start, int *stack) {
+  size_t depth;
+  int current;
+  int index;
+  Node *node;
+  float total;
+
+  depth = 0;
+  current = start;
+  while (current >= 0 && nodes[current].state == 0) {
+    nodes[current].state = 1;
+    stack[depth++] = current;
+    current = choose_successor(nodes, neighbors, map, current);
+  }
+
+  while (depth != 0) {
+    index = stack[--depth];
+    node = &nodes[index];
+    total = node->value;
+    if (node->next >= 0)
+      total += nodes[node->next].cost;
+    node->cost = total;
+    node->state = 2;
+  }
+
+  return nodes[start].cost;
+}
+
+int main(void) {
+  Node *nodes;
+  TextList neighbors = { NULL, 0, 0 };
+  QueryList queries = { NULL, 0, 0, NULL };
+  IdMap map;
+  int *stack;
+  int count;
+  size_t i;
+  int index;
+  float result;
+
+  nodes = NULL;
+  stack = NULL;
+  count = 0;
+  read_input(&nodes, &count, &neighbors, &queries);
+  map = make_id_map(nodes, count);
+
+  if (count > 0)
+    stack = allocate((size_t)count, sizeof(*stack));
+
+  for (i = 0; i < queries.size; ++i) {
+    index = map_find(&map, queries.data[i].id);
+    result = 0.0f;
+    if (index >= 0)
+      result = get_cost(nodes, &neighbors, &map, index, stack);
+    printf("%s: %f%c", queries.data[i].text, result, 10);
+  }
+
+  free(stack);
+  free_id_map(&map);
+  free(nodes);
+  free(neighbors.data);
+  free(queries.data);
+  free(queries.storage);
+  return 0;
+}

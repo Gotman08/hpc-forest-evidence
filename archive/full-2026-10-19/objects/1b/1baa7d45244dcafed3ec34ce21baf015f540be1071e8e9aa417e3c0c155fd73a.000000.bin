@@ -1,0 +1,140 @@
+#include <algorithm>
+#include <iostream>
+#include <vector>
+
+using namespace std;
+
+constexpr int MOD = 1000000007;
+
+int main() {
+    int n, m;
+    if (!(cin >> n >> m)) return 0;
+
+    // Store only blocked columns; a dense n-by-n bitmap is unnecessary.
+    vector<vector<int>> blockedColumns(n);
+    for (int c = 0; c < m; ++c) {
+        int row, column;
+        cin >> row >> column;
+        blockedColumns[row].push_back(column);
+    }
+    for (auto& columns : blockedColumns) {
+        sort(columns.begin(), columns.end());
+    }
+
+    vector<int> previous(n, 0);
+    vector<int> current(n, 0);
+    previous[0] = 1;
+
+#ifdef _OPENMP
+    constexpr int PARALLEL_THRESHOLD = 4096;
+    constexpr int CHUNK_SIZE = 256;
+
+    if (n >= PARALLEL_THRESHOLD) {
+        const int chunkCount = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        vector<int> transferValue(chunkCount, 0);
+        vector<unsigned char> transferHasReset(chunkCount, 0);
+        vector<int> carryIn(chunkCount, 0);
+
+        // Each chunk's row transformation is either carry + value (no
+        // obstacle) or a value independent of the incoming carry (obstacle).
+        // A serial prefix over these compact summaries sets chunk carries;
+        // the two column passes themselves are work-shared.
+#pragma omp parallel shared(previous, current, blockedColumns, transferValue, transferHasReset, carryIn)
+        {
+            for (int row = 0; row < n; ++row) {
+#pragma omp for schedule(static)
+                for (int chunk = 0; chunk < chunkCount; ++chunk) {
+                    const int begin = chunk * CHUNK_SIZE;
+                    const int end = min(n, begin + CHUNK_SIZE);
+                    const auto& obstacles = blockedColumns[row];
+                    size_t obstacle = lower_bound(obstacles.begin(), obstacles.end(), begin) - obstacles.begin();
+                    int value = 0;
+                    bool hasReset = false;
+
+                    for (int column = begin; column < end; ++column) {
+                        if (obstacle < obstacles.size() && obstacles[obstacle] == column) {
+                            do {
+                                ++obstacle;
+                            } while (obstacle < obstacles.size() && obstacles[obstacle] == column);
+                            value = 0;
+                            hasReset = true;
+                        } else {
+                            value += previous[column];
+                            if (value >= MOD) value -= MOD;
+                        }
+                    }
+                    transferValue[chunk] = value;
+                    transferHasReset[chunk] = static_cast<unsigned char>(hasReset);
+                }
+
+#pragma omp single
+                {
+                    int carry = 0;
+                    for (int chunk = 0; chunk < chunkCount; ++chunk) {
+                        carryIn[chunk] = carry;
+                        if (transferHasReset[chunk]) {
+                            carry = transferValue[chunk];
+                        } else {
+                            carry += transferValue[chunk];
+                            if (carry >= MOD) carry -= MOD;
+                        }
+                    }
+                }
+
+#pragma omp for schedule(static)
+                for (int chunk = 0; chunk < chunkCount; ++chunk) {
+                    const int begin = chunk * CHUNK_SIZE;
+                    const int end = min(n, begin + CHUNK_SIZE);
+                    const auto& obstacles = blockedColumns[row];
+                    size_t obstacle = lower_bound(obstacles.begin(), obstacles.end(), begin) - obstacles.begin();
+                    int carry = carryIn[chunk];
+
+                    for (int column = begin; column < end; ++column) {
+                        if (obstacle < obstacles.size() && obstacles[obstacle] == column) {
+                            do {
+                                ++obstacle;
+                            } while (obstacle < obstacles.size() && obstacles[obstacle] == column);
+                            carry = 0;
+                            current[column] = 0;
+                        } else {
+                            carry += previous[column];
+                            if (carry >= MOD) carry -= MOD;
+                            current[column] = carry;
+                        }
+                    }
+                }
+
+#pragma omp single
+                {
+                    previous.swap(current);
+                }
+            }
+        }
+    } else
+#endif
+    {
+        for (int row = 0; row < n; ++row) {
+            const auto& obstacles = blockedColumns[row];
+            size_t obstacle = 0;
+            int carry = 0;
+
+            for (int column = 0; column < n; ++column) {
+                if (obstacle < obstacles.size() && obstacles[obstacle] == column) {
+                    do {
+                        ++obstacle;
+                    } while (obstacle < obstacles.size() && obstacles[obstacle] == column);
+                    carry = 0;
+                    current[column] = 0;
+                } else {
+                    carry += previous[column];
+                    if (carry >= MOD) carry -= MOD;
+                    current[column] = carry;
+                }
+            }
+            previous.swap(current);
+        }
+    }
+
+    cout << previous[n - 1] << '\n';
+    return 0;
+}

@@ -1,0 +1,153 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using u32 = std::uint32_t;
+using u64 = std::uint64_t;
+
+static constexpr u64 MOD = 1000000007ULL;
+
+static inline u32 negate_mod(u32 x) {
+    return x == 0 ? 0U : static_cast<u32>(MOD - x);
+}
+
+static inline u64 product_block16(const u32* a, const u32* b) {
+#if defined(__aarch64__)
+    uint64x2_t low = vdupq_n_u64(0);
+    uint64x2_t high = vdupq_n_u64(0);
+    for (int i = 0; i < 16; i += 4) {
+        const uint32x4_t x = vld1q_u32(a + i);
+        const uint32x4_t y = vld1q_u32(b + i);
+        low = vmlal_u32(low, vget_low_u32(x), vget_low_u32(y));
+        high = vmlal_u32(high, vget_high_u32(x), vget_high_u32(y));
+    }
+    return vaddvq_u64(vaddq_u64(low, high));
+#else
+    u64 s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    for (int i = 0; i < 16; i += 4) {
+        s0 += static_cast<u64>(a[i]) * b[i];
+        s1 += static_cast<u64>(a[i + 1]) * b[i + 1];
+        s2 += static_cast<u64>(a[i + 2]) * b[i + 2];
+        s3 += static_cast<u64>(a[i + 3]) * b[i + 3];
+    }
+    return (s0 + s1) + (s2 + s3);
+#endif
+}
+
+static inline u32 dot_mod(const u32* a, const u32* b, int count) {
+    if (count == 0) return 0;
+    u64 sum = 0;
+    // 16*(MOD-1)^2 plus a reduced carry fits in unsigned 64 bits.
+    while (count >= 16) {
+        sum = (sum + product_block16(a, b)) % MOD;
+        a += 16;
+        b += 16;
+        count -= 16;
+    }
+#if defined(__aarch64__)
+    if (count >= 4) {
+        uint64x2_t low = vdupq_n_u64(0);
+        uint64x2_t high = vdupq_n_u64(0);
+        do {
+            const uint32x4_t x = vld1q_u32(a);
+            const uint32x4_t y = vld1q_u32(b);
+            low = vmlal_u32(low, vget_low_u32(x), vget_low_u32(y));
+            high = vmlal_u32(high, vget_high_u32(x), vget_high_u32(y));
+            a += 4;
+            b += 4;
+            count -= 4;
+        } while (count >= 4);
+        sum += vaddvq_u64(vaddq_u64(low, high));
+    }
+#endif
+    while (count > 0) {
+        sum += static_cast<u64>(*a++) * *b++;
+        --count;
+    }
+    return static_cast<u32>(sum % MOD);
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n;
+    u64 h;
+    if (!(std::cin >> n >> h)) return 0;
+
+    std::vector<u32> a(n), q(n + 1);
+    for (int i = 0; i < n; ++i) std::cin >> a[i];
+    q[0] = 1;
+    for (int i = 1; i <= n; ++i) {
+        u32 value;
+        std::cin >> value;
+        q[i] = negate_mod(value);
+    }
+
+    if (h <= static_cast<u64>(n)) {
+        std::cout << a[h - 1] << '\n';
+        return 0;
+    }
+
+    std::vector<u32> u(n), next_u(n), next_q(n + 1), reversed(n + 1);
+
+    // The generating function is U/Q, with U = (A*Q) modulo x^n.
+    for (int i = 0; i <= n; ++i) reversed[n - i] = q[i];
+    for (int i = 0; i < n; ++i) {
+        u[i] = dot_mod(a.data(), reversed.data() + n - i, i + 1);
+    }
+
+    int u_size = n;
+    int degree = n;
+    u64 index = h - 1;
+    while (index != 0) {
+        const int parity = static_cast<int>(index & 1ULL);
+        const u64 next_index = index >> 1;
+        // Higher coefficients cannot affect the remaining target coefficient.
+        const int next_u_size = static_cast<int>(
+            std::min<u64>(u_size, next_index + 1));
+        const int next_degree = static_cast<int>(
+            std::min<u64>(degree, next_index));
+
+        // Reverse Q(-x) so every convolution dot product reads forward.
+        for (int i = 0; i <= degree; ++i) {
+            reversed[degree - i] = (i & 1) ? negate_mod(q[i]) : q[i];
+        }
+
+        // Retain only the required parity of U(x)*Q(-x).
+        for (int j = 0; j < next_u_size; ++j) {
+            const int power = 2 * j + parity;
+            const int first = std::max(0, power - degree);
+            const int last = std::min(u_size - 1, power);
+            next_u[j] = dot_mod(u.data() + first,
+                reversed.data() + degree - power + first,
+                last - first + 1);
+        }
+
+        next_q[0] = 1;
+        // Q(x)*Q(-x) is even; paired off-diagonal products are equal.
+        for (int j = 1; j <= next_degree; ++j) {
+            const int first = std::max(0, 2 * j - degree);
+            const u32 half = dot_mod(q.data() + first,
+                reversed.data() + degree - 2 * j + first,
+                j - first);
+            const u64 diagonal = static_cast<u64>(q[j]) * reversed[degree - j];
+            next_q[j] = static_cast<u32>((2ULL * half + diagonal) % MOD);
+        }
+
+        u.swap(next_u);
+        q.swap(next_q);
+        u_size = next_u_size;
+        degree = next_degree;
+        index = next_index;
+    }
+
+    // Q[0] remains one throughout Bostan-Mori extraction.
+    std::cout << u[0] << '\n';
+    return 0;
+}

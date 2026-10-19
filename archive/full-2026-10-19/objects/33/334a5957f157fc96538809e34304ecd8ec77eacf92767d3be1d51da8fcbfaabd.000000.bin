@@ -1,0 +1,89 @@
+"""Read Git SHA-1 loose objects without Git CLI, hooks, worktree repair or writes."""
+from __future__ import annotations
+
+import hashlib
+import re
+import zlib
+from pathlib import Path
+
+
+class GitEvidenceError(ValueError):
+    pass
+
+
+class LooseGit:
+    def __init__(self, repo: Path):
+        self.repo = repo.resolve(strict=True)
+        self.gitdir = self.repo / ".git"
+        if not self.gitdir.is_dir() or self.gitdir.is_symlink():
+            raise GitEvidenceError("Expected archived central .git directory")
+        self.cache = {}
+
+    def object(self, oid):
+        if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}", oid):
+            raise GitEvidenceError("Only exact SHA-1 Git objects are supported")
+        if oid not in self.cache:
+            path = self.gitdir / "objects" / oid[:2] / oid[2:]
+            if not path.is_file() or path.is_symlink():
+                raise GitEvidenceError("Required Git object is packed or missing; no CLI fallback")
+            compressed = path.read_bytes()
+            if len(compressed) > 32 * 1024 * 1024:
+                raise GitEvidenceError("Oversized Git object")
+            reader = zlib.decompressobj()
+            raw = reader.decompress(compressed, 32 * 1024 * 1024 + 1)
+            if len(raw) > 32 * 1024 * 1024 or not reader.eof or reader.unused_data:
+                raise GitEvidenceError("Invalid or oversized compressed Git object")
+            if hashlib.sha1(raw).hexdigest() != oid:
+                raise GitEvidenceError("Git object SHA-1 differs from its name")
+            header, payload = raw.split(b"\0", 1)
+            kind, size = header.split(b" ", 1)
+            if not size.isdigit() or int(size) != len(payload):
+                raise GitEvidenceError("Git object length mismatch")
+            self.cache[oid] = kind.decode("ascii"), payload
+        return self.cache[oid]
+
+    def commit(self, oid):
+        kind, raw = self.object(oid)
+        if kind != "commit":
+            raise GitEvidenceError("Expected a commit object")
+        header = raw.split(b"\n\n", 1)[0].decode("utf8")
+        trees = [line[5:] for line in header.splitlines() if line.startswith("tree ")]
+        parents = [line[7:] for line in header.splitlines() if line.startswith("parent ")]
+        if len(trees) != 1:
+            raise GitEvidenceError("Commit must name one tree")
+        return {"tree": trees[0], "parents": parents}
+
+    def tree(self, oid, prefix="", depth=0):
+        if depth > 32:
+            raise GitEvidenceError("Git tree nesting exceeds limit")
+        kind, raw = self.object(oid)
+        if kind != "tree":
+            raise GitEvidenceError("Expected tree object")
+        result, position = {}, 0
+        while position < len(raw):
+            space, end = raw.index(b" ", position), raw.index(b"\0", position)
+            mode, name = raw[position:space], raw[space + 1:end].decode("utf8")
+            child = raw[end + 1:end + 21]
+            if len(child) != 20 or name in {"", ".", ".."} or "/" in name or "\\" in name:
+                raise GitEvidenceError("Unsafe Git tree entry")
+            path = prefix + name
+            if mode == b"40000":
+                values = self.tree(child.hex(), path + "/", depth + 1)
+            elif mode in {b"100644", b"100755"}:
+                objkind, data = self.object(child.hex())
+                if objkind != "blob":
+                    raise GitEvidenceError("File entry does not reference a blob")
+                values = {path: data}
+            else:
+                raise GitEvidenceError("Symlink/gitlink/nonregular Git entries are not supported")
+            if result.keys() & values.keys():
+                raise GitEvidenceError("Duplicate Git tree path")
+            result.update(values)
+            position = end + 21
+        return result
+
+    def files_at(self, commit):
+        return self.tree(self.commit(commit)["tree"])
+
+    def sources_at(self, commit):
+        return {name: raw.decode("utf8") for name, raw in self.files_at(commit).items() if name.startswith("src/")}

@@ -1,0 +1,108 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define TARGET_TILE 4
+#define PARALLEL_THRESHOLD 64
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/* Workshare target tiles while retaining the original ascending source order. */
+void body_force(Body *p, float dt, int n) {
+  long long block_count = ((long long)n + TARGET_TILE - 1) / TARGET_TILE;
+
+  #pragma omp for schedule(static)
+  for (long long block = 0; block < block_count; ++block) {
+    int base = (int)(block * TARGET_TILE);
+    int count = n - base;
+    if (count > TARGET_TILE) count = TARGET_TILE;
+
+    float tx[TARGET_TILE], ty[TARGET_TILE], tz[TARGET_TILE];
+    float fx[TARGET_TILE] = {0.0f};
+    float fy[TARGET_TILE] = {0.0f};
+    float fz[TARGET_TILE] = {0.0f};
+
+    for (int lane = 0; lane < count; ++lane) {
+      tx[lane] = p[base + lane].x;
+      ty[lane] = p[base + lane].y;
+      tz[lane] = p[base + lane].z;
+    }
+
+    for (int j = 0; j < n; ++j) {
+      float xj = p[j].x;
+      float yj = p[j].y;
+      float zj = p[j].z;
+
+      #pragma omp simd
+      for (int lane = 0; lane < count; ++lane) {
+        float dx = xj - tx[lane];
+        float dy = yj - ty[lane];
+        float dz = zj - tz[lane];
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1 / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+        fx[lane] += dx * inv_dist3;
+        fy[lane] += dy * inv_dist3;
+        fz[lane] += dz * inv_dist3;
+      }
+    }
+
+    for (int lane = 0; lane < count; ++lane) {
+      p[base + lane].vx += dt * fx[lane];
+      p[base + lane].vy += dt * fy[lane];
+      p[base + lane].vz += dt * fz[lane];
+    }
+  }
+}
+
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr, "\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr, "\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr, "\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+
+  #pragma omp parallel if (nbodies >= PARALLEL_THRESHOLD) shared(bodies, nbodies)
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      body_force(bodies, DT, nbodies);
+
+      #pragma omp for schedule(static)
+      for (int i = 0; i < nbodies; ++i) {
+        bodies[i].x += bodies[i].vx * DT;
+        bodies[i].y += bodies[i].vy * DT;
+        bodies[i].z += bodies[i].vz * DT;
+      }
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

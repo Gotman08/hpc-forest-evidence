@@ -1,0 +1,121 @@
+"""Seal local source bytes only; never import the source or execute native code."""
+import ast
+import difflib
+import hashlib
+import json
+import xml.etree.ElementTree as ET
+import zipfile
+from collections import Counter
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parents[3]
+HERE = Path(__file__).resolve().parent
+PROJECT = BASE / "work/hpc-forest-primes-natif-relance-r2g/project"
+OLD = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2f/correction-cli/candidats/revision-r1/HPC-Forest-Primes-Natif-MAX-r2f.zip"
+OUT = HERE / "candidats/revision-r1"
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def write_json(path, value):
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+
+
+def ref(path):
+    return {"path": str(path), "sha256": digest(path.read_bytes())}
+
+
+def functions(raw):
+    tree = ast.parse(raw.decode("utf8"))
+    return {node.name: ast.dump(node, include_attributes=False) for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def main():
+    assert digest(OLD.read_bytes()) == "47f97afabcd6d10c5e95a1dc3aae0a34b0841183919785a6bd62d58aa1e90d75"
+    with zipfile.ZipFile(OLD) as archive:
+        before = {name.removeprefix("HPC-Forest/"): archive.read(name) for name in archive.namelist()}
+    assert len(before) == 109
+    files = sorted(path for path in PROJECT.rglob("*") if path.is_file())
+    assert all(not path.is_symlink() and not path.is_junction() for path in files)
+    after = {path.relative_to(PROJECT).as_posix(): path.read_bytes() for path in files}
+    changed = sorted(name for name in before if before[name] != after.get(name))
+    added = sorted(set(after) - set(before))
+    assert changed == ["src/hpc_forest/codex_process.py", "src/hpc_forest/native_r2max.py",
+                       "tests/test_codex_cli_diagnostics_r2e.py"]
+    assert added == ["tests/test_host_policy_r2g.py"] and len(after) == 110
+    assert set(before) <= set(after)
+    key = "src/hpc_forest/codex_process.py"
+    old_functions, new_functions = functions(before[key]), functions(after[key])
+    changed_functions = sorted(name for name in old_functions if old_functions[name] != new_functions[name])
+    assert changed_functions == ["check_cli_metadata_projection", "command_for", "load_task_cli_policy"]
+    assert set(new_functions) - set(old_functions) == {"task_feature_overrides"}
+    native = "src/hpc_forest/native_r2max.py"
+    old_tree, new_tree = ast.parse(before[native]), ast.parse(after[native])
+    for tree in (old_tree, new_tree):
+        tree.body = [node for node in tree.body if not (isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id in {"SCOPE", "CELLS"} for target in node.targets))]
+    assert ast.dump(old_tree, include_attributes=False) == ast.dump(new_tree, include_attributes=False)
+    junit = HERE / "tests-premier-passage.xml"
+    root = ET.parse(junit).getroot()
+    suite = next(root.iter("testsuite"))
+    assert suite.attrib["tests"] == "163" and all(suite.attrib[k] == "0" for k in ("errors", "failures", "skipped"))
+    counts = Counter(case.attrib["classname"].split(".")[-1] for case in root.iter("testcase"))
+    assert sorted(counts.values()) == [6, 12, 20, 36, 41, 48]
+    host_repeat = ET.parse(HERE / "tests-host-apres-import-format.xml").getroot()
+    host_suite = next(host_repeat.iter("testsuite"))
+    assert host_suite.attrib["tests"] == "41" and all(host_suite.attrib[k] == "0" for k in ("errors", "failures", "skipped"))
+    OUT.mkdir(parents=True, exist_ok=False)
+    manifest = {name: digest(raw) for name, raw in sorted(after.items())}
+    runtime = OUT / "runtime-manifest-r2max.json"
+    write_json(runtime, manifest)
+    source_manifest = OUT / "source-manifest.json"
+    write_json(source_manifest, manifest)
+    source_zip = OUT / "HPC-Forest-Primes-Natif-MAX-r2g.zip"
+    with zipfile.ZipFile(source_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, raw in sorted(after.items()):
+            info = zipfile.ZipInfo("HPC-Forest/" + name, date_time=(2026, 10, 18, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, raw)
+    diff = "".join("".join(difflib.unified_diff(before[name].decode("utf8").splitlines(True),
+        after[name].decode("utf8").splitlines(True), fromfile="F109/" + name, tofile="G110/" + name)) for name in changed)
+    (OUT / "delta-ferme.diff").write_text(diff, encoding="utf8", newline="\n")
+    delta = {"schema": "hpc-forest-r2g-source-closed-delta-v1", "ancestor": ref(OLD),
+             "before_count": 109, "after_count": 110, "unchanged_count": 106,
+             "changed": [{"path": n, "before_sha256": digest(before[n]), "after_sha256": manifest[n]} for n in changed],
+             "added": [{"path": n, "sha256": manifest[n]} for n in added],
+             "modified_existing_functions": changed_functions, "added_function": "task_feature_overrides",
+             "other_functions_byte_AST_equal": True, "native_delta_only_SCOPE_CELLS": True,
+             "policy_schema": "hpc-forest-r2g-local-cli-policy-v1",
+             "host_only_feature_true": True, "features_closed_count": 22, "other_features_false": 21,
+             "features_checked_as_exact_bool_singletons": True, "canonical_argv_order": True,
+             "policy_new_fields": ["cli_feature_overrides", "code_mode_host_executable_sha256"],
+             "code_mode_host_executable_sha256": "3b6a9179a4da17fa5fc6948219cd61486dc3b534c683838076d8c61bd311c68e",
+             "diagnostics_usage_tool_event_refusal_unchanged": True, "worker_hold_first_batch_gate_unchanged": True,
+             "algorithm_oracle_budget_scientific_inputs_changed": False,
+             "raw_local_skill_paths_in_source_delta": False,
+             "native_research_admitted": False, "effective_host_or_runtime_tool_absence_proven": False,
+             "diff": ref(OUT / "delta-ferme.diff")}
+    write_json(OUT / "DELTA-SOURCE-F109-G110.json", delta)
+    delivery = {"schema": "hpc-forest-r2g-local-source-candidate-v1", "verified_local_source": True,
+                "source_members": 110, "source_zip": ref(source_zip), "runtime_manifest": ref(runtime),
+                "source_manifest": ref(source_manifest), "closed_delta": ref(OUT / "DELTA-SOURCE-F109-G110.json"),
+                "tests": {"unique_cases": 163, "suites": dict(counts), "first_run": ref(junit),
+                          "final_host_suite_after_import_format_only": ref(HERE / "tests-host-apres-import-format.xml"),
+                          "repeated_cases": 41, "failures": 0, "errors": 0, "skipped": 0},
+                "ruff_final_changed_files_passed": True, "first_lint_refusals_preserved": True,
+                "native_research_admitted": False, "CLI_compatibility_qualified": False,
+                "first_NORMAL_received": False, "runtime_tool_absence_proven": False,
+                "requires_new_qualification_and_private_first_batch_audit": True,
+                "plan_bundle_factory_owned_by_peer": True}
+    write_json(OUT / "LIVRAISON-SOURCE-CANDIDATE.json", delivery)
+    print(json.dumps({"source_zip": delivery["source_zip"], "runtime_manifest": delivery["runtime_manifest"],
+                      "delivery": ref(OUT / "LIVRAISON-SOURCE-CANDIDATE.json"), "tests": dict(counts)}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,263 @@
+#include <ctype.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    uint64_t value;
+    uint64_t scale;
+} Fragment;
+
+static char *read_token(FILE *stream)
+{
+    int ch;
+    size_t capacity = 32;
+    size_t length = 0;
+    char *token;
+
+    do {
+        ch = fgetc(stream);
+    } while (ch != EOF && isspace((unsigned char)ch));
+    if (ch == EOF)
+        return NULL;
+
+    token = malloc(capacity);
+    if (token == NULL)
+        return NULL;
+
+    while (ch != EOF && !isspace((unsigned char)ch)) {
+        if (length + 1 >= capacity) {
+            size_t new_capacity;
+            char *resized;
+
+            if (capacity > SIZE_MAX / 2) {
+                free(token);
+                return NULL;
+            }
+            new_capacity = capacity * 2;
+            resized = realloc(token, new_capacity);
+            if (resized == NULL) {
+                free(token);
+                return NULL;
+            }
+            token = resized;
+            capacity = new_capacity;
+        }
+        token[length++] = (char)ch;
+        ch = fgetc(stream);
+    }
+    token[length] = '\0';
+    return token;
+}
+
+static int parse_fragment(const char *text, Fragment *fragment)
+{
+    uint64_t value = 0;
+    uint64_t scale = 1;
+    const unsigned char *p = (const unsigned char *)text;
+
+    if (*p == '\0')
+        return 0;
+    for (; *p != '\0'; ++p) {
+        unsigned digit;
+
+        if (*p < '0' || *p > '9')
+            return 0;
+        digit = (unsigned)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10 || scale > UINT64_MAX / 10)
+            return 0;
+        value = value * 10 + digit;
+        scale *= 10;
+    }
+    fragment->value = value;
+    fragment->scale = scale;
+    return 1;
+}
+
+static uint64_t integer_sqrt(uint64_t value)
+{
+    uint64_t low = 0;
+    uint64_t high = UINT32_MAX;
+
+    while (low < high) {
+        uint64_t middle = low + (high - low + 1) / 2;
+        if (middle <= value / middle)
+            low = middle;
+        else
+            high = middle - 1;
+    }
+    return low;
+}
+
+static int is_prime_from_sieve(uint64_t value, const uint32_t *primes,
+                               size_t prime_count)
+{
+    size_t i;
+
+    if (value < 2)
+        return 0;
+    for (i = 0; i < prime_count; ++i) {
+        uint64_t factor = primes[i];
+        if (factor > value / factor)
+            break;
+        if (value % factor == 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int compare_u64(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+    return (a > b) - (a < b);
+}
+
+int main(void)
+{
+    size_t count;
+    size_t candidate_count;
+    size_t i;
+    size_t j;
+    size_t result_count = 0;
+    uint64_t maximum = 0;
+    uint64_t limit;
+    size_t sieve_size;
+    size_t sieve_prime_count = 0;
+    Fragment *left;
+    Fragment *right;
+    uint64_t *candidates;
+    uint8_t *composite;
+    uint32_t *small_primes = NULL;
+
+    if (scanf("%zu", &count) != 1 || count == 0)
+        return 0;
+    if (count > SIZE_MAX / sizeof(*left) ||
+        count > SIZE_MAX / sizeof(*right) ||
+        count > SIZE_MAX / count)
+        return 1;
+
+    candidate_count = count * count;
+    if (candidate_count > SIZE_MAX / sizeof(*candidates))
+        return 1;
+
+    left = malloc(count * sizeof(*left));
+    right = malloc(count * sizeof(*right));
+    if (left == NULL || right == NULL) {
+        free(left);
+        free(right);
+        return 1;
+    }
+
+    for (i = 0; i < count; ++i) {
+        char *token = read_token(stdin);
+        int valid = token != NULL && parse_fragment(token, &left[i]);
+        free(token);
+        if (!valid) {
+            free(left);
+            free(right);
+            return 1;
+        }
+    }
+    for (i = 0; i < count; ++i) {
+        char *token = read_token(stdin);
+        int valid = token != NULL && parse_fragment(token, &right[i]);
+        free(token);
+        if (!valid) {
+            free(left);
+            free(right);
+            return 1;
+        }
+    }
+
+    candidates = malloc(candidate_count * sizeof(*candidates));
+    if (candidates == NULL) {
+        free(left);
+        free(right);
+        return 1;
+    }
+
+    for (i = 0; i < count; ++i) {
+        for (j = 0; j < count; ++j) {
+            if (left[i].value >
+                (UINT64_MAX - right[j].value) / right[j].scale) {
+                free(left);
+                free(right);
+                free(candidates);
+                return 1;
+            }
+            candidates[i * count + j] =
+                left[i].value * right[j].scale + right[j].value;
+            if (candidates[i * count + j] > maximum)
+                maximum = candidates[i * count + j];
+        }
+    }
+
+    limit = integer_sqrt(maximum);
+    sieve_size = (size_t)(limit + 1);
+    composite = malloc(sieve_size * sizeof(*composite));
+    if (composite == NULL) {
+        free(left);
+        free(right);
+        free(candidates);
+        return 1;
+    }
+    memset(composite, 0, sieve_size * sizeof(*composite));
+    composite[0] = 1;
+    if (limit >= 1)
+        composite[1] = 1;
+
+    for (i = 2; i <= (size_t)limit / i; ++i) {
+        if (!composite[i]) {
+            size_t multiple;
+            for (multiple = i * i; multiple <= (size_t)limit; multiple += i)
+                composite[multiple] = 1;
+        }
+    }
+    for (i = 2; i <= (size_t)limit; ++i) {
+        if (!composite[i])
+            ++sieve_prime_count;
+    }
+
+    if (sieve_prime_count > 0) {
+        if (sieve_prime_count > SIZE_MAX / sizeof(*small_primes)) {
+            free(left);
+            free(right);
+            free(candidates);
+            free(composite);
+            return 1;
+        }
+        small_primes = malloc(sieve_prime_count * sizeof(*small_primes));
+        if (small_primes == NULL) {
+            free(left);
+            free(right);
+            free(candidates);
+            free(composite);
+            return 1;
+        }
+        sieve_prime_count = 0;
+        for (i = 2; i <= (size_t)limit; ++i) {
+            if (!composite[i])
+                small_primes[sieve_prime_count++] = (uint32_t)i;
+        }
+    }
+
+    for (i = 0; i < candidate_count; ++i) {
+        uint64_t value = candidates[i];
+        if (is_prime_from_sieve(value, small_primes, sieve_prime_count))
+            candidates[result_count++] = value;
+    }
+
+    qsort(candidates, result_count, sizeof(*candidates), compare_u64);
+    for (i = 0; i < result_count; ++i)
+        printf("%" PRIu64 "\n", candidates[i]);
+
+    free(left);
+    free(right);
+    free(candidates);
+    free(composite);
+    free(small_primes);
+    return 0;
+}

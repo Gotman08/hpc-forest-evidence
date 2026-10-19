@@ -1,0 +1,44 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\nstatic inline float32x4_t inverse_distance4(float32x4_t squared) {\n  const float64x2_t one = vdupq_n_f64(1.0);\n  float64x2_t lo = vcvt_f64_f32(vget_low_f32(squared));\n  float64x2_t hi = vcvt_f64_f32(vget_high_f32(squared));\n\n  /* Match the reference's double sqrt and division before narrowing. */\n  float64x2_t inv_lo = vdivq_f64(one, vsqrtq_f64(lo));\n  float64x2_t inv_hi = vdivq_f64(one, vsqrtq_f64(hi));\n  return vcombine_f32(vcvt_f32_f64(inv_lo), vcvt_f32_f64(inv_hi));\n}\n#endif\n\n/*\n * Compute the gravitational impact among all pairs of bodies in\n * the system.\n */\nvoid body_force(Body *p, float dt, int n) {\n  int i = 0;\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n  const int neon_end = n - n % 8;\n  for (; i < neon_end; i += 8) {\n    const float x[8] = {p[i].x, p[i+1].x, p[i+2].x, p[i+3].x,\n                        p[i+4].x, p[i+5].x, p[i+6].x, p[i+7].x};\n    const float y[8] = {p[i].y, p[i+1].y, p[i+2].y, p[i+3].y,\n                        p[i+4].y, p[i+5].y, p[i+6].y, p[i+7].y};\n    const float z[8] = {p[i].z, p[i+1].z, p[i+2].z, p[i+3].z,\n                        p[i+4].z, p[i+5].z, p[i+6].z, p[i+7].z};\n    float fx[8] = {0.0f};\n    float fy[8] = {0.0f};\n    float fz[8] = {0.0f};\n\n    /* Vector lanes are independent targets; j is never a reduction lane. */\n    for (int j = 0; j < n; ++j) {\n      const float xj = p[j].x;\n      const float yj = p[j].y;\n      const float zj = p[j].z;\n      float dx[8], dy[8], dz[8], squared[8], inverse[8];\n\n      #pragma omp simd\n      for (int lane = 0; lane < 8; ++lane) {\n        float dx_lane = xj - x[lane];\n        float dy_lane = yj - y[lane];\n        float dz_lane = zj - z[lane];\n        dx[lane] = dx_lane;\n        dy[lane] = dy_lane;\n        dz[lane] = dz_lane;\n        squared[lane] = dx_lane*dx_lane + dy_lane*dy_lane\n                      + dz_lane*dz_lane + SOFTENING;\n      }\n\n      float32x4_t inv0 = inverse_distance4(vld1q_f32(squared));\n      float32x4_t inv1 = inverse_distance4(vld1q_f32(squared + 4));\n      vst1q_f32(inverse, inv0);\n      vst1q_f32(inverse + 4, inv1);\n\n      #pragma omp simd\n      for (int lane = 0; lane < 8; ++lane) {\n        float inv_dist = inverse[lane];\n        float inv_dist3 = inv_dist * inv_dist * inv_dist;\n        fx[lane] += dx[lane] * inv_dist3;\n        fy[lane] += dy[lane] * inv_dist3;\n        fz[lane] += dz[lane] * inv_dist3;\n      }\n    }\n\n    for (int lane = 0; lane < 8; ++lane) {\n      p[i+lane].vx += dt*fx[lane];\n      p[i+lane].vy += dt*fy[lane];\n      p[i+lane].vz += dt*fz[lane];\n    }\n  }\n#endif\n\n  const int vector_end = n - n % 4;\n  for (; i < vector_end; i += 4) {\n    const float x[4] = {p[i].x, p[i+1].x, p[i+2].x, p[i+3].x};\n    const float y[4] = {p[i].y, p[i+1].y, p[i+2].y, p[i+3].y};\n    const float z[4] = {p[i].z, p[i+1].z, p[i+2].z, p[i+3].z};\n    float fx[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n    float fy[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n    float fz[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n\n    /* Each lane retains the original ascending-j accumulation order. */\n    for (int j = 0; j < n; ++j) {\n      const float xj = p[j].x;\n      const float yj = p[j].y;\n      const float zj = p[j].z;\n\n      #pragma omp simd\n      for (int lane = 0; lane < 4; ++lane) {\n        float dx = xj - x[lane];\n        float dy = yj - y[lane];\n        float dz = zj - z[lane];\n        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n        float inv_dist = 1 / sqrt(sqrd_dist);\n        float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n        fx[lane] += dx * inv_dist3;\n        fy[lane] += dy * inv_dist3;\n        fz[lane] += dz * inv_dist3;\n      }\n    }\n\n    for (int lane = 0; lane < 4; ++lane) {\n      p[i+lane].vx += dt*fx[lane];\n      p[i+lane].vy += dt*fy[lane];\n      p[i+lane].vz += dt*fz[lane];\n    }\n  }\n\n  for (; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n\n  /*\n   * At each simulation iteration, interbody forces are computed,\n   * and bodies' positions are integrated.\n   */\n  for (int iter = 0; iter < N_ITER; iter++) {\n    body_force(bodies, DT, nbodies);\n\n    for (int i = 0; i < nbodies; i++) {\n      bodies[i].x += bodies[i].vx * DT;\n      bodies[i].y += bodies[i].vy * DT;\n      bodies[i].z += bodies[i].vz * DT;\n    }\n  }\n\n  write_dataset(nbodies, bodies);\n\n  free(bodies);\n  \n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "Eight-target blocks with explicit ARM64 SIMD square roots and divisions can improve source-load reuse and overlap independent operations while preserving each body's force accumulation order.",
+    "notes": "No commands executed. Retains double-precision sqrt/division, ordered float accumulation, existing remainder paths, and unchanged binary I/O.",
+    "sources_kept": [],
+    "transformations": [
+      "Add an ARM64 eight-target fast path using two four-lane NEON inverse-distance calculations, retaining the original floating-point expressions and ascending-j accumulation.",
+      "Preserve the existing four-target and scalar loops for remaining bodies and non-ARM64 builds."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "1f50d326ae8946c88a6b40fec3c16238",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "58bd3bdfced814016214be18c2c03d1409054152caee80275b8830154294aab5",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "8f1a1938a644bea78defae57db4e9c55c4917288a15fa4c901355d01c0659871",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 14122,
+        "output_tokens": 10858,
+        "reasoning_output_tokens": 8286
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 24980,
+    "tool_events": []
+  }
+}

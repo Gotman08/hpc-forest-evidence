@@ -1,0 +1,153 @@
+--- OBS2/observer-mixte.py
++++ OBS3/observer-mixte.py
+@@ -394,6 +394,118 @@
+     for row in actual:
+         argv = parser(row["CommandLine"])
+         verify_command(argv, expected, authorization_path, cache, Path(cli["executable_path"]).resolve(), policy, route)
++
++
++def verify_negative_terminal(receipt, expected, route, rows, actual):
++    """Closed negative metadata only. Never admit a phase or decode model response/JSONL."""
++    require(expected["phase"] in {"roots", "advice", "harvest"} and not actual,
++            "Negative technical terminal requires an absent worker session; never pilot")
++    require_binding(receipt, expected)
++    require(receipt.get("schema") == "hpc-forest-dynamic-r4b-negative-phase-reconciliation-v1"
++            and receipt.get("phase") == expected["phase"] and receipt.get("verified") is True
++            and receipt.get("metadata_reconciliation_verified") is True
++            and receipt.get("all_started_calls_reconciled") is True
++            and type(receipt.get("unknown_invocations")) is int and receipt["unknown_invocations"] == 0
++            and receipt.get("unresolved_invocations") == []
++            and type(receipt.get("native_invocation_count")) is int and receipt["native_invocation_count"] == 1
++            and type(receipt.get("native_calls_replayed")) is int and receipt["native_calls_replayed"] == 0,
++            "Complete one-call negative reconciliation required; no unknown/replay")
++    require(all(receipt.get(key) is False for key in ("closed_schema_verified", "normal_native_delivery_verified",
++            "first_normal_candidate_delivery_and_evaluation_verified", "global_admission_verified",
++            "independent_performance_audit_verified"))
++            and receipt.get("transport_delivery_verified") is True
++            and receipt.get("usage_exact") is True and type(receipt.get("tokens")) is int and receipt["tokens"] >= 0,
++            "Negative limits must stay explicit; delivery bytes do not qualify normal CLI/model output")
++    evidence = receipt.get("evidence_refs")
++    require(isinstance(evidence, list) and evidence, "Negative terminal evidence required")
++    for ref in evidence:
++        bound(ref)
++    def included(ref):
++        bound(ref)
++        require(ref in evidence, "Required negative proof missing from evidence graph")
++
++    exit_proof = receipt.get("worker_natural_exit", {})
++    require_binding(exit_proof, {k: v for k, v in expected.items() if k != "remote_root"})
++    require(exit_proof.get("schema") == "hpc-forest-dynamic-r4b-once-worker-natural-exit-v1"
++            and exit_proof.get("verified") is True and exit_proof.get("phase") == expected["phase"]
++            and all(exit_proof.get(k) is True for k in ("natural_exit_observed", "no_stop_or_replay", "all_owned_full_identities_absent"))
++            and type(exit_proof.get("worker_exit_code")) is int and exit_proof["worker_exit_code"] == 0,
++            "Actual natural exit receipt required before any cold snapshot reads")
++    owned = exit_proof.get("owned_full_identities")
++    verify_pair(owned, owned)
++    require({identity(r) for r in owned} == {identity(r) for r in route["relay_identities"]},
++            "Negative exit differs from actual route pair")
++    require(exit_proof.get("evidence_refs"), "Real natural exit evidence required")
++    for ref in exit_proof["evidence_refs"]:
++        included(ref)
++    require(receipt.get("fresh_full_cim") == exit_proof.get("fresh_full_cim"), "One exact exit census required")
++    included(receipt["fresh_full_cim"])
++    census = read(bound(receipt["fresh_full_cim"]))
++    observed_rows = census.get("rows")
++    require(census.get("schema") == "hpc-forest-dynamic-r4b-full-cim-v1" and census.get("complete_census") is True
++            and census.get("strict_utf8_decoding") is True and isinstance(observed_rows, list) and observed_rows
++            and len(observed_rows) == census.get("rows_count")
++            and all(all(k in r for k in FIELDS) and type(r["ProcessId"]) is int
++                    and type(r["ParentProcessId"]) is int for r in observed_rows)
++            and len({r["ProcessId"] for r in observed_rows}) == len(observed_rows), "Complete historical exit census required")
++    captured = datetime.fromisoformat(census["captured_at_utc"])
++    require(captured.tzinfo is not None and captured.utcoffset().total_seconds() == 0
++            and type(exit_proof.get("observed_at")) in (int, float)
++            and exit_proof["observed_at"] <= time.time()
++            and 0 <= exit_proof["observed_at"] - captured.timestamp() <= 120,
++            "Historical census must be fresh at natural-exit reception")
++    for prior in owned:
++        require(expected["session_id"] in prior["CommandLine"]
++                and datetime.fromisoformat(utc_creation(prior["CreationDate"])).timestamp() <= captured.timestamp(),
++                "Exit pair has wrong session or impossible creation time")
++        require(not any(same_identity(prior, r) for r in observed_rows)
++                and not any(same_identity(prior, r) for r in rows), "Closed worker pair is still present")
++    snapshot = Path(receipt.get("cache_snapshot", "")).resolve(strict=True)
++    original = (BOOTSTRAP.parent / ("worker-" + expected["session_id"])).resolve()
++    require(snapshot.is_dir() and not snapshot.is_symlink() and not snapshot.is_junction() and snapshot != original
++            and exit_proof.get("snapshot_root") == str(snapshot) and exit_proof.get("source_cache") == str(original)
++            and receipt.get("complete_snapshot_after_natural_exit_only") is True,
++            "Only the actual closed snapshot may be hashed; never the original live cache")
++    for key in ("inventory_before", "inventory_after", "strict_audit_refusal", "known_source_sidecar"):
++        included(receipt[key])
++    inventory = receipt.get("complete_cache_inventory")
++    require(isinstance(inventory, dict) and len(inventory) == 19
++            and read(bound(receipt["inventory_before"])) == read(bound(receipt["inventory_after"])) == inventory
++            and receipt.get("cache_inventory_before_after_identical") is True, "Exact unchanged 19-file cold inventory required")
++    refs = receipt.get("refs")
++    names = {"request_downloaded", "request_native", "claim", "invocation", "process", "jsonl", "response", "ready",
++             "delivered", "agent_result", "cli_identity", "worker_ready", "cell_binding"}
++    require(isinstance(refs, dict) and set(refs) == names, "Exactly thirteen received refs required")
++    nonce = Path(refs["claim"]["path"]).parent.name
++    require(re.fullmatch(r"[0-9a-f]{32}", nonce), "One exact nonce required")
++    locations = {"request_downloaded": nonce + "/downloaded-request.json", "request_native": nonce + "/request.json",
++        "claim": nonce + "/generation-claimed.json", "invocation": nonce + "/invocation.json", "process": nonce + "/process.json",
++        "jsonl": nonce + "/codex.jsonl", "response": nonce + "/response.json", "ready": nonce + "/response-ready.json",
++        "delivered": nonce + "/delivered.json", "agent_result": nonce + "/agent-result.json",
++        "cli_identity": "CLI-IDENTITY-VERIFIED.json", "worker_ready": "worker-ready.json", "cell_binding": "CELL-BINDING.json"}
++    expected_files = set(locations.values()) | {"OWNER.json", "worker.lock", nonce + "/download-receipt.json",
++        nonce + "/instructions.txt", nonce + "/output-schema.json", nonce + "/codex.jsonl.json"}
++    require(set(inventory) == expected_files, "Unknown/orphan/duplicate invocation evidence in snapshot")
++    actual_inventory = {}
++    for path in sorted(snapshot.rglob("*")):
++        require(not path.is_symlink() and not path.is_junction(), "Cold snapshot alias refused")
++        if path.is_file():
++            actual_inventory[path.relative_to(snapshot).as_posix()] = digest(path)
++        else:
++            require(path.is_dir(), "Cold snapshot special member refused")
++    require(actual_inventory == inventory and (snapshot / "worker.lock").stat().st_size == 1,
++            "Actual complete cold snapshot SHA differs")
++    for name, relative in locations.items():
++        included(refs[name])
++        require(bound(refs[name]) == snapshot / relative and refs[name]["sha256"] == inventory[relative],
++                "Received ref is outside the exact cold snapshot")
++    require(bound(receipt["known_source_sidecar"]) == snapshot / nonce / "codex.jsonl.json",
++            "Known historical process sidecar must stay linked")
++    require(read(bound(refs["cell_binding"])) == read(bound(route["authorization"])), "Cold CELL-BINDING differs from actual route")
++    worker_pid = read(bound(refs["worker_ready"]))["pid"]
++    require(type(worker_pid) is int and worker_pid in {r["ProcessId"] for r in owned}, "Exit proof omits actual ready PID")
++    require({p.relative_to(snapshot).as_posix(): digest(p) for p in snapshot.rglob("*") if p.is_file()} == inventory,
++            "Cold snapshot changed during passive verification")
+ 
+ 
+ def verify_routes(bundle, policy, rows, history, *, parser=windows_argv, worker_check=verify_worker):
+@@ -442,17 +554,20 @@
+             else:
+                 receipt = read(bound(route["terminal_reception"]))
+                 require_binding(receipt, expected)
+-                schema = ("hpc-forest-dynamic-r4b-reconciled-phase-receipt-v1" if expected["phase"] != "pilot"
+-                          else "hpc-forest-dynamic-r4b-pilot-reconciliation-v1")
+-                require(receipt.get("schema") == schema and receipt.get("verified") is True
+-                        and receipt.get("all_started_calls_reconciled") is True
+-                        and receipt.get("unknown_invocations") == 0 and receipt.get("phase") == expected["phase"],
+-                        "Actual terminal receipt/reconciliation required")
+-                for ref in receipt.get("evidence_refs", []):
+-                    bound(ref)
+-                require(receipt.get("evidence_refs"), "Terminal receipt lacks real evidence")
+-                if actual:
+-                    worker_check(route, policy, rows, actual, parser)
++                if receipt.get("schema") == "hpc-forest-dynamic-r4b-negative-phase-reconciliation-v1":
++                    verify_negative_terminal(receipt, expected, route, rows, actual)
++                else:
++                    schema = ("hpc-forest-dynamic-r4b-reconciled-phase-receipt-v1" if expected["phase"] != "pilot"
++                              else "hpc-forest-dynamic-r4b-pilot-reconciliation-v1")
++                    require(receipt.get("schema") == schema and receipt.get("verified") is True
++                            and receipt.get("all_started_calls_reconciled") is True
++                            and receipt.get("unknown_invocations") == 0 and receipt.get("phase") == expected["phase"],
++                            "Actual terminal receipt/reconciliation required")
++                    for ref in receipt.get("evidence_refs", []):
++                        bound(ref)
++                    require(receipt.get("evidence_refs"), "Terminal receipt lacks real evidence")
++                    if actual:
++                        worker_check(route, policy, rows, actual, parser)
+         immutable = {k: route[k] for k in ("submission_observed", "allocation_marker") if k in route}
+         worker = {k: route[k] for k in ("authorization", "relay_identities", "cell_binding", "worker_ready", "cache_root",
+                                        "codex_config", "owner") if k in route}

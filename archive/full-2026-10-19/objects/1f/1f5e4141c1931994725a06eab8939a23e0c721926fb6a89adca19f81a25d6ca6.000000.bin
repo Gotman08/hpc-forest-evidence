@@ -1,0 +1,216 @@
+#include "knn.h"
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+static char winning_label(const size_t counts[UCHAR_MAX + 1]) {
+    char winner = (char)CHAR_MIN;
+    size_t best_count = 0;
+
+    for (int label = CHAR_MIN; label <= CHAR_MAX; ++label) {
+        size_t count = counts[(unsigned char)label];
+        if (count > best_count) {
+            best_count = count;
+            winner = (char)label;
+        }
+    }
+    return winner;
+}
+
+static char knn_insertion(int n_groups, Group *groups, int k,
+                          Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * (size_t)k);
+    float *distances = (float *)malloc(sizeof(float) * (size_t)k);
+    size_t counts[UCHAR_MAX + 1] = {0};
+
+    for (int i = 0; i < k; ++i) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (int i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ++j) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (int x = 0; x < k; ++x) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (int y = k - 1; y > x; --y) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < k; ++i) {
+        ++counts[(unsigned char)labels[i]];
+    }
+    free(distances);
+    free(labels);
+    return winning_label(counts);
+}
+
+static int compare_keys(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a;
+    uint64_t y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static uint64_t median_key(uint64_t a, uint64_t b, uint64_t c) {
+    if (a > b) {
+        uint64_t temporary = a;
+        a = b;
+        b = temporary;
+    }
+    if (b > c) {
+        b = c;
+    }
+    return a > b ? a : b;
+}
+
+static void retain_smallest_keys(uint64_t *keys, size_t count, size_t keep) {
+    if (keep == 0 || keep >= count) {
+        return;
+    }
+
+    size_t nth = keep - 1;
+    size_t left = 0;
+    size_t right = count;
+    unsigned depth = 0;
+    for (size_t n = count; n > 1; n >>= 1) {
+        ++depth;
+    }
+    depth *= 2;
+
+    while (right - left > 32) {
+        if (depth == 0) {
+            qsort(keys + left, right - left, sizeof(*keys), compare_keys);
+            return;
+        }
+        --depth;
+
+        size_t middle = left + (right - left) / 2;
+        uint64_t pivot = median_key(keys[left], keys[middle], keys[right - 1]);
+        size_t low = left;
+        size_t high = right;
+
+        while (low < high) {
+            while (low < high && keys[low] < pivot) {
+                ++low;
+            }
+            while (low < high && keys[high - 1] > pivot) {
+                --high;
+            }
+            if (low >= high) {
+                break;
+            }
+            --high;
+            uint64_t temporary = keys[low];
+            keys[low] = keys[high];
+            keys[high] = temporary;
+            ++low;
+        }
+
+        if (nth < high) {
+            right = high;
+        } else if (nth >= low) {
+            left = low;
+        } else {
+            return;
+        }
+    }
+
+    for (size_t i = left + 1; i < right; ++i) {
+        uint64_t value = keys[i];
+        size_t j = i;
+        while (j > left && keys[j - 1] > value) {
+            keys[j] = keys[j - 1];
+            --j;
+        }
+        keys[j] = value;
+    }
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0) {
+        return (char)-1;
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t)groups[i].length;
+            if (length > SIZE_MAX - total) {
+                return knn_insertion(n_groups, groups, k, to_evaluate);
+            }
+            total += length;
+        }
+    }
+
+    size_t counts[UCHAR_MAX + 1] = {0};
+    if ((size_t)k >= total) {
+        for (int i = 0; i < n_groups; ++i) {
+            if (groups[i].length > 0) {
+                counts[(unsigned char)groups[i].label] +=
+                    (size_t)groups[i].length;
+            }
+        }
+        counts[(unsigned char)-1] += (size_t)k - total;
+        return winning_label(counts);
+    }
+
+    if (sizeof(float) != sizeof(uint32_t) ||
+        total > SIZE_MAX / sizeof(uint64_t)) {
+        return knn_insertion(n_groups, groups, k, to_evaluate);
+    }
+
+    uint64_t *keys = (uint64_t *)malloc(total * sizeof(*keys));
+    if (keys == NULL) {
+        return knn_insertion(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t position = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ++j) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            uint32_t bits;
+            memcpy(&bits, &d, sizeof(bits));
+            bits &= UINT32_C(0x7fffffff);
+            if (bits > UINT32_C(0x7f800000)) {
+                free(keys);
+                return knn_insertion(n_groups, groups, k, to_evaluate);
+            }
+
+            /* Equal-distance points in one group have identical labels. */
+            keys[position++] = ((uint64_t)bits << 32) | (uint32_t)i;
+        }
+    }
+
+    retain_smallest_keys(keys, total, (size_t)k);
+    for (size_t i = 0; i < (size_t)k; ++i) {
+        ++counts[(unsigned char)groups[(uint32_t)keys[i]].label];
+    }
+    free(keys);
+    return winning_label(counts);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

@@ -1,0 +1,284 @@
+"""22 prepared neutral cases. Only ROOT may execute; never call copy main.
+
+Pure startup metadata uses synthetic string/number data only. Native operations
+touch tiny new files under this test directory, never OBS8 runtime sources.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+
+CODE = Path(__file__).resolve().parent
+HELPER = CODE/'copier-quatre-sources-demarrage-R8-parent.py'
+SELF = CODE/'test_copie_quatre_sources_R8_neutre.py'
+H = None
+
+
+def checksum(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def fixture_start():
+    run = H.OBS/'execution-root-99'
+    refs = {'start_intent': {'path': str(H.OBS/'INTENTION-UNIQUE-OBS4-R8.json'), 'sha256': 'a'*64},
+            'start_observed': {'path': str(run/'LANCEMENT-OBSERVE.json'), 'sha256': 'b'*64}}
+    policy = H.OBS/'execution-root-99-policy/POLICY-OBS4.json'
+    routes = policy.parent/'ROUTES-OBS4.json'
+    transition = H.OBS/'execution-root-99-absence/TRANSITION-OBS3-OBS4.json'
+    intent = {'schema': 'hpc-forest-r8-owned-passive-start-intent-v1', 'observer_sha256': H.OBSERVER_SHA,
+              'one_start_only': True, 'unknown_outcome_forbids_retry': True,
+              'model_generation_admitted': False, 'stop_or_submission_authorized': False,
+              'created_at_utc': '2030-03-17T17:46:39Z', 'policy': {'path': str(policy), 'sha256': 'c'*64},
+              'routes': {'path': str(routes), 'sha256': 'd'*64},
+              'transition': {'path': str(transition), 'sha256': 'e'*64}}
+    intent['argv'] = [str(H.BASE/'work/.venv/Scripts/python.exe'), '-I', '-B', '-u',
+                      str(H.CHAIN/'observer/observer-mixte.py'), '--policy', str(policy),
+                      '--routes', str(routes), '--transition', str(transition), '--run']
+    observed = {'schema': 'hpc-forest-r8-owned-passive-start-observed-v1', 'start_intent': refs['start_intent'],
+                'observed_full_pair_independently_verified': False, 'native_generation_admitted': False,
+                'source_or_native_workers_started': 0, 'launcher_pid': 900001,
+                'observed_at_utc': '2030-03-17T17:46:40Z',
+                'stdout': str(run/'stdout.log'), 'stderr': str(run/'stderr.log')}
+    return intent, observed, refs
+
+
+class FourColdCopyCases(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='INERT-copie4-', dir=CODE)
+        self.root = Path(self.temp.name)
+        self.assertEqual(self.root.resolve().parent, CODE.resolve())
+        self.io = H.NativeSharedIO(self.root)
+
+    def tearDown(self):
+        # Verify the exact fixture root before the standard-library recursive cleanup.
+        self.assertFalse(self.root.is_symlink())
+        self.assertEqual(self.root.resolve().parent, CODE.resolve())
+        self.assertTrue(self.root.name.startswith('INERT-copie4-'))
+        self.temp.cleanup()
+
+    def file(self, name, raw=b'abc'):
+        path = self.root/name
+        with path.open('xb') as stream:
+            stream.write(raw)
+        return path
+
+    def test_01_inert_metadata_refused(self):
+        with self.assertRaises(ValueError):
+            H.actual({'schema': 'INERT-example-v1'})
+
+    def test_02_prepared_metadata_refused(self):
+        with self.assertRaises(ValueError):
+            H.actual({'schema': 'actual-shaped-v1', 'prepared_only': True})
+
+    def test_03_exact_passive_source_derivation_is_four(self):
+        intent, observed, refs = fixture_start()
+        result = H.derive_sources(intent, observed, refs, now=H.epoch(observed['observed_at_utc'])+1)
+        self.assertEqual(set(result), {'routes', 'state', 'stdout.log', 'stderr.log'})
+        self.assertEqual(result['state'], H.CHAIN/'observer/observer-state.json')
+
+    def test_04_wrong_passive_argv_refused(self):
+        intent, observed, refs = fixture_start()
+        intent['argv'][-1] = '--admit-cell'
+        with self.assertRaises(ValueError):
+            H.derive_sources(intent, observed, refs, now=H.epoch(observed['observed_at_utc'])+1)
+
+    def test_05_other_run_log_refused(self):
+        intent, observed, refs = fixture_start()
+        observed['stdout'] = str(H.OBS/'execution-root-98/stdout.log')
+        with self.assertRaises(ValueError):
+            H.derive_sources(intent, observed, refs, now=H.epoch(observed['observed_at_utc'])+1)
+
+    def test_06_dotdot_refused_before_filesystem(self):
+        with self.assertRaises(ValueError):
+            H.lexical(self.root/'..'/'foreign.bin', self.root)
+
+    def test_07_ads_refused_before_filesystem(self):
+        with self.assertRaises(ValueError):
+            H.lexical(self.root/'ordinary.bin:stream', self.root)
+
+    def test_08_lock_refused_before_payload(self):
+        path = self.file('WORKER.LOCK', b'x')
+        with self.assertRaises(ValueError):
+            self.io.read_source(path)
+        self.assertEqual(self.io.payload_reads, 0)
+
+    def test_09_directory_refused_before_payload(self):
+        path = self.root/'directory'
+        path.mkdir()
+        with self.assertRaises((ValueError, OSError)):
+            self.io.read_source(path)
+        self.assertEqual(self.io.payload_reads, 0)
+
+    def test_10_source_hardlink_refused_before_payload(self):
+        path = self.file('source.bin')
+        os.link(path, self.root/'alias.bin')
+        with self.assertRaises(ValueError):
+            self.io.read_source(path)
+        self.assertEqual(self.io.payload_reads, 0)
+
+    def test_11_two_real_stable_reads_match(self):
+        path = self.file('source.bin')
+        first, second = self.io.read_source(path), self.io.read_source(path)
+        H.compare_reads(first, second)
+        self.assertEqual(first['bytes'], b'abc')
+        self.assertEqual(first['record']['metadata']['links'], 1)
+
+    def test_12_existing_shared_writer_does_not_block_reader(self):
+        path = self.file('source.bin')
+        writer = self.io.open(path, 0x40000000, 7)
+        try:
+            self.assertEqual(self.io.read_source(path)['bytes'], b'abc')
+        finally:
+            self.io.close(writer)
+
+    def test_13_same_bytes_timestamp_mutation_refused(self):
+        path = self.file('source.bin')
+        first = self.io.read_source(path)
+        point = path.stat()
+        os.utime(path, ns=(point.st_atime_ns, point.st_mtime_ns+1_000_000_000))
+        second = self.io.read_source(path)
+        self.assertEqual(first['bytes'], second['bytes'])
+        with self.assertRaises(ValueError):
+            H.compare_reads(first, second)
+
+    def test_14_same_bytes_replacement_refused(self):
+        path = self.file('source.bin')
+        first = self.io.read_source(path)
+        other = self.file('replacement.bin')
+        os.replace(other, path)
+        second = self.io.read_source(path)
+        self.assertEqual(first['bytes'], second['bytes'])
+        with self.assertRaises(ValueError):
+            H.compare_reads(first, second)
+
+    def test_15_changed_bytes_refused(self):
+        path = self.file('source.bin')
+        first = self.io.read_source(path)
+        path.write_bytes(b'xyz')
+        second = self.io.read_source(path)
+        with self.assertRaises(ValueError):
+            H.compare_reads(first, second)
+
+    def test_16_create_new_preserves_existing_file(self):
+        path = self.file('COPY.bin', b'keep')
+        with self.assertRaises(OSError):
+            self.io.create_copy(path, b'replace')
+        self.assertEqual(path.read_bytes(), b'keep')
+
+    def test_17_four_actual_copies_physically_distinct(self):
+        sources, copies = {}, {}
+        for index, (role, name) in enumerate(H.COPY_NAMES.items()):
+            path = self.file('source-'+str(index)+'.bin', bytes([index]))
+            sources[role] = self.io.read_source(path)
+            copies[role] = self.io.create_copy(self.root/name, sources[role]['bytes'])
+        H.distinct_copies(sources, copies)
+        self.assertTrue(all(value['metadata']['links'] == 1 for value in copies.values()))
+        for role in sources:
+            self.assertEqual(Path(copies[role]['path']).read_bytes(), sources[role]['bytes'])
+
+    def test_18_same_object_as_copy_refused(self):
+        sources, aliases = {}, {}
+        for index, role in enumerate(H.COPY_NAMES):
+            path = self.file('source-'+str(index)+'.bin', bytes([index]))
+            sources[role] = self.io.read_source(path)
+            # Actual metadata of the same single-link object, never a mocked payload reader.
+            aliases[role] = {'metadata': sources[role]['record']['metadata']}
+        with self.assertRaises(ValueError):
+            H.distinct_copies(sources, aliases)
+
+    def readiness(self):
+        # Real received cold R5 metadata only, never R5 imports or operational main.
+        refs = copy.deepcopy(H.R5_REFS)
+        code_sha = checksum(refs['receiver_code']['path'])
+        test_sha = checksum(H.R5_TEST)
+        review = json.loads(Path(refs['receiver_review']['path']).read_bytes())
+        completion = json.loads(Path(refs['receiver_neutral_completion']['path']).read_bytes())
+        self.assertEqual(checksum(refs['receiver_review']['path']), refs['receiver_review']['sha256'])
+        self.assertEqual(checksum(refs['receiver_neutral_completion']['path']), refs['receiver_neutral_completion']['sha256'])
+        return refs, code_sha, test_sha, review, completion
+
+    def test_19_real_R5_readiness_metadata_accepted(self):
+        H.receiver_ready(*self.readiness())
+
+    def test_20_missing_receiver_ref_refused(self):
+        refs, code_sha, test_sha, review, completion = self.readiness()
+        del refs['receiver_review']
+        with self.assertRaises(ValueError):
+            H.receiver_ready(refs, code_sha, test_sha, review, completion)
+
+    def test_21_other_receiver_code_refused(self):
+        refs, _, test_sha, review, completion = self.readiness()
+        with self.assertRaises(ValueError):
+            H.receiver_ready(refs, '0'*64, test_sha, review, completion)
+
+    def test_22_nonmatching_or_failed_ROOT_completion_refused(self):
+        refs, code_sha, test_sha, review, completion = self.readiness()
+        for key, value in (('tests_run', 31), ('failures', 1), ('receiver_main_executed', True)):
+            changed = dict(completion)
+            changed[key] = value
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                H.receiver_ready(refs, code_sha, test_sha, review, changed)
+
+
+def frozen62():
+    manifest = json.loads((H.CHAIN/'COMPONENTS.json').read_bytes())
+    if len(manifest['code_pins']) != 62:
+        raise ValueError('Exact62 frozen source inputs required')
+    result = {str(H.CHAIN/'COMPONENTS.json'): checksum(H.CHAIN/'COMPONENTS.json')}
+    for name, expected in manifest['code_pins'].items():
+        path = H.CHAIN/name
+        actual = checksum(path)
+        if actual != expected:
+            raise ValueError('Frozen component changed')
+        result[str(path)] = actual
+    return result
+
+
+def main():
+    global H
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--receipt', type=Path, required=True)
+    args = parser.parse_args()
+    if os.name != 'nt':
+        raise ValueError('Actual Windows neutral API qualification required; no platform skip')
+    path = args.receipt
+    if not path.is_absolute() or path.parent != CODE or path.exists():
+        raise ValueError('New direct receipt in this owned test directory required')
+    for parent in (*reversed(path.parents),):
+        facts = parent.lstat()
+        if parent.is_symlink() or getattr(facts, 'st_file_attributes', 0) & 1024:
+            raise ValueError('Receipt parent reparse refused')
+    before = {str(HELPER): checksum(HELPER), str(SELF): checksum(SELF)}
+    spec = importlib.util.spec_from_file_location('copy4_prepared_neutral_module_only', HELPER)
+    H = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(H)  # Functions only; copy main is never called.
+    source_before = frozen62()
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(FourColdCopyCases))
+    source_after = frozen62()
+    after = {str(HELPER): checksum(HELPER), str(SELF): checksum(SELF)}
+    exit_code = 0 if result.wasSuccessful() and before == after and source_before == source_after else 1
+    receipt = {'schema': 'hpc-forest-r8-startup-four-cold-copy-neutral-test-completion-v1',
+               'helper_sha256': before[str(HELPER)], 'test_source_sha256': before[str(SELF)],
+               'tests_run': result.testsRun, 'failures': len(result.failures), 'errors': len(result.errors),
+               'skipped': len(result.skipped), 'exit_code': exit_code,
+               'source62_before_after_equal': source_before == source_after,
+               'helper_and_test_before_after_equal': before == after,
+               'copy_main_executed': False, 'live_source_payload_read': False,
+               'fixture_scope': 'Tiny newly created INERT-copie4 directories under this test source directory only.',
+               'native_generation_admitted': False}
+    with path.open('xb') as stream:
+        stream.write((json.dumps(receipt, indent=2)+'\n').encode())
+        stream.flush()
+        os.fsync(stream.fileno())
+    raise SystemExit(exit_code)
+
+
+if __name__ == '__main__':
+    main()

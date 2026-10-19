@@ -1,0 +1,72 @@
+"""Fetch bounded official metadata only. Never download tensors or execute remote code."""
+from __future__ import annotations
+
+import hashlib
+import json
+import urllib.request
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+REPOSITORY = "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+
+def get(url, name, maximum=8_000_000, expected=None):
+    path = ROOT / name
+    if path.exists():
+        raw = path.read_bytes()
+        cached = True
+    else:
+        cached = False
+        request = urllib.request.Request(url, headers={"User-Agent": "HPC-Forest-metadata-audit/1"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read(maximum + 1)
+            if len(raw) > maximum:
+                raise RuntimeError("Metadata exceeds its declared limit")
+        path.write_bytes(raw)
+    if expected is not None:
+        blob = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+        if len(raw) != expected["size"] or blob != expected["blobId"]:
+            raise RuntimeError("Official metadata Git-blob bytes differ from the pinned repository index")
+    record = {"url": url, "utc": datetime.now(UTC).isoformat(), "bytes": len(raw),
+              "sha256": hashlib.sha256(raw).hexdigest(), "cached_preserved_observation": cached,
+              "git_blob_verified": expected is not None}
+    return raw, record
+
+
+def main():
+    raw, metadata = get("https://huggingface.co/api/models/" + REPOSITORY + "?blobs=true", "repo.json")
+    info = json.loads(raw)
+    revision = info["sha"]
+    if len(revision) != 40 or info["id"] != REPOSITORY:
+        raise RuntimeError("Official repository or revision mismatch")
+    receipts = {"repository": metadata}
+    siblings_by_name = {row["rfilename"]: row for row in info["siblings"]}
+    for source, name in [("config.json", "config.json"), ("README.md", "model-card.md"),
+                         ("model.safetensors.index.json", "tensor-index.json"),
+                         ("encoding/README.md", "encoding-readme.md"),
+                         ("LICENSE", "LICENSE"), ("tokenizer_config.json", "tokenizer-config.json"),
+                         ("encoding/encoding_dsv4.py", "encoding_dsv4.py"),
+                         ("inference/README.md", "inference-readme.md")]:
+        _, receipts[name] = get("https://huggingface.co/" + REPOSITORY + "/raw/" + revision + "/" + source,
+                               name, expected=siblings_by_name[source])
+    config = json.loads((ROOT / "config.json").read_bytes())
+    siblings = info["siblings"]
+    weights = [row for row in siblings if row["rfilename"].endswith(".safetensors")]
+    total = sum(row.get("size", row.get("lfs", {}).get("size", 0)) for row in weights)
+    index = json.loads((ROOT / "tensor-index.json").read_bytes())
+    result = {"repository": REPOSITORY, "revision": revision, "license": info.get("cardData", {}).get("license"),
+              "weights_files": len(weights), "weights_storage_bytes": total,
+              "tensor_index_metadata": index.get("metadata"), "model_type": config["model_type"],
+              "expert_dtype": config.get("expert_dtype"), "quantization": config.get("quantization_config"),
+              "template_requires_official_encoding_review": True,
+              "inference_available_does_not_admit_training": True,
+              "generic_r5_lora_compatibility_proved": False,
+              "weights_downloaded": False, "model_loaded": False, "training_started": False,
+              "receipts": receipts}
+    (ROOT / "observation-modele.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({k: v for k, v in result.items() if k != "receipts"}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

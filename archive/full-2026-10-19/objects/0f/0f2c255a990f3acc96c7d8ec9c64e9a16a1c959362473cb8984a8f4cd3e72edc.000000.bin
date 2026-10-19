@@ -1,0 +1,104 @@
+"""Reaudit the completed source-only group on a new read-only restoration."""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+COMPARE = HERE.parents[1]
+WORKSPACE = COMPARE.parents[1]
+STUDY = COMPARE.parent / "HPC-Forest-Etude-2020-2024-r1"
+ORIGINAL = COMPARE / "runs/source-only-gpt-6-luna-max"
+sys.path.insert(0, str(COMPARE))
+from comparison_reception import audit_group, inventory
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def save_new(path, value):
+    with path.open("x", encoding="utf-8", newline="\n") as output:
+        output.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+def descriptor(path):
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def main():
+    state = read(COMPARE / "coordinator-state.json")
+    group = next(g for g in state["queue"] if g["key"] == "source-only-gpt-6-luna-max")
+    assert group["state"] == "received_and_audited"
+    assert group["job_id"] == "749843" and group["session_id"] == "bb7a58941e74486ba24267f2f526de8f"
+    archive = ORIGINAL / "results-749843.tar.gz"
+    expected = "4ed34c905e42c51f318538d7d09cf60a9f627d1588cf5607ff860235be13d672"
+    assert sha(archive) == expected
+    transfer = read(ORIGINAL / "archive-transfer.json")
+    assert transfer["verifie"] and transfer["remote_sha256"] == expected == transfer["empreinte_locale"]
+    save_new(HERE / "groupe-recu.json", group)
+    original_audit = read(ORIGINAL / "audit.json")
+    assert original_audit["all_outcomes_accounted_for"] and original_audit["deliveries_reconciled"]
+    stop = read(ORIGINAL / "owned-worker-stopped.json")
+    assert stop["after_audit"] and stop["after_deliveries"]
+    assert stop["audit_sha256"] == sha(ORIGINAL / "audit.json")
+    assert stop["all_owned_process_identities_absent_after_stop"]
+    destination = HERE / "restauration-neuve"
+    assert not destination.exists()
+    restore = COMPARE.parent / "Marathon22-DeepSeek-v11/cadre-execution/restaurer-preuves.py"
+    with (HERE / "restauration.log").open("xb") as log:
+        subprocess.run([sys.executable, "-B", str(restore), str(archive),
+                        str(STUDY / "sources-officielles-restauration"), str(destination)],
+                       stdout=log, stderr=subprocess.STDOUT, check=True, timeout=600)
+    root = destination / "results-749843"
+    before = inventory(root)
+    save_new(HERE / "inventaire-avant.json", before)
+    original_before = inventory(ORIGINAL / "preuves/results-749843")
+    assert before == original_before
+    audit = audit_group(root, archive, COMPARE / "HPC-Forest-Harnais-Comparaison-r1.zip", group,
+                        read(COMPARE / "contrats-reference.json")["subjects"], ORIGINAL / "worker")
+    save_new(HERE / "audit-independant.json", audit)
+    assert audit["coverage_and_final_confirmations_verified"] and audit["deliveries_reconciled"]
+    after = inventory(root)
+    save_new(HERE / "inventaire-apres.json", after)
+    assert before == after == inventory(ORIGINAL / "preuves/results-749843")
+    assert len(before) == 7433 and len(audit["subjects"]) == 15
+    status_counts = Counter()
+    for row in audit["subjects"]:
+        status_counts.update(row["statuses"])
+    usage = audit["local_delivery_reconciliation"]
+    assert usage["requests"] == usage["native_invocations_observed"] == 150
+    assert usage["known_exact_tokens"] == 3564823 and usage["unmeasured_native_invocations"] == 0
+    receipt = {"schema": "hpc-forest-source-only-independent-reception-v1", "verified": True,
+        "job_id": "749843", "session_id": group["session_id"], "arm": "source-only",
+        "model": "gpt-6-luna", "effort": "max", "archive": descriptor(archive),
+        "archive_announced_remote_local_sha256": expected,
+        "coordinator_audit": descriptor(ORIGINAL / "audit.json"),
+        "independent_audit": descriptor(HERE / "audit-independant.json"),
+        "owned_stop": descriptor(ORIGINAL / "owned-worker-stopped.json"),
+        "restored_files_unchanged": len(before), "original_restoration_also_unchanged": True,
+        "subjects_received_and_audited": 15, "modified_programs_confirmed": sum(
+            row["confirmed_gain_fraction"] > 0 for row in audit["subjects"]),
+        "baseline_retained_subjects": [row["subject"] for row in audit["subjects"] if row["confirmed_gain_fraction"] == 0],
+        "trial_status_counts": dict(status_counts), "native_invocations": 150,
+        "exact_tokens": 3564823, "unmetered_invocations": 0,
+        "total_exact_for_this_cohort_only": True, "all_150_requests_delivered_and_reconciled": True,
+        "no_new_model_call_compilation_or_candidate_execution": True,
+        "new_source_only_cells": 15, "source_only_300_barrier_passed": False,
+        "causal_harness_advantage_proved": False,
+        "article_admission_pending": True}
+    save_new(HERE / "reception-verifiee.json", receipt)
+    print(json.dumps({k:v for k,v in receipt.items() if not isinstance(v,dict)}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

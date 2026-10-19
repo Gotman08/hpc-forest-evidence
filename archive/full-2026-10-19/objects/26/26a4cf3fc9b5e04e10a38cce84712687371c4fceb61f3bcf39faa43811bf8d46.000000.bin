@@ -1,0 +1,232 @@
+#include "knn.h"
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef uint64_t KnnNeighbor;
+
+static inline KnnNeighbor knn_neighbor_key(float distance, uint32_t group) {
+    uint32_t bits;
+    memcpy(&bits, &distance, sizeof(bits));
+    if (distance == 0.0f) {
+        bits = 0;
+    }
+
+    /* Within-group distance ties are vote-equivalent. Group order preserves
+       every observable tie from the original sequential insertion order. */
+    return ((uint64_t) bits << 32) | (uint64_t) group;
+}
+
+static inline float knn_neighbor_distance(KnnNeighbor value) {
+    uint32_t bits = (uint32_t) (value >> 32);
+    float distance;
+    memcpy(&distance, &bits, sizeof(distance));
+    return distance;
+}
+
+static inline void knn_sift_down(KnnNeighbor *heap, size_t count,
+                                 size_t root, KnnNeighbor value) {
+    size_t child = root * 4 + 1;
+
+    while (child < count) {
+        size_t farthest = child;
+        KnnNeighbor farthest_value = heap[child];
+
+        if (child + 1 < count && heap[child + 1] > farthest_value) {
+            farthest = child + 1;
+            farthest_value = heap[child + 1];
+        }
+        if (child + 2 < count && heap[child + 2] > farthest_value) {
+            farthest = child + 2;
+            farthest_value = heap[child + 2];
+        }
+        if (child + 3 < count && heap[child + 3] > farthest_value) {
+            farthest = child + 3;
+            farthest_value = heap[child + 3];
+        }
+
+        if (farthest_value <= value) {
+            break;
+        }
+
+        heap[root] = farthest_value;
+        root = farthest;
+        child = root * 4 + 1;
+    }
+
+    heap[root] = value;
+}
+
+static char knn_reference(int n_groups, Group *groups, int k,
+                          Point to_evaluate) {
+    char *labels = (char *) malloc(sizeof(char) * k);
+    float *distances = (float *) malloc(sizeof(float) * k);
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0) {
+        return knn_reference(n_groups, groups, k, to_evaluate);
+    }
+
+    const size_t capacity = (size_t) k;
+    if (capacity > ((size_t) -1) / sizeof(KnnNeighbor)) {
+        return knn_reference(n_groups, groups, k, to_evaluate);
+    }
+
+    KnnNeighbor *heap = (KnnNeighbor *) malloc(capacity * sizeof(*heap));
+    if (heap == NULL) {
+        return knn_reference(n_groups, groups, k, to_evaluate);
+    }
+
+    enum { TILE_POINTS = 256 };
+    float distance_tile[TILE_POINTS];
+    size_t used = 0;
+    float cutoff = 0.0f;
+
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        int begin = 0;
+
+        while (begin < g.length) {
+            int length = g.length - begin;
+            if (length > TILE_POINTS) {
+                length = TILE_POINTS;
+            }
+
+            for (int p = 0; p < length; p++) {
+                distance_tile[p] = euclidean_distance_no_sqrt(
+                    to_evaluate, g.points[begin + p]);
+            }
+
+            int p = 0;
+            if (used < capacity) {
+                while (p < length && used < capacity) {
+                    float d = distance_tile[p];
+
+                    /* Preserve the original insertion behavior for NaNs. */
+                    if (d != d) {
+                        free(heap);
+                        return knn_reference(n_groups, groups, k, to_evaluate);
+                    }
+
+                    heap[used++] = knn_neighbor_key(d, (uint32_t) i);
+                    p++;
+                }
+
+                if (used == capacity) {
+                    for (size_t parent = (used + 2) / 4; parent > 0; parent--) {
+                        knn_sift_down(heap, used, parent - 1,
+                                      heap[parent - 1]);
+                    }
+                    cutoff = knn_neighbor_distance(heap[0]);
+                }
+            }
+
+            for (; p < length; p++) {
+                float d = distance_tile[p];
+                if (d < cutoff) {
+                    KnnNeighbor candidate = knn_neighbor_key(d, (uint32_t) i);
+                    knn_sift_down(heap, used, 0, candidate);
+                    cutoff = knn_neighbor_distance(heap[0]);
+                }
+            }
+
+            begin += length;
+        }
+    }
+
+    size_t frequencies[UCHAR_MAX + 1] = {0};
+    for (size_t i = 0; i < used; i++) {
+        size_t group_index = (size_t) (uint32_t) heap[i];
+        frequencies[(unsigned char) groups[group_index].label]++;
+    }
+
+    char missing_label = (char) -1;
+    frequencies[(unsigned char) missing_label] += capacity - used;
+    free(heap);
+
+    char most_frequent = missing_label;
+    size_t most_frequent_count = 0;
+
+    /* Match compare_for_sort on both signed-char and unsigned-char targets. */
+    for (int value = CHAR_MIN; value <= CHAR_MAX; value++) {
+        size_t frequency = frequencies[(unsigned char) (char) value];
+        if (frequency > most_frequent_count) {
+            most_frequent = (char) value;
+            most_frequent_count = frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

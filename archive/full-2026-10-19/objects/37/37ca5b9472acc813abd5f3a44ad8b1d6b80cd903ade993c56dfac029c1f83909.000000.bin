@@ -1,0 +1,241 @@
+"""Opt-in bounded search; model proposals and host measurements are separate ports."""
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+
+from ..core import FileLock
+from .contracts import (
+    EvolutionError,
+    Identity,
+    Measurement,
+    Usage,
+    encoded,
+    fingerprint,
+    identifier,
+)
+from .evidence import Evidence
+from .journal import Journal
+from .policy import ABPolicy
+from .population import Population, code_features
+from .routing import BanditRouter, Route
+
+
+@dataclass(frozen=True)
+class Proposal:
+    files: dict[str, str]
+    usage: Usage
+    identity: Identity
+
+
+def create(root: Path, *, scope: str, strategy="ab-mcts", seed=23, missions=8,
+           tokens=1_500_000, wall_seconds=1800):
+    identifier(scope)
+    if strategy not in {"ab-mcts", "population"} or type(seed) is not int or not 0 <= seed < 2**32:
+        raise EvolutionError("Invalid strategy or seed")
+    return Journal(root, {"scope": scope, "strategy": strategy, "seed": seed,
+                          "missions": missions, "tokens": tokens, "wall_seconds": wall_seconds})
+
+
+class Evolution:
+    """Host-only composition API. It does not start a native agent or admit a runtime.
+
+    generate(context, route, reservation) -> Proposal
+    evaluate(files, program_id) -> Measurement
+    The generator must enforce the reserved inference ceiling itself. The engine
+    charges observed totals and stops on missing counters or excess consumption.
+    The evaluator owns the exact oracle and any protected confirmation inputs.
+    """
+    def __init__(self, journal: Journal, official: dict[str, str], routes: list[Route], *,
+                 protocol: dict, generate, evaluate, contextual_router=None):
+        code_features(official)
+        self.journal = journal
+        self.config = journal.get("config")
+        self.scope = self.config["scope"]
+        self.official, self.routes = json.loads(encoded(official)), tuple(routes)
+        self.prefixes = tuple(protocol.get("source_prefixes", ["src/"]))
+        if not self.prefixes or any(not isinstance(p, str) or not p.endswith("/")
+                                    or p.startswith("/") or ".." in p for p in self.prefixes):
+            raise EvolutionError("Explicit relative source directory prefixes are required")
+        self.generate, self.evaluate = generate, evaluate
+        self.contextual = copy.deepcopy(contextual_router)
+        if self.contextual is not None and (
+                self.config["strategy"] != "population" or self.contextual.features != 2
+                or self.contextual.routes != [r.key for r in routes]):
+            raise EvolutionError("Learned routing requires population mode and the declared two-feature route pool")
+        self.binding = fingerprint({"official": official, "protocol": protocol,
+                                    "routes": [asdict(r) for r in routes],
+                                    "router_weights": self.contextual.weights if self.contextual else None})
+        old = journal.get("binding")
+        if old is not None and old != self.binding:
+            raise EvolutionError("Source, protocol or route pool changed; create a new campaign")
+        journal.set("binding", self.binding)
+        self.population = Population(journal, self.scope)
+        self.evidence = Evidence(journal.root / "evidence")
+        self.router = BanditRouter(routes)
+        for row in journal.events():
+            if row["kind"] == "route_observation":
+                data = json.loads(row["payload"])
+                route = next(r for r in routes if r.key == data["route"])
+                self.router.observe(row["id"], route, data["quality"], data["cost"], data["baseline"])
+        self.policy = ABPolicy(journal) if self.config["strategy"] == "ab-mcts" else None
+
+    def _selection(self, island):
+        key = "pending:" + island
+        saved = self.journal.get(key)
+        if saved is not None:
+            return saved
+        ordinal = self.journal.get("next_trial", 0)
+        seed = (self.config["seed"] + ordinal) % 2**32
+        if self.policy is not None:
+            trial = self.policy.ask(island, [r.key for r in self.routes], seed)
+            parent = trial.parent_state
+            selection = {"route": trial.action, "parent": parent["program_id"] if parent else None,
+                         "depth": parent["depth"] + 1 if parent else 0}
+        else:
+            parent = self.population.parent(island, seed)
+            if self.contextual is None:
+                action = self.router.select(seed=seed).key
+            else:
+                peers = self.population.members(island)
+                features = [len(peers), max((p["measurement"]["quality"] for p in peers), default=0.0)]
+                probabilities = self.contextual.probabilities(features)
+                action = self.contextual.routes[max(range(len(probabilities)), key=probabilities.__getitem__)]
+            selection = {"route": action,
+                         "parent": parent["id"] if parent else None, "depth": 0}
+        selection.update({"id": f"trial-{ordinal:06d}", "island": island, "ordinal": ordinal})
+        self.journal.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.journal.set(key, selection)
+            self.journal.set("next_trial", ordinal + 1)
+            self.journal.db.execute("COMMIT")
+        except BaseException:
+            self.journal.db.execute("ROLLBACK")
+            raise
+        return selection
+
+    def run_one(self, island="root", *, reservation=196608):
+        identifier(island)
+        with FileLock(self.journal.root / "evolution.lock"):
+            return self._run_one(island, reservation)
+
+    def _run_one(self, island, reservation):
+        item = self._selection(island)
+        program_id = item["id"]
+        parent = next((p for p in self.population.members(island, valid_only=False)
+                       if p["id"] == item["parent"]), None)
+        if item["parent"] is not None and parent is None:
+            raise EvolutionError("Search selected an unavailable or sibling parent")
+        context = {"scope": self.scope, "island": island, "program_id": program_id,
+                   "official": json.loads(encoded(self.official)), "parent_id": item["parent"],
+                   "parent_files": json.loads(encoded(parent["code"] if parent else self.official)),
+                   "parent_measurement": json.loads(encoded(parent["measurement"])) if parent else None,
+                   "depth": item["depth"], "protocol_binding": self.binding}
+        route = next(r for r in self.routes if r.key == item["route"])
+        call_id = "call:" + program_id
+        row = self.journal.db.execute("SELECT * FROM calls WHERE id=?", (call_id,)).fetchone()
+        if row is None:
+            self.journal.claim(call_id, route.key, reservation)
+            proposal = self.generate(context, route, reservation)
+            if not isinstance(proposal, Proposal):
+                raise EvolutionError("Generation port omitted its proposal and usage contract")
+            self.journal.finish(call_id, proposal.usage,
+                                {"files": proposal.files, "identity": asdict(proposal.identity)})
+            row = self.journal.db.execute("SELECT * FROM calls WHERE id=?", (call_id,)).fetchone()
+        if row["state"] != "complete":
+            raise EvolutionError("Started generation has no cached result; reconcile without replay")
+        usage, generated = Usage(**json.loads(row["usage"])), json.loads(row["result"])
+        if usage.total is None or usage.total > row["reserved"]:
+            raise EvolutionError("Usage unknown or above reservation; no subsequent invocation admitted")
+        if Identity(**generated["identity"]) != route.identity:
+            raise EvolutionError("Actual identity differs from the requested model and effort")
+        files = generated["files"]
+        code_features(files)
+        if any(not name.startswith(self.prefixes) for name in files):
+            raise EvolutionError("Proposal attempts to modify a protected non-source path")
+        evaluation_key = "evaluation:" + program_id
+        evaluated = self.journal.get(evaluation_key)
+        if evaluated is None:
+            novelty = self.population.novelty(files, island)
+            if novelty["exact_alias"]:
+                measurement = Measurement("duplicate", None, None)
+            else:
+                self.journal.set(evaluation_key, {"phase": "started"})
+                # An exception leaves the durable started marker. The host must
+                # reconcile it; restarting never repeats an unknown evaluation.
+                evaluation_files = json.loads(encoded(files))
+                measurement = self.evaluate(evaluation_files, program_id)
+                if fingerprint(evaluation_files) != fingerprint(files):
+                    raise EvolutionError("Evaluator changed the source proposal; no repaired candidate is admitted")
+                if not isinstance(measurement, Measurement):
+                    raise EvolutionError("Host evaluator omitted its typed measurement")
+            digest = self.evidence.put(self.scope, "evaluation",
+                        {"program_id": program_id, "code_sha256": fingerprint(files),
+                         "measurement": measurement.record(), "parent": item["parent"],
+                         "route": route.key, "binding": self.binding, "novelty": novelty})
+            measurement = replace(measurement, evidence_ids=(*measurement.evidence_ids, digest))
+            evaluated = {"phase": "complete", "measurement": measurement.record(),
+                         "alias_of": novelty["exact_alias"], "evidence": digest}
+            self.journal.set(evaluation_key, evaluated)
+        if evaluated["phase"] != "complete":
+            raise EvolutionError("Started evaluation needs reconciliation; no automatic remeasurement")
+        measurement = Measurement(**evaluated["measurement"])
+        self.population.add(program_id, files, island, item["parent"], measurement,
+                            alias_of=evaluated["alias_of"])
+        baseline = parent["measurement"]["quality"] if parent and parent["measurement"]["quality"] else 0.0
+        observation = {"route": route.key, "quality": measurement.quality,
+                       "cost": usage.total, "baseline": baseline}
+        event_id = "routing:" + program_id
+        self.journal.event(event_id, "route_observation", observation)
+        self.router.observe(event_id, route, measurement.quality, usage.total, baseline)
+        if self.policy is not None:
+            self.policy.finish(island, program_id, item["depth"], measurement.quality)
+        self.journal.event("finished:" + program_id, "trial_finished",
+                           {**item, "evaluation": evaluated["evidence"]})
+        self.journal.db.execute("DELETE FROM meta WHERE key=?", ("pending:" + island,))
+        return {**item, "measurement": measurement.record(), "costs": self.journal.costs()}
+
+
+def inspect(root: Path):
+    """Read-only report: verifies evidence and history, never loads TreeQuest pickle."""
+    journal = Journal(root, read_only=True)
+    try:
+        scope = journal.get("config")["scope"]
+        evidence = Evidence.__new__(Evidence)
+        evidence.root = root.resolve() / "evidence"
+        programs = Population(journal, scope).members(valid_only=False)
+        for program in programs:
+            if fingerprint(program["code"]) != program["code_sha"]:
+                raise EvolutionError("Archived source bytes changed")
+            call = journal.db.execute("SELECT result FROM calls WHERE id=? AND state='complete'",
+                                      ("call:" + program["id"],)).fetchone()
+            if call is None or fingerprint(json.loads(call[0])["files"]) != program["code_sha"]:
+                raise EvolutionError("Archived source differs from its durable generation result")
+            Measurement(**program["measurement"])
+            for digest in program["measurement"]["evidence_ids"]:
+                record = evidence.get(digest, scope=scope)
+                if record["kind"] == "evaluation" and record["payload"].get("program_id") == program["id"]:
+                    retained = dict(program["measurement"])
+                    retained["evidence_ids"] = [v for v in retained["evidence_ids"] if v != digest]
+                    if (record["payload"].get("code_sha256") != program["code_sha"]
+                            or encoded(record["payload"]["measurement"]) != encoded(retained)):
+                        raise EvolutionError("Evaluation evidence differs from archived source or measurement")
+            final = journal.db.execute("SELECT payload FROM events WHERE id=?",
+                                       ("finished:" + program["id"],)).fetchone()
+            if final is None:
+                raise EvolutionError("Program has no completed trial receipt")
+            digest = json.loads(final[0])["evaluation"]
+            record = evidence.get(digest, scope=scope, kind="evaluation")
+            if (record["payload"]["program_id"] != program["id"]
+                    or digest not in program["measurement"]["evidence_ids"]):
+                raise EvolutionError("Completed trial is not linked to the archived program")
+        valid = [p for p in programs if p["measurement"]["status"] == "valid"]
+        return {"revision": journal.get("revision"), "config": journal.get("config"),
+                "history_digest": journal.verify(), "costs": journal.costs(),
+                "programs": [{k: v for k, v in p.items() if k != "code"} for p in programs],
+                "best_search": max(valid, key=lambda p: p["measurement"]["quality"])["id"] if valid else None,
+                "independent_confirmation_received": False, "native_runtime_admitted": False}
+    finally:
+        journal.close()

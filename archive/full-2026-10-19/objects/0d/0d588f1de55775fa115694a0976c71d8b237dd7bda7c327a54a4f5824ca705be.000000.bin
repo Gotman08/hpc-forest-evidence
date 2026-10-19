@@ -1,0 +1,241 @@
+"""Construct only a new, separate zero-model qualification packet; never submit."""
+import ast
+import gzip
+import hashlib
+import io
+import json
+import tarfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CHAIN = HERE.parent
+ADAPT = CHAIN.parent
+OLD = ADAPT / 'qualification-complete110-r4-G-bound'
+BASE = CHAIN.parents[3]
+PREP = ADAPT.parent
+COMPONENTS = 'dc64e1360ea8c7b061cbda5eb2dc638f7cb76d9f4264c2f062a495c62ba12f30'
+SOURCE_BUNDLE = '033a4625e70bf4430c73f337cabf988afff2c927986379e9007356552dac271e'
+REMOTE = '/scratch_p/nimarano/hpc-forest-r4b-source110-completeQ-r7-20261018-dc64e1360ea8'
+DATA = PREP / ('operations-parent-premier-roots-source110-r1/preparation-roots-operationnelle-r1/'
+               'revision-source-state-binding-r2')
+READER = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2d/source-only-reader-r4/source_only_state.py'
+INTEGRATION_REVIEW = PREP / 'operations-parent-premier-roots-source110-r1/audit-compatibilite-factory-reelle-r1/revue-r7-code-r1/REVUE-INTEGRATION-R7-PREPARATION.json'
+INTEGRATION_REVIEW_SHA = '026445269563f1cc282bff8619831358391adbd26823a15044b6d3a3f23cc3dd'
+
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def encoded(value):
+    return (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode('utf8')
+
+
+def write_new(name, value):
+    with (HERE / name).open('xb') as stream:
+        stream.write(value)
+
+
+def packed(files):
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode='wb', filename='', mtime=0) as zipped, tarfile.open(fileobj=zipped, mode='w') as archive:
+        for name, value in sorted(files.items()):
+            info = tarfile.TarInfo(name); info.size = len(value); info.mode = 0o600; info.mtime = 0
+            archive.addfile(info, io.BytesIO(value))
+    return buffer.getvalue()
+
+
+def once(text, before, after):
+    assert text.count(before) == 1, before[:120]
+    return text.replace(before, after)
+
+
+def render_wrapper(source_bundle_sha):
+    value = (OLD / 'qualification-wrapper.py').read_text(encoding='utf8')
+    value = value.replace('d08ac00bcfb75625a24971b2684d7479c4da7a98b339e4e10eae5b9ac525ef27', '5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70').replace(SOURCE_BUNDLE, source_bundle_sha)
+    value = once(value, 'import hashlib\n', 'import hashlib\nimport importlib.util\n')
+    value = once(value, 'def main():\n', '''def verify_review_payload(root, bindings):
+    expected = bindings["review_payload_files"]
+    need(inventory(root / "review-payload") == expected, "All and only exact review payload bytes required")
+    actual = read(root / "review-payload/actual-review.json")
+    need(actual.get("verified_source_preparation_only") is True and actual.get("blocking_findings") == []
+         and actual.get("source_state_reader_sha256") == "564398d676dceb6b5ba893fcbb3835c7aec31a1cbd5d5c5dcef6b361a3a23338"
+         and actual.get("reviewed_files", {}).get("verifier-current.py") == "ed888a9ab9c35e4e1a6c227525e9578281ed57c6961ccd9c9928eb397f62e450",
+         "Actual independent code-only review fields required")
+    need(sha(root / "review-payload/actual-review.json") == "1a65d2c23b12a14768bc9367d09f519623a7d6ed0c8bb27cfef8d3d7bfb9712a"
+         and sha(root / "review-payload/source_only_state.py") == actual["source_state_reader_sha256"]
+         and sha(root / "review-payload/verifier-current.py") == actual["reviewed_files"]["verifier-current.py"],
+         "Actual review/reader/verifier data bytes changed")
+    return expected
+
+
+def main():
+''')
+    value = once(value, 'source_before = adapter_before = None', 'source_before = adapter_before = review_before = None')
+    value = once(value, '        adapter_before = inventory(root / "adapters")', '''        need(sha(root / "review-payload.tar.gz") == bindings["review_payload_bundle_sha256"]
+             and sha(root / "archive_regular_only.py") == bindings["archive_helper_sha256"], "Review payload/archive helper changed")
+        extract_new(root / "review-payload.tar.gz", root / "review-payload", expected_count=bindings["review_payload_member_count"])
+        review_before = verify_review_payload(root, bindings)
+        save(output / "review-payload-before.json", review_before)
+        adapter_before = inventory(root / "adapters")''')
+    value = once(value, '            "observer-neutral":([root/"adapters/observer/test_obs4_neutre.py"],5)}',
+        '            "observer-neutral":([root/"adapters/observer/test_obs4_neutre.py"],5),\n'
+        '            "source-state-review":([root/"review-payload/test_source_state_review_portable.py"],9)}')
+    value = once(value, '            cutoff=root/("adapters" if label in ("adapter-portable","observer-neutral") else "source/project/tests")',
+        '            cutoff = root / "review-payload" if label == "source-state-review" else root / (\n'
+        '                "adapters" if label in ("adapter-portable", "observer-neutral") else "source/project/tests")')
+    value = once(value, '            observer_neutral_tests=suite_results["observer-neutral"]["counts"],',
+        '            observer_neutral_tests=suite_results["observer-neutral"]["counts"],\n'
+        '            source_state_review_portable_tests=suite_results["source-state-review"]["counts"],\n'
+        '            source_state_review_portable_unique_count=9, total_neutral_unique_count=274,\n'
+        '            source_state_review_fixture_scope="Computed ARM fixture paths; no actual Windows state or admission",\n'
+        '            reader_and_verifier_payload_executed_or_imported=False,')
+    value = once(value, '        source_after=verify_source(root/"source")',
+        '        review_after = verify_review_payload(root, bindings)\n'
+        '        save(output / "review-payload-after.json", review_after)\n'
+        '        need(review_before == review_after, "Read-only review data changed during tests")\n'
+        '        source_after=verify_source(root/"source")')
+    value = once(value, '                       OMP_NUM_THREADS="4", OPENBLAS_NUM_THREADS="1")',
+        '                       OMP_NUM_THREADS="4", OPENBLAS_NUM_THREADS="1",\n'
+        '                       R6_REVIEW_PAYLOAD=str(root / "review-payload"), R6_ADAPTER_ROOT=str(root / "adapters"))')
+    start = value.index('        with tarfile.open(archive, "w:gz") as packed:')
+    end = value.index('        envelope = ', start)
+    value = value[:start] + '''        helper = root / "archive_regular_only.py"
+        need(sha(helper) == bindings["archive_helper_sha256"], "Exact archive helper changed before import")
+        spec = importlib.util.spec_from_file_location("r6_regular_result_archive", helper)
+        archiver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(archiver)
+        archive_receipt = archiver.archive_results(root, archive)
+        need(archive_receipt.get("verified_archive_only") is True
+             and archive_receipt.get("symlinks_followed_or_archived") is False, "Regular-only stable archive required")
+''' + value[end:]
+    value = once(value, '                    "qualification": {"path": str(output / "qualification.json"), "sha256": sha(output / "qualification.json")}}',
+        '                    "qualification": {"path": str(output / "qualification.json"), "sha256": sha(output / "qualification.json")},\n'
+        '                    "archive_regular_receipt": {"path": str(root / "archive-metadata/archive-regular-receipt.json"),\n'
+        '                        "sha256": sha(root / "archive-metadata/archive-regular-receipt.json")},\n'
+        '                    "adapter_components_manifest_sha256": record["adapter_components_manifest_sha256"],\n'
+        '                    "fixture_links_inert_metadata_only": True}')
+    ast.parse(value)
+    return value.encode('utf8')
+
+
+def render_bootstrap():
+    value = (OLD / 'bootstrap-alloue.py').read_text(encoding='utf8')
+    value = once(value, '                "adapter-bundle.tar.gz", "packet-manifest.json"}',
+        '                "adapter-bundle.tar.gz", "review-payload.tar.gz", "archive_regular_only.py", "packet-manifest.json"}')
+    value = once(value, '"Exact five regular packet files required"', '"Exact seven regular packet files required"')
+    ast.parse(value)
+    return value.encode('utf8')
+
+
+def main():
+    components_bytes = (CHAIN / 'COMPONENTS.json').read_bytes()
+    assert digest(components_bytes) == COMPONENTS
+    code_pins = json.loads(components_bytes)['code_pins']; assert len(code_pins) == 62
+    actual_review = INTEGRATION_REVIEW.read_bytes(); assert digest(actual_review) == INTEGRATION_REVIEW_SHA
+    approved = json.loads(actual_review)
+    assert approved['verified'] is True and approved['blocking_findings'] == [] and approved['reviewed_files'] == code_pins
+    assert approved['adapter_components_manifest_sha256'] == COMPONENTS and approved['native_generation_admitted'] is False
+    adapters = {'COMPONENTS.json': components_bytes}
+    for name, checksum in code_pins.items():
+        value = (CHAIN / name).read_bytes(); assert digest(value) == checksum; adapters[name] = value
+    source = new_source_bundle()
+    payload = {'actual-review.json': (DATA / 'REVUE-SOURCE-STATE-564-ED888-PREPARATION.json').read_bytes(),
+        'actual-windows-binding-CANDIDATE-NOT-ADMITTED.json': (DATA / 'SOURCE-STATE-BINDING-R2-CANDIDAT-NON-ADMIS.json').read_bytes(),
+        'source_only_state.py': READER.read_bytes(), 'verifier-current.py': READER.with_name('verifier-current.py').read_bytes(),
+        'previous-reader-bridge-r5.py': (CHAIN.with_name('revision-r5-G-recu-avant-Q') / 'reader_bridge.py').read_bytes(),
+        'test_source_state_review_portable.py': (HERE / 'test_source_state_review_portable.py').read_bytes(),
+        'source-preparation-review-R7.json': (CHAIN / 'revue-source110-plan-r7/REVUE-INDEPENDANTE-SOURCE110-PLAN-R7.json').read_bytes(),
+        'adapter-independent-review-R7.json': actual_review}
+    payload['payload-manifest.json'] = encoded({'files': {name: digest(value) for name, value in payload.items()},
+        'Windows_code_metadata_data_only': True, 'no_current_CIM_or_authorization_or_credential_or_policy_catalogue': True,
+        'portable_positive_boundary': 'Exact production function reaches source_modules sentinel; no projection or admission returned'})
+    adapter_bytes, payload_bytes = packed(adapters), packed(payload)
+    archive_helper = (HERE / 'archive_regular_only.py').read_bytes()
+    bindings = json.loads((OLD / 'bindings.json').read_bytes())
+    bindings.update(plan_sha256='5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70',
+        source_bundle_sha256=digest(source), adapter_bundle_sha256=digest(adapter_bytes), adapter_components_manifest_sha256=COMPONENTS,
+        remote_root=REMOTE, review_payload_bundle_sha256=digest(payload_bytes), review_payload_member_count=len(payload),
+        review_payload_files={name: digest(value) for name, value in payload.items()},
+        archive_helper_sha256=digest(archive_helper), source_state_review_case_count=9, total_neutral_case_count=274,
+        old_Q_promoted=False, native_generation_admitted=False)
+    files = {'qualification-wrapper.py': extend_profile_wrapper(render_wrapper(digest(source))), 'bindings.json': encoded(bindings), 'source-bundle.tar.gz': source,
+        'adapter-bundle.tar.gz': adapter_bytes, 'review-payload.tar.gz': payload_bytes, 'archive_regular_only.py': archive_helper}
+    files['packet-manifest.json'] = encoded({name: digest(value) for name, value in files.items()})
+    packet = packed(files); bootstrap = render_bootstrap()
+    command = (OLD / 'commande-allouee-zero-modele.sh').read_text(encoding='utf8')
+    original_root = json.loads((OLD / 'bindings.json').read_bytes())['remote_root']
+    command = command.replace(original_root, REMOTE)
+    command = command.replace('0aa02f8fb0661e1689df51563ebfa1faa5c7b3f1b5b31af6794089080f2290b1', digest(packet))
+    delimiter = "<<'R4B_Q110_BOOTSTRAP'\n"; start = command.index(delimiter) + len(delimiter)
+    finish = command.index('\nR4B_Q110_BOOTSTRAP', start)
+    command = command[:start] + bootstrap.decode().rstrip('\n') + command[finish:]
+    job = json.loads((OLD / 'job-prepare-NON-ADMIS.json').read_bytes())
+    job.update(name='forest-r4b-Q110-recovery-r7', command=command)
+    local_payload = HERE / 'donnees-review-portables-locales'; local_payload.mkdir(exist_ok=False)
+    for name, value in payload.items():
+        with (local_payload / name).open('xb') as stream:
+            stream.write(value)
+    for name, value in files.items():
+        if name != 'archive_regular_only.py':
+            write_new(name, value)
+    write_new('complete-source110-r7-neutral-target-packet.tar.gz', packet)
+    write_new('bootstrap-alloue.py', bootstrap)
+    write_new('commande-allouee-zero-modele.sh', command.encode())
+    write_new('job-prepare-PROPOSITION-NON-SOUMISE.json', encoded(job))
+    print(json.dumps({'packet_sha256': digest(packet), 'remote_root': REMOTE, 'components_sha256': COMPONENTS,
+                      'source_bundle_unchanged': digest(source), 'packet_regular_members': len(files),
+                      'adapter_members': len(adapters), 'review_payload_members': len(payload), 'total_neutral_cases_planned': 274}))
+
+
+def new_source_bundle():
+    original = (OLD / 'source-bundle.tar.gz').read_bytes()
+    assert digest(original) == SOURCE_BUNDLE
+    with tarfile.open(fileobj=io.BytesIO(original), mode='r:gz') as archive:
+        headers = archive.getmembers()
+        assert len(headers) == 116 and all(h.isfile() and not h.issym() and not h.islnk() for h in headers)
+        files = {h.name: archive.extractfile(h).read() for h in headers}
+    new_plan = (CHAIN / 'plan-technique-neuf/dynamic-plan-r4b-lane-r3-max-r7.json').read_bytes()
+    assert digest(new_plan) == '5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70'
+    assert len(files) == 116 and 'dynamic-plan.json' in files
+    files['dynamic-plan.json'] = new_plan
+    return packed(files)
+
+
+PROFILE_FUNCTIONS = 'def digest(raw):\n    return hashlib.sha256(raw).hexdigest()\n\ndef validate_profile(value, allocation):\n    need(value.get(\'schema\') == \'hpc-forest-target-profile-v1\' and all(value.get(k) == allocation[k]\n        for k in (\'slurm_job_id\', \'architecture\', \'cpu_cores\', \'tasks\', \'nodes\', \'allocated_memory_mib\', \'allocated_gpus\')),\n        \'Profile belongs to another allocation\')\n    need(value.get(\'verified_capabilities\') == [\'cpu\', \'c\', \'cxx\', \'openmp\']\n         and value.get(\'operator_algorithm_advice\') is False and set(value.get(\'compilers\', {})) == {\'gcc\', \'g++\'},\n         \'Only official CPU/C/CXX/OpenMP probes required\')\n    for item in value[\'compilers\'].values():\n        need(type(item.get(\'probe_returncode\')) is int and item[\'probe_returncode\'] == 0 and item.get(\'probe_stdout\') == \'4\\n\'\n             and isinstance(item.get(\'path\'), str) and Path(item[\'path\']).is_absolute()\n             and all(re.fullmatch(\'[0-9a-f]{64}\', item.get(k, \'\')) for k in (\'sha256\', \'probe_binary_sha256\')),\n             \'Both actual official neutral compiler/runtime records required\')\n    unsigned = {k: v for k, v in value.items() if k != \'profile_digest\'}\n    need(digest(json.dumps(unsigned, sort_keys=True, ensure_ascii=False, separators=(\',\', \':\')).encode()) == value.get(\'profile_digest\'),\n         \'Official target profile digest changed\')\n    return value\n\ndef official_profile_once(root, output, record, allocation):\n    need(not any(name == "hpc_forest" or name.startswith("hpc_forest.") for name in sys.modules),\n         "No other project source may be loaded before official profile preparation")\n    src = root / "source/project/src"\n    temporary = output / "temporary-official-neutral-probes"\n    temporary.mkdir(exist_ok=False)\n    os.environ["TMPDIR"] = str(temporary)\n    sys.dont_write_bytecode = True\n    sys.path.insert(0, str(src))\n    target = importlib.import_module("hpc_forest.target_profile")\n    expected = read(root / "source/runtime-manifest.json")\n    need(Path(target.__file__).resolve() == (src / "hpc_forest/target_profile.py").resolve()\n         and sha(Path(target.__file__)) == expected["src/hpc_forest/target_profile.py"],\n         "Exact official source110 target helper required")\n    record["official_prepare_target_profile_calls"] = 1\n    save(output / "official-target-intention.json", {"allocation": allocation, "source_zip_sha256": SOURCE,\n        "plan_sha256": PLAN, "maximum_official_prepare_target_profile_calls": 1,\n        "two_expected_neutral_compilers": ["gcc", "g++"], "candidate_compilation_or_models": 0,\n        "no_retry_or_monkeypatch": True})\n    profile = target.prepare_target_profile()\n    validate_profile(profile, allocation)\n    save(output / "target-profile.json", profile)\n    record.update(target_profile_verified=True, confirmed_successful_official_compiler_records=2,\n        target_profile_sha256=sha(output / "target-profile.json"), target_profile_digest=profile["profile_digest"],\n        official_target_allocation_is_this_Q_job=True)\n\n\n'
+
+
+def extend_profile_wrapper(value):
+    text = value.decode('utf8')
+    text = once(text, 'Allocated Python-neutral qualification only. Never invoke C, CLI or a model.', 'Allocated R7 qualification: 274 neutral tests and two official GCC/G++ OpenMP probes. No candidate, CLI, model or inference.')
+    text = once(text, '"started_at_utc": datetime.now(UTC).isoformat(), "qualification_attempt": 1}',
+        '"started_at_utc": datetime.now(UTC).isoformat(), "qualification_attempt": 1,\n'
+        '              "official_prepare_target_profile_calls": 0, "target_profile_verified": False,\n'
+        '              "expected_official_neutral_compiler_probes": 2, "confirmed_successful_official_compiler_records": 0,\n'
+        '              "partial_official_probe_counts_not_exposed_on_failure": True, "reference_contracts_reexecuted": 0,\n'
+        '              "candidate_compilations": 0, "scientific_budget_reset_or_recredit": False}')
+    text = once(text, '        suites={', '        official_profile_once(root, output, record, allocation)\n        suites={')
+    text = once(text, '    return expected\n\n\ndef main():',
+        '    source_review = read(root / "review-payload/source-preparation-review-R7.json")\n'
+        '    need(source_review.get("verified_source_preparation_only") is True and source_review.get("blocking_findings") == []\n'
+        '         and source_review.get("source_zip", {}).get("sha256") == SOURCE\n'
+        '         and source_review.get("plan", {}).get("sha256") == PLAN\n'
+        '         and source_review.get("native_generation_admitted") is False, "Actual unchanged source/new-plan preparation review required")\n'
+        '    return expected\n\n\ndef main():')
+    text = once(text, '    return expected\n\n\ndef main():',
+        '    code_ref = {"path": str(root / "review-payload/adapter-independent-review-R7.json"),\n'
+        '                "sha256": "026445269563f1cc282bff8619831358391adbd26823a15044b6d3a3f23cc3dd"}\n'
+        '    need(sha(Path(code_ref["path"])) == code_ref["sha256"], "Exact actual independent R7 review required")\n'
+        '    spec = importlib.util.spec_from_file_location("r7_qualified_metadata_contract", root / "adapters/chain_contract.py")\n'
+        '    code_contract = importlib.util.module_from_spec(spec)\n'
+        '    spec.loader.exec_module(code_contract)\n'
+        '    checked = code_contract.integration_review(code_ref, root / "adapters")\n'
+        '    need(checked.get("native_generation_admitted") is False, "Code review is not native admission")\n'
+        '    return expected\n\n\ndef main():')
+    text = once(text, 'def main():\n', PROFILE_FUNCTIONS + '\n\ndef main():\n')
+    ast.parse(text)
+    return text.encode('utf8')
+
+
+if __name__ == '__main__':
+    main()

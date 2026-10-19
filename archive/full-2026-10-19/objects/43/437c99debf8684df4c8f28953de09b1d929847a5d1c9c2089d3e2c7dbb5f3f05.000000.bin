@@ -1,0 +1,277 @@
+"""Neutral received-file tests only: no collect(), bootstrap, process, CLI or RPC.
+
+The real factory is imported solely for pure validation helpers. Fake CLI files
+are never executed; their test-only hashes are explicit validate_oauth inputs.
+"""
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+from pathlib import Path
+
+import collect_parent_observations as collector
+import pytest
+
+NOW = 1000
+
+
+@pytest.fixture
+def f():
+    # Import-safe factory definitions only; bootstrap_source/assemble are never called.
+    return collector.factory()
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf8")
+    return collector.ref(path)
+
+
+def cell(f):
+    session = f.SESSIONS["roots"]
+    return {"scope_id": f.SCOPE, "source_zip_sha256": f.SOURCE, "plan_sha256": f.PLAN,
+            "model": f.MODEL, "effort": "max", "session_id": session, "job_id": "999999",
+            "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session}
+
+
+def oauth_fixture(tmp_path):
+    cli = tmp_path / "neutral-cli-never-executed"
+    cli.mkdir()
+    files = {}
+    for name in ("codex.exe", "codex-code-mode-host.exe", "codex-command-runner.exe", "codex-windows-sandbox-setup.exe"):
+        path = cli / name
+        path.write_bytes(("NEUTRAL NEVER EXECUTED " + name).encode())
+        files[name] = collector.sha(path)
+    pins = {"copied_cli_executable": str((cli / "codex.exe").resolve())}
+    config = tmp_path / "neutral-private-config.toml"
+    config.write_bytes(b"NEUTRAL CONFIG BODY NOT TO BE PARSED OR EXPORTED")
+    config_ref = collector.ref(config)
+    value = {"schema": "hpc-forest-r4b-parent-local-cli-oauth-observation-v1", "verified": True,
+             "neutral_fixture_only": True, "observed_at": NOW, "authentication": "existing-local-ChatGPT",
+             "auth_mode": "chatgpt", "cli_login_status": "Logged in using ChatGPT", "model_provider": "openai",
+             "executable_path": pins["copied_cli_executable"], "executable_sha256": files["codex.exe"],
+             "version": "codex-cli 0.163.0-alpha.10.2", "codex_config": config_ref,
+             "api_key_environment_presence": dict.fromkeys(("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"), False),
+             "endpoint_environment_presence": dict.fromkeys(("OPENAI_BASE_URL", "OPENAI_API_BASE", "AZURE_OPENAI_ENDPOINT", "CODEX_MODEL_PROVIDER"), False),
+             **dict.fromkeys(("api_key_in_auth_present", "endpoint_override_present", "credentials_exported",
+                             "new_connection_or_auth", "model_inference_executed", "native_generation_admitted"), False),
+             "files": [collector.ref(cli / name) for name in files]}
+    return value, config_ref, pins, files
+
+
+def tool_receipt(tmp_path, name, tool, result, *, observed_at=NOW, envelope="structured"):
+    if envelope == "structured":
+        result = {"structuredContent": result}
+    elif envelope == "text":
+        result = {"content": [{"type": "text", "text": json.dumps(result)}]}
+    return write_json(tmp_path / (name + ".json"), {"observed_at": observed_at, "tool": tool, "result": result})
+
+
+def remote_fixture(tmp_path, selected_cell):
+    marker = write_json(tmp_path / "neutral-allocation-marker.json", {"neutral_fixture_only": True, "kind": "marker"})
+    request = write_json(tmp_path / "neutral-request-prepared.json", {"neutral_fixture_only": True, "kind": "request"})
+    root, job = selected_cell["remote_root"], selected_cell["job_id"]
+    output = root + "/results-" + job
+    checks = {"ok": True, "unchecked": [], "dynamic_paths": [], "scope": "remote_literal_paths",
+              "paths": [{"path": path, "exists": False} for path in sorted(collector.required_absences(selected_cell))]}
+    packet = {"schema": "hpc-forest-dynamic-r4b-actual-remote-checks-v1", "verified": True,
+              "path_absence": tool_receipt(tmp_path, "absence", "sbatch_check_paths", checks),
+              "listings": [], "downloads": []}
+    listings = {root: ["results-" + job], output + "/mailbox": ["OWNER.json", "requests", "responses", "logs"],
+                **{output + "/mailbox/" + name: [] for name in ("requests", "responses", "logs")}}
+    for index, (path, names) in enumerate(listings.items()):
+        value = {"ok": True, "path": path, "truncated": False, "count": len(names), "disappeared_entries": 0,
+                 "entries": [{"name": name, "is_symlink": False, "is_dir": name != "OWNER.json"} for name in names]}
+        packet["listings"].append(tool_receipt(tmp_path, "listing-" + str(index), "list_dir", value,
+                                               envelope="text" if index % 2 else "raw"))
+    downloads = {"/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + selected_cell["session_id"] + "/allocation-marker.json": marker,
+                 output + "/request-prepared.json": request}
+    for index, (remote, local) in enumerate(downloads.items()):
+        result = {"ok": True, "downloaded": remote, "to": local["path"], "verifie": True, "remote_sha256": local["sha256"],
+                  "empreinte_locale": local["sha256"], "empreinte_distante": local["sha256"],
+                  "bytes": Path(local["path"]).stat().st_size, "transport": "scp"}
+        packet["downloads"].append(tool_receipt(tmp_path, "download-" + str(index), "download_from_romeo", result))
+    return packet, marker, request
+
+
+def identity(pid, parent, command):
+    return {"ProcessId": pid, "ParentProcessId": parent, "ExecutablePath": "C:/neutral/python.exe",
+            "CommandLine": command, "CreationDate": "1970-01-01T00:00:01.0000000Z"}
+
+
+def census_fixture(tmp_path, f):
+    so_command = "python -m hpc_forest.ablation_worker --session-id 665743a02b824021a697b6a4884a667c"
+    so = [identity(37900, 21004, so_command), identity(37848, 37900, so_command)]
+    observer = identity(101, 100, "python neutral_passive_observer.py")
+    census = {"schema": "hpc-forest-dynamic-r4b-full-cim-v1", "complete_census": True,
+              "strict_utf8_decoding": True, "captured_at_utc": "1970-01-01T00:16:40Z",
+              "rows": [*copy.deepcopy(so), observer], "rows_count": 3, "other_native_groups": []}
+    closure = {"schema": "hpc-forest-r2c-owned-main-only-stop-receipt-v1", "verified": True,
+               "neutral_fixture_only": True, "all_three_main_identities_absent": True,
+               "source_only_identities_preserved": True, "source_only": so,
+               "actions": [{"identity": identity(pid, 1, "python neutral_old_main.py")} for pid in (201, 202, 203)]}
+    proof = write_json(tmp_path / "neutral-policy-underlying-evidence.json", {"neutral_fixture_only": True})
+    policy = {**cell(f), "schema": "hpc-forest-dynamic-r4b-mixed-observer-admission-v1", "verified": True,
+              "neutral_fixture_only": True, "maximum_native_workers_total": 4, "observed_at": NOW,
+              **dict.fromkeys(("source_only_preserved", "existing_observer_untouched", "all_native_sessions_covered", "native_calls_started_zero"), True),
+              "evidence_refs": [proof], "observer_full_identities": [copy.deepcopy(observer)]}
+    return census, closure, policy
+
+
+@pytest.mark.parametrize("violation", ["absent", "sha", "relative"])
+def test_artifact_refuses_missing_changed_or_relative_reference(tmp_path, violation):
+    path = tmp_path / "neutral.bin"
+    path.write_bytes(b"neutral")
+    ref = collector.ref(path)
+    if violation == "absent":
+        path.unlink()
+    elif violation == "sha":
+        ref["sha256"] = "0" * 64
+    else:
+        ref["path"] = "neutral.bin"
+    with pytest.raises(ValueError):
+        collector.artifact(ref)
+
+
+def test_oauth_accepts_only_test_cli_hashes_and_preserves_private_bytes(tmp_path, f):
+    value, config_ref, pins, files = oauth_fixture(tmp_path)
+    source = write_json(tmp_path / "neutral-oauth.json", value)
+    before = Path(config_ref["path"]).read_bytes()
+    assert collector.validate_oauth(source, config_ref, pins, files, f, NOW) == value
+    assert Path(config_ref["path"]).read_bytes() == before
+
+
+@pytest.mark.parametrize("violation", ["missing-flag", "missing-env", "future", "expired", "cli-bytes"])
+def test_oauth_refuses_unknown_flags_environment_time_or_changed_cli(tmp_path, f, violation):
+    value, config_ref, pins, files = oauth_fixture(tmp_path)
+    if violation == "missing-flag":
+        value.pop("new_connection_or_auth")
+    elif violation == "missing-env":
+        value["api_key_environment_presence"].pop("AZURE_OPENAI_API_KEY")
+    elif violation == "future":
+        value["observed_at"] = NOW + 1
+    elif violation == "expired":
+        value["observed_at"] = NOW - 121
+    else:
+        Path(value["files"][1]["path"]).write_bytes(b"NEUTRAL CHANGED")
+    source = write_json(tmp_path / "neutral-oauth.json", value)
+    with pytest.raises(ValueError):
+        collector.validate_oauth(source, config_ref, pins, files, f, NOW)
+
+
+def test_remote_accepts_timestamped_actual_shapes_and_exact_empty_directories(tmp_path, f):
+    selected = cell(f)
+    packet, marker, request = remote_fixture(tmp_path, selected)
+    remote_ref = write_json(tmp_path / "neutral-remote-packet.json", packet)
+    assert collector.validate_remote(remote_ref, selected, marker, request, f, NOW) == NOW
+
+
+@pytest.mark.parametrize("violation", ["download-sha", "missing-download", "expired", "unexpected-entry"])
+def test_remote_refuses_incomplete_stale_or_mismatched_evidence(tmp_path, f, violation):
+    selected = cell(f)
+    packet, marker, request = remote_fixture(tmp_path, selected)
+    if violation == "missing-download":
+        packet["downloads"].pop()
+    else:
+        if violation == "download-sha":
+            group, index = "downloads", 0
+            ref = packet[group][index]
+        elif violation == "expired":
+            group, index, ref = None, None, packet["path_absence"]
+        else:
+            group, index = "listings", 1
+            ref = packet[group][index]
+        value = collector.read(ref)
+        if violation == "download-sha":
+            value["result"]["structuredContent"]["remote_sha256"] = "0" * 64
+        elif violation == "expired":
+            value["observed_at"] = NOW - 121
+        else:
+            text = value["result"]["content"][0]
+            result = json.loads(text["text"])
+            result["entries"].append({"name": "orphan-claim", "is_symlink": False, "is_dir": True})
+            text["text"] = json.dumps(result)
+        changed = write_json(Path(ref["path"]), value)
+        if group is None:
+            packet["path_absence"] = changed
+        else:
+            packet[group][index] = changed
+    remote_ref = write_json(tmp_path / "neutral-remote-packet.json", packet)
+    with pytest.raises(ValueError):
+        collector.validate_remote(remote_ref, selected, marker, request, f, NOW)
+
+
+def test_census_preserves_so_complete_fields_and_binds_observer(tmp_path, f):
+    census, closure, policy = census_fixture(tmp_path, f)
+    before = copy.deepcopy((census, closure, policy))
+    collector.validate_census(census, closure, policy, cell(f), f, NOW)
+    assert (census, closure, policy) == before
+
+
+@pytest.mark.parametrize("violation", ["false-closure", "so-identity", "foreign-module", "unknown-worker"])
+def test_census_refuses_false_closure_changed_so_and_unknown_native(tmp_path, f, violation):
+    census, closure, policy = census_fixture(tmp_path, f)
+    if violation == "false-closure":
+        closure["verified"] = False
+    elif violation == "so-identity":
+        census["rows"][0]["CommandLine"] += " --changed"
+    else:
+        command = ("python -m hpc_forest.foreign_worker --session-id " if violation == "foreign-module"
+                   else "python bootstrap_worker.py --execute --session-id ") + "a" * 32
+        census["rows"].append(identity(301, 300, command))
+        census["rows_count"] += 1
+    with pytest.raises(ValueError):
+        collector.validate_census(census, closure, policy, cell(f), f, NOW)
+
+
+def test_import_safe_does_not_read_inputs_or_call_factory(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Import must not collect or read evidence")
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(Path, "read_text", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    spec = importlib.util.spec_from_file_location("neutral_import_only_collector", Path(collector.__file__))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert callable(module.collect) and callable(module.factory) and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("violation", [False, True])
+def test_optional_third_owner_is_bound_to_marker_and_actual_bytes(tmp_path, f, violation):
+    selected = cell(f)
+    packet, marker, request = remote_fixture(tmp_path, selected)
+    remote = selected["remote_root"] + "/results-" + selected["job_id"] + "/mailbox/OWNER.json"
+    owner = write_json(tmp_path / "neutral-owner.json", {"protocol": "hpc-forest-codex-mailbox-v1",
+        "session_id": selected["session_id"], "job_id": selected["job_id"],
+        "model": selected["model"], "reasoning_effort": "max"})
+    marker_value = collector.read(marker)
+    marker_value["owner"] = {"path": remote, "sha256": owner["sha256"]}
+    marker = write_json(Path(marker["path"]), marker_value)
+    old_download = collector.read(packet["downloads"][0])
+    data = old_download["result"]["structuredContent"]
+    data.update(bytes=Path(marker["path"]).stat().st_size,
+        remote_sha256=marker["sha256"], empreinte_locale=marker["sha256"], empreinte_distante=marker["sha256"])
+    packet["downloads"][0] = write_json(Path(packet["downloads"][0]["path"]), old_download)
+    result = {"ok": True, "downloaded": remote, "to": owner["path"], "bytes": Path(owner["path"]).stat().st_size,
+        "transport": "scp", "verifie": True, **dict.fromkeys(("remote_sha256", "empreinte_locale", "empreinte_distante"), owner["sha256"])}
+    if violation:
+        result["empreinte_locale"] = "0" * 64
+    packet["downloads"].append(tool_receipt(tmp_path, "owner-download", "download_from_romeo", result))
+    remote_ref = write_json(tmp_path / "neutral-remote-owner-packet.json", packet)
+    if violation:
+        with pytest.raises(ValueError):
+            collector.validate_remote(remote_ref, selected, marker, request, f, NOW)
+    else:
+        assert collector.validate_remote(remote_ref, selected, marker, request, f, NOW) == NOW
+
+
+def test_operator_packet_requires_three_downloads_before_any_source_bootstrap(tmp_path, f, monkeypatch):
+    remote = write_json(tmp_path / "neutral-two-downloads.json", {"downloads": [None, None]})
+    inert = write_json(tmp_path / "neutral-inert-proof.json", {"neutral_fixture_only": True})
+    packet = {"schema": "hpc-forest-dynamic-r4b-collection-inputs-v1", "phase": "roots", "job_id": "999999",
+        "refs": {key: remote if key == "remote_checks" else inert for key in collector.INPUT_REFS}}
+    monkeypatch.setattr(collector, "factory", lambda: f)
+    monkeypatch.setattr(f, "bootstrap_source", lambda: pytest.fail("Source bootstrap must not be reached"))
+    with pytest.raises(ValueError, match="operator_packet_requires_marker_request_owner_downloads"):
+        collector.collect(packet, tmp_path / "never-created", now=NOW)
+    assert not (tmp_path / "never-created").exists()

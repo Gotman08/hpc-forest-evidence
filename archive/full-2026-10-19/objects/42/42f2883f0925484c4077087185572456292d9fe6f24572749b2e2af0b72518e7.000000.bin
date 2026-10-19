@@ -1,0 +1,110 @@
+"""Stop Luna xhigh relay identities after audit; prune reused parent PIDs by creation time."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+SESSION = "fb704484f3a5459ca3a4a358d2208a0b"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+OWNED = {3496, 4952, 11384, 19048, 40752, 52588, 55064}
+PRESERVED = {27336, 11168, 25896, 41388}
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def load(p):
+    return json.loads(p.read_text(encoding="utf-8-sig"))
+
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=True, indent=2)
+        f.write("\n")
+
+
+def census():
+    command = "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{n='CreationDate';e={$_.CreationDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Depth 4 -Compress"
+    p = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True,
+                       text=True, check=True, timeout=30, creationflags=NO_WINDOW)
+    return json.loads(p.stdout)
+
+
+def same(a, b):
+    return b is not None and all(a[k] == b[k] for k in FIELDS)
+
+
+def chronological_tree(rows, root):
+    lookup = {p["ProcessId"]: p for p in rows}
+    assert root in lookup
+    selected = {root}
+    while True:
+        expanded = selected | {p["ProcessId"] for p in rows if p["ParentProcessId"] in selected
+            and datetime.fromisoformat(p["CreationDate"]) >=
+            datetime.fromisoformat(lookup[p["ParentProcessId"]]["CreationDate"])}
+        if expanded == selected:
+            return [lookup[i] for i in sorted(selected)]
+        selected = expanded
+
+
+def main():
+    assert not (HERE / "owned-worker-stopped.json").exists(), "Never repeat a completed stop"
+    proof = load(HERE / "audit-complementaire.json")
+    assert proof["all_final_confirmations_verified"] and proof["all_restored_bytes_unchanged"]
+    assert proof["actual_deliveries"]["all_published_requests_delivered"]
+    assert proof["actual_deliveries"]["published_requests"] == 158
+    spec = importlib.util.spec_from_file_location("sol_stop_reconcile", STUDY / "receptions/coverage-terra-max-748782/reconcilier-r1.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    group = {"job_id": "749940", "session_id": SESSION, "model": "gpt-6-luna", "effort": "xhigh"}
+    fresh = module.reconcile(HERE / "restauration-neuve/results-749940", STUDY / "runs/coverage-gpt-6-luna-xhigh/worker", group)
+    assert fresh == load(HERE / "reconciliation-livraisons.json")
+    terminal = load(HERE / "efficiency.json")
+    assert "COMPLETED" in json.dumps(terminal) and "0:0" in json.dumps(terminal)
+    reviewed = load(HERE / "cim-initial-complet.json")
+    expected = chronological_tree(reviewed, 3496)
+    assert {p["ProcessId"] for p in expected} == OWNED
+    assert all(all(p.get(k) is not None for k in FIELDS) for p in expected)
+    assert all(SESSION in p["CommandLine"] and "-m hpc_forest.matrix_worker" in p["CommandLine"]
+               for p in expected if p["ProcessId"] in {3496, 4952})
+    assert not any("codex.exe" in p["ExecutablePath"].lower() for p in expected)
+    preserved = [p for p in reviewed if p["ProcessId"] in PRESERVED]
+    assert len(preserved) == len(PRESERVED)
+    first, second = census(), census()
+    for rows in (first, second):
+        assert chronological_tree(rows, 3496) == expected, "Tree changed; inspect before stopping"
+        assert all(same(p, next((q for q in rows if q["ProcessId"] == p["ProcessId"]), None)) for p in preserved)
+    save("arbre-complet-revu.json", {"reviewed_tree": expected, "preserved_processes": preserved,
+        "excluded_reused_parent_pid": 3496, "reason": "Epic processes were created before the current Luna xhigh relay",
+        "recursive_pid_tree_stop_forbidden": True})
+    save("cim-avant-arret.json", {"first": chronological_tree(first, 3496), "second": chronological_tree(second, 3496)})
+    argv = ["taskkill.exe", "/F"]
+    for pid in (19048, 52588, 11384, 55064, 40752, 4952, 3496):
+        argv.extend(["/PID", str(pid)])
+    stopped = subprocess.run(argv, capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW, check=False)
+    save("commande-arret-resultat.json", {"argv": argv, "returncode": stopped.returncode,
+         "stdout": stopped.stdout, "stderr": stopped.stderr, "recursive": False})
+    after = census()
+    save("cim-apres-arret.json", [p for p in after if p["ProcessId"] in OWNED | PRESERVED
+                                 or SESSION in (p.get("CommandLine") or "")])
+    assert not any(same(p, q) for p in expected for q in after)
+    assert not any(SESSION in (p.get("CommandLine") or "") for p in after)
+    assert all(same(p, next((q for q in after if q["ProcessId"] == p["ProcessId"]), None)) for p in preserved)
+    save("owned-worker-stopped.json", {"schema": "hpc-forest-owned-relay-stop-v2", **group,
+        "observed_utc": datetime.now(UTC).isoformat(), "after_audit": True, "after_deliveries": True,
+        "native_audit_sha256": module.sha(HERE / "audit-initial.json"),
+        "supplemental_audit_sha256": module.sha(HERE / "audit-complementaire.json"),
+        "reconciliation_sha256": module.sha(HERE / "reconciliation-livraisons.json"),
+        "verified_process_tree_before_stop": expected, "two_consistent_current_cim_censuses": True,
+        "all_owned_process_identities_absent_after_stop": True, "only_owned_relay_identities_stopped": True,
+        "source_only_coordinator_and_relay_preserved": True, "foreign_processes_preserved": True,
+        "recursive_pid_tree_stop_used": False})
+    print(json.dumps({"stopped_owned_identities": len(expected), "preserved_identities": len(preserved),
+                      "audit_and_reconciliation_before_stop": True}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

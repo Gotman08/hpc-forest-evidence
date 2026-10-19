@@ -1,0 +1,306 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using Word = std::uint32_t;
+using Sum = std::int32_t;
+
+constexpr std::size_t kBatchBytes = 1u << 20;
+
+struct CountSlot {
+    std::size_t value;
+    unsigned char padding[64 - sizeof(std::size_t)];
+};
+
+struct BatchReader {
+    std::unique_ptr<unsigned char[]> storage;
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    bool pending = false;
+    bool negative = false;
+    bool ended = false;
+    Word magnitude = 0;
+
+    BatchReader() : storage(new unsigned char[kBatchBytes + 1]) {}
+
+    bool next(Word* matrix, std::size_t& produced, std::size_t total) {
+        begin = end = 0;
+        while (!ended && produced < total) {
+            unsigned char* const data = storage.get();
+            const std::size_t got = std::fread(data, 1, kBatchBytes, stdin);
+            const bool at_eof = got < kBatchBytes;
+            data[got] = 0;
+            std::size_t start = 0;
+
+            if (pending) {
+                while (start < got && data[start] > ' ') {
+                    magnitude = magnitude * 10u
+                              + static_cast<Word>(data[start] - '0');
+                    ++start;
+                }
+                if (start < got || at_eof) {
+                    matrix[produced++] = negative ? Word(0) - magnitude : magnitude;
+                    pending = false;
+                } else {
+                    continue;
+                }
+            }
+
+            std::size_t finish = got;
+            if (!at_eof && finish > start && data[finish - 1] > ' ') {
+                while (finish > start && data[finish - 1] > ' ') --finish;
+                std::size_t p = finish;
+                negative = false;
+                if (p < got && (data[p] == '-' || data[p] == '+')) {
+                    negative = data[p] == '-';
+                    ++p;
+                }
+                magnitude = 0;
+                while (p < got) {
+                    magnitude = magnitude * 10u
+                              + static_cast<Word>(data[p] - '0');
+                    ++p;
+                }
+                pending = true;
+            }
+
+            ended = at_eof;
+            begin = start;
+            end = finish;
+            data[finish] = 0;
+            if (begin < end) return true;
+        }
+        return false;
+    }
+};
+
+static inline std::size_t align_boundary(const unsigned char* data,
+                                         std::size_t position,
+                                         std::size_t begin,
+                                         std::size_t end) {
+    if (position != begin) {
+        while (position < end && data[position - 1] > ' ') ++position;
+    }
+    return position;
+}
+
+static inline std::size_t decode_words(const unsigned char* cursor,
+                                       const unsigned char* end,
+                                       Word* __restrict__ destination) {
+    std::size_t count = 0;
+    for (;;) {
+        while (cursor != end && *cursor <= ' ') ++cursor;
+        if (cursor == end) break;
+
+        const bool negative = *cursor == '-';
+        if (*cursor == '-' || *cursor == '+') ++cursor;
+        Word magnitude = 0;
+        unsigned digit = static_cast<unsigned>(*cursor)
+                       - static_cast<unsigned>('0');
+        while (digit < 10u) {
+            magnitude = magnitude * 10u + digit;
+            ++cursor;
+            digit = static_cast<unsigned>(*cursor)
+                  - static_cast<unsigned>('0');
+        }
+        destination[count++] = negative ? Word(0) - magnitude : magnitude;
+        if (cursor != end) ++cursor;
+    }
+    return count;
+}
+
+static inline Sum signed_sum(Word bits) {
+    Sum value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+#if defined(__aarch64__)
+static inline uint32x4_t prefix_four(uint32x4_t values) {
+    const uint32x4_t zero = vdupq_n_u32(0);
+    values = vaddq_u32(values, vextq_u32(zero, values, 3));
+    return vaddq_u32(values, vextq_u32(zero, values, 2));
+}
+#endif
+
+static inline void horizontal_sums(Word* row, int n, int s) {
+    const int windows = n - s + 1;
+    Word total = 0;
+    #pragma omp simd reduction(+:total)
+    for (int c = 0; c < s; ++c) total += row[c];
+
+    int c = 0;
+#if defined(__aarch64__)
+    uint32x4_t carry = vdupq_n_u32(total);
+    for (; c + 8 < windows; c += 8) {
+        // Load both source ranges before overwriting any overlapping input.
+        const uint32x4_t leaving0 = vld1q_u32(row + c);
+        const uint32x4_t leaving1 = vld1q_u32(row + c + 4);
+        const uint32x4_t entering0 = vld1q_u32(row + c + s);
+        const uint32x4_t entering1 = vld1q_u32(row + c + s + 4);
+
+        const uint32x4_t prefix0 = prefix_four(vsubq_u32(entering0, leaving0));
+        uint32x4_t prefix1 = prefix_four(vsubq_u32(entering1, leaving1));
+        prefix1 = vaddq_u32(prefix1,
+                           vdupq_n_u32(vgetq_lane_u32(prefix0, 3)));
+        const uint32x4_t values0 = vaddq_u32(carry, prefix0);
+        const uint32x4_t values1 = vaddq_u32(carry, prefix1);
+
+        vst1q_u32(row + c, vextq_u32(carry, values0, 3));
+        vst1q_u32(row + c + 4, vextq_u32(values0, values1, 3));
+        carry = vdupq_n_u32(vgetq_lane_u32(values1, 3));
+    }
+    total = vgetq_lane_u32(carry, 0);
+#endif
+    for (; c < windows - 1; ++c) {
+        const Word leaving = row[c];
+        const Word entering = row[c + s];
+        row[c] = total;
+        total += entering - leaving;
+    }
+    row[windows - 1] = total;
+}
+
+int main() {
+    int n, s;
+    if (std::scanf("%d%d", &n, &s) != 2) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t elements = static_cast<std::size_t>(n) * n;
+    std::unique_ptr<Word[]> matrix(new Word[elements]);
+    Word* const data = matrix.get();
+    BatchReader input;
+
+    const int windows = n - s + 1;
+    constexpr int max_stripe_width = 256;
+    int workers = 1;
+#ifdef _OPENMP
+    workers = omp_get_max_threads();
+#endif
+    std::unique_ptr<CountSlot[]> counts(new CountSlot[workers]);
+    const int stripe_width = std::min(max_stripe_width,
+        std::max(1, (windows + workers - 1) / workers));
+    const int stripes = (windows + stripe_width - 1) / stripe_width;
+    std::size_t produced = 0;
+    std::size_t batch_base = 0;
+    bool have_batch = false;
+    Sum maximum = std::numeric_limits<Sum>::lowest();
+
+    #pragma omp parallel if(elements >= 65536) reduction(max:maximum)
+    {
+        int tid = 0;
+        int team = 1;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+        team = omp_get_num_threads();
+#endif
+        {
+            const std::size_t staging_capacity = std::min(
+                elements, kBatchBytes / static_cast<std::size_t>(team) + 8);
+            std::unique_ptr<Word[]> staged(new Word[staging_capacity]);
+
+            for (;;) {
+                #pragma omp single
+                {
+                    have_batch = input.next(data, produced, elements);
+                    batch_base = produced;
+                }
+                if (!have_batch) break;
+
+                const unsigned char* const bytes = input.storage.get();
+                const std::size_t length = input.end - input.begin;
+                std::size_t left = input.begin
+                    + length * static_cast<std::size_t>(tid) / team;
+                std::size_t right = input.begin
+                    + length * static_cast<std::size_t>(tid + 1) / team;
+                left = align_boundary(bytes, left, input.begin, input.end);
+                right = align_boundary(bytes, right, input.begin, input.end);
+                const std::size_t count = decode_words(
+                    bytes + left, bytes + right, staged.get());
+                counts[tid].value = count;
+
+                #pragma omp barrier
+                std::size_t offset = batch_base;
+                for (int t = 0; t < tid; ++t) offset += counts[t].value;
+                if (count != 0) {
+                    std::memcpy(data + offset, staged.get(), count * sizeof(Word));
+                }
+
+                #pragma omp single
+                {
+                    std::size_t batch_count = 0;
+                    for (int t = 0; t < team; ++t) batch_count += counts[t].value;
+                    produced = batch_base + batch_count;
+                }
+            }
+        }
+
+        if (produced == elements) {
+            #pragma omp for schedule(static)
+            for (int r = 0; r < n; ++r) {
+                horizontal_sums(data + static_cast<std::size_t>(r) * n, n, s);
+            }
+
+            alignas(64) Word column_sums[max_stripe_width];
+            alignas(64) Sum column_maxima[max_stripe_width];
+
+            #pragma omp for schedule(static) nowait
+            for (int block = 0; block < stripes; ++block) {
+                const int first = block * stripe_width;
+                const int width = std::min(stripe_width, windows - first);
+                #pragma omp simd
+                for (int c = 0; c < width; ++c) column_sums[c] = 0;
+
+                for (int r = 0; r < s; ++r) {
+                    const Word* const row = data
+                        + static_cast<std::size_t>(r) * n + first;
+                    #pragma omp simd
+                    for (int c = 0; c < width; ++c) column_sums[c] += row[c];
+                }
+                #pragma omp simd
+                for (int c = 0; c < width; ++c) {
+                    column_maxima[c] = signed_sum(column_sums[c]);
+                }
+
+                for (int r = s; r < n; ++r) {
+                    const Word* const entering = data
+                        + static_cast<std::size_t>(r) * n + first;
+                    const Word* const leaving = data
+                        + static_cast<std::size_t>(r - s) * n + first;
+                    #pragma omp simd
+                    for (int c = 0; c < width; ++c) {
+                        const Word total = column_sums[c] + entering[c] - leaving[c];
+                        column_sums[c] = total;
+                        column_maxima[c] = std::max(column_maxima[c], signed_sum(total));
+                    }
+                }
+
+                Sum block_maximum = std::numeric_limits<Sum>::lowest();
+                #pragma omp simd reduction(max:block_maximum)
+                for (int c = 0; c < width; ++c) {
+                    block_maximum = std::max(block_maximum, column_maxima[c]);
+                }
+                maximum = std::max(maximum, block_maximum);
+            }
+        }
+    }
+
+    if (produced != elements) return 0;
+    std::printf("%d\n", static_cast<int>(maximum));
+    return 0;
+}

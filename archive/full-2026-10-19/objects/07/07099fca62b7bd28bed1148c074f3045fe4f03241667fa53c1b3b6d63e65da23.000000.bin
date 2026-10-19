@@ -1,0 +1,189 @@
+"""Independent certificate reader: no preparer import and no C/model execution."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from collections import Counter
+from pathlib import Path
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def prime32(value: int) -> bool:
+    """Deterministic Miller-Rabin for the admitted signed-32-bit integer range."""
+    require(type(value) is int and 0 <= value <= 2**31 - 1, "outside independent primality domain")
+    if value < 2:
+        return False
+    for small in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if value % small == 0:
+            return value == small
+    odd = value - 1
+    power = 0
+    while odd % 2 == 0:
+        odd //= 2
+        power += 1
+    for base in (2, 7, 61):
+        if base % value == 0:
+            continue
+        residue = pow(base, odd, value)
+        if residue in (1, value - 1):
+            continue
+        for _ in range(power - 1):
+            residue = pow(residue, 2, value)
+            if residue == value - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def parse_input(raw: bytes) -> tuple[int, list[str], list[str]]:
+    require(raw.endswith(b"\n") and b"\r" not in raw, "canonical LF input required")
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("input is not ASCII") from exc
+    lines = text.splitlines()
+    require(bool(lines) and lines[0].isdigit(), "invalid P")
+    p = int(lines[0])
+    require(lines[0] == str(p) and 1 <= p <= 30, "P outside independently admitted finite bound")
+    require(len(lines) == 1 + 2 * p, "input must contain exactly 2P fragment lines")
+    fragments = lines[1:]
+    require(all(x and x.isascii() and x.isdigit() and len(x) < 50 for x in fragments), "invalid fragment")
+    left, right = fragments[:p], fragments[p:]
+    require(all(not x.startswith("0") and int(x[-1]) % 2 == 0 for x in left), "left restriction violated")
+    require(all(len(x) == 7 and x.startswith("0") for x in right), "seven-character right leading zero restriction violated")
+    require(p <= 100 and p * p < 1000, "official array bound exceeded")
+    return p, left, right
+
+
+def validate_case(folder: Path) -> dict:
+    raw = (folder / "input.txt").read_bytes()
+    expected = (folder / "expected.txt").read_bytes()
+    cert = json.loads((folder / "certificate.json").read_text(encoding="utf-8"))
+    p, left, right = parse_input(raw)
+    require(cert["p"] == p and type(cert["p"]) is int, "certificate P mismatch")
+    require(hashlib.sha256(raw).hexdigest() == cert["input_sha256"], "input digest mismatch")
+    require(hashlib.sha256(expected).hexdigest() == cert["output_sha256"], "output digest mismatch")
+    sources = cert["source_primes"]
+    require(len(sources) == p, "exactly P original primes required")
+    for source in sources:
+        n = source["prime"]
+        require(prime32(n), "source number is not independently prime")
+        require(source["decimal"] == str(n), "source prime decimal mismatch")
+        cut = source["cut_index"]
+        require(type(cut) is int and 0 < cut < len(str(n)), "invalid nonempty cut")
+        require(str(n)[:cut] == source["left"] and str(n)[cut:] == source["right"], "cut lost leading zeros")
+    for key, actual, part in (("left_permutation", left, "left"), ("right_permutation", right, "right")):
+        order = cert[key]
+        require(all(type(i) is int for i in order) and sorted(order) == list(range(p)), "not a bijective permutation")
+        require(actual == [sources[i][part] for i in order], "permuted fragment provenance mismatch")
+    source_primes = sorted(source["prime"] for source in sources)
+    require(source_primes == cert["expected_primes_with_multiplicity"], "source multiset mismatch")
+    require(expected == b"".join(f"{n}\n".encode("ascii") for n in source_primes), "exact ascending P-line output mismatch")
+    matrix = cert["matrix"]
+    require(len(matrix) == p * p, "full P-squared matrix required")
+    matrix_seen = set()
+    grouped_primes = []
+    max_value = 0
+    for entry in matrix:
+        i, j = entry["left_index"], entry["right_index"]
+        require(type(i) is int and type(j) is int and 0 <= i < p and 0 <= j < p, "matrix index invalid")
+        require((i, j) not in matrix_seen, "duplicate matrix pair")
+        matrix_seen.add((i, j))
+        joined = left[i] + right[j]
+        n = int(joined)
+        require(len(joined) < 50 and 2 <= n <= 2**31 - 1 and n <= 2**53, "long/string/double bound violated")
+        require(entry["value"] == n and type(entry["value"]) is int, "matrix value mismatch")
+        is_prime = prime32(n)
+        factor = entry["factor"]
+        require(type(factor) is int, "factor must be an integer")
+        if is_prime:
+            require(factor == 0, "prime marked composite")
+            grouped_primes.append(n)
+        else:
+            require(1 < factor < n and n % factor == 0, "invalid independent composite witness")
+        max_value = max(max_value, n)
+    require(sorted(grouped_primes) == source_primes, "extra or missing cross prime, including multiplicity")
+    # Treat fragments as physical occurrences and exhaust ALL orientations allowed
+    # by the statement, independent of the C input grouping.
+    all_fragments = left + right
+    unordered_primes = []
+    tested = 0
+    for i, first in enumerate(all_fragments):
+        if first.startswith("0"):
+            continue
+        for j, second in enumerate(all_fragments):
+            if i == j:
+                continue
+            joined = first + second
+            require(len(joined) < 50 and int(joined) <= 2**31 - 1, "unordered numeric/string bound violated")
+            tested += 1
+            if prime32(int(joined)):
+                unordered_primes.append(int(joined))
+    require(Counter(unordered_primes) == Counter(source_primes), "unordered statement admits additional prime concatenations")
+    bounds = cert["bounds"]
+    require(bounds["p"] == p and bounds["pairs"] == p * p and bounds["maximum_concatenation"] == max_value,
+            "claimed bounds differ from independent observations")
+    require(bounds["maxnum"] == 100 and bounds["maxstr"] == 50 and bounds["maxresults"] == 1000
+            and bounds["portable_signed_long_maximum"] == 2**31 - 1
+            and bounds["integer_double_exact_maximum"] == 2**53, "claimed C limits differ from fixed anchors")
+    return {"case": folder.name, "p": p, "pairs": p * p, "unordered_allowed_pairs": tested,
+            "prime_outputs": len(grouped_primes), "max_value": max_value,
+            "input_sha256": hashlib.sha256(raw).hexdigest(), "multiset_exact": True,
+            "source_prime_provenance": True, "leading_zeros_retained": True}
+
+
+def validate_preparation(root: Path) -> dict:
+    provenance = json.loads((root / "provenance.json").read_text(encoding="utf-8"))
+    anchors = {
+        "primes-official.zip": "978f299d25c398d5513127f1228c3cbb57b4047d0a21919db8cbfdc9fb195d54",
+        "primetest.c": "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d",
+        "statement-2020.txt": "29d63952cb0546db7a2f7f24b8425225320fb2848c3bf34a1376c6ed139669c0",
+    }
+    for name, expected_hash in anchors.items():
+        require(hashlib.sha256((root / "sources" / name).read_bytes()).hexdigest() == expected_hash,
+                "original provenance anchor differs")
+    for name, info in provenance["source_files"].items():
+        data = (root / "sources" / name).read_bytes()
+        require(len(data) == info["bytes"] and hashlib.sha256(data).hexdigest() == info["sha256"], "frozen source changed")
+    prep = json.loads((root / "preparation.json").read_text(encoding="utf-8"))
+    require(prep["status"] == "local_data_prepared_not_hpc_admitted", "unexpected admission claim")
+    require(prep["native_model_calls"] == prep["reference_compilations"] == prep["candidate_executions"] == 0,
+            "local preparation cannot claim native execution")
+    names = [item["name"] for item in prep["fixtures"]]
+    require(len(names) == len(set(names)), "duplicate fixture entry")
+    require(set(names) == {p.name for p in (root / "private-audit-fixtures").iterdir() if p.is_dir()},
+            "fixture coverage differs from manifest")
+    rows = []
+    for item in prep["fixtures"]:
+        folder = root / "private-audit-fixtures" / item["name"]
+        require(hashlib.sha256((folder / "certificate.json").read_bytes()).hexdigest() == item["certificate_sha256"],
+                "certificate digest mismatch")
+        row = validate_case(folder)
+        require(row["input_sha256"] == item["input_sha256"], "prepared input digest mismatch")
+        rows.append(row)
+    require({1, 2, 4, 8}.issubset({row["p"] for row in rows}), "minimum finite sizes not certified")
+    return {"schema": 1, "status": "local_independent_data_validation_passed_not_hpc_admitted",
+            "method": "deterministic Miller-Rabin bases 2/7/61, <=2^31-1; independent of preparer sieve",
+            "cases": rows, "refused": prep["refused"], "all_statement_domain_claimed": False,
+            "native_model_calls": 0, "reference_compilations": 0, "candidate_executions": 0}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", type=Path)
+    parser.add_argument("--report", type=Path, required=True)
+    args = parser.parse_args()
+    require(not args.report.exists(), "refuse overwriting a validation receipt")
+    report = validate_preparation(args.root)
+    args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"status": report["status"], "cases": len(report["cases"])}))
+
+
+if __name__ == "__main__":
+    main()

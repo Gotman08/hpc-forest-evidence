@@ -1,0 +1,209 @@
+"""Receive once, restore safely, independently recalculate every timing and ratio."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import csv
+import hashlib
+import importlib.util
+import json
+import math
+import statistics
+import tarfile
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("private_rpc", HERE.parent / "HPC-Forest-Etude-2020-2024-r1/romeo-prive.py")
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf8"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write(path, value):
+    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+
+
+def csvwrite(path, rows):
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+
+
+def near(a, b):
+    return math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-14)
+
+
+def audit(root):
+    receipt = read(root / "reception.json")
+    if sha(root / "results.tar.gz") != receipt["announced_sha256"]:
+        raise RuntimeError("Received archive SHA-256 differs from the announced archive")
+    dest = root / "preuves"
+    if not dest.exists():
+        dest.mkdir()
+        with tarfile.open(root / "results.tar.gz") as stream:
+            members = stream.getmembers()
+            if sum(m.size for m in members) > 128 * 1024 * 1024:
+                raise RuntimeError("Oversized scaling archive")
+            seen = set()
+            for item in members:
+                relative = PurePosixPath(item.name)
+                if (relative.is_absolute() or ".." in relative.parts or "\\" in item.name
+                        or item.name in seen or not (item.isdir() or item.isfile())):
+                    raise RuntimeError("Unsafe or duplicate evidence member")
+                seen.add(item.name); path = dest / item.name
+                if not path.resolve().is_relative_to(dest.resolve()): raise RuntimeError("Path escapes evidence")
+                if item.isdir(): path.mkdir(exist_ok=True, parents=True)
+                else:
+                    path.parent.mkdir(exist_ok=True, parents=True)
+                    with stream.extractfile(item) as source: path.write_bytes(source.read())
+    evidence = dest / "results"; files = read(evidence / "FILES.sha256.json")
+    def verify():
+        actual = {p.relative_to(evidence).as_posix() for p in evidence.rglob("*") if p.is_file()}
+        if actual != {*files, "FILES.sha256.json"}: raise RuntimeError("Unexpected evidence file inventory")
+        for name, expected in files.items():
+            if sha(evidence / name) != expected: raise RuntimeError("Evidence changed: " + name)
+    verify()
+    before = {name: sha(evidence / name) for name in files}
+    plan = read(root / "payload/plan.json"); result = read(evidence / "results.json")
+    if result["plan_sha256"] != sha(root / "payload/plan.json"): raise RuntimeError("Wrong frozen plan")
+    manifest = read(root / "payload/FILES.sha256.json")
+    for name, expected in manifest.items():
+        if sha(root / "payload" / name) != expected: raise RuntimeError("Local frozen payload changed")
+    if result["model_calls"] or result["source_edits"] or result["compilations"]:
+        raise RuntimeError("This is not the authorized no-model scaling protocol")
+    profile = result["resources"]
+    assert len(profile["affinity"]) == 16 and profile["physical_cpu_count"] == 16
+    assert len({(v["package"], v["core"]) for v in profile["topology"]}) == 16
+    assert profile["architecture"] == "ARM64" and profile["gpus"] == 0 and profile["memory_gib"] == 16
+    assert result["payload_files_verified_before"] == result["payload_files_verified_after"] == len(manifest)
+    points = {}; raw_rows = []; point_rows = []
+    cases = {c["key"]: c for c in plan["cases"]}; binaries = {b["key"]: b for b in plan["binaries"]}
+    domain_spec = importlib.util.spec_from_file_location("posthoc_domain_review", HERE / "preparer.py")
+    domain_module = importlib.util.module_from_spec(domain_spec); domain_spec.loader.exec_module(domain_module)
+    for c in cases.values():
+        input_path = root / "payload" / c["input"]
+        assert sha(input_path) == c["input_sha256"]
+        assert domain_module.domain(c["subject"], input_path.read_bytes())["checked"]
+    for b in binaries.values():
+        assert sha(root / "payload" / b["binary"]) == b["sha256"]
+    oracle_by_case = {r["case_key"]: r for r in result["oracles"]}
+    for p in result["points"]:
+        if p.get("reference_failed"): continue
+        key = (p["case_key"], p["program_key"], p["cores"])
+        assert key not in points and p["cores"] in plan["cores"]
+        assert p["program_key"] in binaries and p["case_key"] in cases
+        assert binaries[p["program_key"]]["subject"] == cases[p["case_key"]]["subject"]
+        assert p["input_sha256"] == cases[p["case_key"]]["input_sha256"]
+        for sample in [p["warmup"], *p["samples"]]:
+            if sample is None: continue
+            assert sample["cpu_affinity"] == profile["affinity"][:p["cores"]]
+            correct = sample["returncode"] == 0 and not sample.get("timed_out") and sample["stdout_sha256"] == oracle_by_case[p["case_key"]]["stdout_sha256"]
+            assert bool(correct) == sample["matches_oracle"]
+            assert sample["seconds"] > 0 and sample["cpu_seconds"] >= 0
+            assert near(sample["average_used_cores"], sample["cpu_seconds"] / sample["seconds"])
+        good = p["warmup"] is not None and p["warmup"]["matches_oracle"] and len(p["samples"]) == 5 and all(v["matches_oracle"] for v in p["samples"])
+        assert p["full_valid_measurement"] == good
+        if good:
+            times = [v["seconds"] for v in p["samples"]]
+            assert near(p["mean_seconds"], statistics.mean(times))
+            assert near(p["stdev_seconds"], statistics.stdev(times))
+            assert near(p["median_seconds"], statistics.median(times))
+            assert near(p["mean_average_used_cores"], statistics.mean(v["average_used_cores"] for v in p["samples"]))
+        points[key] = p
+        for i, sample in enumerate(p["samples"], 1):
+            raw_rows.append({"subject": p["subject"], "case": cases[p["case_key"]]["name"], "input_sha256": p["input_sha256"],
+                "program_key": p["program_key"], "cores": p["cores"], "repeat": i, "seconds": sample["seconds"],
+                "cpu_seconds": sample["cpu_seconds"], "average_used_cores": sample["average_used_cores"],
+                "matches_oracle": sample["matches_oracle"], "returncode": sample["returncode"]})
+    expected_points = {(c["key"], b["key"], cores) for c in plan["cases"] for b in plan["binaries"]
+                       if b["subject"] == c["subject"] for cores in plan["cores"]}
+    coverage = set(points) == expected_points
+    campaign_rows = []
+    for campaign in plan["campaigns"]:
+        for c in plan["cases"]:
+            if c["subject"] != campaign["subject"]: continue
+            one = points.get((c["key"], campaign["keys"]["chosen"], 1))
+            for cores in plan["cores"]:
+                chosen = points.get((c["key"], campaign["keys"]["chosen"], cores))
+                ownref = points.get((c["key"], campaign["keys"]["original_reference"], cores))
+                common = points.get((c["key"], c["canonical_reference_key"], cores))
+                good = all(p is not None and p["full_valid_measurement"] for p in [chosen, ownref, common, one])
+                t, tr, tc, t1 = [p["mean_seconds"] if good else None for p in [chosen, ownref, common, one]]
+                campaign_rows.append({"subject": campaign["subject"], "job_id": campaign["job_id"],
+                    "model": campaign["model"], "effort": campaign["effort"] or "not_applicable",
+                    "retained_baseline": campaign["chosen_is_unchanged_baseline"], "case": c["name"], "size": c["input_domain_review"]["size"],
+                    "parameters": json.dumps(c["input_domain_review"]["parameters"], ensure_ascii=True),
+                    "cores": cores, "full_valid_measurement": good, "input_sha256": c["input_sha256"],
+                    "chosen_binary_sha256": binaries[campaign["keys"]["chosen"]]["sha256"],
+                    "reference_seconds": tr, "chosen_seconds": t, "common_reference_seconds": tc,
+                    "seconds_saved": tr - t if good else None, "time_reduction_fraction": 1-t/tr if good else None,
+                    "speedup_vs_reference": tr/t if good else None, "own_speedup_vs_one_core": t1/t if good else None,
+                    "own_parallel_efficiency": t1/t/cores if good else None,
+                    "stdev_seconds": chosen["stdev_seconds"] if good else None,
+                    "mean_average_used_cores": chosen["mean_average_used_cores"] if good else None,
+                    "new_optimization_search": False, "full_contest_compliance_certified": False})
+    csvwrite(root / "mesures-brutes.csv", raw_rows)
+    csvwrite(root / "comparaisons-par-campagne.csv", campaign_rows)
+    for (case, key, cores), p in points.items():
+        point_rows.append({"subject": p["subject"], "case": cases[case]["name"], "size": p["size"],
+            "program_key": key, "cores": cores, "valid": p["full_valid_measurement"], "mean_seconds": p["mean_seconds"],
+            "stdev_seconds": p["stdev_seconds"], "sample_count": len(p["samples"])})
+    csvwrite(root / "configurations-executables-uniques.csv", point_rows)
+    verify()
+    assert before == {name: sha(evidence / name) for name in files}
+    audit_result = {"schema": "hpc-forest-core-scaling-audit-v2", "observed_utc": datetime.now(UTC).isoformat(),
+        "job_id": result["job_id"], "evidence_integrity_verified": True, "files_verified_before_and_after": len(files),
+        "archive_sha256": receipt["announced_sha256"], "plan_sha256": result["plan_sha256"],
+        "all_cases_and_physical_core_counts_received": coverage, "measurement_completed": result["complete"],
+        "configuration_count": len(points), "raw_sample_count": len(raw_rows), "campaign_comparison_rows": len(campaign_rows),
+        "failed_or_incomplete_configurations": sum(not p["full_valid_measurement"] for p in points.values()),
+        "all_oracles_match_archived_outputs": all(r["accepted"] for r in result["oracles"]),
+        "statistics_recomputed": True, "ratios_recomputed_locally": True, "affinities_verified": True,
+        "model_calls": 0, "candidate_edits": 0, "candidate_compilations": 0,
+        "official_contest_compliance_certified": False, "old_confirmations_replaced": False,
+        "results_are_never_model_input": True, "campaign_count": len(plan["campaigns"]),
+        "model_count": len({c["model"] for c in plan["campaigns"]}), "subjects": sorted({c["subject"] for c in plan["campaigns"]})}
+    write(root / "audit.json", audit_result)
+    write(root / "resultats-verifies.json", {"audit": audit_result, "rows": campaign_rows, "unique_points": point_rows})
+    print(json.dumps(audit_result))
+
+
+async def receive(root):
+    job = read(root / "current-job.json")
+    if not (root / "reception.json").exists():
+        async with module.ScopedRomeo(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+            efficiency = await rpc.call("job_efficiency", job_id=job["job_id"])
+            write(root / "efficacite.json", efficiency)
+            if efficiency.get("state") not in {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"}:
+                raise RuntimeError("Job not finished; leave the live measurements alone")
+            logs = await rpc.call("job_log_tail", job_id=job["job_id"], lines=12, max_chars=12000, max_files=2, stream="both")
+            write(root / "journal-final.json", logs)
+            events = []
+            for line in logs["content"].splitlines():
+                try: events.append(json.loads(line))
+                except ValueError: pass
+            end = next(v for v in reversed(events) if v.get("event") == "scaling_end")
+            allowed = {job["remote_root"] + "/results.tar.gz",
+                       job["remote_root"].replace("/scratch_p/", "/gpfs/scratch/", 1) + "/results.tar.gz"}
+            if end["archive"] not in allowed: raise RuntimeError("Unexpected result archive")
+            transfer = await rpc.download(end["archive"], root / "results.tar.gz")
+            if sha(root / "results.tar.gz") != end["sha256"]: raise RuntimeError("Announced SHA-256 mismatch")
+            write(root / "reception.json", {"transfer": transfer, "announced_sha256": end["sha256"],
+                "observed_utc": datetime.now(UTC).isoformat(), "job_id": job["job_id"]})
+    audit(root)
+    checked = read(root / "audit.json")
+    job.update(state="received_and_audited", archive_sha256=checked["archive_sha256"],
+        configuration_points=checked["configuration_count"], timed_runs=checked["raw_sample_count"],
+        observed_utc=datetime.now(UTC).isoformat())
+    write(root / "current-job.json", job)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("root", type=Path)
+    asyncio.run(receive(parser.parse_args().root.resolve(strict=True)))

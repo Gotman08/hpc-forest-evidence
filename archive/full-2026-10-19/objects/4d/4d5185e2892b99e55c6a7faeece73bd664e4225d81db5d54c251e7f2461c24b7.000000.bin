@@ -1,0 +1,145 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+void body_force(float *x, float *y, float *z,
+                float *vx, float *vy, float *vz,
+                int n, float dt) {
+  // Force accumulators for each body (SoA style)
+  float *fx = (float*)calloc(n, sizeof(float));
+  float *fy = (float*)calloc(n, sizeof(float));
+  float *fz = (float*)calloc(n, sizeof(float));
+
+  // Tile size for the j-loop; chosen to fit in L1 cache with SoA layout
+  #define BLOCK 128
+
+  #pragma omp parallel
+  {
+    for (int bj = 0; bj < n; bj += BLOCK) {
+      int jend = bj + BLOCK < n ? bj + BLOCK : n;
+      // Parallelize over i, each thread handles a contiguous chunk of bodies
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        float xi = x[i];
+        float yi = y[i];
+        float zi = z[i];
+        // Load current partial forces from global accumulators
+        float fxi = fx[i];
+        float fyi = fy[i];
+        float fzi = fz[i];
+
+        for (int j = bj; j < jend; ++j) {
+          float dx = x[j] - xi;
+          float dy = y[j] - yi;
+          float dz = z[j] - zi;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1.0f / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+          fxi += dx * inv_dist3;
+          fyi += dy * inv_dist3;
+          fzi += dz * inv_dist3;
+        }
+
+        // Write back partial forces for this block
+        fx[i] = fxi;
+        fy[i] = fyi;
+        fz[i] = fzi;
+      }
+    }
+  }
+
+  // Update velocities after all force contributions have been accumulated
+  #pragma omp parallel for schedule(static)
+  for (int i = 0; i < n; ++i) {
+    vx[i] += dt * fx[i];
+    vy[i] += dt * fy[i];
+    vz[i] += dt * fz[i];
+  }
+
+  free(fx);
+  free(fy);
+  free(fz);
+}
+
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *tmp = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(tmp, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+  return tmp;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  Body *tmp = read_dataset(&nbodies);
+
+  // Convert from AoS (input format) to SoA for better cache behavior
+  float *x = (float*)malloc(nbodies * sizeof(float));
+  float *y = (float*)malloc(nbodies * sizeof(float));
+  float *z = (float*)malloc(nbodies * sizeof(float));
+  float *vx = (float*)malloc(nbodies * sizeof(float));
+  float *vy = (float*)malloc(nbodies * sizeof(float));
+  float *vz = (float*)malloc(nbodies * sizeof(float));
+
+  for (int i = 0; i < nbodies; ++i) {
+    x[i] = tmp[i].x;
+    y[i] = tmp[i].y;
+    z[i] = tmp[i].z;
+    vx[i] = tmp[i].vx;
+    vy[i] = tmp[i].vy;
+    vz[i] = tmp[i].vz;
+  }
+  free(tmp);
+
+  for (int iter = 0; iter < N_ITER; ++iter) {
+    body_force(x, y, z, vx, vy, vz, nbodies, DT);
+
+    // Update positions in parallel
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < nbodies; ++i) {
+      x[i] += vx[i] * DT;
+      y[i] += vy[i] * DT;
+      z[i] += vz[i] * DT;
+    }
+  }
+
+  // Convert back to AoS for output (same binary format as input)
+  Body *out = (Body*)malloc(nbodies * sizeof(Body));
+  for (int i = 0; i < nbodies; ++i) {
+    out[i].x = x[i];
+    out[i].y = y[i];
+    out[i].z = z[i];
+    out[i].vx = vx[i];
+    out[i].vy = vy[i];
+    out[i].vz = vz[i];
+  }
+  write_dataset(nbodies, out);
+
+  free(out);
+  free(x); free(y); free(z); free(vx); free(vy); free(vz);
+
+  exit(EXIT_SUCCESS);
+}

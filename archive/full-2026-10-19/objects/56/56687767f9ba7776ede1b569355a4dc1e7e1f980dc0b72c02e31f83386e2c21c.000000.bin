@@ -1,0 +1,583 @@
+"""New unbound R2f envelope; exact new source and independent wrapper reviews required."""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import platform
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+import traceback
+import zipfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
+
+SCOPE = "hpc-forest-primes-native-max-r2f"
+DEADLINE = datetime(2026, 10, 31, 23, tzinfo=UTC)
+PYTHON = "/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python"
+SPACK_GCC = "/zrtbeqke25s2vbqo4yrhsowjz7mg3pjf"
+PREPARATION_SHA = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+REFERENCE_SHA = "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d"
+FLAGS = ["-O2", "-std=c11", "-Werror=uninitialized", "-Werror=maybe-uninitialized", "-lm"]
+MAX_BYTES = 64 * 1024**2
+MAX_MEMBER_BYTES = 8 * 1024**2
+PINNED = {'source_zip_sha256': '47f97afabcd6d10c5e95a1dc3aae0a34b0841183919785a6bd62d58aa1e90d75', 'plan_sha256': '8d91ebe83ab550ad50acc330f830e1bc86bcc67f66b88054538df6b394558450', 'payload_sha256': '232c714734ae1c60dca8b45f3c04f5739625cffcbcfeedfbc317f767380248f6', 'bundle_manifest_sha256': '8ec6bace5f71e728db9f15f747132525359cbe8cc4de10f106dfbb3f6abf1ec2', 'runtime_manifest_sha256': 'e515b741bb27911b5270a8379b75b533ab3391aca6db2ec4c70cd470f98f29ef', 'delivery_sha256': 'ba60c702be9b5bb9bd990f2df79fad3815fb045a6979a2563d0a659bdff04625', 'integration_review_sha256': 'd0735f9903a185f3678e6584146497a456e3b6f130a629015f0e1dbd4d8a797b', 'payload_bytes': 571343, 'payload_member_count': 182, 'source_member_count': 109, 'remote_root': '/scratch_p/nimarano/hpc-forest-primes-native-contract-qualification-20261018-r2f-232c714734ae', 'payload_path': '/scratch_p/nimarano/hpc-forest-primes-native-max-r2f-232c714734ae1c60.tar.gz'}
+NEUTRAL_TESTS = {'test_r2max_r2d_lane.py': 36, 'test_owned_timeout_r2e.py': 6, 'test_codex_cli_diagnostics_r2e.py': 48, 'test_first_batch_gate_r2e.py': 20, 'test_worker_argument_routing_r2f.py': 12}
+QUALIFICATION_SECONDS = 1800
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def file_sha(path):
+    return digest(path.read_bytes())
+
+
+def deadline_guard(now=None):
+    now = datetime.now(UTC) if now is None else now
+    require(now + timedelta(seconds=QUALIFICATION_SECONDS + 10800) < DEADLINE,
+            "30-minute qualification plus three-hour reception/audit reserve exceeds exclusive deadline")
+
+
+def allocation_guard():
+    """Must run before any creation, extraction, Spack, subprocess or compiler."""
+    env = os.environ
+    require(platform.system() == "Linux" and platform.machine().lower() in {"aarch64", "arm64"},
+            "Own Linux ARM64 compute allocation required")
+    require(re.fullmatch(r"[0-9]+", env.get("SLURM_JOB_ID", "")), "Concrete Slurm job required")
+    expected = {"SLURM_JOB_NUM_NODES": "1", "SLURM_NTASKS": "1",
+                "SLURM_CPUS_PER_TASK": "4", "SLURM_MEM_PER_NODE": "16384"}
+    require(all(env.get(key) == value for key, value in expected.items()),
+            "Exact one-node/one-task/four-CPU/16384-MiB allocation required")
+    gpu_keys = ("SLURM_GPUS", "SLURM_GPUS_PER_NODE", "SLURM_JOB_GPUS", "SLURM_STEP_GPUS")
+    require(all(env.get(key, "") in {"", "0"} for key in gpu_keys), "Zero GPU allocation required")
+    require(env.get("CUDA_VISIBLE_DEVICES", "") == "", "No CUDA device may be visible")
+    require(env.get("SLURM_RESTART_COUNT", "0") == "0", "An earlier Slurm attempt must not be replayed")
+    require(hasattr(os, "sched_getaffinity"), "Effective affinity observation required")
+    affinity = sorted(os.sched_getaffinity(0))
+    require(len(affinity) == 4, "Exactly four CPUs must be present in the effective affinity")
+    deadline_guard()
+    return {"job_id": env["SLURM_JOB_ID"], "architecture": platform.machine().lower(),
+            "nodes": 1, "tasks": 1, "cpus_per_task": 4, "memory_mib": 16384, "gpus": 0,
+            "affinity_cpu_ids": affinity, "affinity_cpu_count": 4}
+
+
+def canonical_name(name):
+    path = PurePosixPath(name)
+    require(isinstance(name, str) and name and not path.is_absolute()
+            and str(path) == name and not any(part in {".", "..", ""} for part in path.parts)
+            and "\\" not in name and ":" not in name
+            and not any(ord(char) < 32 for char in name), "Noncanonical or unsafe archive member")
+    return path
+
+
+def read_tar(path, root_name, count):
+    """Read regular unique members in memory before any extraction."""
+    material = {}
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        require(len(members) == count and 1 <= count <= 1000, "Unexpected bundle member count")
+        total = 0
+        for member in members:
+            name = canonical_name(member.name)
+            require(member.isfile() and not member.issym() and not member.islnk()
+                    and (root_name is None or (name.parts[0] == root_name and len(name.parts) > 1)),
+                    "Bundle members must be regular files beneath the exact root")
+            key = name.relative_to(root_name).as_posix() if root_name else name.as_posix()
+            total += member.size
+            require(key not in material and 0 <= member.size <= MAX_MEMBER_BYTES and total <= MAX_BYTES,
+                    "Duplicate or oversized bundle member")
+            stream = archive.extractfile(member)
+            require(stream is not None, "Bundle member has no bytes")
+            raw = stream.read(MAX_MEMBER_BYTES + 1)
+            require(len(raw) == member.size, "Bundle member size differs from header")
+            material[key] = raw
+    return material
+
+
+def read_zip(raw, expected, count):
+    material = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        items = archive.infolist()
+        require(len(items) == count and 1 <= count <= 1000, "Unexpected source ZIP member count")
+        total = 0
+        for member in items:
+            name = canonical_name(member.filename)
+            kind = (member.external_attr >> 16) & 0o170000
+            require(not member.is_dir() and kind in {0, 0o100000}
+                    and name.parts[0] == "HPC-Forest" and len(name.parts) > 1,
+                    "Source ZIP must contain only regular files beneath HPC-Forest")
+            key = name.relative_to("HPC-Forest").as_posix()
+            total += member.file_size
+            require(key not in material and member.file_size <= MAX_MEMBER_BYTES and total <= MAX_BYTES,
+                    "Duplicate or oversized source ZIP member")
+            with archive.open(member) as stream:
+                value = stream.read(MAX_MEMBER_BYTES + 1)
+            require(len(value) == member.file_size, "Source ZIP member size differs from header")
+            material[key] = value
+    require(isinstance(expected, dict) and set(material) == set(expected), "Runtime manifest membership changed")
+    require(all(digest(value) == expected[name] for name, value in material.items()),
+            "Runtime manifest/source ZIP bytes differ")
+    return material
+
+
+def validate_bindings(bindings):
+    fields = {"schema", "status", "scope_id", "payload_path", "payload_sha256", "payload_bytes",
+              "payload_root", "payload_member_count", "source_member_count", "source_zip_sha256",
+              "plan_sha256", "bundle_manifest_sha256", "runtime_manifest_sha256", "remote_root",
+              "delivery_sha256", "integration_review_sha256"}
+    require(set(PINNED) == fields - {"schema", "status", "scope_id", "payload_root"},
+            "Unbound template: complete new source-reviewed pins required")
+    required_tests = {"test_r2max_r2d_lane.py", "test_owned_timeout_r2e.py",
+                      "test_codex_cli_diagnostics_r2e.py", "test_worker_argument_routing_r2f.py"}
+    require(required_tests.issubset(NEUTRAL_TESTS) and len(NEUTRAL_TESTS) == 5
+            and any("first_batch" in name and "r2e" in name for name in NEUTRAL_TESTS)
+            and all(re.fullmatch(r"test_[a-z0-9_]+\.py", name)
+                    and type(count) is int and count > 0 for name, count in NEUTRAL_TESTS.items()),
+            "Exactly lane/core/diagnostic/first-batch/real-inherited-parser neutral suites with real integer counts required")
+    require(isinstance(bindings, dict) and set(bindings) == fields, "Exact final bindings required")
+    require(bindings["schema"] == "hpc-forest-primes-r2max-qualification-bindings-v2"
+            and bindings["status"] == "sealed_local_proposal_source_reviewed_wrapper_review_required" and bindings["scope_id"] == SCOPE,
+            "Exact sealed local source-reviewed proposal required; wrapper review remains external")
+    require(all(bindings.get(key) == value for key, value in PINNED.items()), "Pinned r2d input binding changed")
+    for key in fields:
+        if key.endswith("_sha256"):
+            require(re.fullmatch(r"[a-f0-9]{64}", bindings[key]), "Invalid immutable input SHA: " + key)
+    root = PurePosixPath(bindings["remote_root"])
+    payload = PurePosixPath(bindings["payload_path"])
+    require(root.is_absolute() and root.parent == PurePosixPath("/scratch_p/nimarano")
+            and root.name.startswith("hpc-forest-primes-native-contract-qualification-")
+            and root.name.endswith(bindings["payload_sha256"][:12]) and ".." not in root.parts,
+            "New attempt root must be narrow, fresh and payload-bound")
+    require(payload.is_absolute() and payload.parent == PurePosixPath("/scratch_p/nimarano")
+            and ".." not in payload.parts and "\\" not in str(payload), "Invalid exact payload path")
+    require(type(bindings["payload_bytes"]) is int and 0 < bindings["payload_bytes"] <= MAX_BYTES,
+            "Invalid bounded payload size")
+    require(bindings["payload_root"] == "flat_manifested", "Unexpected bundle layout")
+    for key in ("payload_member_count", "source_member_count"):
+        require(type(bindings[key]) is int and 1 <= bindings[key] <= 1000, "Invalid member count")
+    return Path(str(root)), Path(str(payload))
+
+
+def validate_bundle(bindings, payload):
+    require(payload.is_file() and not payload.is_symlink()
+            and payload.stat().st_size == bindings["payload_bytes"]
+            and file_sha(payload) == bindings["payload_sha256"], "Exact payload bytes/type changed")
+    material = read_tar(payload, None, bindings["payload_member_count"])
+    require(digest(material["proposal-bundle-manifest.json"]) == bindings["bundle_manifest_sha256"],
+            "Bundle manifest changed")
+    bundle = json.loads(material["proposal-bundle-manifest.json"])
+    expected = bundle.get("files")
+    require(bundle.get("schema") == "hpc-forest-r2max-proposal-bundle-manifest-v3"
+            and isinstance(expected, dict)
+            and set(material) == set(expected) | {"proposal-bundle-manifest.json"},
+            "Bundle manifest membership changed")
+    require(all(digest(material[name]) == value for name, value in expected.items()),
+            "Bundle manifested bytes changed")
+    for name, expected_sha in {
+        "HPC-Forest-Primes-Natif-MAX-r2f.zip": bindings["source_zip_sha256"],
+        "native-max-plan.json": bindings["plan_sha256"],
+        "runtime-manifest-r2max.json": bindings["runtime_manifest_sha256"],
+        "certified-preparation/prototype-manifest.json": PREPARATION_SHA,
+        "certified-preparation/data/model-view/primetest.c": REFERENCE_SHA,
+    }.items():
+        require(digest(material[name]) == expected_sha, "Pinned input changed: " + name)
+    plan = json.loads(material["native-max-plan.json"])
+    require(plan.get("scope_id") == SCOPE and plan.get("source_zip_sha256") == bindings["source_zip_sha256"]
+            and plan.get("preparation_manifest_sha256") == PREPARATION_SHA
+            and plan.get("efforts") == ["max"] and plan.get("automatic_extension") is False
+            and plan.get("compiler_flags") == FLAGS
+            and plan.get("maximum_native_workers_total") == 4
+            and plan.get("maximum_cells_per_authorization") == 1, "Final R2 plan binding/flags/cap changed")
+    manifest = json.loads(material["certified-preparation/prototype-manifest.json"])
+    preparation = {name.removeprefix("certified-preparation/"): raw for name, raw in material.items()
+                   if name.startswith("certified-preparation/")}
+    require(set(preparation) == set(manifest) | {"prototype-manifest.json"}, "Preparation membership changed")
+    for name, info in manifest.items():
+        require(len(preparation[name]) == info["bytes"] and digest(preparation[name]) == info["sha256"],
+                "Certified preparation member changed")
+    runtime_manifest = json.loads(material["runtime-manifest-r2max.json"])
+    sources = read_zip(material["HPC-Forest-Primes-Natif-MAX-r2f.zip"], runtime_manifest,
+                       bindings["source_member_count"])
+    for name, raw in material.items():
+        if name.startswith("HPC-Forest/"):
+            require(sources.get(name.removeprefix("HPC-Forest/")) == raw,
+                    "Expanded bundle runtime differs from exact source ZIP")
+    return material, sources
+
+
+def merge_extraction(material, sources):
+    """Flat bundle includes runtime files too: compare first, then write each path once."""
+    merged = {name: raw for name, raw in material.items() if not name.startswith("HPC-Forest/")}
+    for name, raw in material.items():
+        if name.startswith("HPC-Forest/"):
+            require(sources.get(name.removeprefix("HPC-Forest/")) == raw, "Conflicting expanded runtime member")
+    merged.update({"HPC-Forest/" + name: raw for name, raw in sources.items()})
+    return merged
+
+
+def save(path, value):
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, ensure_ascii=True, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        require(not path.is_symlink(), "A live input was replaced by a link")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = file_sha(path)
+    return result
+
+
+def write_new_tree(root, material):
+    root.mkdir()
+    for name, raw in material.items():
+        relative = canonical_name(name)
+        path = root.joinpath(*relative.parts)
+        require(path.resolve().is_relative_to(root.resolve()), "Fresh extraction escaped its root")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(raw)
+    require(inventory(root) == {name: digest(raw) for name, raw in material.items()},
+            "Freshly restored input bytes differ")
+
+
+def make_command(extraction, output):
+    argv = [PYTHON, "-I", "-B", str(extraction / "HPC-Forest/examples/marathon22/qualify_r2max_contract.py"),
+            "--package", str(extraction / "certified-preparation"), "--output", str(output),
+            "--source-zip", str(extraction / "HPC-Forest-Primes-Natif-MAX-r2f.zip"),
+            "--plan", str(extraction / "native-max-plan.json")]
+    command = ("set -euo pipefail\nromeo_load_armgpu_env\nspack load "
+               + shlex.quote(SPACK_GCC) + "\nexec " + shlex.join(argv))
+    return argv, ["bash", "-lc", command]
+
+
+def qualification_allocation_matches(qualified, observed):
+    """Compare actual common fields; do not fabricate absent qualifier affinity fields."""
+    required = ("job_id", "architecture", "nodes", "tasks", "cpus_per_task", "memory_mib", "gpus")
+    return (isinstance(qualified, dict)
+            and all(key in qualified and qualified[key] == observed[key] for key in required)
+            and observed.get("affinity_cpu_count") == 4
+            and len(observed.get("affinity_cpu_ids", [])) == 4
+            and all(key not in qualified or qualified[key] == observed[key]
+                    for key in ("affinity_cpu_ids", "affinity_cpu_count")))
+
+
+def resolve_exact_artifact(announced, expected, *, directory=False):
+    """Allocation first; resolve both complete paths, never compare names alone."""
+    allocation_guard()
+    require(isinstance(announced, str) and announced and Path(announced).is_absolute()
+            and expected.is_absolute(), "Absolute original and expected artifact paths required")
+    announced_resolved = Path(announced).resolve(strict=True)
+    expected_resolved = expected.resolve(strict=True)
+    require(announced_resolved == expected_resolved, "Artifact alias resolves to a different object")
+    require(expected_resolved.is_dir() if directory else expected_resolved.is_file(),
+            "Resolved artifact has an unexpected type")
+    return expected_resolved, {"announced_path_original": announced,
+                               "expected_path_original": str(expected),
+                               "resolved_path": str(expected_resolved),
+                               "same_complete_resolved_path": True,
+                               "expected_type": "directory" if directory else "regular_file"}
+
+
+def regular_file_snapshot(path):
+    require(path.is_file(), "Regular artifact file required")
+    before = path.stat()
+    require(0 <= before.st_size <= MAX_BYTES, "Artifact file size exceeds the bounded receipt")
+    raw = path.read_bytes()
+    after = path.stat()
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    require(all(getattr(before, key) == getattr(after, key) for key in fields)
+            and len(raw) == before.st_size, "Artifact changed during the exact byte/size observation")
+    return {"sha256": digest(raw), "bytes": len(raw)}
+
+
+def verify_inner_archive_identity(sidecar, expected):
+    resolved, proof = resolve_exact_artifact(sidecar.get("path"), expected)
+    snapshot = regular_file_snapshot(resolved)
+    require(re.fullmatch(r"[a-f0-9]{64}", sidecar.get("sha256", ""))
+            and snapshot["sha256"] == sidecar["sha256"]
+            and type(sidecar.get("native_model_calls")) is int and sidecar["native_model_calls"] == 0,
+            "Inner qualification archive SHA or zero-inference proof differs")
+    declared_size = sidecar.get("bytes")
+    require(declared_size is None or (type(declared_size) is int and declared_size == snapshot["bytes"]),
+            "Inner qualification archive declared size differs")
+    # Original r1b sidecars have no size field. Record actual exact bytes without inventing one.
+    return {**proof, **snapshot, "sidecar_declared_bytes": declared_size,
+            "size_observed_from_exact_artifact": True, "verified": True}
+
+
+def verify_prepared_root_identity(qualification, expected):
+    resolved, proof = resolve_exact_artifact(qualification.get("prepared_root"), expected, directory=True)
+    files = qualification.get("prepared_files")
+    require(isinstance(files, dict) and 0 < len(files) <= 1000, "Exact prepared file inventory required")
+    actual = {}
+    total = 0
+    for path in sorted(resolved.rglob("*")):
+        require(not path.is_symlink(), "Linked member in prepared artifact refused")
+        if path.is_file():
+            require(path.resolve(strict=True).is_relative_to(resolved), "Prepared member escaped the exact root")
+            name = path.relative_to(resolved).as_posix()
+            canonical_name(name)
+            snapshot = regular_file_snapshot(path)
+            total += snapshot["bytes"]
+            require(total <= MAX_BYTES, "Prepared artifact total size exceeds its bounded receipt")
+            actual[name] = snapshot
+    require(set(actual) == set(files) and all(re.fullmatch(r"[a-f0-9]{64}", value)
+            and actual[name]["sha256"] == value for name, value in files.items()),
+            "Prepared file membership or exact SHA differs")
+    return {**proof, "files": actual, "total_bytes": total, "verified": True}
+
+
+def verify_trace_root_identity(qualification, expected):
+    allocation_guard()
+    original = qualification.get("official_evaluator_trace_qualification", {})
+    exact_file, file_identity = resolve_exact_artifact(original.get("path"), expected / "trace-qualification.json")
+    require(file_sha(exact_file) == original.get("sha256") and original.get("verified") is True
+            and original.get("execution_purpose") == "qualification-only-not-model-official",
+            "Original official Evaluator trace receipt identity differs")
+    # Reuse the closed full-path/inventory check without modifying the original object.
+    inventory_proof = verify_prepared_root_identity({"prepared_root": str(exact_file.parent),
+        "prepared_files": qualification.get("official_evaluator_trace_files")}, expected)
+    return {"qualification_receipt_original": original, "receipt_identity": file_identity,
+            "inventory_identity": inventory_proof, "verified": True}
+
+
+def verify_inner_archive_members(qualification, raw_receipt, archive_path, verify_trace):
+    """Use original archived bytes for trace links, never a standalone positive summary."""
+    allocation_guard()
+    prepared = qualification.get("prepared_files", {})
+    trace = qualification.get("official_evaluator_trace_files", {})
+    expected = {"qualification.json": digest(raw_receipt), **{"prepared/" + name: value for name, value in prepared.items()},
+                **{"official-evaluator-trace/" + name: value for name, value in trace.items()}}
+    material = read_tar(archive_path, "qualification", len(expected))
+    require(set(material) == set(expected) and all(digest(material[name]) == expected[name] for name in material),
+            "Original qualification archive members/receipt/prepared/trace bytes differ")
+    links = verify_trace(qualification, lambda name: material["official-evaluator-trace/" + name],
+                         read_prepared_member=lambda name: material["prepared/" + name])
+    require(links.get("original_archive_links_verified") is True and links.get("cluster_paths_followed_locally") is False,
+            "Original archived Evaluator links have not been verified")
+    return {"member_count": len(material), "all_original_archive_member_sha256_equal": True,
+            "official_evaluator_links": links, "native_model_calls": 0, "verified": True}
+
+
+def load_allocated_trace_verifier(extraction):
+    allocation_guard()
+    manifest_path = extraction / "runtime-manifest-r2max.json"
+    require(file_sha(manifest_path) == PINNED["runtime_manifest_sha256"], "Runtime manifest changed before trace reader import")
+    manifest = json.loads(manifest_path.read_text(encoding="utf8"))
+    require(len(manifest) == PINNED["source_member_count"] and inventory(extraction / "HPC-Forest") == manifest,
+            "Exact newly pinned source bytes required before trace reader import")
+    require(not any(name == "hpc_forest" or name.startswith("hpc_forest.") for name in sys.modules),
+            "Unexpected previously loaded project module in qualification envelope")
+    sys.path.insert(0, str(extraction / "HPC-Forest/src"))
+    from hpc_forest.native_r2max import verify_trace_members
+    return verify_trace_members
+
+
+def preserve_envelope(root, receipt):
+    save(root / "envelope-receipt.json", receipt)
+    links = [{"relative_path": p.relative_to(root).as_posix(), "target": os.readlink(p),
+              "followed": False} for p in sorted(root.rglob("*")) if p.is_symlink()]
+    save(root / "fixture-links-metadata.json", {"links": links, "links_followed": False})
+    paths = [p for p in sorted(root.rglob("*")) if not p.is_symlink() and p.is_file()]
+    require(all(p.stat().st_nlink == 1 for p in paths), "Refusing hard-linked result in envelope")
+    archive = root / ("envelope-results-" + os.environ["SLURM_JOB_ID"] + ".tar.gz")
+    with tarfile.open(archive, "x:gz") as result:
+        for path in paths:
+            result.add(path, arcname="qualification-envelope/" + path.relative_to(root).as_posix(), recursive=False)
+    sidecar = {"path": str(archive), "sha256": file_sha(archive), "bytes": archive.stat().st_size,
+               "passed": receipt["passed"], "native_model_calls": 0, "native_research_admitted": False}
+    save(root / "envelope-archive.json", sidecar)
+    print(json.dumps(sidecar), flush=True)
+
+
+
+def run_lane_delta_tests(root, extraction):
+    """All four explicitly pinned suites are inert; no native process/transport/auth."""
+    allocation_guard()
+    deadline_guard()
+    tests = [extraction / "HPC-Forest/tests" / name for name in sorted(NEUTRAL_TESTS)]
+    require(all(path.is_file() and not path.is_symlink() for path in tests),
+            "All source-manifested neutral suites must be present")
+    plugin = root / "qualification_no_effects.py"
+    plugin.write_text("""import os, socket, subprocess
+import pytest
+
+@pytest.fixture(autouse=True)
+def no_real_native_effects(monkeypatch):
+    def blocked(*args, **kwargs):
+        raise AssertionError('Neutral qualification forbids real process/signal/socket effects')
+    class NoNativePopen(subprocess.Popen):
+        def __new__(cls, *args, **kwargs):
+            raise AssertionError('Neutral qualification forbids process instantiation')
+    monkeypatch.setattr(subprocess, 'Popen', NoNativePopen)
+    for name in ('run', 'call', 'check_call', 'check_output'):
+        monkeypatch.setattr(subprocess, name, blocked)
+    for name in ('system', 'kill', 'killpg'):
+        monkeypatch.setattr(os, name, blocked, raising=False)
+    class NoNativeSocket(socket.socket):
+        def __new__(cls, *args, **kwargs):
+            raise AssertionError('Neutral qualification forbids socket instantiation')
+    monkeypatch.setattr(socket, 'socket', NoNativeSocket)
+""", encoding="utf8")
+    script = """import os, socket, subprocess, sys
+def blocked(*args, **kwargs):
+    raise AssertionError('Neutral qualification forbids real effects during import/collection')
+class NoNativePopen(subprocess.Popen):
+    def __new__(cls, *args, **kwargs):
+        raise AssertionError('Neutral qualification forbids process instantiation during import/collection')
+subprocess.Popen = NoNativePopen
+for name in ('run', 'call', 'check_call', 'check_output'):
+    setattr(subprocess, name, blocked)
+for name in ('system', 'kill', 'killpg'):
+    setattr(os, name, blocked)
+class NoNativeSocket(socket.socket):
+    def __new__(cls, *args, **kwargs):
+        raise AssertionError('Neutral qualification forbids socket instantiation during import/collection')
+socket.socket = NoNativeSocket
+os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
+sys.path[:0] = sys.argv[1:3]
+import pytest
+raise SystemExit(pytest.main(sys.argv[3:]))
+"""
+    argv = [PYTHON, "-I", "-B", "-c", script, str(extraction / "HPC-Forest/src"), str(root),
+            "--noconftest", "-p", "no:cacheprovider", "-p", "qualification_no_effects", "-q",
+            *map(str, tests), "--basetemp", str(root / "lane-delta-fixtures"),
+            "--junitxml=" + str(root / "lane-delta.xml")]
+    save(root / "lane-delta-intent.json", {"argv": argv, "launch_count": 1,
+         "native_model_calls": 0, "no_retry": True, "expected_test_cases": sum(NEUTRAL_TESTS.values()),
+         "test_suites": NEUTRAL_TESTS, "effect_blocker_sha256": file_sha(plugin)})
+    try:
+        process = subprocess.run(argv, capture_output=True, check=False, timeout=180,
+                                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                                      "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"})
+    except subprocess.TimeoutExpired as exc:
+        (root / "lane-delta.stdout").write_bytes(exc.stdout or b"")
+        (root / "lane-delta.stderr").write_bytes(exc.stderr or b"")
+        save(root / "lane-delta-process.json", {"returncode": 124, "timed_out": True,
+             "partial_stdout_preserved": True, "partial_stderr_preserved": True,
+             "executions": 1, "retry": False, "native_model_calls": 0})
+        raise RuntimeError("Owned neutral tests timed out; partial streams preserved, no retry") from exc
+    (root / "lane-delta.stdout").write_bytes(process.stdout)
+    (root / "lane-delta.stderr").write_bytes(process.stderr)
+    save(root / "lane-delta-process.json", {"returncode": process.returncode, "timed_out": False,
+         "executions": 1, "retry": False, "native_model_calls": 0})
+    import xml.etree.ElementTree as ET
+    suites = ET.fromstring((root / "lane-delta.xml").read_bytes()).findall(".//testsuite")
+    cases = sum(int(s.get("tests", "0")) for s in suites)
+    require(process.returncode == 0 and cases == sum(NEUTRAL_TESTS.values())
+            and all(int(s.get(k, "0")) == 0 for s in suites for k in ("failures", "errors", "skipped")),
+            "Exact newly reviewed neutral suites/counts must pass once without skips")
+    return {"returncode": process.returncode, "passed": cases, "executions": 1,
+            "native_model_calls": 0, "test_suites": NEUTRAL_TESTS,
+            "junit_sha256": file_sha(root / "lane-delta.xml")}
+
+
+def main(bindings):
+    allocation = allocation_guard()
+    root, payload = validate_bindings(bindings)
+    require(not root.exists() and not root.is_symlink(), "Prior attempt exists; preserve it without replay")
+    root.mkdir()
+    receipt = {"schema": "hpc-forest-primes-r2max-qualification-envelope-v1", "scope_id": SCOPE,
+               "started_utc": datetime.now(UTC).isoformat(), "allocation": allocation,
+               "bindings": bindings, "native_model_calls": 0, "native_research_admitted": False,
+               "performance_claimed": False, "qualification_launched_count": 0,
+               "passed": False, "negative_preserved_no_retry": True,
+               "python_executable": sys.executable, "python_version": sys.version,
+               "spack_gcc_hash": SPACK_GCC, "qualification_returncode": None}
+    save(root / "allocation-before-work.json", receipt)
+    extraction, output, before = root / "extraction", root / "Q", None
+    try:
+        material, sources = validate_bundle(bindings, payload)
+        write_new_tree(extraction, merge_extraction(material, sources))
+        before = inventory(extraction)
+        save(root / "input-inventory-before.json", before)
+        receipt["lane_delta_tests"] = run_lane_delta_tests(root, extraction)
+        deadline_guard()
+        allocation_guard()
+        argv, command = make_command(extraction, output)
+        save(root / "qualification-launch-intent.json",
+             {"argv": argv, "allocated_shell_argv": command, "launch_count": 1,
+              "native_model_calls": 0, "no_retry": True, "utc": datetime.now(UTC).isoformat()})
+        receipt["qualification_launched_count"] = 1
+        try:
+            process = subprocess.run(command, capture_output=True, check=False, timeout=780,
+                                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                                          "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "4"})
+            stdout, stderr, code = process.stdout, process.stderr, process.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr, code = exc.stdout or b"", exc.stderr or b"", 124
+            receipt["timeout"] = "Owned direct qualification process timed out; no recursive stop or retry"
+        (root / "qualification-launch.stdout").write_bytes(stdout)
+        (root / "qualification-launch.stderr").write_bytes(stderr)
+        receipt["qualification_returncode"] = code
+        qualification_path = output / "qualification.json"
+        qualification_raw = qualification_path.read_bytes()
+        qualification = json.loads(qualification_raw)
+        with (root / "qualification-original.json").open("xb") as original:
+            original.write(qualification_raw)
+        # Preserve the original remote prepared_root and receipt bytes; never normalize these paths.
+        receipt["qualification_path"] = str(qualification_path)
+        receipt["qualification_sha256"] = digest(qualification_raw)
+        receipt["prepared_root_original"] = qualification.get("prepared_root")
+        receipt["qualification_allocation_original"] = qualification.get("allocation")
+        receipt["qualification_archive_sidecar_sha256"] = file_sha(root / "Q-archive.json")
+        inner_archive = json.loads((root / "Q-archive.json").read_text(encoding="utf8"))
+        receipt["qualification_archive_identity"] = verify_inner_archive_identity(inner_archive, root / "Q.tar.gz")
+        receipt["qualification_archive_sha256"] = inner_archive["sha256"]
+        prepared_identity = (verify_prepared_root_identity(qualification, output / "prepared")
+                             if qualification.get("verified") is True else None)
+        receipt["prepared_root_identity"] = prepared_identity
+        if qualification.get("verified") is True:
+            receipt["official_evaluator_trace_identity"] = verify_trace_root_identity(qualification, output / "official-evaluator-trace")
+            receipt["original_inner_archive_verification"] = verify_inner_archive_members(
+                qualification, qualification_raw, root / "Q.tar.gz", load_allocated_trace_verifier(extraction))
+        receipt["passed"] = (code == 0 and qualification.get("verified") is True
+                             and qualification.get("scope_id") == SCOPE
+                             and qualification.get("source_zip_sha256") == bindings["source_zip_sha256"]
+                             and qualification.get("plan_sha256") == bindings["plan_sha256"]
+                             and qualification.get("reference_source_sha256") == REFERENCE_SHA
+                             and qualification.get("compiler_flags") == FLAGS
+                             and qualification.get("preparation_manifest_sha256") == PREPARATION_SHA
+                             and qualification.get("reference_outputs_all_certified_bytes") is True
+                             and qualification.get("unique_certified_cases") == 12
+                             and qualification.get("native_model_calls") == 0
+                             and qualification.get("native_research_admitted") is False
+                             and prepared_identity is not None
+                             and receipt.get("original_inner_archive_verification", {}).get("verified") is True
+                             and qualification_allocation_matches(qualification.get("allocation"), allocation))
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, ImportError, AttributeError,
+            SyntaxError, tarfile.TarError, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
+        receipt.update(passed=False, error_type=type(exc).__name__, error=str(exc),
+                       private_traceback=traceback.format_exc())
+    finally:
+        try:
+            after = inventory(extraction) if extraction.exists() else None
+            receipt["input_files_unchanged"] = before is not None and before == after
+            save(root / "input-inventory-after.json", {"files": after})
+        except (OSError, ValueError, RuntimeError) as exc:
+            receipt["input_files_unchanged"] = False
+            receipt["inventory_error"] = type(exc).__name__ + ": " + str(exc)
+        receipt["passed"] = receipt["passed"] and receipt["input_files_unchanged"]
+        receipt["finished_utc"] = datetime.now(UTC).isoformat()
+        preserve_envelope(root, receipt)
+    return 0 if receipt["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit("Unbound local template: require sealed reviewed final bindings in the allocated command")

@@ -1,0 +1,102 @@
+#include <iostream>
+#include <vector>
+#include <cstdio>
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+#include <omp.h>
+
+static inline int read_int() {
+    int x = 0;
+    char c = getchar_unlocked();
+    while (c <= ' ') c = getchar_unlocked();
+    bool neg = false;
+    if (c == '-') { neg = true; c = getchar_unlocked(); }
+    while (c >= '0' && c <= '9') {
+        x = x * 10 + (c - '0');
+        c = getchar_unlocked();
+    }
+    return neg ? -x : x;
+}
+
+int main() {
+    int n = read_int();
+    int s = read_int();
+
+    // Flattened matrix storage (row-major)
+    std::vector<int> mat(n * n);
+    for (int i = 0; i < n; ++i) {
+        int base = i * n;
+        for (int j = 0; j < n; ++j) {
+            mat[base + j] = read_int();
+        }
+    }
+
+    const int stride = n + 1;
+    std::vector<int64_t> ps(stride * stride, 0);
+
+    // Two-pass integral image construction (horizontal then vertical)
+    for (int i = 0; i < n; ++i) {
+        long long row_sum = 0;
+        int base_i = (i + 1) * stride;
+        int mat_base = i * n;
+        for (int j = 0; j < n; ++j) {
+            row_sum += mat[mat_base + j];
+            ps[base_i + (j + 1)] = row_sum;
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        const int64_t *prev_row = &ps[i * stride];
+        int64_t *cur_row = &ps[(i + 1) * stride];
+        for (int j = 0; j < n; ++j) {
+            cur_row[j + 1] += prev_row[j + 1];
+        }
+    }
+
+    // Search for maximum SxS submatrix sum using OpenMP and NEON
+    int64_t mxSum = LLONG_MIN;
+    const int jmax = n - s;
+
+#pragma omp parallel for reduction(max:mxSum) schedule(static)
+    for (int i = 0; i <= n - s; ++i) {
+        const int base_i   = i * stride;
+        const int base_is  = (i + s) * stride;
+
+#ifdef __ARM_NEON
+        // Process two consecutive columns at once using NEON.
+        int j = 0;
+        for (; j + 1 <= jmax; j += 2) {
+            const int64x2_t v_a = vld1q_s64(&ps[base_is + (j + s)]);
+            const int64x2_t v_b = vld1q_s64(&ps[base_i  + (j + s)]);
+            const int64x2_t v_c = vld1q_s64(&ps[base_is + j]);
+            const int64x2_t v_d = vld1q_s64(&ps[base_i  + j]);
+
+            // sum = a - b - c + d
+            int64x2_t sum = vsubq_s64(v_a, v_b);
+            sum = vsubq_s64(sum, v_c);
+            sum = vaddq_s64(sum, v_d);
+
+            const int64_t s0 = vgetq_lane_s64(sum, 0);
+            const int64_t s1 = vgetq_lane_s64(sum, 1);
+            if (s0 > mxSum) mxSum = s0;
+            if (s1 > mxSum) mxSum = s1;
+        }
+        // Handle remaining column.
+        for (; j <= jmax; ++j) {
+#else
+        // Scalar fallback (auto-vectorized by compiler).
+        for (int j = 0; j <= jmax; ++j) {
+#endif
+            const int64_t sum_val = ps[base_is + (j + s)] - ps[base_i + (j + s)]
+                                  - ps[base_is + j] + ps[base_i + j];
+            if (sum_val > mxSum) mxSum = sum_val;
+        }
+    }
+
+    printf("%lld\n", static_cast<long long>(mxSum));
+    return 0;
+}

@@ -1,0 +1,54 @@
+$ErrorActionPreference = 'Stop'
+$taskBase = 'C:\Users\nicol\Documents\Codex\2026-10-15\cr'
+$taskOut = Join-Path $taskBase 'outputs\HPC-Forest-Primes-Natif-Lancement-r1'
+$taskAuth = Join-Path $taskOut 'admissions\authorization-local.json'
+$taskPython = Join-Path $taskBase 'work\.venv\Scripts\python.exe'
+$taskSource = Join-Path $taskBase 'work\hpc-forest-primes-native-max-r1\project\src'
+$taskCliIdentity = Get-Content -LiteralPath (Join-Path $taskOut 'cli-identity.json') -Raw | ConvertFrom-Json
+$taskCli = $taskCliIdentity.executable_path
+$taskSession = 'c8044062692149138d826d3f388a08ef'
+$taskJob = '751992'
+$taskChannel = '/scratch_p/nimarano/hpc-forest-primes-native-max-r1-c8044062692149138d826d3f388a08ef/results-751992/mailbox'
+$taskWorker = Join-Path $taskOut 'worker'
+$taskAuthData = Get-Content -LiteralPath $taskAuth -Raw | ConvertFrom-Json
+if ($taskAuthData.verified -ne $true -or $taskAuthData.job_id -ne $taskJob -or $taskAuthData.session_id -ne $taskSession -or $taskAuthData.effort -ne 'max' -or $taskAuthData.model -ne 'gpt-6-luna') { throw 'Wrong native authorization' }
+if ((Get-FileHash -LiteralPath $taskCli -Algorithm SHA256).Hash.ToLower() -ne $taskCliIdentity.executable_sha256) { throw 'CLI bytes changed' }
+if (-not (Get-Command Start-Process).Parameters.ContainsKey('Environment')) { throw 'Per-child environment support required' }
+if (Test-Path -LiteralPath $taskWorker) { throw 'Worker cache already exists; preserve without replay' }
+$taskAllocEnd = [DateTimeOffset]::Parse('2026-10-18T01:47:07Z')
+$taskRemaining = [Math]::Floor(($taskAllocEnd - [DateTimeOffset]::UtcNow).TotalSeconds)
+$taskMaxSeconds = [Math]::Min(10800, $taskRemaining + 870)
+if ($taskMaxSeconds -le 0) { throw 'Allocation delivery reserve expired' }
+$taskArguments = @('-B','-u','-m','hpc_forest.r2max_worker','--channel',$taskChannel,'--session-id',$taskSession,'--output',$taskWorker,'--codex-config','C:\Users\nicol\.codex\config.toml','--dependency-receipt',$taskAuth,'--required-jobs','hpc-forest-primes-native-max-r1','--max-seconds',[string]$taskMaxSeconds,'--executable',$taskCli)
+foreach ($taskArgument in $taskArguments) { if ($taskArgument -match '[\s"]') { throw 'Argument requires a different reviewed quoting strategy' } }
+$taskRoute = Join-Path $taskBase 'outputs\HPC-Forest-Harnais-Comparaison-r1\reprises\bascule-max-r2-20261017\route-secondaire-max.json'
+if (Test-Path -LiteralPath $taskRoute) { throw 'Secondary native route already exists' }
+$null = New-Item -ItemType Directory -Path $taskWorker
+$taskStarted = [DateTimeOffset]::UtcNow
+$taskIntent = [ordered]@{schema='hpc-forest-primes-r2max-owned-worker-launch-intent-v1';verified=$true;job_id=$taskJob;session_id=$taskSession;model='gpt-6-luna';effort='max';utc=$taskStarted.ToString('o');executable=$taskPython;arguments=$taskArguments;max_seconds=$taskMaxSeconds;one_launch_only=$true;authorization=@{path=$taskAuth;sha256=(Get-FileHash -LiteralPath $taskAuth -Algorithm SHA256).Hash.ToLower()};native_first_start_proved=$false}
+[IO.File]::WriteAllText((Join-Path $taskOut 'worker-launch-intent.json'),($taskIntent | ConvertTo-Json -Depth 7),[Text.UTF8Encoding]::new($false))
+$taskEnvironment = @{PYTHONPATH=$taskSource;PYTHONDONTWRITEBYTECODE='1';PYTHONUNBUFFERED='1';PATH=((Split-Path -Parent $taskCli) + ';' + $env:PATH)}
+$taskProcess = Start-Process -FilePath $taskPython -ArgumentList $taskArguments -WorkingDirectory $taskBase -WindowStyle Hidden -RedirectStandardOutput (Join-Path $taskOut 'worker.stdout.log') -RedirectStandardError (Join-Path $taskOut 'worker.stderr.log') -Environment $taskEnvironment -PassThru
+[IO.File]::WriteAllText((Join-Path $taskOut 'worker-start-pid.json'),(@{pid=$taskProcess.Id;utc=[DateTimeOffset]::UtcNow.ToString('o');job_id=$taskJob;session_id=$taskSession} | ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+$taskPair = @()
+$taskEnd = [DateTimeOffset]::UtcNow.AddSeconds(10)
+do {
+  $taskRows = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,@{n='CreationDate';e={$_.CreationDate.ToUniversalTime().ToString('o')}})
+  $taskPair = @($taskRows | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLower().EndsWith('python.exe') -and $_.CommandLine -like '*-m hpc_forest.r2max_worker*' -and $_.CommandLine -like "*--session-id $taskSession*" })
+  if ($taskPair.Count -eq 2) { break }
+  Start-Sleep -Milliseconds 100
+} while ([DateTimeOffset]::UtcNow -lt $taskEnd)
+[IO.File]::WriteAllText((Join-Path $taskOut 'cim-after-worker-launch.json'),($taskRows | ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+if ($taskPair.Count -ne 2) { throw 'Complete owned launcher/Python pair not observed; no restart or stop authorized by this helper' }
+if ($taskPair[0].CommandLine -ne $taskPair[1].CommandLine -or -not (($taskPair[0].ParentProcessId -eq $taskPair[1].ProcessId) -or ($taskPair[1].ParentProcessId -eq $taskPair[0].ProcessId))) { throw 'Owned pair relation differs' }
+if ($taskProcess.Id -notin $taskPair.ProcessId) { throw 'Started process is not in observed pair' }
+foreach ($taskRow in $taskPair) {
+  if (-not $taskRow.ExecutablePath -or -not $taskRow.CommandLine -or -not $taskRow.CreationDate -or [DateTimeOffset]::Parse($taskRow.CreationDate) -lt $taskStarted.AddSeconds(-1)) { throw 'Incomplete or stale owned identity' }
+}
+$taskRouteData = [ordered]@{schema='hpc-forest-max-secondary-lane-route-v1';role='R2-MAX';job_id=$taskJob;session_id=$taskSession;model='gpt-6-luna';effort='max';admission_receipt=@{path=$taskAuth;sha256=(Get-FileHash -LiteralPath $taskAuth -Algorithm SHA256).Hash.ToLower()};relay_identities=$taskPair}
+$taskTemporary = $taskRoute + '.pending-' + [Guid]::NewGuid().ToString('N')
+[IO.File]::WriteAllText($taskTemporary,($taskRouteData | ConvertTo-Json -Depth 7),[Text.UTF8Encoding]::new($false))
+[IO.File]::Move($taskTemporary,$taskRoute)
+[IO.File]::WriteAllText((Join-Path $taskOut 'worker-lancement.json'),($taskRouteData | ConvertTo-Json -Depth 7),[Text.UTF8Encoding]::new($false))
+[pscustomobject]@{verified=$true;job_id=$taskJob;session_id=$taskSession;launcher_pid=$taskProcess.Id;pair=$taskPair.ProcessId;native_first_start_proved=$false;route_written=$true} | ConvertTo-Json -Depth 4
+

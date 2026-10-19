@@ -6,7 +6,7 @@ _Keep every claim connected to a concrete observation and its provenance._
 
 Report a reproducibility problem, improve an explanation, add a meaningful rejection test, or propose an independently collected comparison. Identify the affected release/commit and include the smallest public example that supports the issue.
 
-New data should arrive as a separate named cohort with a frozen plan, actual environment, raw observations, complete negative outcomes and provenance. Do not replace older observations, alter an oracle after seeing failures or present an unexecuted plan as a result. Keep confidential implementations and protected inputs outside contributions.
+New data should arrive as a separate named cohort with a frozen plan, actual environment, raw observations, complete negative outcomes and provenance. Do not replace older observations, alter an oracle after seeing failures or present an unexecuted plan as a result. The owner-authorized historical source release is described separately in the full snapshot. Do not contribute credentials or another party's confidential material. Historical cases made public by this release must not be described as unseen tests in a future experiment.
 
 ## Local checks
 

@@ -1,0 +1,147 @@
+#include "knn.h"
+#include <omp.h>
+
+static float *local_dist;
+static char *local_labels;
+static int *local_idx;
+#pragma omp threadprivate(local_dist, local_labels, local_idx)
+
+typedef struct {
+    float d;
+    char label;
+    int idx;
+} Candidate;
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    // Count total points across all groups
+    int N_total = 0;
+    for (int i = 0; i < n_groups; i++) N_total += groups[i].length;
+
+    // Flatten points and their labels into contiguous arrays
+    Point *points_flat = (Point*)malloc(sizeof(Point) * N_total);
+    char *labels_flat = (char*)malloc(sizeof(char) * N_total);
+    int offset = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            points_flat[offset] = g.points[j];
+            labels_flat[offset] = g.label;
+            offset++;
+        }
+    }
+
+    int max_threads = omp_get_max_threads();
+    Candidate *all_cands = (Candidate*)malloc(sizeof(Candidate) * max_threads * k);
+    int *counts = (int*)calloc(max_threads, sizeof(int));
+
+    #pragma omp parallel
+    {
+        local_dist = (float*)malloc(sizeof(float) * k);
+        local_labels = (char*)malloc(sizeof(char) * k);
+        local_idx = (int*)malloc(sizeof(int) * k);
+
+        for (int i = 0; i < k; i++) {
+            local_dist[i] = -1;
+            local_labels[i] = -1;
+            local_idx[i] = -1;
+        }
+
+        #pragma omp for schedule(static)
+        for (int idx = 0; idx < N_total; idx++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, points_flat[idx]);
+            char lab = labels_flat[idx];
+
+            int x;
+            for (x = 0; x < k; x++) {
+                if (d < local_dist[x] || local_dist[x] == -1) {
+                    // Shift larger distances to the right
+                    for (int y = k - 1; y > x; y--) {
+                        local_dist[y] = local_dist[y - 1];
+                        local_labels[y] = local_labels[y - 1];
+                        local_idx[y] = local_idx[y - 1];
+                    }
+                    local_dist[x] = d;
+                    local_labels[x] = lab;
+                    local_idx[x] = idx;
+                    break;
+                }
+            }
+        }
+
+        int tid = omp_get_thread_num();
+        int cnt = 0;
+        while (cnt < k && local_dist[cnt] != -1) {
+            all_cands[tid * k + cnt].d = local_dist[cnt];
+            all_cands[tid * k + cnt].label = local_labels[cnt];
+            all_cands[tid * k + cnt].idx = local_idx[cnt];
+            cnt++;
+        }
+        counts[tid] = cnt;
+
+        free(local_dist);
+        free(local_labels);
+        free(local_idx);
+    }
+
+    int total_count = 0;
+    for (int t = 0; t < max_threads; t++) {
+        total_count += counts[t];
+    }
+
+    int actual_k = k < total_count ? k : total_count;
+    char *labels = (char*)malloc(sizeof(char) * actual_k);
+    if (actual_k > 0) {
+        int *pos = (int*)calloc(max_threads, sizeof(int));
+        for (int i = 0; i < actual_k; i++) {
+            int best_t = -1;
+            for (int t = 0; t < max_threads; t++) {
+                if (pos[t] < counts[t]) {
+                    Candidate *cand = &all_cands[t * k + pos[t]];
+                    if (best_t == -1) {
+                        best_t = t;
+                    } else {
+                        Candidate *best_cand = &all_cands[best_t * k + pos[best_t]];
+                        if (cand->d < best_cand->d ||
+                            (cand->d == best_cand->d && cand->idx < best_cand->idx)) {
+                            best_t = t;
+                        }
+                    }
+                }
+            }
+            Candidate *chosen = &all_cands[best_t * k + pos[best_t]];
+            labels[i] = chosen->label;
+            pos[best_t]++;
+        }
+        free(pos);
+    }
+
+    qsort(labels, actual_k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < actual_k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == actual_k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(points_flat);
+    free(labels_flat);
+    free(all_cands);
+    free(counts);
+
+    return most_frequent;
+}

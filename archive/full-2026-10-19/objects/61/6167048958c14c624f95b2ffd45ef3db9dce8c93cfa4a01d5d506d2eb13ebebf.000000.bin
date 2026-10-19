@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "/*\n    This program solves Laplace's equation on a regular 2D grid using simple Jacobi iteration.\n\n    The stencil calculation stops when  ( err >= CONV_THRESHOLD OR  iter > ITER_MAX )\n*/\n#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n#include <sys/time.h>\n#ifdef _OPENMP\n#include <omp.h>\n#endif\n\n#define CONV_THRESHOLD 1.0e-5f // threshold of convergence\n\n// matrix to be solved\ndouble **grid;\n\n// auxiliary matrix\ndouble **new_grid;\n\n// size of each side of the grid\nint size;\nint iter_max_num;\n\n// return the absolute value of a number\ndouble absolute(double num){\n    if(num < 0)\n        return -1.0 * num;\n    return num;\n}\n\n\n// allocate memory for the grid\nvoid allocate_memory(){\n    grid = (double **) malloc(size * sizeof(double *));\n    new_grid = (double **) malloc(size * sizeof(double *));\n\n    for(int i = 0; i < size; i++){\n        grid[i] = (double *) malloc(size * sizeof(double));\n        new_grid[i] = (double *) malloc(size * sizeof(double));\n    }\n}\n\n// initialize the grid\nvoid initialize_grid(){\n    int center = size / 2;\n    int linf = center - (size / 10);\n    int lsup = center + (size / 10);\n    for (int i = 0; i < size; i++){\n        for (int j = 0; j < size; j++){\n            // inicializa região de calor no centro do grid\n            if ( i >= linf && i <= lsup && j >= linf && j <= lsup)\n                grid[i][j] = 100;\n            else\n                grid[i][j] = 0;\n            // Both buffers retain the same fixed boundaries when swapped.\n            new_grid[i][j] = grid[i][j];\n        }\n    }\n}\n\n// Calculate one interior row without changing the stencil evaluation order.\nstatic inline int update_row(int i){\n    int changed = 0;\n    for(int j = 1; j < size-1; j++){\n        new_grid[i][j] = 0.25 * (grid[i][j+1] + grid[i][j-1] +\n                                 grid[i-1][j] + grid[i+1][j]);\n\n        double errorCurrent = absolute(new_grid[i][j] - grid[i][j]);\n        if(errorCurrent > CONV_THRESHOLD){\n            changed = 1;\n        }\n    }\n    return changed;\n}\n\n// save the grid in a file\nvoid save_grid(){\n\n    for(int i = 0; i < size; i++){\n        for(int j = 0; j < size; j++){\n            fprintf(stdout, \"%lf \", grid[i][j]);\n        }\n        fprintf(stdout, \"\\n\");\n    }\n}\n\nint main(int argc, char *argv[]){\n\n    fscanf(stdin, \"%d\", &size);\n    fscanf(stdin, \"%d\", &iter_max_num);\n\n    int hasError = 1;\n    int iter = 0;\n\n    struct timeval time_start;\n    struct timeval time_end;\n\n    // allocate memory to the grid (matrix)\n    allocate_memory();\n\n    // set grid initial conditions\n    initialize_grid();\n\n    //printf(\"Jacobi relaxation calculation: %d x %d grid\\n\", size, size);\n\n    // get the start time\n    //gettimeofday(&time_start, NULL);\n\n    // Jacobi iteration\n#ifdef _OPENMP\n    // Amortize synchronization with at least 8192 interior cells per worker.\n    size_t interior_side = size > 2 ? (size_t)(size - 2) : 0;\n    size_t useful_threads = interior_side * interior_side / 8192;\n    int thread_count = omp_get_max_threads();\n    if((size_t)thread_count > useful_threads){\n        thread_count = (int)useful_threads;\n    }\n\n    if(thread_count > 1 && iter_max_num > 0){\n        int finished = 0;\n        hasError = 0;\n\n        #pragma omp parallel num_threads(thread_count) shared(hasError, iter, finished)\n        {\n            while(1){\n                #pragma omp for schedule(static) reduction(|:hasError)\n                for(int i = 1; i < size-1; i++){\n                    hasError |= update_row(i);\n                }\n\n                // The reduction barrier completes every row before the swap.\n                #pragma omp single\n                {\n                    double **previous_grid = grid;\n                    grid = new_grid;\n                    new_grid = previous_grid;\n                    iter++;\n                    finished = !hasError || iter >= iter_max_num;\n                    if(!finished){\n                        hasError = 0;\n                    }\n                }\n                // The single-region barrier publishes the swap and decision.\n                if(finished){\n                    break;\n                }\n            }\n        }\n    } else\n#endif\n    {\n        // Small workloads avoid OpenMP worksharing and barrier overhead.\n        while(hasError && iter < iter_max_num){\n            hasError = 0;\n            for(int i = 1; i < size-1; i++){\n                hasError |= update_row(i);\n            }\n\n            double **previous_grid = grid;\n            grid = new_grid;\n            new_grid = previous_grid;\n            iter++;\n        }\n    }\n\n    // get the end time\n    //gettimeofday(&time_end, NULL);\n\n    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +\n    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;\n\n    //save the final grid in file\n    save_grid();\n\n    //printf(\"\\nKernel executed in %lf seconds with %d iterations.\\n\", exec_time, iter);\n\n    return 0;\n}\n",
+        "path": "src/laplace_seq.c"
+      }
+    ],
+    "hypothesis": "A persistent OpenMP team with static row scheduling, integer convergence reduction, and synchronized buffer swapping should reduce Jacobi runtime on four ARM64 cores while avoiding threading overhead for small grids.",
+    "notes": "Unmeasured; no commands executed. Preserves stencil arithmetic order, strict threshold comparison, fixed boundaries, iteration limits, and output formatting. Builds without OpenMP use the serial path.",
+    "sources_kept": [],
+    "transformations": [
+      "Use one persistent OpenMP region with static row work sharing and bitwise-OR convergence reduction.",
+      "Limit the team to at least 8192 interior cells per worker, respecting the runtime thread maximum; use a serial path below two workers.",
+      "Replace interior copy-back with buffer swaps, initializing both buffers identically to preserve boundaries, including degenerate grids."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "026feb60667f4fe195c94b29c390d65a",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "6cc1d40a28a2a83e66caaf3f963330a12388788471eced00543ac70064a972c7",
+  "session_id": "aa970cf8bf5d4c1aaa0fdabb21d73a72",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "bc0f577c922a534a872caa960414388064035a33f9a11684c1fcf2336746e988",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 4224,
+        "input_tokens": 12520,
+        "output_tokens": 7861,
+        "reasoning_output_tokens": 6214
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 20381,
+    "tool_events": []
+  }
+}

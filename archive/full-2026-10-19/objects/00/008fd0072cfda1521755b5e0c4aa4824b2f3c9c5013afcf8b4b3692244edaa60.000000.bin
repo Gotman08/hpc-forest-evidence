@@ -1,0 +1,182 @@
+"""Publish local scientific addenda from received hashes and all raw samples.
+
+This reads no active model state and supplies no context to a generation worker.
+"""
+import csv
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
+
+ROOT = Path(__file__).resolve().parent
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf8"))
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    received = load(ROOT / "scaling-reception-verifiee.json")
+    assert received["points_verified"] == 125 and received["timed_runs_verified"] == 625
+    data = load(ROOT / "preuves-748067/results/results.json")
+    static = load(ROOT / "conformite-statique.json")
+    previous = load(ROOT.parent / "HPC-Forest-Etude-2020-2024-r1/comparaison-precise-max.json")
+    points = data["points"]
+    lookup = {(p["program"], p["size"], p["cores"]): p for p in points}
+    names = ["gpt-6-luna", "gpt-6-astra", "gpt-5.6-terra", "gpt-6.1-sol", "reference"]
+    short = {"gpt-6-luna": "Luna", "gpt-6-astra": "Astra", "gpt-5.6-terra": "Terra",
+             "gpt-6.1-sol": "Sol 6.1", "reference": "Référence"}
+    colors = dict(zip(names, ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#555555"]))
+    fields = ["program", "size", "cores", "reference_seconds", "mean_seconds", "seconds_saved",
+              "time_reduction_fraction", "speedup_vs_reference", "own_speedup_vs_one_core",
+              "own_parallel_efficiency", "stdev_seconds", "median_seconds", "input_sha256", "correct"]
+    with (ROOT / "comparaison-125-configurations.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fields)
+        writer.writeheader()
+        writer.writerows({k: p[k] for k in fields} for p in points)
+    with (ROOT / "mesures-brutes-625.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+        fields_raw = ["program", "size", "cores", "repetition", "seconds", "stdout_sha256", "returncode", "matches_oracle"]
+        writer = csv.DictWriter(stream, fields_raw)
+        writer.writeheader()
+        for p in points:
+            for ordinal, sample in enumerate(p["samples"], 1):
+                writer.writerow({"program": p["program"], "size": p["size"], "cores": p["cores"],
+                                 "repetition": ordinal, **{k: sample[k] for k in fields_raw[4:]}})
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
+                         "axes.spines.top": False, "axes.spines.right": False})
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.7), layout="constrained")
+    x = data["core_counts"]
+    for name in names:
+        values = [lookup[name, 16384, c] for c in x]
+        axes[0].errorbar(x, [v["mean_seconds"] * 1000 for v in values],
+                        yerr=[v["stdev_seconds"] * 1000 for v in values], label=short[name],
+                        marker="o", color=colors[name], linewidth=1.8, capsize=3)
+        if name != "reference":
+            axes[1].plot(x, [v["own_speedup_vs_one_core"] for v in values],
+                         marker="o", color=colors[name], label=short[name], linewidth=1.8)
+    axes[1].plot(x, x, linestyle="--", color="#999999", label="Idéal linéaire")
+    for ax in axes:
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(x, labels=x)
+        ax.set_xlabel("Cœurs physiques accessibles au programme")
+        ax.grid(alpha=.2)
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("Temps du processus complet (ms, log)")
+    axes[0].set_title("Temps absolus · moyenne de 5 mesures ± écart-type")
+    axes[0].legend(frameon=False, ncols=2, fontsize=9)
+    axes[1].set_ylabel("Accélération du même programme : T(1) / T(p)")
+    axes[1].set_title("Astra exploite les cœurs ; les autres courbes restent ≈ 1")
+    axes[1].legend(frameon=False, ncols=2, fontsize=9)
+    fig.suptitle("2023-count · N = 16 384 · exécutables inchangés · ROMEO ARM64", fontsize=14)
+    for extension in ["png", "svg"]:
+        fig.savefig(ROOT / ("courbes-1-2-4-8-16." + extension), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    fig, axes = plt.subplots(1, 5, figsize=(16, 4), sharey=True, layout="constrained")
+    core_colors = ["#0072B2", "#56B4E9", "#009E73", "#E69F00", "#D55E00"]
+    for ax, name in zip(axes, names, strict=True):
+        for cores, color in zip(x, core_colors, strict=True):
+            ax.plot(data["profiled_sizes"], [lookup[name, n, cores]["mean_seconds"] * 1000
+                    for n in data["profiled_sizes"]], color=color, marker="o", label=str(cores))
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_xticks([512, 4096, 16384], ["512", "4 096", "16 384"], rotation=25)
+        ax.set_xlabel("Dimension N de la grille N × N")
+        ax.set_title(short[name])
+        ax.grid(alpha=.2)
+    axes[0].set_ylabel("Temps total (ms, échelle logarithmique)")
+    axes[0].legend(title="Cœurs", frameon=False, fontsize=8)
+    fig.suptitle("Cinq tailles et cinq affinités CPU · mêmes entrées et mêmes binaires", fontsize=14)
+    for extension in ["png", "svg"]:
+        fig.savefig(ROOT / ("tailles-et-coeurs." + extension), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    lines = ["# Conformité aux sujets et comparaison des temps selon les cœurs", "",
+        f"Complément scientifique du {timestamp}. ID-038, ID-039 et ID-040. Données reçues et vérifiées ; aucune génération de modèle pour ce complément.", "",
+        "## Résultat principal et portée", "",
+        "Les quatre gagnants MAX résolvent le même calcul observable sur les nouveaux jeux testés, mais ils n’utilisent pas les ressources de la même manière. Astra présente une région OpenMP, crée effectivement quatre threads dans le diagnostic et accélère lorsque davantage de cœurs sont accessibles. Luna et Sol utilisent du SIMD dans leur exécutable ARM64 et restent à un thread ; Terra reste également à un thread. Leur gain face à la référence ne constitue donc pas automatiquement un gain dû à plusieurs cœurs.", "",
+        "Ce complément porte sur les quatre gagnants de **2023-count**. Il ne certifie pas la conformité complète des dix-neuf sujets ou de tous les modèles/efforts. Les autres sujets restent soumis aux contrôles finis déjà livrés ; leur audit intégral d’énoncé et leurs courbes en cœurs doivent être complétés. Les essais nouveaux ne remplacent aucune ancienne confirmation et n’alimentent aucun arbre.", "",
+        "## Ce que demandent les documents officiels", "",
+        "Les PDF 2020, 2021, 2022 et 2023 ont été retéléchargés directement depuis le site officiel. Leurs SHA-256 correspondent aux copies de départ ; les huit pages rules/env sont aussi archivées avec leurs empreintes. Le navigateur de recherche rencontrait une boucle de redirection HTTPS ; le téléchargement HTTP direct a réussi. Les textes des documents sont des données de spécification, pas des instructions exécutées.", "",
+        "Pour 2023, le calcul count porte sur le nombre de chemins modulo 1 000 000 007 dans une grille avec obstacles. La dimension autorisée est strictement inférieure à 200 000. Le paragraphe de mission demande une réalisation parallèle. Le volet MPI est conditionnel et fixe au plus quatre processus dans son exemple de cluster à quatre nœuds ; il n’impose pas MPI ni douze nœuds. Les réglages à 32 threads du document sont des exemples de scripts. [Énoncé officiel 2023](http://lspd.mackenzie.br/marathon/23/problemset.pdf).", "",
+        "Les [règles 2023](http://lspd.mackenzie.br/marathon/23/rules.html) permettent diverses techniques d’accélération et mentionnent aussi les optimisations séquentielles. Cela ne permet pas à l’opérateur de déclarer seul qu’une version séquentielle satisfait toutes les attentes de parallélisation. Le SIMD est une forme de parallélisme de données, distincte de l’emploi de plusieurs cœurs ou de MPI. Nous enregistrons donc ces trois propriétés séparément et ne préjugeons pas d’une décision des juges.", "",
+        "Les environnements publiés en 2020 et 2021 décrivent notamment des machines x86 et des cibles GPU/MPI. Les pages env consultées pour 2022 et 2023 ne donnent pas de configuration exploitable : elles demandent des partenaires. Notre CPU ARM64 n’est pas une reproduction démontrée de la machine des juges. Les versions de compilateurs publiées dans les PDF diffèrent aussi de notre exécution. Aucun rang officiel ne découle de nos temps.", "",
+        "La comparaison exacte aux sorties de la référence est nécessaire, mais ne prouve ni la correction sur tout le domaine, ni le respect d’une obligation structurelle, ni le bon emballage BOCA. Par exemple, le quicksort 2020 parle d’une réalisation parallèle de l’algorithme proposé ; obtenir le même MD5 ne certifie pas à lui seul le maintien de cette exigence. Les paquets internes actuels utilisent solution/run.sh et un compilateur figé ; leur conformité aux noms de scripts et aux variables CC/CXX du dépôt officiel n’a pas été certifiée. [Énoncé 2020](http://lspd.mackenzie.br/marathon/20/problemset.pdf).", "",
+        "## Un problème de préparation retenu avant la future campagne primes", "",
+        "Le texte 2020 décrit des fragments issus de nombres premiers. Notre générateur antérieur choisissait indépendamment des fragments décimaux aléatoires : il ne prouve pas cette garantie. Le contrat reçu du prévol R3 contient notamment deux sorties search vides. Cela démontre la nécessité de revoir le domaine admis et les divergences possibles entre énoncé et référence ; il ne faut pas rebaptiser automatiquement ces entrées comme des cas officiels légitimes.", "",
+        "Le supplément R2 n’avait appelé aucun modèle : son lancement est retenu par CONFORMITE-EN-ATTENTE.json et un garde local du coordinateur. Ni sa source figée, ni l’algorithme officiel, ni un candidat n’ont été réparés. Une préparation certifiée et un nouveau protocole sont nécessaires avant ce supplément. Les trois autres exclusions historiques restent séparées : observabilité de Jacobi 2020, checksum Johnson 2021 et diagnostic d’initialisation de path 2023. Un prévol qui compile une référence ne certifie pas à lui seul son domaine mathématique.", "",
+        "## Provenance des programmes et du contrôle initial", "",
+        "Les programmes sont exactement les binaires retenus après les cinq confirmations des jobs Luna 747952, Astra 747967, Terra 747988 et Sol 748008. Chaque empreinte a été comparée à l’évaluation enregistrée dans sa base reçue en lecture seule. Les sources exportées pour lecture sont sous sources-gagnants-lecture-seule. Elles n’ont pas été modifiées ni recompilées pour les deux nouveaux jobs.", "",
+        "Le diagnostic 748060 a utilisé quatre cœurs ARM64 et 16 GiB, sans GPU et sans modèle. Il a comparé les sorties de 22 entrées, comprenant l’ancien benchmark et 21 entrées supplémentaires de tailles 1, 2, 3, 4, 97, 1 024 et 8 192, à l’oracle inchangé. Chaque gagnant a été lancé sur ces cas avec OMP_NUM_THREADS égal à 1 puis 4, soit 176 exécutions de candidats. Toutes ont donné les sorties de la référence. Un échantillonnage /proc a observé au maximum un thread pour Luna/Terra/Sol et quatre pour Astra. La granularité des ticks CPU ne permet pas de mesurer précisément le travail de chaque thread pendant des processus si courts.", "",
+        "Le désassemblage reçu contient des additions vectorielles ARM dans Luna et Sol ; le symbole GOMP_parallel apparaît pour Astra. La présence d’instructions dans un binaire n’est pas une trace exhaustive de leur exécution sur toutes les entrées. Ces observations et le code explicite sont conservés comme indices techniques séparés des courbes de performance. Les temps collectés avec cet échantillonneur ne sont pas utilisés pour les tableaux suivants.", "",
+        "## Protocole de la montée en cœurs", "",
+        "Le job 748067 a réservé seize cœurs physiques distincts sur romeo-a057, une tâche, 16 GiB et zéro GPU. srun a lié le processus à ses seize CPU alloués ; les identifiants de cœurs physiques ont été contrôlés dans sysfs. Pour chaque exécution, le parent et l’enfant ont été limités à un sous-ensemble de 1, 2, 4, 8 ou 16 de ces cœurs. Le runtime recevait le même nombre de threads, avec OMP_DYNAMIC=FALSE, OMP_PROC_BIND=close et OMP_PLACES=cores. Le nombre de cœurs accessibles ne signifie pas que chaque programme les utilise.", "",
+        "Cinq tailles N ont été testées : 512, 2 048, 4 096, 8 192 et 16 384. Chaque entrée est une grille N × N, avec une génération déterministe d’obstacles de graine 23 et des empreintes identiques pour tous les programmes et tous les nombres de cœurs de cette taille. La densité d’obstacles varie avec N ; cette distribution n’épuise pas celles de l’énoncé. La référence inchangée fournit les sorties attendues. Un résultat n’est chronométriquement accepté que si son code retour et ses octets de sortie sont corrects.", "",
+        "Pour chaque taille, cinq programmes — référence et quatre gagnants — ont été mesurés sur cinq nombres de cœurs. Un tour de chauffe est écarté ; cinq tours sont conservés. L’ordre des 25 combinaisons programme/cœurs est mélangé par une graine enregistrée à chaque tour. Cela représente 125 configurations, 625 mesures conservées, 125 chauffes et cinq calculs initiaux d’oracle. Il n’y a pas d’échantillonneur de threads pendant ces temps. La durée mesurée est celle du processus complet, démarrage et entrées/sorties inclus, avec un même mécanisme subprocess.run. Les programmes n’ont pas été réoptimisés séparément pour seize cœurs.", "",
+        "L’archive finale et ses six fichiers ont été vérifiés avant/après recalcul des statistiques. Les empreintes des cinq binaires sont identiques avant/après. Tous les octets de sortie comparés sont conformes à l’oracle. L’efficacité Slurm moyenne est de 6,2 % sur les seize CPU réservés : les phases à un cœur et la référence séquentielle occupent une grande part de la durée. Cette moyenne n’est pas l’efficacité parallèle d’Astra sur un point particulier. Le RSS maximal n’est pas disponible dans le reçu ; les 16 GiB sont une allocation, pas une consommation mesurée.", "",
+        "## Calculs utilisés", "",
+        "Pour une taille et une affinité données, T_ref et T_opt sont les moyennes arithmétiques de cinq durées. Secondes gagnées : ΔT = T_ref − T_opt. Réduction : 100 × (1 − T_opt / T_ref). Accélération par rapport à la référence : T_ref / T_opt. Montée en cœurs du même programme : S(p) = T_opt(1) / T_opt(p). Efficacité parallèle : S(p) / p. Ces rapports répondent à des questions différentes : un grand gain face à une référence lente ne prouve pas l’utilisation de plusieurs cœurs.", "",
+        "Les tableaux conservent six décimales en secondes, les CSV/JSON les flottants enregistrés et les cinq échantillons. Les barres d’erreur sont des écarts-types de durées, pas des intervalles de confiance sur une supériorité générale des modèles. Une seule recherche a choisi chaque gagnant ; répéter son chronométrage ne constitue pas plusieurs recherches indépendantes.", "",
+        "## Temps absolus sur la grille 16 384 × 16 384", "",
+        "| Cœurs accessibles | Référence (s) | Luna (s) | Astra (s) | Terra (s) | Sol 6.1 (s) |",
+        "|---:|---:|---:|---:|---:|---:|"]
+    for c in data["core_counts"]:
+        lines.append("| " + str(c) + " | " + " | ".join(f"{lookup[name,16384,c]['mean_seconds']:.6f}" for name in ["reference", *names[:-1]]) + " |")
+    lines += ["", "| Programme, 16 cœurs accessibles | Référence → programme (s) | Secondes gagnées | Réduction | Gain sur son propre temps à 1 cœur | Efficacité à 16 |",
+              "|---|---:|---:|---:|---:|---:|"]
+    for name in names[:-1]:
+        p = lookup[name, 16384, 16]
+        lines.append(f"| {short[name]} | {p['reference_seconds']:.6f} → {p['mean_seconds']:.6f} | {p['seconds_saved']:.6f} | {p['time_reduction_fraction']:.3%} | ×{p['own_speedup_vs_one_core']:.3f} | {p['own_parallel_efficiency']:.2%} |")
+    lines += ["", "![Temps absolus et accélération du même programme](courbes-1-2-4-8-16.png)", "",
+        "Pour Astra, le temps passe de 0,054660 s sur un cœur à 0,009482 s sur seize. Le facteur de montée en cœurs est ×5,764, avec 36,03 % d’efficacité relativement à l’idéal ×16. Sa réduction de 99,194 % face aux 1,176323 s de la référence est un autre rapport. Luna et Sol sont déjà proches de 0,035 s sur un cœur ; Terra est proche de 0,273 s. Leurs faibles variations avec p ne constituent pas une démonstration d’accélération multicœur.", "",
+        "## Explication des différences et limites", "",
+        "La région OpenMP d’Astra est conditionnelle à la taille et partage effectivement du travail dans le code. L’absence d’amélioration de Luna/Sol/Terra quand on augmente l’affinité est cohérente avec l’observation d’un seul thread. Luna et Sol ont du parallélisme SIMD à l’intérieur d’un cœur. La courbe ne mesure pas isolément combien de leur gain vient du SIMD, de la réduction des allocations ou d’autres transformations ; il faudrait des expériences séparées pour établir ces contributions. Aucun programme n’a utilisé MPI dans ces contrôles.", "",
+        "Le coût de lancement et les parties séquentielles limitent particulièrement les petits cas. Le travail par thread, les synchronisations, la mémoire et les entrées/sorties peuvent expliquer une efficacité inférieure à l’idéal, mais cette attribution reste une interprétation à tester par profilage. Les autres jobs pouvaient partager le nœud ; nous avons réservé les cœurs et entrelacé les mesures, sans obtenir une exclusivité du nœud ou une fréquence CPU fixe.", "",
+        "Le plus grand N nouveau vaut 16 384, et non 199 999. Les nouveaux jeux augmentent la couverture de tailles et ne démontrent toujours pas la correction pour toutes les entrées admissibles, les grandes densités, tous les adversaires ou toutes les machines. Le meilleur programme à un cœur diffère du meilleur à seize sur ces mesures : le choix du matériel est donc une partie du protocole expérimental, pas un détail décoratif.", "",
+        "## Arbres, jetons et différence entre génération et mesure", "",
+        "Les nouveaux jobs n’ont créé aucun sommet MCTS, appelé aucune mère et consommé aucun nouveau jeton de génération. Ils exécutent les résultats existants. Les compteurs ci-dessous décrivent les recherches MAX précédentes de 2023-count ; ils ne sont pas multipliés par les 125 configurations de mesure.", "",
+        "| Modèle MAX | Sommets notés précédents | Profondeur | Fils maximum | Jetons natifs exacts connus | Appels sans compteur exact |",
+        "|---|---:|---:|---:|---:|---:|"]
+    for row in previous["rows"]:
+        lines.append(f"| {short[row['model']]} | {row['scored_nodes']} | {row['max_depth']} | {row['max_children']} | {row['total_tokens_known']} | {row['unknown_calls']} |")
+    lines += ["", "Ces nombres de sommets excluent les quatre racines structurelles A/B/C/G de R1. Une émission interne du harnais et un appel mère ne sont pas automatiquement un sommet. Les réservations sur les appels interrompus ne sont pas présentées comme des consommations exactes. Le détail des requêtes, délais et bilans reste dans COMPARAISON-PRECISE-MAX.md et ses preuves. La nouvelle mère dynamique R4 n’est pas validée par ces anciennes recherches fixes.", "",
+        "## Annexes complètes et traçabilité", "",
+        "Les tableaux de toutes les tailles suivent ci-dessous. comparaison-125-configurations.csv contient les moyennes, écarts-types, médianes, secondes gagnées et rapports ; mesures-brutes-625.csv donne chaque durée, code retour et empreinte de sortie. Les ordres d’exécution, affinités physiques, empreintes d’entrées, sorties et binaires sont dans preuves-748067/results/results.json. Les sources, désassemblages et observations de threads sont séparés dans les dossiers de preuves, sans les transformer en contextes de modèle.", "",
+        "Archives : diagnostic 748060 SHA-256 eee970be176627ac554a981cb4fd02ce72ef1c5851a3bff23dba3484bf432701 ; mesure 748067 SHA-256 cd80af91aff57da700f55b23de55f16f95abf9d86f819a69b2ebc67b1f75d4c3. Les reçus de réception, efficacités et vérifications sont joints. Ces deux jobs sont terminés et ne doivent pas être relancés pour modifier leurs résultats.", "",
+        "La comparaison avec les vingt couples modèle/effort, les autres problèmes et les nouvelles racines dynamiques reste un travail distinct. Les contraintes demandées par ID-040 sont désormais explicites dans CONTRAT-DE-DETAILS-RAPPORT.md. Les éléments non établis seront nommés, jamais comblés par un récit inventé.", "",
+        "![Temps selon les tailles pour chaque programme](tailles-et-coeurs.png)", "", "## Tous les tableaux par taille", ""]
+    for n in data["profiled_sizes"]:
+        lines += [f"### Grille {n:,} × {n:,}".replace(",", " "), "",
+                  "| Cœurs | Référence (s) | Luna (s) | Astra (s) | Terra (s) | Sol 6.1 (s) |",
+                  "|---:|---:|---:|---:|---:|---:|"]
+        for c in data["core_counts"]:
+            lines.append("| " + str(c) + " | " + " | ".join(f"{lookup[name,n,c]['mean_seconds']:.6f}" for name in ["reference", *names[:-1]]) + " |")
+        lines.append("")
+    (ROOT / "RAPPORT-CONFORMITE-ET-COEURS.md").write_text("\n".join(lines) + "\n", encoding="utf8")
+    summary = {"generated_utc": timestamp, "scope": "four closed MAX winners of 2023-count",
+               "requirements_review": "PDFs 2020–2023 plus rules/env pages, refreshed and SHA-256 verified",
+               "runtime_diagnostic": load(ROOT / "reception-verifiee-748060.json"),
+               "scaling": received, "fully_official_contest_compliance_certified": False,
+               "old_confirmations_replaced": False, "model_calls_in_new_tests": 0,
+               "primes_supplement_held_for_domain_review": True,
+               "other_subjects_core_scaling_complete": False,
+               "largest_size_points": [lookup[name,16384,c] for name in names for c in data["core_counts"]]}
+    (ROOT / "resultats-verifies.json").write_text(json.dumps(summary, indent=2) + "\n")
+    manifest = {p.name: sha(p) for p in ROOT.iterdir() if p.is_file() and p.name != "MANIFEST-RAPPORT.json"}
+    (ROOT / "MANIFEST-RAPPORT.json").write_text(json.dumps({"generated_utc": timestamp, "files": manifest}, indent=2) + "\n")
+    print(json.dumps({"report": str((ROOT / 'RAPPORT-CONFORMITE-ET-COEURS.md').resolve()),
+                      "configurations": 125, "raw_samples": 625, "model_calls": 0}))
+
+
+if __name__ == "__main__":
+    main()

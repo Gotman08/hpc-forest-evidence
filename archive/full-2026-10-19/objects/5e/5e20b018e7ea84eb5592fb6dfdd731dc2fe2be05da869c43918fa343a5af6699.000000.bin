@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\n/*\n * Compute the gravitational impact among all pairs of bodies in\n * the system.\n */\nvoid body_force(Body *p, float dt, int n) {\n  for (int i = 0; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/*\n * Advance into a separate buffer, keeping the source state read-only.\n * All threads in the persistent team call this work-sharing function.\n */\nstatic void body_step(const Body *p, Body *next, float dt, int n) {\n  #pragma omp for schedule(static)\n  for (int i = 0; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    next[i] = p[i];\n    next[i].vx += dt*fx;\n    next[i].vy += dt*fy;\n    next[i].vz += dt*fz;\n\n    next[i].x += next[i].vx * DT;\n    next[i].y += next[i].vy * DT;\n    next[i].z += next[i].vz * DT;\n  }\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n  Body *scratch = (Body *)malloc((size_t)nbodies * sizeof(Body));\n  Body *result = bodies;\n\n  if (scratch != NULL) {\n    #pragma omp parallel\n    {\n      Body *current = bodies;\n      Body *next = scratch;\n\n      for (int iter = 0; iter < N_ITER; iter++) {\n        body_step(current, next, DT, nbodies);\n\n        /* The implicit work-sharing barrier completes the next state. */\n        Body *tmp = current;\n        current = next;\n        next = tmp;\n      }\n    }\n\n    result = (N_ITER & 1) ? scratch : bodies;\n  } else {\n    /* Preserve the original simulation if the extra buffer is unavailable. */\n    for (int iter = 0; iter < N_ITER; iter++) {\n      body_force(bodies, DT, nbodies);\n\n      for (int i = 0; i < nbodies; i++) {\n        bodies[i].x += bodies[i].vx * DT;\n        bodies[i].y += bodies[i].vy * DT;\n        bodies[i].z += bodies[i].vz * DT;\n      }\n    }\n  }\n\n  write_dataset(nbodies, result);\n\n  free(scratch);\n  free(bodies);\n\n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "Double-buffered states should improve persistent OpenMP work sharing by fusing force and position updates, requiring only one work-sharing barrier per timestep and avoiding writes to shared source cache lines.",
+    "notes": "Adds O(n) storage with an original serial fallback on allocation failure. Preserves ascending-j accumulation and arithmetic expressions. No commands or measurements executed.",
+    "sources_kept": [],
+    "transformations": [
+      "Alternate between the original Body array and one temporary Body array.",
+      "Fuse each target body's force, velocity and position updates in a statically scheduled OpenMP loop.",
+      "Reuse one OpenMP team across all ten timesteps, with thread-local buffer swaps after each implicit barrier."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "09a2e9ba980644148434a521aeeabdc6",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "c622394d1587c2a34feb776d98ce39cdb8e002a2ae50ed64778ffb725a5f88cf",
+  "session_id": "665743a02b824021a697b6a4884a667c",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "ae548a1fc3164fa708ed1a2f4fb9ce792ba7672b48315c369b85e63e318345dd",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 11998,
+        "output_tokens": 8725,
+        "reasoning_output_tokens": 7163
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 20723,
+    "tool_events": []
+  }
+}

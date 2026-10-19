@@ -1,0 +1,47 @@
+"""Read-only proof of local model identity and independence from prior candidates."""
+import hashlib,json,sys
+from pathlib import Path
+
+def read(p):return json.loads(p.read_text(encoding='utf8'))
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def verify(root, previous, previous_diagnostic):
+ identity=read(root/'model-identity.json');spec=read(root/'model-specification.json')
+ installed=read(root/'model-manifest.json');downloads=read(root/'weight-downloads.json')
+ assert sha(root/'model-manifest-raw.json')==identity['model_digest']
+ assert read(root/'model-manifest-raw.json')==installed
+ assert identity['model']==spec['model'] and identity['server_version']=='0.40.4'
+ expected={f['sha256']:f['bytes'] for f in spec['files']}
+ assert {d['verified_sha256']:d['bytes'] for d in downloads}==expected
+ model_layers=[l for l in installed['layers'] if l['mediaType']=='application/vnd.ollama.image.model']
+ assert {l['digest'].removeprefix('sha256:'):l['size'] for l in model_layers}==expected
+ assert all(d['sha256']==d['verified_sha256'] and sum(x['bytes'] for x in d['ranges'])==d['bytes'] for d in downloads)
+ assert read(root/'cleanup.json')['owned_cache_removed'] and read(root/'cleanup.json')['owned_server_stopped']
+ old_ids=set()
+ for old in previous.rglob('report/experiments.json'):
+  data=read(old)
+  old_ids.update(t['id'] for t in data.get('experiments',[]))
+ diagnostic=read(previous_diagnostic)
+ diagnostic_ids={r['experiment_id'] for r in diagnostic['responses']}
+ assert len(diagnostic_ids)==6 and diagnostic['job_id']=='747374'
+ old_ids.update(diagnostic_ids)
+ results=[]
+ for problem in read(root/'results.json')['problems']:
+  slug=problem['problem'];campaign=root/slug
+  report=read(campaign/'report/experiments.json');settings=report['config']['ollama']
+  assert settings['model']==identity['model'] and settings['model_digest']==identity['model_digest']
+  assert problem['identity']['model_digest']==identity['model_digest']
+  count=0
+  for request in (campaign/'logs').glob('*/ollama-request.json'):
+   raw=request.read_text(encoding='utf8');data=json.loads(raw)
+   assert data['model']==identity['model']
+   assert all(old_id not in raw for old_id in old_ids), request
+   assert '20261015-r9-' not in raw and '20261015-r10b-' not in raw
+   assert 'quality-review.json' not in raw and 'compiler-review.json' not in raw
+   assert '20261015-v11b-' not in raw
+   count+=1
+  results.append({'problem':slug,'recorded_model_requests':count,'pinned_digest':settings['model_digest'],'previous_trial_ids_excluded':len(old_ids),'previous_diagnostic_ids_excluded':len(diagnostic_ids),'manual_candidate_edits':0})
+ return {'verified':True,'model':identity['model'],'repository':spec['upstream'],'revision':spec['revision'],'shards_verified':len(expected),'weight_bytes':sum(expected.values()),'cloud_inference':False,'controller_and_prompt_changes':False,'problems':results}
+
+if __name__=='__main__':
+ root=Path(sys.argv[1]);result=verify(root,Path(sys.argv[2]),Path(sys.argv[4]));Path(sys.argv[3]).write_text(json.dumps(result,indent=2)+'\n',encoding='utf8');print(json.dumps(result))

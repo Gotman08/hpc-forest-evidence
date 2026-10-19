@@ -1,0 +1,194 @@
+"""Only the new r2 graph/phase/unknown-effect guards. No r1 test suite replay."""
+import ast
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('pure_owned_graph21', HERE / 'graphe_possede_21.py')
+graph = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(graph)
+HISTORY = json.loads((HERE / 'GRAPHE-HISTORIQUE-21-CANDIDAT.json').read_text(encoding='utf8'))
+
+
+def rows():
+    return {node['identity']['ProcessId']: copy.deepcopy(node['identity']) for node in HISTORY['nodes']}
+
+
+def outsider(parent, command='inert foreign child', birth='2026-10-18T15:00:00.0000000Z'):
+    return {'ProcessId': 900001, 'ParentProcessId': parent, 'ExecutablePath': 'C:\\inert\\python.exe',
+            'CommandLine': command, 'CreationDate': birth}
+
+
+class NewOwned21Guards(unittest.TestCase):
+    def test_exact21_contextual_graph_accepted_as_observation_data(self):
+        state = graph.check_current_graph(rows(), HISTORY)
+        self.assertEqual(state['present_ids'], graph.ALL_IDS)
+        self.assertFalse(state['all21_absent'])
+        self.assertFalse(state['all_three_mains_absent'])
+
+    def test_historical_roles_dates_edges_closed(self):
+        expected = graph.validate_history(HISTORY)
+        self.assertEqual(len(expected), 21)
+        self.assertEqual({role: sum(n['role'] == role for n in expected.values()) for role in graph.ROLES},
+                         {role: 3 for role in graph.ROLES})
+        for kind in ('role', 'edge', 'birth', 'count', 'admission'):
+            candidate = copy.deepcopy(HISTORY)
+            if kind == 'role': candidate['nodes'][0]['role'] = 'foreign'
+            if kind == 'edge': candidate['nodes'][0]['identity']['ParentProcessId'] += 1
+            if kind == 'birth': candidate['nodes'][0]['identity']['CreationDate'] = '2026-10-18T14:00:00.0000000Z'
+            if kind == 'count': candidate['nodes'].pop()
+            if kind == 'admission': candidate['fresh_effect_authorization'] = True
+            with self.subTest(kind=kind), self.assertRaises(ValueError): graph.validate_history(candidate)
+
+    def test_every_service_five_fields_are_authoritative(self):
+        for pid in graph.ALL_IDS:
+            for field in graph.FIELDS:
+                current = rows()
+                current[pid][field] = current[pid][field] + 1 if type(current[pid][field]) is int else current[pid][field] + '-changed'
+                with self.subTest(pid=pid, field=field), self.assertRaises(ValueError): graph.check_current_graph(current, HISTORY)
+
+    def test_same_historical_orphans_allowed_after_main_parent_natural_exit(self):
+        current = rows()
+        for pid in graph.MAIN_IDS + graph.ROLE_IDS['worker_launcher'] + graph.ROLE_IDS['mcp_launcher']:
+            del current[pid]
+        state = graph.check_current_graph(current, HISTORY)
+        self.assertTrue(state['all_three_mains_absent'])
+        self.assertTrue(all(pid in state['present_ids'] for pid in graph.ROLE_IDS['mcp_ssh']))
+
+    def test_reused_absent_main_or_service_pid_refuses(self):
+        for pid in (graph.MAIN_IDS[0], graph.ROLE_IDS['mcp_ssh'][0]):
+            current = {pid: copy.deepcopy(rows()[pid])}
+            current[pid]['CreationDate'] = '2026-10-18T17:50:00.0000000Z'
+            with self.subTest(pid=pid), self.assertRaisesRegex(ValueError, 'reused'): graph.check_current_graph(current, HISTORY)
+
+    def test_new_descendant_at_every_depth_refused(self):
+        for parent in graph.ALL_IDS:
+            current = rows(); current[900001] = outsider(parent)
+            with self.subTest(parent=parent), self.assertRaisesRegex(ValueError, 'Unexpected descendant'):
+                graph.check_current_graph(current, HISTORY)
+
+    def test_opaque_possible_descendant_refused(self):
+        current = rows(); current[900001] = outsider(graph.ROLE_IDS['mcp_python'][0]); current[900001]['CommandLine'] = None
+        with self.assertRaisesRegex(ValueError, 'five-field'): graph.check_current_graph(current, HISTORY)
+
+    def test_orphan_unlisted_cohort_cli_marker_blocks(self):
+        current = rows(); current[900001] = outsider(123456, 'inert -C worker-' + graph.CELL_ROWS[0][2])
+        with self.assertRaisesRegex(ValueError, 'cohort session/cache marker'): graph.check_current_graph(current, HISTORY)
+
+    def test_unrelated_process_is_never_adopted_as_effect_target(self):
+        current = rows(); current[900001] = outsider(123456)
+        state = graph.check_current_graph(current, HISTORY)
+        self.assertNotIn(900001, graph.effect_scope(True, True, state))
+        older = outsider(graph.MAIN_IDS[0], birth='2026-10-18T14:00:00.0000000Z')
+        current[900001] = older
+        self.assertNotIn(900001, graph.check_current_graph(current, HISTORY)['present_ids'])
+
+    def test_all21_natural_absence_requires_no_effect(self):
+        state = graph.check_current_graph({}, HISTORY)
+        self.assertTrue(state['all21_absent'])
+        self.assertEqual(graph.effect_scope(False, False, state), [])
+        self.assertEqual(graph.effect_scope(True, True, state), [])
+
+    def test_non_action_observation_has_fresh_complete_bound_and_no_admission(self):
+        now = datetime(2026, 10, 18, 17, 50, tzinfo=UTC)
+        census = {'complete_census': True, 'rows_count': 0, 'rows': [], 'captured_at_utc': now.isoformat()}
+        self.assertTrue(graph.observe_fresh_supplied(census, HISTORY, now)['all21_absent'])
+        for kind in ('stale', 'future', 'incomplete', 'count'):
+            candidate = copy.deepcopy(census)
+            if kind == 'stale': candidate['captured_at_utc'] = (now - timedelta(seconds=46)).isoformat()
+            if kind == 'future': candidate['captured_at_utc'] = (now + timedelta(seconds=1)).isoformat()
+            if kind == 'incomplete': candidate['complete_census'] = False
+            if kind == 'count': candidate['rows_count'] = 1
+            with self.subTest(kind=kind), self.assertRaises(ValueError): graph.observe_fresh_supplied(candidate, HISTORY, now)
+        source = (HERE / 'constater-naturel-sans-action-21.py').read_text(encoding='utf8')
+        ast.parse(source)
+        for forbidden in ('Get-CimInstance', 'Get-Process', 'Popen', '.Kill(', 'worker.lock'):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("'effect_or_stop_admitted': False", source)
+
+    def test_default_three_main_phase_and_explicit_service_opt_in(self):
+        state = graph.check_current_graph(rows(), HISTORY)
+        self.assertEqual(graph.effect_scope(False, False, state), [])
+        self.assertEqual(graph.effect_scope(True, False, state), graph.MAIN_IDS)
+        self.assertEqual(graph.effect_scope(True, True, state), graph.ALL_IDS)
+        with self.assertRaises(ValueError): graph.effect_scope(False, True, state)
+
+    def test_service_requires_all_mains_absent_and_initial_opt_in(self):
+        current = rows(); live = graph.check_current_graph(current, HISTORY); target = graph.ROLE_IDS['mcp_ssh'][0]
+        with self.assertRaises(ValueError): graph.service_effect_allowed(target, live, True)
+        for pid in graph.MAIN_IDS: del current[pid]
+        absent = graph.check_current_graph(current, HISTORY)
+        with self.assertRaises(ValueError): graph.service_effect_allowed(target, absent, False)
+        self.assertTrue(graph.service_effect_allowed(target, absent, True))
+        with self.assertRaises(ValueError): graph.service_effect_allowed(graph.MAIN_IDS[0], absent, True)
+
+    def test_fixed_effect_order_main_then_services_leaf_to_root(self):
+        self.assertEqual(graph.ALL_IDS[:3], graph.MAIN_IDS)
+        self.assertEqual(len(set(graph.ALL_IDS)), 21)
+        for cell in graph.CELL_ROWS:
+            main, launcher, console, mcp, mcp_console, mcp_python, ssh = cell[3:]
+            self.assertLess(graph.ALL_IDS.index(main), graph.ALL_IDS.index(ssh))
+            self.assertLess(graph.ALL_IDS.index(ssh), graph.ALL_IDS.index(mcp_python))
+            self.assertLess(graph.ALL_IDS.index(mcp_python), graph.ALL_IDS.index(mcp))
+            self.assertLess(graph.ALL_IDS.index(mcp_console), graph.ALL_IDS.index(mcp))
+            self.assertLess(graph.ALL_IDS.index(console), graph.ALL_IDS.index(launcher))
+
+    def test_unknown_effect_or_unproven_natural_exit_refuses_next_action(self):
+        for issued, waited, exited in ((True, False, False), (True, False, True), (True, True, False), (False, False, False)):
+            with self.subTest(issued=issued, waited=waited, exited=exited), self.assertRaisesRegex(ValueError, 'unknown'):
+                graph.audit_effect_result(issued, waited, exited)
+        self.assertEqual(graph.audit_effect_result(False, False, True), 'already_exited_naturally')
+        self.assertIn('no_causality', graph.audit_effect_result(True, True, True))
+
+    def test_source_and_final_pins_remain_non_admis(self):
+        pin = json.loads((HERE / 'PIN-SOURCE-CONFIG-GRAPHE-NON-ADMIS.json').read_text(encoding='utf8'))
+        self.assertEqual(pin['status'], 'NON_ADMIS'); self.assertIsNone(pin['path']); self.assertIsNone(pin['sha256'])
+        finals = json.loads((HERE / 'PINS-FINAUX-NON-ADMIS.json').read_text(encoding='utf8'))
+        self.assertEqual(len(finals['proofs']), 6)
+        self.assertTrue(all(p['status'] == 'NON_ADMIS' and p['path'] is None and p['sha256'] is None for p in finals['proofs'].values()))
+        self.assertFalse(finals['effect_admitted'])
+
+    def test_new_wrapper_static_durable_handles_scope_and_unknown_stop(self):
+        source = (HERE / 'fermer-identites-possedes-r2g-r2.ps1').read_text(encoding='utf8')
+        for forbidden in ('Stop-Process', 'taskkill', 'Get-Process -Name', '.Kill($true)', '/T'):
+            self.assertNotIn(forbidden, source)
+        self.assertEqual(source.count('$taskOwned.Kill()'), 1)
+        self.assertIn('[IO.FileMode]::CreateNew', source); self.assertIn('$taskStream.Flush($true)', source)
+        self.assertIn('FinishRemainingOwned', source); self.assertIn('EFFET-UNKNOWN-', source)
+        self.assertIn('permitted_effect_ids', source)
+        self.assertLess(source.index('Final proof NON_ADMIS'), source.index('function New-TaskCensus'))
+        self.assertLess(source.index('Write-NewTaskJson @{schema=\'hpc-forest-r2g-fixed21-individual-effect-intent'), source.index('$taskOwned.Kill()'))
+        self.assertIn('$taskOwned.StartTime.ToUniversalTime().Ticks -ne $taskBirthTicks', source)
+        self.assertIn('$taskGrace.Elapsed.TotalSeconds -lt 20', source)
+
+    def test_only_two_inherited_functions_changed_no_old_test_replay(self):
+        old = HERE.parent / 'fermeture-relais-r2g-r1/preparer-fermeture-r2g.py'
+        new = HERE / 'preparer-fermeture-r2g-r2.py'
+        def functions(path):
+            return {n.name: ast.dump(n, include_attributes=False) for n in ast.parse(path.read_text(encoding='utf8')).body if isinstance(n, ast.FunctionDef)}
+        before, after = functions(old), functions(new)
+        self.assertEqual(sorted(k for k in before if before[k] != after.get(k)), ['check_descendants', 'main'])
+        self.assertEqual(sorted(set(after) - set(before)), ['load_source_graph'])
+
+
+if __name__ == '__main__':
+    log = io.StringIO()
+    result = unittest.TextTestRunner(stream=log, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(NewOwned21Guards))
+    report = {'schema': 'hpc-forest-r2g-new-owned21-guards-neutral-tests-v2', 'new_guards_only': True,
+        'old_r1_tests_replayed': False, 'tests_run': result.testsRun, 'success': result.wasSuccessful(),
+        'failures': len(result.failures), 'errors': len(result.errors), 'details': log.getvalue(),
+        'observation_or_effect_main_executed': False, 'live_CIM_cache_CLI_MCP_process_or_network_access': False,
+        'tested_files_sha256': {name: hashlib.sha256((HERE / name).read_bytes()).hexdigest() for name in
+            ('graphe_possede_21.py', 'preparer-fermeture-r2g-r2.py', 'fermer-identites-possedes-r2g-r2.ps1',
+             'GRAPHE-HISTORIQUE-21-CANDIDAT.json', 'PIN-SOURCE-CONFIG-GRAPHE-NON-ADMIS.json', 'PINS-FINAUX-NON-ADMIS.json',
+             'constater-naturel-sans-action-21.py', 'test-nouveaux-gardes-21.py')}}
+    path = HERE / ('TESTS-NOUVEAUX-GARDES-21-' + datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ') + '.json')
+    with path.open('x', encoding='utf8') as stream: json.dump(report, stream, indent=2); stream.write('\n')
+    print(log.getvalue(), end=''); print('Neutral report: ' + str(path))
+    raise SystemExit(0 if result.wasSuccessful() else 1)

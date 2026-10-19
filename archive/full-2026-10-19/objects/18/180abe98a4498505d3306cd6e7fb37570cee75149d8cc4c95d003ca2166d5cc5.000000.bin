@@ -1,0 +1,229 @@
+#include "knn.h"
+#include <float.h>
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+
+static char knn_insertion_fallback(int n_groups, Group *groups, int k, Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * k);
+    float *distances = (float *)malloc(sizeof(float) * k);
+
+    int i, j, x, y;
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+static int compare_keys(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a;
+    uint64_t y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static uint64_t median_key(uint64_t a, uint64_t b, uint64_t c) {
+    if (a < b) {
+        return b < c ? b : (a < c ? c : a);
+    }
+    return a < c ? a : (b < c ? c : b);
+}
+
+/* Partition one compact stream; only the selected prefix is needed. */
+static void select_prefix(uint64_t *keys, size_t count, size_t take) {
+    if (take == 0 || take >= count) return;
+
+    size_t target = take - 1;
+    size_t lo = 0;
+    size_t hi = count;
+    size_t budget = count <= SIZE_MAX / 8 ? count * 8 : SIZE_MAX;
+
+    while (hi - lo > 24) {
+        size_t length = hi - lo;
+        if (length > budget) {
+            qsort(keys + lo, length, sizeof(*keys), compare_keys);
+            return;
+        }
+        budget -= length;
+
+        uint64_t pivot = median_key(keys[lo], keys[lo + length / 2], keys[hi - 1]);
+        size_t lower = lo;
+        size_t scan = lo;
+        size_t upper = hi;
+
+        while (scan < upper) {
+            uint64_t value = keys[scan];
+            if (value < pivot) {
+                keys[scan] = keys[lower];
+                keys[lower] = value;
+                lower++;
+                scan++;
+            } else if (value > pivot) {
+                upper--;
+                keys[scan] = keys[upper];
+                keys[upper] = value;
+            } else {
+                scan++;
+            }
+        }
+
+        if (target < lower) {
+            hi = lower;
+        } else if (target >= upper) {
+            lo = upper;
+        } else {
+            return;
+        }
+    }
+
+    for (size_t i = lo + 1; i < hi; i++) {
+        uint64_t value = keys[i];
+        size_t j = i;
+        while (j > lo && value < keys[j - 1]) {
+            keys[j] = keys[j - 1];
+            j--;
+        }
+        keys[j] = value;
+    }
+}
+
+static char vote_labels(const size_t *counts) {
+    char best = (char)-1;
+    size_t best_count = 0;
+    for (int value = CHAR_MIN; value <= CHAR_MAX; value++) {
+        size_t frequency = counts[(unsigned char)(char)value];
+        if (frequency > best_count) {
+            best_count = frequency;
+            best = (char)value;
+        }
+    }
+    return best;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0 || sizeof(float) != sizeof(uint32_t) ||
+        FLT_RADIX != 2 || FLT_MANT_DIG != 24 || FLT_MAX_EXP != 128) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            size_t length = (size_t)groups[i].length;
+            if (length > SIZE_MAX - total) {
+                return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+            }
+            total += length;
+        }
+    }
+
+    size_t counts[UCHAR_MAX + 1] = {0};
+    size_t take = (size_t)k;
+    if (take > total) {
+        counts[(unsigned char)((char)-1)] = take - total;
+        take = total;
+    }
+
+    if (take == total) {
+        for (int i = 0; i < n_groups; i++) {
+            if (groups[i].length > 0) {
+                counts[(unsigned char)groups[i].label] += (size_t)groups[i].length;
+            }
+        }
+        return vote_labels(counts);
+    }
+
+    if (total > SIZE_MAX / sizeof(uint64_t)) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+    uint64_t *keys = (uint64_t *)malloc(total * sizeof(*keys));
+    if (keys == NULL) {
+        return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t used = 0;
+    for (int i = 0; i < n_groups; i++) {
+        const Group *g = &groups[i];
+        for (int j = 0; j < g->length; j++) {
+            float distance = euclidean_distance_no_sqrt(to_evaluate, g->points[j]);
+            uint32_t bits;
+            memcpy(&bits, &distance, sizeof(bits));
+            uint32_t magnitude = bits & UINT32_C(0x7fffffff);
+            if (magnitude > UINT32_C(0x7f800000) ||
+                ((bits & UINT32_C(0x80000000)) && magnitude != 0)) {
+                free(keys);
+                return knn_insertion_fallback(n_groups, groups, k, to_evaluate);
+            }
+            if (magnitude == 0) bits = 0;
+
+            /* Equal distances prefer earlier groups, as in the input scan.
+               Ties within a group have identical labels. */
+            keys[used++] = ((uint64_t)bits << 32) | (uint32_t)i;
+        }
+    }
+
+    select_prefix(keys, total, take);
+    for (size_t i = 0; i < take; i++) {
+        uint32_t group_index = (uint32_t)keys[i];
+        counts[(unsigned char)groups[group_index].label]++;
+    }
+    free(keys);
+    return vote_labels(counts);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

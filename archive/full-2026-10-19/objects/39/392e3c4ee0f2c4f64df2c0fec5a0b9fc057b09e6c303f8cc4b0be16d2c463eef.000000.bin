@@ -1,0 +1,353 @@
+"""Astra-only LOCAL factory. Reads real parent observations; never starts any process."""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import re
+import time
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('astra_revision4', HERE / 'preparer-astra-max.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+SOURCE_REVIEW_SHA = '71285b2f1e04ffb6454b3bd67676cfd24bc759c866dc6430a980f099fe4e4ff1'
+QDIR = m.BASE / 'outputs/HPC-Forest-Primes-Natif-Qualification-r2b/reception-752087'
+LDIR = m.BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r1'
+FIELDS = {'ProcessId', 'ParentProcessId', 'ExecutablePath', 'CommandLine', 'CreationDate'}
+SO_SESSION = '665743a02b824021a697b6a4884a667c'
+
+
+def fresh(value, key='observed_at', now=None, ceiling=120):
+    text = value.get(key, '')
+    m.require(isinstance(text, str), 'UTC observation time required')
+    instant = datetime.fromisoformat(text)
+    m.require(instant.tzinfo is not None and 0 <= (time.time() if now is None else now) - instant.timestamp() <= ceiling,
+              'Real parent observation must be fresh within120seconds')
+
+
+def full_identity(row):
+    m.require(isinstance(row, dict) and FIELDS <= set(row), 'Five complete identity fields required')
+    value = {key: row[key] for key in FIELDS}
+    stamp = value['CreationDate']
+    m.require(isinstance(stamp, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z', stamp),
+              'UTC ISO full process creation time required')
+    if '.' in stamp:
+        stamp = stamp[:-1].rstrip('0').rstrip('.') + 'Z'
+    value['CreationDate'] = stamp
+    return value
+
+
+def check_census(census, expected_source_only, now=None, old_luna=()):
+    m.require(census.get('schema') == 'hpc-forest-primes-r2max-fresh-full-cim-v1'
+              and census.get('complete_census') is True, 'Complete UTF8 parent census required')
+    fresh(census, 'captured_at_utc', now)
+    rows = census.get('rows', [])
+    m.require(len(rows) == census.get('rows_count') and bool(rows), 'Complete census count mismatch')
+    m.require(all(isinstance(r, dict) and FIELDS <= set(r) and type(r['ProcessId']) is int for r in rows), 'Incomplete census rows')
+    m.require(len({r['ProcessId'] for r in rows}) == len(rows), 'Duplicate census PIDs')
+    by_pid = {r['ProcessId']: r for r in rows}
+    m.require({r['ProcessId'] for r in expected_source_only} == {37900, 37848}, 'Pinned source-only family required')
+    for row in expected_source_only:
+        m.require(row['ProcessId'] in by_pid and full_identity(by_pid[row['ProcessId']]) == full_identity(row),
+                  'Source-only five-field identity changed or absent')
+    for old in old_luna:
+        m.require(old['ProcessId'] not in by_pid or full_identity(by_pid[old['ProcessId']]) != full_identity(old),
+                  'An old owned Luna identity remains present')
+    native_rows = [r for r in rows if re.search(r'(?:^|\s)-m\s+hpc_forest\.(?:r2max_worker|matrix_worker|ablation_worker|codex_worker)(?:\s|$)', str(r['CommandLine']))]
+    m.require({r['ProcessId'] for r in native_rows} == {37900, 37848}
+              and all(SO_SESSION in r['CommandLine'] for r in native_rows), 'Another/old Luna/unknown native worker blocks the lane')
+    return [{key: by_pid[pid][key] for key in FIELDS} for pid in (37900, 37848)]
+
+
+def identity(value, job):
+    expected = {'scope_id': m.SCOPE, 'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION,
+                'job_id': job, 'source_zip_sha256': m.SOURCE, 'plan_sha256': m.PLAN}
+    m.require(all(value.get(k) == v for k, v in expected.items()), 'Observation is not the exact Astra/source/plan/job')
+
+
+def evidence(value):
+    refs = value.get('evidence_refs')
+    m.require(isinstance(refs, list) and bool(refs), 'Real local parent evidence references required')
+    for ref in refs:
+        m.artifact(ref)
+
+
+def check_observations(obs, job, source_only, old_luna):
+    m.require(obs.get('schema') == 'hpc-forest-astra-max-parent-observations-v1' and obs.get('verified') is True,
+              'Actual reviewed parent observations required; templates never admit')
+    identity(obs, job)
+    fresh(obs)
+    evidence(obs)
+    census = m.read(m.artifact(obs['complete_utf8_cim']))
+    so = check_census(census, source_only, old_luna=old_luna)
+    marker = m.read(m.artifact(obs['allocation_ready']))
+    identity(marker, job)
+    fresh(marker, 'utc', ceiling=600)
+    m.require(marker.get('schema') == 'hpc-forest-astra-max-allocation-ready-v1' and marker.get('verified') is True
+              and marker.get('admission_root') == m.ADMISSION_ROOT and marker.get('native_root') == m.REMOTE_ROOT
+              and marker.get('native_root_absent_before_wait') is True and marker.get('native_model_calls') == 0
+              and marker.get('authorization_still_required') is True and marker.get('source_files_verified') == 103,
+              'Actual allocated admission-directory marker required')
+    allocation = marker.get('allocation', {})
+    m.require(all(allocation.get(k) == v for k, v in {'job_id': job, 'nodes': 1, 'tasks': 1,
+        'cpus_per_task': 4, 'memory_mib': 16384, 'gpus': 0, 'affinity_cpu_count': 4}.items())
+        and len(set(allocation.get('affinity_cpu_ids', []))) == 4, 'Marker allocation is not exact4CPU/16Gi/0GPU')
+    remote = m.read(m.artifact(obs['remote_freshness']))
+    identity(remote, job)
+    fresh(remote)
+    evidence(remote)
+    m.require(remote.get('schema') == 'hpc-forest-astra-max-remote-freshness-observation-v1' and remote.get('verified') is True
+              and remote.get('remote_root') == m.REMOTE_ROOT and remote.get('admission_root') == m.ADMISSION_ROOT
+              and all(remote.get(k) is True for k in ('native_root_absent', 'registry_absent', 'channel_absent',
+                    'prior_session_claims_absent', 'parent_actual_observation_reviewed')),
+              'Actual remote roots/registry/channel/session observations required')
+    transport = m.read(m.artifact(obs['transport']))
+    identity(transport, job)
+    fresh(transport)
+    evidence(transport)
+    m.require(transport.get('schema') == 'hpc-forest-astra-max-existing-transport-observation-v1'
+              and transport.get('verified') is True and transport.get('configuration_path') == str(m.CONFIG)
+              and transport.get('configuration_sha256') == m.sha(m.CONFIG)
+              and transport.get('transport_name') == 'romeo-mcp'
+              and all(transport.get(k) is True for k in ('existing_transport_only', 'no_new_authentication',
+                    'cli_tools_disabled', 'neutral_controls_passed', 'parent_actual_observation_reviewed')),
+              'Actual existing transport/config hash/neutral-control observations required')
+    m.require(not (m.LAUNCH / ('worker-' + m.SESSION)).exists(), 'Fresh local cell cache must be absent')
+    return so, census, remote, transport, marker
+
+
+def check_factory_review(value):
+    m.require(value.get('schema') == 'hpc-forest-astra-max-launch-factory-independent-review-v1'
+              and value.get('verified') is True and value.get('blocking_findings') == []
+              and value.get('source_zip_sha256') == m.SOURCE and value.get('plan_sha256') == m.PLAN,
+              'Actual independent wrapper/factory review required')
+    expected = {name: m.sha(HERE / name) for name in ('preparer-astra-max.py', 'allocated-preflight.py', 'assembler-admissions.py')}
+    m.require(value.get('reviewed_files') == expected
+              and value.get('command_sha256') == __import__('hashlib').sha256(m.proposal_command().encode()).hexdigest(),
+              'Factory/preflight/command changed after review')
+
+
+def common(schema):
+    return {'schema': schema, 'scope_id': m.SCOPE, 'verified': True, 'source_zip_sha256': m.SOURCE,
+            'plan_sha256': m.PLAN, 'preparation_manifest_sha256': m.PREP}
+
+
+def assemble(inputs, output_name):
+    m.require(set(inputs) == {'schema', 'job_id', 'submission_intent', 'submission_observed', 'observations',
+        'factory_review', 'human_scope'}, 'Closed factory input required')
+    m.require(inputs['schema'] == 'hpc-forest-astra-max-factory-input-v1', 'Wrong factory input schema')
+    job = str(inputs['job_id'])
+    m.require(job.isdigit(), 'Actual submitted job required, never job alone')
+    module = m.native()
+    m.qualification(module, m.ref(QDIR / 'reception-contrat.json'), m.ref(QDIR / 'qualification.json'))
+    closure_ref = m.ref(LDIR / 'cloture-luna-max-verifiee.json')
+    closure, first_ref = m.checked_luna(closure_ref)
+    review = m.read(m.artifact(inputs['factory_review']))
+    check_factory_review(review)
+    original_review = m.SEALED / 'REVUE-INDEPENDANTE-P1.json'
+    m.require(m.sha(original_review) == SOURCE_REVIEW_SHA and m.read(original_review).get('blocking_findings') == [], 'Actual source review required')
+    scope = m.read(m.artifact(inputs['human_scope']))
+    identity(scope, job)
+    m.require(scope.get('schema') == 'hpc-forest-astra-max-human-scope-attestation-v1' and scope.get('verified') is True
+              and scope.get('max_only') is True and scope.get('one_cell_only') is True
+              and scope.get('user_messages') and scope.get('automatic_extension') is False,
+              'Real parent-attested human MAX/single-cell scope required')
+    evidence(scope)
+    obs = m.read(m.artifact(inputs['observations']))
+    stopped = m.read(m.artifact(closure['owned_stop']))
+    source_only = stopped['preserved_source_only_full_identities']
+    old_luna = m.read(m.artifact(stopped['stop_plan_ref']))['owned_targets_in_stop_order']
+    m.require(len(old_luna) == 7, 'Exact old owned family required for absence comparison')
+    so, census, remote, _transport, _marker = check_observations(obs, job, source_only, old_luna)
+    m.submission_guard(inputs['submission_intent'], inputs['submission_observed'], {'job_id': job})
+    m.require(m.sha(m.CLI) == m.CLI_SHA, 'Preserved CLI copy changed')
+    old_cli = m.read(LDIR / 'cli-identity.json')
+    m.require(old_cli['version'] == m.CLI_VERSION and {Path(r['path']).name:r['sha256'] for r in old_cli['files']} == m.CLI_FILES,
+              'Immutable original CLI metadata changed')
+    for item in old_cli['files']:
+        m.artifact(item)
+    m.require(re.fullmatch('[A-Za-z0-9][A-Za-z0-9_-]{0,63}', output_name), 'Fresh simple local output name required')
+    out = HERE / output_name
+    out.mkdir(exist_ok=False)
+    local_dir, remote_dir = out / 'local', out / 'remote'
+    local_dir.mkdir(); remote_dir.mkdir()
+    now = datetime.now(UTC).isoformat()
+    def local(name, value):
+        return m.save(local_dir, name, value)
+    # Safe upload summaries: no complete foreign census, config contents, credentials or private URLs.
+    minimal = local('native-observations-minimal.json', {**common('hpc-forest-astra-max-minimal-native-observations-v1'),
+        'job_id': job, 'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION,
+        'observed_at': obs['observed_at'], 'source_only_full_identities': so,
+        'complete_local_census_sha256': obs['complete_utf8_cim']['sha256'], 'complete_local_census_exported': False,
+        'active_native_workers_before_start': 1, 'maximum_native_workers': 2,
+        'old_luna_owned_family_absent': True, 'no_other_native_workers': True,
+        'remote_root': m.REMOTE_ROOT, 'admission_root': m.ADMISSION_ROOT,
+        'native_root_registry_channel_absent': True, 'prior_session_claims_absent': True,
+        'local_cache_absent': True, 'transport_name': 'romeo-mcp', 'configuration_path': str(m.CONFIG),
+        'configuration_sha256': m.sha(m.CONFIG), 'configuration_contents_exported': False,
+        'parent_observations_sha256': inputs['observations']['sha256'],
+        'actual_allocation_marker_sha256': obs['allocation_ready']['sha256'],
+        'independent_remote_observation_by_factory': False})
+    qminimal = local('qualification-provenance-minimal.json', {**common('hpc-forest-astra-max-qualification-provenance-v1'),
+        'qualification_sha256': m.QJSON, 'archive_sha256': m.QARCHIVE, 'audit_sha256': m.QAUDIT,
+        'reception_sha256': m.QRECEPTION, 'qualification_job_id': '752087', 'native_model_calls': 0})
+    lminimal = local('luna-closure-provenance-minimal.json', {'schema': 'hpc-forest-astra-max-luna-closure-provenance-v1',
+        'verified': True, 'job_id': '751992', 'bounded_closure_sha256': m.LUNA_CLOSURE,
+        'audit_sha256': m.LUNA_AUDIT, 'owned_stop_sha256': m.LUNA_STOP,
+        'readable_data_before_stop': 132, 'files_after_owned_stop': 133, 'lock_sha256_before': None,
+        'independent_performance_audit_verified': False, 'independent_raw_stdout_per_candidate_verified': False,
+        'native_research_admitted': False})
+    cli_min = local('cli-file-hashes-minimal.json', {'schema': 'hpc-forest-astra-max-cli-files-rehash-v1',
+        'verified': True, 'executable_path': str(m.CLI), 'executable_sha256': m.CLI_SHA, 'version': m.CLI_VERSION,
+        'files': old_cli['files'], 'observed_at': now, 'authentication_exported': False, 'cli_executed': False})
+    scope_min = local('human-scope-minimal.json', {**common('hpc-forest-astra-max-human-scope-minimal-v1'),
+        'job_id': job, 'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION,
+        'max_only': True, 'one_cell_only': True, 'automatic_extension': False,
+        'local_human_scope_attestation_sha256': inputs['human_scope']['sha256']})
+    refs = {'source_zip': m.ref(m.SEALED / 'HPC-Forest-Primes-Natif-MAX-r2b.zip'),
+        'plan': m.ref(m.SEALED / 'native-max-plan.json'),
+        'preparation_manifest': m.ref(m.SEALED / 'certified-preparation/prototype-manifest.json'),
+        'preparation_review': m.ref(m.SEALED / 'preparation-review-original.json'),
+        'allocated_contract_qualification': m.ref(QDIR / 'qualification.json'),
+        'allocated_contract_reception': m.ref(QDIR / 'reception-contrat.json'), 'luna_first_start': first_ref}
+    refs['luna_closure'] = local('luna-closure-admission.json', m.closure_admission(closure_ref))
+    refs['cli_identity'] = local('cli-identity.json', {**common(module.SCHEMAS['cli_identity']),
+        **{k: old_cli[k] for k in ('version', 'executable_path', 'executable_sha256', 'source_execution_allowed', 'files')},
+        'observed_at': now, 'authentication': 'Not exported; existing local authentication must be rechecked by worker before readiness',
+        'evidence_refs': [cli_min]})
+    factory_min = local('factory-review-minimal.json', {**common('hpc-forest-astra-max-factory-review-minimal-v1'),
+        'actual_local_review_sha256': inputs['factory_review']['sha256'], 'reviewed_files': review['reviewed_files'],
+        'command_sha256': review['command_sha256'], 'blocking_findings': [], 'native_calls': 0})
+    refs['integration_review'] = local('integration-review.json', {**common(module.SCHEMAS['integration_review']),
+        'neutral_tests_passed': True, 'blocking_findings': [], 'reviewer': review.get('reviewer'), 'reviewed_at': now,
+        'limitations': ['Source review and wrapper/factory review only; no Astra normal call or independent performance proved'],
+        'evidence_refs': [m.ref(original_review), factory_min]})
+    refs['worker_lane_admission'] = local('worker-lane-admission.json', {**common(module.SCHEMAS['worker_lane_admission']),
+        'active_native_workers_before_start': 1, 'maximum_native_workers': 2, 'live_worker_identities': so,
+        'observed_at': census['captured_at_utc'], 'job_reservation': {'job_id': job, 'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION},
+        'evidence_refs': [minimal]})
+    refs['session_freshness'] = local('session-freshness.json', {**common(module.SCHEMAS['session_freshness']),
+        'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION, 'job_id': job, 'observed_at': remote['observed_at'],
+        'verified_no_prior_claims': True, 'new_cache': True, 'new_registry': True, 'native_calls_started_at_admission': 0,
+        'evidence_refs': [minimal]})
+    refs['transport_admission'] = local('transport-admission.json', {**common(module.SCHEMAS['transport_admission']),
+        'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION, 'job_id': job, 'native_model_calls': 0,
+        'normal_first_call_proved': False, 'cli_tools_disabled': True, 'neutral_tests_passed': True,
+        'cli_identity_sha256': refs['cli_identity']['sha256'], 'allocated_contract_qualification_sha256': m.QJSON,
+        'limits': ['Pre-call transport/source/CLI scope only; first NORMAL delivery/evaluation still required'], 'evidence_refs': [minimal]})
+    refs['extension_admission'] = local('extension-admission.json', {**common(module.SCHEMAS['extension_admission']),
+        'model': m.MODEL, 'effort': m.EFFORT, 'session_id': m.SESSION, 'job_id': job,
+        'luna_first_start_sha256': first_ref['sha256'], 'luna_closure_sha256': refs['luna_closure']['sha256'],
+        'human_max_only': True, 'one_cell_only': True, 'automatic_extension': False, 'all_prior_calls_reconciled': True,
+        'maximum_native_workers': 2, 'evidence_refs': [scope_min, lminimal]})
+    auth = {'schema': 'hpc-forest-primes-r2max-authorization-v2', 'scope_id': m.SCOPE, 'model': m.MODEL,
+        'effort': m.EFFORT, 'session_id': m.SESSION, 'verified': True, 'expires_at': time.time() + 4 * 3600,
+        'user_messages': scope['user_messages'], 'old_candidates_imported': False, 'operator_algorithm_advice': False,
+        'native_calls_started_at_authorization': 0, 'job_id': job, 'remote_root': m.REMOTE_ROOT, 'artifacts': refs}
+    local_auth = m.save(out, 'authorization-local-DRAFT.json', auth)
+    mirrors, memo = [], {}
+    approved_raw = {r['path'] for r in [qrec_ref for qrec_ref in (m.read(QDIR / 'reception-contrat.json')['archive'],
+        m.read(QDIR / 'reception-contrat.json')['audit'], first_ref, m.ref(original_review),
+        *[closure[k] for k in ('archive', 'audit', 'recorded_role_costs', 'owned_stop')])]}
+    approved_existing = {refs[k]['path'] for k in ('source_zip', 'plan', 'preparation_manifest', 'preparation_review', 'allocated_contract_qualification')}
+    def alias(source, name, existing=None):
+        path = m.artifact(source)
+        m.require(path.is_relative_to(local_dir) or path.is_relative_to(remote_dir)
+                  or source['path'] in approved_raw or (existing is not None and source['path'] in approved_existing),
+                  'Export source is not an owned derived proof or explicitly approved native/qualification artifact')
+        remote_path = existing or m.ADMISSION_ROOT + '/' + name
+        key = (str(path), remote_path)
+        if key not in memo:
+            mirrors.append({'remote_path': remote_path, 'local': source})
+            memo[key] = {'path': remote_path, 'sha256': source['sha256']}
+        return memo[key]
+    for key, suffix in {'source_zip': 'HPC-Forest-Primes-Natif-MAX-r2b.zip', 'plan': 'native-max-plan.json',
+        'preparation_manifest': 'certified-preparation/prototype-manifest.json', 'preparation_review': 'preparation-review-original.json'}.items():
+        alias(refs[key], suffix, m.EXTRACTION + '/' + suffix)
+    alias(refs['allocated_contract_qualification'], 'qualification.json', str(PurePosixPath(m.EXTRACTION).parent) + '/Q/qualification.json')
+    # Only these approved raw artifacts cross environments. No arbitrary evidence recursion/export.
+    qrec = m.read(m.artifact(refs['allocated_contract_reception']))
+    qr = {**qrec, 'archive': alias(qrec['archive'], 'qualified-archive.tar.gz'),
+          'audit': alias(qrec['audit'], 'qualified-audit.json'), 'evidence_refs': [alias(qminimal, 'qualification-provenance-minimal.json')]}
+    remote_refs = {key: next(row for row in mirrors if row['local'] == refs[key]) for key in
+                   ('source_zip', 'plan', 'preparation_manifest', 'preparation_review', 'allocated_contract_qualification')}
+    remote_refs = {key: {'path': row['remote_path'], 'sha256': row['local']['sha256']} for key, row in remote_refs.items()}
+    remote_refs['allocated_contract_reception'] = alias(m.save(remote_dir, 'allocated-contract-reception.json', qr), 'allocated-contract-reception.json')
+    remote_refs['luna_first_start'] = alias(first_ref, 'luna-first-normal-start-original.json')
+    lc = m.read(m.artifact(refs['luna_closure']))
+    for key in ('archive', 'audit', 'reconciliation', 'owned_worker_absence'):
+        lc[key] = alias(lc[key], 'luna-' + key + ('.tar.gz' if key == 'archive' else '.json'))
+    lc['evidence_refs'] = [alias(lminimal, 'luna-closure-provenance-minimal.json')]
+    remote_refs['luna_closure'] = alias(m.save(remote_dir, 'luna-closure-admission.json', lc), 'luna-closure-admission.json')
+    for key in ('cli_identity', 'integration_review', 'worker_lane_admission', 'session_freshness'):
+        proof = m.read(m.artifact(refs[key]))
+        proof['evidence_refs'] = [alias(r, Path(r['path']).name) for r in proof['evidence_refs']]
+        remote_refs[key] = alias(m.save(remote_dir, key + '.json', proof), key + '.json')
+    for key in ('transport_admission', 'extension_admission'):
+        proof = m.read(m.artifact(refs[key]))
+        if key == 'transport_admission':
+            proof['cli_identity_sha256'] = remote_refs['cli_identity']['sha256']
+        else:
+            proof['luna_closure_sha256'] = remote_refs['luna_closure']['sha256']
+        proof['evidence_refs'] = [alias(r, Path(r['path']).name) for r in proof['evidence_refs']]
+        remote_refs[key] = alias(m.save(remote_dir, key + '.json', proof), key + '.json')
+    remote_auth = m.save(out, 'authorization-remote-DRAFT.json', {**auth, 'artifacts': remote_refs})
+    m.validate_authorizations(module, m.artifact(local_auth), m.artifact(remote_auth), mirrors)
+    prep = {'schema': 'hpc-forest-astra-max-local-preparation-input-v1',
+        'qualification_reception': m.ref(QDIR / 'reception-contrat.json'), 'qualification': m.ref(QDIR / 'qualification.json'),
+        'luna_bounded_closure': closure_ref, 'local_authorization': local_auth, 'remote_authorization_mirror': remote_auth,
+        'remote_files': mirrors, 'submission_intent': inputs['submission_intent'], 'submission_observed': inputs['submission_observed'],
+        'parent_admission_review': None}
+    parent_review = {**common('hpc-forest-astra-max-parent-admission-review-v1'), 'model': m.MODEL, 'effort': m.EFFORT,
+        'session_id': m.SESSION, 'job_id': job, 'complete_utf8_cim_fresh_checked': True,
+        'source_only_full_identities_preserved': True, 'luna_full_owned_identities_absent': True,
+        'no_other_native_workers': True, 'local_cache_absent_checked': True, 'remote_root_registry_channel_absent_checked': True,
+        'no_prior_session_claims': True, 'existing_transport_only': True, 'independent_remote_observation_by_generator': False,
+        'reviewed_refs': {'worker_lane_admission': refs['worker_lane_admission'], 'session_freshness': refs['session_freshness'],
+            'submission_intent': inputs['submission_intent'], 'submission_observed': inputs['submission_observed']},
+        'evidence_refs': [inputs['observations'], obs['complete_utf8_cim']]}
+    prep['parent_admission_review'] = m.save(out, 'parent-admission-review-LOCAL-ONLY.json', parent_review)
+    m.parent_review_guard(prep['parent_admission_review'], prep, auth)
+    prepared_input = m.save(out, 'input-validated.json', prep)
+    # Only after all real gates and both native validators pass, publish local ready/argv files.
+    final_local = m.save(out, 'authorization-local.json', auth)
+    final_remote = m.save(out, 'authorization-remote.json', {**auth, 'artifacts': remote_refs})
+    ready = m.save(out, 'authorization-ready.json', {'schema': 'hpc-forest-primes-r2max-authorization-upload-ready-v1',
+        'scope_id': m.SCOPE, 'job_id': job, 'session_id': m.SESSION, 'sha256': final_remote['sha256'],
+        'bytes': m.artifact(final_remote).stat().st_size})
+    worker = [str(m.PYTHON_LOCAL), '-B', '-u', '-m', 'hpc_forest.r2max_worker', '--channel',
+        m.REMOTE_ROOT + '/results-' + job + '/mailbox', '--session-id', m.SESSION, '--output', str(m.LAUNCH / ('worker-' + m.SESSION)),
+        '--codex-config', str(m.CONFIG), '--dependency-receipt', final_local['path'], '--required-jobs', m.SCOPE,
+        '--max-seconds', '10800', '--executable', str(m.CLI)]
+    m.save(out, 'worker-argv-only.json', {'argv': worker, 'cwd': str(m.PROJECT),
+        'environment': {'PYTHONPATH': str(m.PROJECT / 'src'), 'PYTHONUTF8': '1', 'PYTHONDONTWRITEBYTECODE': '1'}, 'executed': False})
+    m.save(out, 'upload-manifest-propose.json', {'schema': 'hpc-forest-astra-max-explicit-upload-proposal-v1', 'verified': False,
+        'job_id': job, 'performed': False, 'dependencies': [r for r in mirrors if r['remote_path'].startswith(m.ADMISSION_ROOT + '/')],
+        'existing_qualified_files': [r for r in mirrors if not r['remote_path'].startswith(m.ADMISSION_ROOT + '/')],
+        'authorization_publish_after_dependencies': {'remote_path': m.ADMISSION_ROOT + '/authorization.json', 'local': final_remote},
+        'ready_publish_last': {'remote_path': m.ADMISSION_ROOT + '/authorization-ready.json', 'local': ready},
+        'full_cim_config_credentials_exported': False, 'validated_input': prepared_input})
+    m.save(out, 'factory-status.json', {'schema': 'hpc-forest-astra-max-factory-completion-v1', 'verified': False,
+        'job_id': job, 'source_zip_sha256': m.SOURCE, 'plan_sha256': m.PLAN, 'native_research_admitted': False,
+        'normal_first_call_proved': False, 'both_authorization_validators_passed': True, 'native_calls': 0,
+        'full_cim_config_credentials_exported': False, 'uploaded': False, 'worker_started': False})
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', type=Path, required=True)
+    parser.add_argument('--input-sha256', required=True)
+    parser.add_argument('--output-name', required=True)
+    args = parser.parse_args()
+    inputs = m.read(m.artifact({'path': str(args.input.resolve()), 'sha256': args.input_sha256}))
+    out = assemble(inputs, args.output_name)
+    print(json.dumps({'directory': str(out), 'executed': False, 'remote_uploads': 0, 'native_calls': 0}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

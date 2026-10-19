@@ -1,0 +1,186 @@
+"""Read-only reception audit. No compilation, inference or candidate execution."""
+from __future__ import annotations
+
+import collections
+import hashlib
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from confirmation_audit import verify_final_selection
+
+HERE = Path(__file__).resolve().parent
+DELIVERY = HERE.parent
+OUTPUTS = DELIVERY.parent
+TOOLS = DELIVERY / "cadre-execution"
+
+
+def read(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def manifest_check(directory):
+    manifest = read(directory / "manifest-verifie.json")
+    for item in manifest["files"]:
+        path = directory / item["path"]
+        assert path.stat().st_size == item["bytes"], path
+        assert sha(path) == item["sha256"], path
+    return {"verified_files": len(manifest["files"]), "manifest_sha256": sha(directory / "manifest-verifie.json")}
+
+
+def run(script, arguments, log, allow_failure=False):
+    p = subprocess.run([sys.executable, str(script), *map(str, arguments)],
+                       capture_output=True, text=True, encoding="utf8", errors="replace")
+    log.write_text(p.stdout + p.stderr, encoding="utf8")
+    if not allow_failure and p.returncode:
+        raise RuntimeError(f"Audit failed: {script.name}; see {log}")
+    return p
+
+
+def main(job):
+    restored = HERE / f"preuves-{job}"
+    root = restored / f"results-{job}"
+    audits = HERE / f"audits-{job}-r2"
+    audits.mkdir(exist_ok=False)
+    archive = HERE / f"results-{job}.tar.gz"
+    receipt = read(HERE / f"recu-{job}.json")
+    assert sha(archive) == receipt["runner_expected_sha256"]
+    before = manifest_check(restored)
+    (audits / "integrite-avant.json").write_text(json.dumps(before, indent=2), encoding="utf8")
+    overall = read(root / "results.json")
+    assert overall["complete"] is True
+    assert {p["problem"] for p in overall["problems"]} == {"knn", "sum", "nbody"}
+    assert len(overall["problems"]) == 3
+    scripts = [
+        ("analyse_results.py", [root, audits / "analyse.json"]),
+        ("verifier-preuves.py", [root, audits / "preuves.json"]),
+        ("audit_rerun.py", [root, audits / "diagnostics.json"]),
+        ("verify_v11.py", [root, OUTPUTS / "Marathon22-32B-v9", audits / "identite-independance.json",
+                           DELIVERY / "diagnostics/audit-output-budget.json"]),
+    ]
+    for name, args in scripts:
+        run(TOOLS / name, args, audits / (name + ".log"))
+    # Keep the original path-layout error, if present. Only the offline auditor's
+    # reference-directory resolver is adapted; every original assertion remains.
+    original = TOOLS / "verifier-feedback.py"
+    feedback = run(original, [root, audits / "feedback.json"],
+                   audits / "feedback-original.log", allow_failure=True)
+    resolver = None
+    if feedback.returncode:
+        assert "FileNotFoundError" in feedback.stderr and "Marathon22-interface-v3" in feedback.stderr
+        old = original.read_text(encoding="utf8")
+        start = old.index('        old=root.parents[1]/"Marathon22-interface-v3"/old_dir')
+        end = old.index('        previous=read(', start)
+        new = old[:start] + '        old=Path(sys.argv[3])/"Marathon22-interface-v3"/old_dir\n' + old[end:]
+        assert old[:start] == new[:start] and old[end:] == new[new.index('        previous=read(', start):]
+        adapted = audits / "verifier-feedback-chemin-explicite.py"
+        adapted.write_text(new, encoding="utf8")
+        run(adapted, [root, audits / "feedback.json", OUTPUTS], audits / "feedback-explicite.log")
+        resolver = {"original_sha256": sha(original), "adapted_sha256": sha(adapted),
+                    "only_change": "explicit historical reference root; all assertions preserved",
+                    "original_failure_preserved": "feedback-original.log"}
+
+    rows = []
+    for slug in ["knn", "sum", "nbody"]:
+        run(TOOLS / "verify_bounded.py", [root, audits / (slug + "-bounded.json"), slug],
+            audits / (slug + "-bounded.log"))
+        summary = read(root / (slug + "-summary.json"))
+        report = read(root / slug / "report/experiments.json")
+        progress = read(root / (slug + "-progress.json"))
+        config = report["config"]
+        assert summary["complete"] is True and summary["search"]["status"] == "search_complete"
+        assert progress["status"] == "search_complete" and progress["trials"] == len(report["experiments"])
+        assert config["minimum_gain"] == 0.03
+        assert config["protocol"]["confirmation_repetitions"] == 5
+        assert config["protocol"]["repetitions"] == 3
+        assert config["protocol"]["environment"]["OMP_NUM_THREADS"] == "4"
+        assert config["protocol"]["environment"]["CUDA_VISIBLE_DEVICES"] == ""
+        contract = read(root / slug / "trusted/contract.json")
+        assert contract["comparison"]["mode"] == "bytes", contract["comparison"]
+        assert contract["comparison"]["abs_tol"] == contract["comparison"]["rel_tol"] == 0
+        assert "-Werror=uninitialized" in contract["compiler_flags"]
+        assert "-Werror=maybe-uninitialized" in contract["compiler_flags"]
+        by_id = {t["id"]: t for t in report["experiments"]}
+        all_nodes, roots = {}, []
+        for tree in progress["trees"]:
+            nodes = {n["id"]: n for n in tree["nodes"]}
+            counts = collections.Counter(n["parent"] for n in nodes.values() if n["parent"])
+            for node in nodes.values():
+                assert node["child_count"] == counts[node["id"]]
+                if node["depth"] == 0:
+                    assert node["parent"] is None
+                    roots.append(node["id"])
+                else:
+                    parent = nodes[node["parent"]]
+                    assert node["depth"] == parent["depth"] + 1
+                    trial = by_id[node["id"]]
+                    assert trial["role"] == tree["role"]
+                    assert node["score"] == trial["score"]
+                    assert node["parent"] == (trial["search_parent"] or trial["tree_id"])
+                assert node["id"] not in all_nodes
+                all_nodes[node["id"]] = node
+        assert len(all_nodes) - len(roots) == progress["scored_nodes"]
+        assert max(n["depth"] for n in all_nodes.values()) == progress["max_depth"]
+        assert max(n["child_count"] for n in all_nodes.values()) == progress["max_children"]
+        for trial in report["experiments"]:
+            if trial["search_parent"]:
+                assert by_id[trial["search_parent"]]["role"] == trial["role"]
+            for source in trial["sources"]:
+                assert source in by_id and by_id[source]["state"] == "valid"
+        calls = []
+        for path in (root / slug / "logs").glob("*/ollama-response.json"):
+            response = read(path)
+            calls.append({"experiment_id": path.parent.name,
+                          "input": response["prompt_eval_count"], "output": response["eval_count"],
+                          "decode_seconds": response.get("eval_duration", 0) / 1e9,
+                          "done_reason": response.get("done_reason")})
+        exact = sum(c["input"] + c["output"] for c in calls)
+        assert exact == summary["costs"]["exact_tokens_used"]
+        winner = summary["best_confirmed"]
+        confirms = [e for e in report["evaluations"] if e["phase"] == "confirmation"]
+        confirmation_validation = verify_final_selection(confirms, winner, contract, root / slug, config["minimum_gain"])
+        ref = next(e["outcome"] for e in confirms if e["experiment_id"].startswith("baseline-"))
+        assert abs(winner["reference_seconds"] - ref["mean_seconds"]) < 1e-12
+        assert abs(winner["improvement_fraction"] - (1 - winner["mean_seconds"] / winner["reference_seconds"])) < 1e-12
+        best = by_id.get(winner["experiment_id"])
+        decode = sum(c["decode_seconds"] for c in calls)
+        rows.append({"problem": slug, "complete": True, "search_complete": True,
+                     "best_confirmed": winner, "speedup": winner["reference_seconds"] / winner["mean_seconds"],
+                     "trials": len(by_id), "outcomes": dict(collections.Counter(t["state"] for t in by_id.values())),
+                     "role_counts": dict(collections.Counter(t["role"] for t in by_id.values())),
+                     "root_count": len(roots), "scored_nodes": progress["scored_nodes"],
+                     "total_nodes_including_role_roots": len(all_nodes),
+                     "max_depth": progress["max_depth"], "max_children": progress["max_children"],
+                     "topology_and_sources_verified": True, "costs": summary["costs"],
+                     "model_calls": len(calls), "input_tokens": sum(c["input"] for c in calls),
+                     "output_tokens": sum(c["output"] for c in calls), "exact_tokens": exact,
+                     "done_reasons": dict(collections.Counter(c["done_reason"] for c in calls)),
+                     "decode_tokens_per_second_weighted": sum(c["output"] for c in calls) / decode if decode else None,
+                     "decode_seconds_sum": decode, "elapsed_search_and_confirmation_seconds": summary["elapsed_seconds"],
+                     "confirmation_evaluations": len(confirms),
+                     "final_confirmation_gate": confirmation_validation,
+                     "winning_trial": best, "no_operator_candidate_repair": True})
+    after = manifest_check(restored)
+    assert before == after
+    result = {"schema": "hpc-forest-deepseek-reception-audit-v1", "job_id": job,
+              "observed_utc": datetime.now(timezone.utc).isoformat(), "verified": True,
+              "complete": True, "expected_problem_count": 3, "coverage_verified": True,
+              "model": read(root / "model-identity.json")["model"],
+              "archive": str(archive.resolve()), "archive_sha256": sha(archive),
+              "root": str(root.resolve()), "integrity_before": before, "integrity_after": after,
+              "offline_auditor_path_resolver": resolver, "problems": rows,
+              "exact_total_tokens": sum(r["exact_tokens"] for r in rows),
+              "operator_analysis_never_model_input": True,
+              "scope": "recorded finite exact-output tests and repeated timings; no universal correctness or official contest rank"}
+    (audits / "audit-complet.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    print(json.dumps({"verified": True, "job_id": job, "problems": [{k: p[k] for k in ["problem", "scored_nodes", "max_depth", "max_children", "exact_tokens"]} for p in rows]}))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

@@ -1,0 +1,98 @@
+"""Opaque preservation of the three terminal held relay caches, excluding live locks."""
+from pathlib import Path
+from datetime import UTC, datetime
+import hashlib
+import json
+import os
+import re
+import stat
+
+BASE = Path(__file__).resolve().parents[3]
+OPS = Path(__file__).resolve().parent
+OUT = OPS / "preservation-caches-avant-arret"
+LAUNCH = BASE / "outputs/HPC-Forest-Primes-Natif-Lancement-r2f"
+CELLS = [("astra", "753368", "5aeceff56b26452290325ed4274d71bd"),
+         ("terra", "753369", "e7c86715f4d34e9f9efcdcc4ce2a81c8"),
+         ("sol", "753370", "1294453607b34c68ba05872072640120")]
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": sha(path)}
+
+def save(path, value):
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, indent=2) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return ref(path)
+
+def inventory(root):
+    value = {}
+    for path in sorted(root.rglob("*")):
+        assert not path.is_symlink() and not path.is_junction(), "Linked cache item"
+        if path.is_dir():
+            continue
+        name = path.relative_to(root).as_posix()
+        if name == "worker.lock":
+            continue
+        assert not re.search(r"\.(?:db|sqlite3?)(?:-(?:wal|shm|journal))?$", path.name, re.I), "Live registry forbidden"
+        info = path.stat()
+        assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+        value[name] = {"sha256": sha(path), "bytes": info.st_size}
+    return value
+
+def main():
+    parent = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2f/reception-native-parent-r1/RECEPTION-TERMINALE-METADATA.json"
+    indie = BASE / "outputs/HPC-Forest-Primes-Natif-Relance-r2f/revue-native-independante-r1/revision-r2/REVUE-TERMINALE-FROIDE-INDEPENDANTE-R2F.json"
+    assert sha(parent) == "dce71c4c8231f383343ca58116fe1740cec1eeb58eead21eb75d8ae465afa162"
+    assert sha(indie) == "aeab727b13fce653d5706c8117028e376b444419ab08a579af899ec47897f3da"
+    OUT.mkdir(exist_ok=False)
+    workers = []
+    for slug, job, session in CELLS:
+        source = LAUNCH / ("worker-" + session)
+        assert source.is_dir() and not source.is_symlink() and not source.is_junction()
+        binding = json.loads((source / "CELL-BINDING.json").read_bytes())
+        hold = json.loads((source / "cli-technical-hold.json").read_bytes())
+        assert binding["session_id"] == session and binding["job_id"] == job and binding["scope_id"] == "hpc-forest-primes-native-max-r2f"
+        assert hold["new_generations_allowed"] is False and hold["process_stop_or_retry"] is False
+        before = inventory(source)
+        output = OUT / slug
+        output.mkdir()
+        copy = output / "copie-opaque"
+        copy.mkdir()
+        before_ref = save(output / "inventaire-avant.json", before)
+        for name, expected in before.items():
+            origin, target = source / name, copy / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with origin.open("rb") as read, target.open("xb") as write:
+                while chunk := read.read(1024 * 1024):
+                    write.write(chunk)
+                write.flush()
+                os.fsync(write.fileno())
+            assert sha(origin) == sha(target) == expected["sha256"]
+        after = inventory(source)
+        assert before == after == inventory(copy)
+        after_ref = save(output / "inventaire-apres.json", after)
+        workers.append({"model_slug": slug, "job_id": job, "session_id": session,
+            "source_cache": str(source), "opaque_copy": str(copy),
+            "regular_files_preserved": len(before), "bytes": sum(v["bytes"] for v in before.values()),
+            "before_after_copy_equal": True, "excluded_live_lock_paths": ["worker.lock"],
+            "live_lock_content_read": False, "database_or_candidate_interpreted": False,
+            "full_cache_preservation_complete_including_lock": False,
+            "evidence_refs": [before_ref, after_ref]})
+    receipt = {"schema": "hpc-forest-r2f-three-worker-cache-preservation-before-stop-v1",
+        "verified": False, "captured_at_utc": datetime.now(UTC).isoformat(),
+        "opaque_regular_cache_files_preserved_except_live_lock": True,
+        "source_cache_unchanged": True, "workers": workers, "processes_stopped": 0,
+        "live_lock_pending_after_stop": True, "not_an_authorization_to_stop": True,
+        "metadata_audits": [ref(parent), ref(indie)]}
+    print(json.dumps({"receipt": save(OUT / "PRESERVATION-CACHES-AVANT-ARRET.json", receipt),
+        "files": sum(v["regular_files_preserved"] for v in workers),
+        "bytes": sum(v["bytes"] for v in workers), "live_locks_not_read": True}))
+
+if __name__ == "__main__":
+    main()
+

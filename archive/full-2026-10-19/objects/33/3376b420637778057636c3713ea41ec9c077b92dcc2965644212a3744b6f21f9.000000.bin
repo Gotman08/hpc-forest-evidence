@@ -1,0 +1,114 @@
+#include "knn.h"
+#include <omp.h>
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    // Determine number of threads
+    int n_threads = omp_get_max_threads();
+    
+    // Allocate flat arrays for per-thread distances and labels
+    float *all_dists = (float *) malloc(n_threads * k * sizeof(float));
+    char *all_labels = (char *) malloc(n_threads * k * sizeof(char));
+    
+    // Initialize all to -1
+    for (int t = 0; t < n_threads; t++) {
+        float *dists_t = &all_dists[t * k];
+        char *labels_t = &all_labels[t * k];
+        for (int i = 0; i < k; i++) {
+            dists_t[i] = -1.0f;
+            labels_t[i] = -1;
+        }
+    }
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        float *dists_local = &all_dists[tid * k];
+        char *labels_local = &all_labels[tid * k];
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n_groups; i++) {
+            Group g = groups[i];
+            for (int j = 0; j < g.length; j++) {
+                float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+                
+                // Insert into local top-k list
+                int x;
+                for (x = 0; x < k; x++) {
+                    if (d < dists_local[x] || dists_local[x] == -1.0f) {
+                        // Shift elements to make room
+                        for (int y = k - 1; y > x; y--) {
+                            dists_local[y] = dists_local[y - 1];
+                            labels_local[y] = labels_local[y - 1];
+                        }
+                        dists_local[x] = d;
+                        labels_local[x] = g.label;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge per-thread lists into global list (first thread's list as base)
+    float *global_dists = &all_dists[0];
+    char *global_labels = &all_labels[0];
+
+    for (int t = 1; t < n_threads; t++) {
+        float *dists_t = &all_dists[t * k];
+        char *labels_t = &all_labels[t * k];
+        
+        // For each entry in thread's list, try to insert into global
+        for (int idx = 0; idx < k; idx++) {
+            if (dists_t[idx] == -1.0f) break; // no more entries
+            
+            float d = dists_t[idx];
+            char lab = labels_t[idx];
+            
+            int x;
+            for (x = 0; x < k; x++) {
+                if (global_dists[x] == -1.0f || d < global_dists[x]) {
+                    // Insert here
+                    for (int y = k - 1; y > x; y--) {
+                        global_dists[y] = global_dists[y - 1];
+                        global_labels[y] = global_labels[y - 1];
+                    }
+                    global_dists[x] = d;
+                    global_labels[x] = lab;
+                    break;
+                } else if (d == global_dists[x]) {
+                    // Equal distance: skip because earlier thread's entry should remain
+                    break;
+                }
+            }
+        }
+    }
+
+    // Now compute most frequent label from global top-k list
+    qsort(global_labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = global_labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (global_labels[i] != global_labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = global_labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = global_labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(all_dists);
+    free(all_labels);
+
+    return most_frequent;
+}

@@ -1,0 +1,140 @@
+<div id="marathon-forest-v4">
+  <h3>Les arbres explorés sur ROMEO</h3>
+  <div class="viz-controls">
+    <label class="form-label">Sujet <select class="form-select" data-subject aria-label="Sujet"></select></label>
+    <button class="btn btn-primary" type="button" data-play>Lire</button>
+    <button class="btn" type="button" data-prev aria-label="Essai précédent">Précédent</button>
+    <button class="btn" type="button" data-next aria-label="Essai suivant">Suivant</button>
+  </div>
+  <label class="form-label" for="mf-step">Essai <span data-position class="tabular-nums"></span></label>
+  <input id="mf-step" class="form-range" type="range" min="0" step="1" value="0">
+  <div class="viz-row text-small" data-counts></div>
+  <svg class="mf-tree" role="img" aria-label="Arbres A, B, C et G ; seuls les nœuds réellement enregistrés sont dessinés"></svg>
+  <div class="viz-row text-small mf-legend">
+    <span><span class="mf-dot mf-valid"></span>Valide</span>
+    <span><span class="mf-dot mf-failed"></span>Score nul</span>
+    <span><span class="mf-dot mf-root"></span>Racine</span>
+  </div>
+  <div class="text-small" data-detail aria-live="polite"></div>
+</div>
+<style>
+#marathon-forest-v4 .mf-tree { width:100%; display:block; overflow:visible; }
+#marathon-forest-v4 .mf-tree text { fill:var(--foreground); font-size:var(--font-size-base); font-weight:400; }
+#marathon-forest-v4 .mf-tree .mf-edge { stroke:var(--border); fill:none; stroke-width:1.5; }
+#marathon-forest-v4 .mf-legend { margin-top:8px; margin-bottom:12px; gap:16px; }
+#marathon-forest-v4 .mf-dot { display:inline-block; width:10px; height:10px; margin-right:4px; }
+#marathon-forest-v4 .mf-valid { fill:var(--viz-series-1); background:var(--viz-series-1); }
+#marathon-forest-v4 .mf-failed { fill:var(--viz-series-3); background:var(--viz-series-3); }
+#marathon-forest-v4 .mf-root { fill:var(--muted-foreground); background:var(--muted-foreground); }
+</style>
+<script type="application/json" id="marathon-observed-data">__OBSERVED_DATA__</script>
+<script>
+(() => {
+  const root = document.getElementById('marathon-forest-v4');
+  const data = JSON.parse(document.getElementById('marathon-observed-data').textContent);
+  const select = root.querySelector('[data-subject]');
+  const range = root.querySelector('input');
+  const svg = root.querySelector('.mf-tree');
+  const play = root.querySelector('[data-play]');
+  const position = root.querySelector('[data-position]');
+  const counts = root.querySelector('[data-counts]');
+  const detail = root.querySelector('[data-detail]');
+  const previous = root.querySelector('[data-prev]');
+  const next = root.querySelector('[data-next]');
+  const ns = 'http://www.w3.org/2000/svg';
+  const labels = {valid:'valide',build_failed:'compilation refusée',incorrect:'résultat incorrect',runtime_failed:'exécution échouée',duplicate:'doublon',generation_failed:'candidat non produit',infrastructure_error:'incident technique',contract_violation:'contrat refusé',depth_limited:'limite de profondeur'};
+  let timer = null, coordinates = new Map(), rendered = false;
+  let selected = Math.max(0,data.findIndex(p=>p.problem==='bucketsort'));
+  let step = data[selected].events.length;
+  data.forEach((p,i) => { const o=document.createElement('option'); o.value=i; o.textContent=p.name; select.append(o); });
+  const saved = window.openai?.widgetState?.privateContent;
+  if(saved && Number.isInteger(saved.selected) && data[saved.selected]) {
+    selected=saved.selected; step=Math.min(data[selected].events.length,Math.max(0,Number(saved.step)||0));
+  }
+  function element(tag, attrs, parent, text) {
+    const e=document.createElementNS(ns,tag);
+    Object.entries(attrs||{}).forEach(([k,v])=>e.setAttribute(k,String(v)));
+    if(text!==undefined)e.textContent=text;
+    if(parent)parent.append(e);
+    return e;
+  }
+  function save() {
+    window.openai?.setWidgetState({modelContent:{problem:data[selected].problem,trial:step},privateContent:{selected,step}})?.catch(()=>{});
+  }
+  function stop() { if(timer)clearInterval(timer); timer=null; play.textContent='Lire'; }
+  function render(animate=false) {
+    const p=data[selected], visible=new Set(p.events.slice(0,step).map(e=>e.id));
+    const eventMap=new Map(p.events.map(e=>[e.id,e]));
+    select.value=selected; range.max=p.events.length; range.value=step;
+    position.textContent=step+' / '+p.events.length;
+    previous.disabled=step===0; next.disabled=step===p.events.length;
+    const width=Math.max(300,root.getBoundingClientRect().width);
+    const currentCoords=new Map(), edges=[], nodes=[];
+    let y=32, maxDepth=0, maxChildren=0;
+    p.trees.forEach(tree=>{
+      const current=tree.nodes.filter(n=>!n.parent || visible.has(n.id));
+      const byId=new Map(current.map(n=>[n.id,{...n,children:[]} ]));
+      current.forEach(n=>{if(n.parent && byId.has(n.parent))byId.get(n.parent).children.push(n.id);});
+      const rootNode=current.find(n=>!n.parent);
+      const depth=Math.max(2,...current.map(n=>n.depth));
+      const dx=(width-98)/depth;
+      let leafY=y;
+      function layout(id) {
+        const n=byId.get(id);
+        let row;
+        if(!n.children.length) {row=leafY; leafY+=42;}
+        else {const values=n.children.map(layout); row=(values[0]+values[values.length-1])/2;}
+        const x=32+n.depth*dx;
+        currentCoords.set(id,{x,y:row});
+        nodes.push(n);
+        maxDepth=Math.max(maxDepth,n.depth); maxChildren=Math.max(maxChildren,n.children.length);
+        n.children.forEach(child=>edges.push({parent:id,child}));
+        return row;
+      }
+      layout(rootNode.id); y=Math.max(leafY,y+42)+24;
+    });
+    const height=y;
+    svg.setAttribute('viewBox',`0 0 ${width} ${height}`); svg.style.height=height+'px';
+    svg.replaceChildren();
+    element('title',{},svg,p.name+' : '+nodes.length+' nœuds, profondeur '+maxDepth);
+    edges.forEach(({parent,child})=>{
+      const a=currentCoords.get(parent),b=currentCoords.get(child),m=(a.x+b.x)/2;
+      element('path',{d:`M${a.x},${a.y} C${m},${a.y} ${m},${b.y} ${b.x},${b.y}`,class:'mf-edge'},svg);
+    });
+    nodes.forEach(n=>{
+      const at=currentCoords.get(n.id), g=element('g',{transform:`translate(${at.x},${at.y})`},svg);
+      const event=eventMap.get(n.id);
+      const status=!n.parent?'mf-root':n.score>0?'mf-valid':'mf-failed';
+      if(!n.parent)element('rect',{x:-5,y:-5,width:10,height:10,class:status},g);
+      else element('circle',{r:7,class:status,'fill-opacity':0.7},g);
+      element('text',{x:12,y:5},g,n.label);
+      if(event) element('title',{},g,`${n.label} : ${labels[event.state]||event.state} ; score ${n.score.toFixed(4)}`);
+      if(rendered && animate && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        const old=coordinates.get(n.id)||coordinates.get(n.parent)||at;
+        g.animate([{transform:`translate(${old.x}px,${old.y}px)`},{transform:`translate(${at.x}px,${at.y}px)`}],{duration:350,easing:'ease-out'});
+      }
+    });
+    coordinates=currentCoords; rendered=true;
+    counts.textContent=`${nodes.length} nœuds, dont 4 racines · profondeur ${maxDepth} · jusqu’à ${maxChildren} fils par nœud`;
+    const e=p.events[step-1];
+    detail.textContent=e ? `${e.label} · ${labels[e.state]||e.state}${visible.has(e.id)&&!nodes.some(n=>n.id===e.id)?' · aucun nouveau nœud':''}${typeof e.score==='number'?' · score '+e.score.toFixed(4):''}` : 'Quatre racines · aucun essai';
+  }
+  function change(value) { step=Math.min(data[selected].events.length,Math.max(0,value)); render(true); save(); }
+  select.addEventListener('change',()=>{stop();selected=Number(select.value);step=data[selected].events.length;coordinates=new Map();rendered=false;render();save();});
+  range.addEventListener('input',()=>{stop();change(Number(range.value));});
+  previous.addEventListener('click',()=>{stop();change(step-1);});
+  next.addEventListener('click',()=>{stop();change(step+1);});
+  play.addEventListener('click',()=>{
+    if(timer){stop();return;}
+    if(step>=data[selected].events.length)change(0);
+    play.textContent='Pause';
+    timer=setInterval(()=>{change(step+1);if(step>=data[selected].events.length)stop();},1100);
+  });
+  window.addEventListener('openai:set_globals',event=>{
+    const s=event.detail?.globals?.widgetState?.privateContent;
+    if(s && Number.isInteger(s.selected) && data[s.selected]){stop();selected=s.selected;step=Math.min(data[selected].events.length,Math.max(0,Number(s.step)||0));render();}
+  });
+  new ResizeObserver(()=>render()).observe(root);
+  render();
+})();
+</script>

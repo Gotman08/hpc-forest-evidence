@@ -1,0 +1,202 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <memory>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+class FastInput {
+    unsigned char buffer_[65536];
+    std::size_t position_ = 0;
+    std::size_t length_ = 0;
+
+    inline int get_char() {
+        if (position_ == length_) {
+            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (length_ == 0) return -1;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    inline int read_int() {
+        int c;
+        do {
+            c = get_char();
+        } while (c >= 0 && c <= ' ');
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = get_char();
+        std::uint32_t value = 0;
+        while (c >= '0' && c <= '9') {
+            value = value * 10u + static_cast<unsigned>(c - '0');
+            c = get_char();
+        }
+        return negative
+            ? static_cast<int>(-static_cast<std::int64_t>(value))
+            : static_cast<int>(value);
+    }
+};
+
+#if defined(__aarch64__)
+static inline int64x2_t maximum64(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+static std::int64_t scan_tile(
+    const std::int64_t* __restrict__ horizontal,
+    int n, int s, int width, int first, int count,
+    std::int64_t* __restrict__ vertical) {
+    std::fill(vertical, vertical + count, std::int64_t(0));
+    const std::int64_t lowest = std::numeric_limits<std::int64_t>::min();
+
+#if defined(__aarch64__)
+    const int vector_end = count & ~7;
+    for (int r = 0; r < s; ++r) {
+        const std::int64_t* p = horizontal + static_cast<std::size_t>(r) * width + first;
+        int j = 0;
+        for (; j < vector_end; j += 8) {
+            vst1q_s64(vertical + j, vaddq_s64(vld1q_s64(vertical + j), vld1q_s64(p + j)));
+            vst1q_s64(vertical + j + 2, vaddq_s64(vld1q_s64(vertical + j + 2), vld1q_s64(p + j + 2)));
+            vst1q_s64(vertical + j + 4, vaddq_s64(vld1q_s64(vertical + j + 4), vld1q_s64(p + j + 4)));
+            vst1q_s64(vertical + j + 6, vaddq_s64(vld1q_s64(vertical + j + 6), vld1q_s64(p + j + 6)));
+        }
+        for (; j < count; ++j) vertical[j] += p[j];
+    }
+
+    int64x2_t best0 = vdupq_n_s64(lowest);
+    int64x2_t best1 = best0;
+    int64x2_t best2 = best0;
+    int64x2_t best3 = best0;
+    std::int64_t scalar_best = lowest;
+    int j = 0;
+    for (; j < vector_end; j += 8) {
+        best0 = maximum64(best0, vld1q_s64(vertical + j));
+        best1 = maximum64(best1, vld1q_s64(vertical + j + 2));
+        best2 = maximum64(best2, vld1q_s64(vertical + j + 4));
+        best3 = maximum64(best3, vld1q_s64(vertical + j + 6));
+    }
+    for (; j < count; ++j) scalar_best = std::max(scalar_best, vertical[j]);
+
+    for (int r = s; r < n; ++r) {
+        const std::int64_t* entering = horizontal + static_cast<std::size_t>(r) * width + first;
+        const std::int64_t* leaving = horizontal + static_cast<std::size_t>(r - s) * width + first;
+        j = 0;
+        for (; j < vector_end; j += 8) {
+            const int64x2_t a = vaddq_s64(vld1q_s64(vertical + j),
+                vsubq_s64(vld1q_s64(entering + j), vld1q_s64(leaving + j)));
+            const int64x2_t b = vaddq_s64(vld1q_s64(vertical + j + 2),
+                vsubq_s64(vld1q_s64(entering + j + 2), vld1q_s64(leaving + j + 2)));
+            const int64x2_t c = vaddq_s64(vld1q_s64(vertical + j + 4),
+                vsubq_s64(vld1q_s64(entering + j + 4), vld1q_s64(leaving + j + 4)));
+            const int64x2_t d = vaddq_s64(vld1q_s64(vertical + j + 6),
+                vsubq_s64(vld1q_s64(entering + j + 6), vld1q_s64(leaving + j + 6)));
+            vst1q_s64(vertical + j, a);
+            vst1q_s64(vertical + j + 2, b);
+            vst1q_s64(vertical + j + 4, c);
+            vst1q_s64(vertical + j + 6, d);
+            best0 = maximum64(best0, a);
+            best1 = maximum64(best1, b);
+            best2 = maximum64(best2, c);
+            best3 = maximum64(best3, d);
+        }
+        for (; j < count; ++j) {
+            vertical[j] += entering[j] - leaving[j];
+            scalar_best = std::max(scalar_best, vertical[j]);
+        }
+    }
+    int64x2_t best = maximum64(maximum64(best0, best1), maximum64(best2, best3));
+    best = maximum64(best, vextq_s64(best, best, 1));
+    return std::max(scalar_best, static_cast<std::int64_t>(vgetq_lane_s64(best, 0)));
+#else
+    for (int r = 0; r < s; ++r) {
+        const std::int64_t* p = horizontal + static_cast<std::size_t>(r) * width + first;
+        for (int j = 0; j < count; ++j) vertical[j] += p[j];
+    }
+    std::int64_t best = lowest;
+    for (int j = 0; j < count; ++j) best = std::max(best, vertical[j]);
+    for (int r = s; r < n; ++r) {
+        const std::int64_t* entering = horizontal + static_cast<std::size_t>(r) * width + first;
+        const std::int64_t* leaving = horizontal + static_cast<std::size_t>(r - s) * width + first;
+        for (int j = 0; j < count; ++j) {
+            vertical[j] += entering[j] - leaving[j];
+            best = std::max(best, vertical[j]);
+        }
+    }
+    return best;
+#endif
+}
+
+int main() {
+    FastInput input;
+    const int n = input.read_int();
+    const int s = input.read_int();
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::int64_t answer = std::numeric_limits<std::int64_t>::min();
+    if (s == 1) {
+        for (int r = 0; r < n; ++r)
+            for (int c = 0; c < n; ++c)
+                answer = std::max(answer, static_cast<std::int64_t>(input.read_int()));
+        std::printf("%lld\n", static_cast<long long>(answer));
+        return 0;
+    }
+
+    const int width = n - s + 1;
+    std::unique_ptr<std::int64_t[]> horizontal(
+        new std::int64_t[static_cast<std::size_t>(n) * width]);
+    std::unique_ptr<int[]> row(new int[n]);
+    for (int r = 0; r < n; ++r) {
+        std::int64_t* destination = horizontal.get() + static_cast<std::size_t>(r) * width;
+        std::int64_t sum = 0;
+        for (int c = 0; c < s; ++c) {
+            row[c] = input.read_int();
+            sum += row[c];
+        }
+        destination[0] = sum;
+        for (int c = s; c < n; ++c) {
+            const int value = input.read_int();
+            row[c] = value;
+            sum += static_cast<std::int64_t>(value) - row[c - s];
+            destination[c - s + 1] = sum;
+        }
+    }
+
+    constexpr int tile_columns = 512;
+#ifdef _OPENMP
+#pragma omp parallel if(n * width >= 262144) reduction(max:answer)
+#endif
+    {
+        int thread = 0;
+        int threads = 1;
+#ifdef _OPENMP
+        thread = omp_get_thread_num();
+        threads = omp_get_num_threads();
+#endif
+        const int first = static_cast<int>(static_cast<std::int64_t>(width) * thread / threads);
+        const int last = static_cast<int>(static_cast<std::int64_t>(width) * (thread + 1) / threads);
+        alignas(64) std::int64_t vertical[tile_columns];
+        std::int64_t local_best = std::numeric_limits<std::int64_t>::min();
+        for (int c = first; c < last; c += tile_columns) {
+            const int count = std::min(tile_columns, last - c);
+            local_best = std::max(local_best,
+                scan_tile(horizontal.get(), n, s, width, c, count, vertical));
+        }
+        answer = std::max(answer, local_best);
+    }
+    std::printf("%lld\n", static_cast<long long>(answer));
+    return 0;
+}

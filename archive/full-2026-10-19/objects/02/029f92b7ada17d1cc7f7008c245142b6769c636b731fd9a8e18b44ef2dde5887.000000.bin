@@ -1,0 +1,131 @@
+"""Durable capture of supplied OS pipes, never a launcher or native admission.
+
+Only duplicated read descriptors are owned here. The caller must separately
+prove exclusive pipe/process ownership, CIM identity, admission and isolation.
+No packet is parsed, written, retried or treated as a generation permission.
+"""
+from __future__ import annotations
+
+import os
+import stat
+import threading
+import time
+import uuid
+
+from native_evidence import DurableObserver
+from native_protocol import require
+
+
+class DurablePipeCapture:
+    """Capture stdout/stderr verbatim in one private durable observer.
+
+    Each chunk is synced by the observer before the next read on that stream.
+    The small interval between a kernel read and fsync is not crash-proof.
+    wait() is bounded and never closes a live process or interrupts inference.
+    A stalled stream stays in progress; a failed stream stays incomplete.
+    """
+
+    def __init__(self, stdout_fd, stderr_fd, observer, *, chunk_bytes=16_384,
+                 max_stream_bytes=64 * 1024 * 1024):
+        require(isinstance(observer, DurableObserver) and not observer.closed
+                and observer.failure is None, "A healthy private durable observer is required")
+        require(type(chunk_bytes) is int and 1 <= chunk_bytes <= 65_536
+                and type(max_stream_bytes) is int and 1 <= max_stream_bytes <= 64 * 1024 * 1024,
+                "Invalid pipe capture bounds")
+        require(type(stdout_fd) is int and type(stderr_fd) is int
+                and stdout_fd >= 0 and stderr_fd >= 0 and stdout_fd != stderr_fd,
+                "Distinct read descriptors are required")
+        for fd in (stdout_fd, stderr_fd):
+            require(stat.S_ISFIFO(os.fstat(fd).st_mode), "Only OS pipes are accepted")
+            require(os.get_blocking(fd), "Supply blocking read descriptors without changing their flags")
+        self.observer, self.chunk_bytes, self.max_stream_bytes = observer, chunk_bytes, max_stream_bytes
+        self.capture_id = uuid.uuid4().hex
+        self.started = False
+        self._mutex = threading.Lock()
+        self._read = {"stdout": 0, "stderr": 0}
+        self._durable = {"stdout": 0, "stderr": 0}
+        self._eof = {"stdout": False, "stderr": False}
+        self._errors = {}
+        self._source_fds = {"stdout": stdout_fd, "stderr": stderr_fd}
+        self._fds, self._threads = {}, {}
+
+    def _capture(self, stream):
+        owned_fd = self._fds[stream]
+        try:
+            while True:
+                with self._mutex:
+                    offset = self._read[stream]
+                # Preserve at most one byte beyond the cap to demonstrate it
+                # was reached, without retaining an unbounded offending chunk.
+                amount = min(self.chunk_bytes, self.max_stream_bytes - offset + 1)
+                raw = os.read(owned_fd, amount)
+                if not raw:
+                    self.observer({"kind": "eof", "source": "os_pipe", "stream": stream,
+                                   "capture_id": self.capture_id, "observed_bytes": offset})
+                    with self._mutex:
+                        self._eof[stream] = True
+                    return
+                with self._mutex:
+                    self._read[stream] += len(raw)
+                self.observer({"kind": "incoming_raw", "source": "os_pipe", "stream": stream,
+                               "capture_id": self.capture_id, "offset": offset, "bytes_hex": raw.hex()})
+                with self._mutex:
+                    self._durable[stream] += len(raw)
+                require(offset + len(raw) <= self.max_stream_bytes,
+                        "Pipe byte bound reached; retain evidence without reread or replay")
+        except Exception as error:
+            with self._mutex:
+                self._errors[stream] = {"type": type(error).__name__, "outcome": "capture_incomplete"}
+        finally:
+            os.close(owned_fd)
+
+    def start(self):
+        require(not self.started, "An existing capture cannot be started or replayed again")
+        self.started = True
+        try:
+            for stream, fd in self._source_fds.items():
+                require(stat.S_ISFIFO(os.fstat(fd).st_mode) and os.get_blocking(fd),
+                        "Supplied descriptors changed before capture")
+                self._fds[stream] = os.dup(fd)
+                os.set_inheritable(self._fds[stream], False)
+        except Exception as error:
+            for owned in self._fds.values():
+                os.close(owned)
+            self._errors["attachment"] = {"type": type(error).__name__, "outcome": "capture_not_attached"}
+            raise
+        self._threads = {stream: threading.Thread(target=self._capture, args=(stream,),
+                                                name="private-pipe-" + stream, daemon=True)
+                         for stream in self._fds}
+        for stream, thread in self._threads.items():
+            try:
+                thread.start()
+            except Exception as error:
+                with self._mutex:
+                    self._errors[stream] = {"type": type(error).__name__, "outcome": "reader_not_started"}
+                for unstarted, candidate in self._threads.items():
+                    if candidate.ident is None:
+                        os.close(self._fds[unstarted])
+                # Other started readers retain their own descriptors until
+                # EOF; there is no attempt to kill their supplied process.
+                raise
+
+    def wait(self, timeout_seconds=1):
+        require(self.started and type(timeout_seconds) in {int, float}
+                and 0 <= timeout_seconds <= 30, "Invalid bounded capture wait")
+        deadline = time.monotonic() + timeout_seconds
+        for thread in self._threads.values():
+            if thread.ident is not None:
+                thread.join(max(0, deadline - time.monotonic()))
+        return self.report()
+
+    def report(self):
+        with self._mutex:
+            complete = self.started and all(self._eof.values()) and not self._errors
+            return {"schema": "hpc-forest-native-pipe-capture-v1", "capture_id": self.capture_id,
+                    "started": self.started, "capture_complete": complete,
+                    "read_bytes": dict(self._read), "durably_recorded_bytes": dict(self._durable),
+                    "eof_observed": dict(self._eof), "errors": dict(self._errors),
+                    "readers_alive": {s: t.is_alive() for s, t in self._threads.items()},
+                    "model_calls_inferred": None, "generation_permitted": False,
+                    "process_stop_receipt": False, "process_ownership_verified": False,
+                    "native_codex_adapter_validated": False}

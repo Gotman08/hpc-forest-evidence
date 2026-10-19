@@ -1,0 +1,379 @@
+"""Read-only audit of received first-batch evidence. No controller, candidate or CLI call."""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAUNCH = HERE.parent
+SOURCE = "3e290f835570a8746be3c52144932b8c6866564980fd858cf4c0495a7b1e68c5"
+PLAN = "54ffd49f4dc868085d22208f773c4b4883590b25251b5992232509a1dc197024"
+PREP = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+SESSION = "c8044062692149138d826d3f388a08ef"
+SCOPE = "hpc-forest-primes-native-max-r1"
+MODEL = "gpt-6-luna"
+CLI_SHA = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+
+
+def check(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path):
+    return json.loads(path.read_bytes())
+
+
+def digest(value):
+    return sha(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":")).encode())
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": sha(path.read_bytes())}
+
+
+def save(name, value):
+    with (HERE / name).open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def snapshot(source, target):
+    before = source.stat()
+    raw = source.read_bytes()
+    after = source.stat()
+    check((before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+          and len(raw) == after.st_size, "Local source changed during snapshot")
+    with target.open("xb") as stream:
+        stream.write(raw)
+    check(target.read_bytes() == raw, "Local snapshot differs")
+    return {"source": str(source.resolve()), "source_bytes": len(raw),
+            "source_mtime_ns": after.st_mtime_ns, "received": ref(target),
+            "snapshot_utc": datetime.now(UTC).isoformat()}
+
+
+def wire_schema(value):
+    value = copy.deepcopy(value)
+    def visit(node):
+        if isinstance(node, dict):
+            node.pop("uniqueItems", None)
+            node.pop("maxItems", None)
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+    visit(value)
+    return value
+
+
+def main():
+    direct = read(HERE / "telechargements-references-premier-passage.json")
+    supplements = read(HERE / "complements-et-refus-preserves.json")
+    main_downloads = read(HERE / "telechargements-principaux.json")
+    received = {}
+    transfer_evidence = []
+    input_paths = []
+    for record in direct:
+        result = record["result"]
+        if result.get("structuredContent", {}).get("verifie") is not True:
+            retry = supplements["single_file_download_retry"]
+            check(retry["remote"] == record["remote"] and retry["sha256"] == record["sha256"],
+                  "Unrelated replacement for failed transfer")
+            result = retry["retry"]
+        value = result["structuredContent"]
+        path = Path(record["local"])
+        actual = sha(path.read_bytes())
+        check(value.get("ok") is True and value.get("verifie") is True
+              and value["downloaded"] == record["remote"]
+              and actual == record["sha256"] == value["remote_sha256"]
+              == value["empreinte_distante"] == value["empreinte_locale"]
+              and path.stat().st_size == value["bytes"], "Direct reference is missing or changed")
+        received[record["remote"]] = path
+        input_paths.append(path)
+        transfer_evidence.append({"remote": record["remote"], "expected_sha256": record["sha256"],
+                                 "label": record["label"], "local": ref(path),
+                                 "bytes": path.stat().st_size})
+    check(len(received) == 33, "Every direct first-start reference must be received")
+    for item in main_downloads["main_downloads"]:
+        value = item["value"]["structuredContent"]
+        path = Path(value["to"])
+        check(value["verifie"] is True and sha(path.read_bytes()) == value["remote_sha256"]
+              == value["empreinte_distante"] == value["empreinte_locale"],
+              "Main download integrity mismatch")
+        input_paths.append(path)
+    config_transfer = supplements["config_download"]["value"]["structuredContent"]
+    config_path = HERE / "config-native.json"
+    check(config_transfer["verifie"] is True
+          and sha(config_path.read_bytes()) == config_transfer["remote_sha256"]
+          == config_transfer["empreinte_distante"] == config_transfer["empreinte_locale"],
+          "Config integrity mismatch")
+    input_paths.append(config_path)
+    before = {str(p.relative_to(HERE)): sha(p.read_bytes()) for p in input_paths}
+    save("inventaire-recus-avant.json", before)
+    first = read(HERE / "premier-demarrage-verifie.json")
+    evaluation = read(HERE / "premiere-evaluation-reelle.json")
+    expected = {"schema": "hpc-forest-primes-r2max-first-start-verified-v1", "scope_id": SCOPE,
+                "verified": True, "model": MODEL, "effort": "max", "session_id": SESSION,
+                "job_id": "751992", "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+                "preparation_manifest_sha256": PREP, "technical_errors_found": False,
+                "pending_first_real_evaluation": False, "blocking_reasons": [],
+                "automatic_extension": False, "extension_to_other_models_allowed": False}
+    check(all(first.get(k) == v for k, v in expected.items()), "First-start identity or state differs")
+    allocation = first["allocation"]
+    check(allocation["job_id"] == "751992" and allocation["architecture"] == "aarch64"
+          and all(allocation[k] == v for k, v in
+                  {"nodes": 1, "tasks": 1, "cpus_per_task": 4, "memory_mib": 16384,
+                   "gpus": 0, "affinity_cpu_count": 4}.items())
+          and len(set(allocation["affinity_cpu_ids"])) == 4, "Allocation/affinity differs")
+    def resolved(reference):
+        path = received[reference["path"]]
+        check(sha(path.read_bytes()) == reference["sha256"], "Nested direct SHA mismatch")
+        return path
+    admission = first["admission_artifacts"]
+    check(set(admission) == {"source_zip", "plan", "preparation_manifest", "preparation_review",
+                            "allocated_contract_qualification", "allocated_contract_reception",
+                            "cli_identity", "integration_review", "worker_lane_admission", "transport_admission"},
+          "Ten admission references required")
+    cli = read(resolved(admission["cli_identity"]))
+    worker = read(resolved(first["worker_identity"]))
+    worker_copy = read(HERE / "worker-identity.json")
+    check(worker == worker_copy, "Runner worker identity copy differs semantically")
+    check(all(worker.get(k) == v for k, v in
+              {"model": MODEL, "reasoning_effort": "max", "session_id": SESSION,
+               "scope_id": SCOPE, "mode": "codex", "pid": 41724,
+               "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+               "codex_executable_sha256": CLI_SHA}.items())
+          and worker["codex_executable"] == cli["executable_path"]
+          and worker["codex_cli_version"] == cli["version"]
+          and cli["source_execution_allowed"] is False
+          and sha(Path(cli["executable_path"]).read_bytes()) == CLI_SHA,
+          "Actual immutable CLI/worker identity differs")
+    reference = read(resolved(first["runtime_reference_origin"]))
+    check(reference["job_id"] == "751992" and reference["allocation"] == allocation
+          and reference["reference_origin_is_current_allocation"] is True
+          and reference["qualification_timings_imported"] is False
+          and reference["native_model_calls"] == 0
+          and reference["source_zip_sha256"] == SOURCE and reference["plan_sha256"] == PLAN,
+          "Native reference imported another allocation's timings")
+    config = read(config_path)
+    check(config["codex"]["model"] == MODEL and config["codex"]["reasoning_effort"] == "max"
+          and config["codex"]["session_id"] == SESSION
+          and config["codex"]["transport"] == "codex-mailbox"
+          and config["budget"]["infrastructure_retries"] == 0
+          and config["protocol"]["repetitions"] == 3
+          and config["protocol"]["confirmation_repetitions"] == 5
+          and "slurm-751992" in config["target_id"]
+          and config["compiler"]["path"] == "/usr/bin/gcc",
+          "Actual native config differs")
+    calls = first["all_started_calls_reconciled"]
+    check(len(calls) == 2 and sum(bool(c["mother_call"]) for c in calls) == 1,
+          "Snapshot must describe exactly the first mother and first child")
+    checks = []
+    snapshots = []
+    for call in calls:
+        request = read(resolved(call["request"]))
+        response = read(resolved(call["response"]))
+        invocation = read(resolved(call["invocation"]))
+        process = read(resolved(call["process"]))
+        delivered = read(resolved(call["delivered"]))
+        ready = read(resolved(call["ready"]))
+        nonce = request["nonce"]
+        check(all(request.get(k) == v for k, v in
+                  {"protocol": "hpc-forest-codex-mailbox-v1", "model": MODEL,
+                   "reasoning_effort": "max", "session_id": SESSION, "kind": "source-proposal"}.items())
+              and all(response.get(k) == v for k, v in
+                      {"nonce": nonce, "model": MODEL, "reasoning_effort": "max", "session_id": SESSION,
+                       "request_sha256": call["request"]["sha256"], "error": None,
+                       "infrastructure_error": False}.items()),
+              "Request/response identity or normal status differs")
+        check(ready["sha256"] == call["response"]["sha256"]
+              and ready["bytes"] == resolved(call["response"]).stat().st_size
+              and delivered["request_sha256"] == call["request"]["sha256"]
+              and delivered["response_sha256"] == call["response"]["sha256"]
+              and all(delivered.get(k) == v for k, v in
+                      {"scope_id": SCOPE, "job_id": "751992", "session_id": SESSION,
+                       "model": MODEL, "effort": "max", "source_zip_sha256": SOURCE, "plan_sha256": PLAN}.items()),
+              "Ready/delivery chain differs")
+        argv = invocation["argv"]
+        configs = {}
+        for i, argument in enumerate(argv):
+            if argument == "--config":
+                key, value = argv[i + 1].split("=", 1)
+                check(key not in configs, "Duplicate effective CLI override")
+                configs[key] = json.loads(value)
+        check(argv == process["argv"] and argv[0] == cli["executable_path"]
+              and argv[1] == "exec" and argv[argv.index("--model") + 1] == MODEL
+              and argv[argv.index("--sandbox") + 1] == "read-only"
+              and "--ignore-user-config" in argv and "--strict-config" in argv
+              and configs["model_reasoning_effort"] == "max"
+              and configs["web_search"] == "disabled" and configs["approval_policy"] == "never"
+              and configs["features.skip_host_skill_discovery"] is True
+              and all(configs["features." + key] is False for key in
+                      ["shell_tool", "unified_exec", "apps", "plugins", "memories", "multi_agent",
+                       "multi_agent_v2", "hooks", "skill_search", "browser_use", "computer_use",
+                       "image_generation", "view_image", "workspace_dependencies", "code_mode_host",
+                       "sleep_tool", "unbounded_connection_retries", "shell_snapshot", "goals"])
+              and invocation["source_execution_allowed"] is False
+              and invocation["request_sha256"] == call["request"]["sha256"]
+              and process["returncode"] == 0 and process["timed_out"] is False,
+              "Actual CLI flags, process success or scope differs")
+        check([m["role"] for m in request["messages"]] == ["system", "user"],
+              "Frozen normal message roles differ")
+        instructions = Path(configs["model_instructions_file"])
+        schema_path = Path(argv[argv.index("--output-schema") + 1])
+        check(instructions.parent.name == nonce and schema_path.parent.name == nonce,
+              "CLI instruction/schema path is not nonce-scoped")
+        check(instructions.read_text(encoding="utf8") == request["messages"][0]["content"]
+              and read(schema_path) == wire_schema(request["schema"]),
+              "Actual CLI instructions/schema differ from the exact request")
+        snapshots.append(snapshot(instructions, HERE / (nonce + "-instructions.txt")))
+        snapshots.append(snapshot(schema_path, HERE / (nonce + "-output-schema.json")))
+        log_path = resolved(call["error_and_usage_log"])
+        events, non_json = [], []
+        for line in log_path.read_text(encoding="utf8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                non_json.append(line)
+        usage_events = [event["usage"] for event in events if event.get("type") == "turn.completed"]
+        check(len(usage_events) == 1 and not any(e.get("type") in {"turn.failed", "error"} for e in events),
+              "Unknown or failed model turn")
+        tool_events = [e["item"]["type"] for e in events
+                       if e.get("type") in {"item.started", "item.completed", "item.updated"}
+                       and e.get("item", {}).get("type") not in {"agent_message", "reasoning", "error", None}]
+        usage = response["usage"]
+        tokens = sum(e["input_tokens"] + e["output_tokens"] for e in usage_events)
+        check(tool_events == [] and usage["tool_events"] == []
+              and usage["events"] == usage_events and usage["tokens"] == tokens
+              and usage["llm_calls"] == 1 and usage["token_accounting"] == "exact"
+              and usage["codex_jsonl_sha256"] == sha(log_path.read_bytes()),
+              "Raw model usage/tool journal differs from delivered usage")
+        warnings = [e["item"]["message"] for e in events if e.get("item", {}).get("type") == "error"]
+        allowed = ["Ignoring malformed agent role definition:", "Under-development features enabled:",
+                   "Code Mode is unavailable because code-mode host is disabled.",
+                   "Exceeded skills context budget."]
+        check(len(warnings) == 5 and all(any(w.startswith(p) for p in allowed) for w in warnings)
+              and all("WARN codex_agent_roles::loader: Ignoring malformed agent role definition:" in line
+                      for line in non_json), "Unclassified CLI error or stderr content")
+        check(call["mother_call"] == bool(request.get("meta_role")),
+              "Mother vs normal-child classification differs")
+        checks.append({"nonce": nonce, "mission_id": request["mission_id"],
+                       "mother_call": call["mother_call"], "delivered_at": delivered["delivered_at"],
+                       "delivered_utc": datetime.fromtimestamp(delivered["delivered_at"], UTC).isoformat(),
+                       "request_sha256": call["request"]["sha256"], "response_sha256": call["response"]["sha256"],
+                       "model": MODEL, "effort": "max", "usage_exact": True,
+                       "tokens_first_boundary_only": tokens, "llm_calls": 1, "tool_events": 0,
+                       "process_returncode": 0, "timed_out": False,
+                       "nonblocking_cli_error_items": warnings, "non_json_warning_lines": len(non_json)})
+    child = next(c for c in checks if c["mother_call"] is False)
+    mother = next(c for c in checks if c["mother_call"] is True)
+    check(child["nonce"] == "636caff92f0f43aa9c420bea527852ed"
+          and mother["nonce"] == "206feaff615348498afb45e9edb08220"
+          and first["first_normal_delivered_call"] == next(c for c in calls if not c["mother_call"]),
+          "The first normal child was confused with mother preparation")
+    outcome = evaluation["outcome"]
+    first_eval = first["first_real_evaluation"]
+    check(evaluation["experiment_id"] == first_eval["experiment_id"] == "6a8571a740854bf6"
+          and child["mission_id"].startswith(evaluation["experiment_id"] + "-h")
+          and evaluation["never_model_input"] is True
+          and digest(outcome) == first_eval["outcome_sha256"]
+          and outcome["status"] == first_eval["status"] == "valid"
+          and outcome["correct"] is first_eval["correct"] is True
+          and len(outcome["times"]) == 3
+          and all(type(t) in (int, float) and math.isfinite(t) and t > 0 for t in outcome["times"]),
+          "First actual evaluation is missing, changed or not linked to normal child")
+    check(set(outcome["logs"]) == {log["path"] for log in first_eval["logs"]},
+          "Evaluation log references differ")
+    for log in first_eval["logs"]:
+        resolved(log)
+    correctness = read(resolved(first_eval["logs"][1]))
+    check(correctness.get("correct") is True, "Actual correctness log is negative")
+    for name in ["worker.stderr.log", "worker.stdout.log", "worker-lancement.json",
+                 "worker-launch-intent.json"]:
+        source = LAUNCH / name
+        snapshots.append(snapshot(source, HERE / ("snapshot-" + name)))
+    after = {str(p.relative_to(HERE)): sha(p.read_bytes()) for p in input_paths}
+    save("inventaire-recus-apres.json", after)
+    check(before == after, "Audit changed received first-start evidence")
+    receipt = {
+        "schema": "hpc-forest-primes-r2max-first-start-reception-verified-v1",
+        "verified": True, "scope_id": SCOPE, "job_id": "751992", "session_id": SESSION,
+        "model": MODEL, "effort": "max",
+        "verification_scope": "Technical first-batch boundary only; one mother and one normal child",
+        "source_revision_sha256": SOURCE, "source_zip_sha256": SOURCE, "plan_sha256": PLAN,
+        "payload_sha256": "1e17d198d5a2ae663504be665a326d3fca580fb4502fa37ede9831d4a71c9226",
+        "preparation_manifest_sha256": PREP,
+        "produced_remote_first_start_receipt": ref(HERE / "premier-demarrage-verifie.json"),
+        "first_start_receipt_sha256": sha((HERE / "premier-demarrage-verifie.json").read_bytes()),
+        "first_evaluation_receipt": ref(HERE / "premiere-evaluation-reelle.json"),
+        "first_evaluation_sha256": sha((HERE / "premiere-evaluation-reelle.json").read_bytes()),
+        "first_normal_request_nonce": child["nonce"], "mother_preparation_nonce": mother["nonce"],
+        "allocation_evidence": {"allocation": allocation, "worker": ref(resolved(first["worker_identity"])),
+                                "runtime_reference_origin": ref(HERE / "runtime-reference-origin.json"),
+                                "config": ref(config_path)},
+        "invocation_and_delivery_evidence": transfer_evidence,
+        "first_evaluation_evidence": {
+            "experiment_id": evaluation["experiment_id"], "reported_status": "valid", "reported_correct": True,
+            "outcome_sha256": digest(outcome), "binary_sha256_reported": outcome["binary_sha256"],
+            "source_commit_reported": outcome["commit"], "raw_logs_received": len(first_eval["logs"]),
+            "actual_evaluation_record_and_logs_linked_by_sha": True,
+            "independent_binary_phase_attribution_proved": False,
+        },
+        "raw_error_evidence": {
+            "CLI_error_items_per_call": 5, "CLI_error_items_are_nonblocking_configuration_warnings": True,
+            "CLI_warning_messages_preserved_in_calls": True,
+            "tool_events_total_first_boundary": 0, "completed_call_returncodes": [0, 0],
+            "scheduler_log_snapshot": ref(HERE / "telechargements-principaux.json"),
+            "worker_log_snapshots": [x for x in snapshots if "worker." in x["source"]],
+            "first_SCP_refusal_preserved": ref(HERE / "telechargements-references-premier-passage.json"),
+            "same_immutable_file_read_and_transfer_retry": ref(HERE / "complements-et-refus-preserves.json"),
+        },
+        "confirmed_infrastructure_defects": [], "isolated_corrections_and_checks": [],
+        "started_claims_reconciliation": {
+            "boundary_only": True, "calls": checks, "requests": 2, "deliveries": 2,
+            "completed_invocations": 2, "unknown_invocations_at_first_boundary": 0,
+            "known_exact_tokens_at_first_boundary": sum(c["tokens_first_boundary_only"] for c in checks),
+            "not_current_cohort_total": True, "generation_replay_performed": False,
+        },
+        "unresolved_limits": [
+            "This receipt covers the first batch, not later calls, terminal cohort admission or final scientific audit.",
+            "Raw candidate stdout logs lack an independently strong binary/phase binding; none is invented here.",
+            "No independent speedup, best confirmed program or causal ranking is established.",
+            "No model weights digest or hardware/process private-data isolation is proved.",
+            "Nonblocking CLI configuration warnings are preserved; logs are not claimed error-free.",
+        ],
+        "continuation_admitted": True,
+        "continuation_scope": "Technical startup prerequisite for the existing Luna MAX cell only.",
+        "extension_to_other_models_allowed": False, "third_worker_allowed": False,
+        "final_scientific_or_cohort_admission": False, "candidate_or_CLI_executed_by_auditor": False,
+        "all_33_direct_remote_refs_SHA_verified": True, "received_bytes_before_after_identical": True,
+        "local_immutable_instruction_schema_and_worker_snapshots": snapshots,
+        "inputs_before": ref(HERE / "inventaire-recus-avant.json"),
+        "inputs_after": ref(HERE / "inventaire-recus-apres.json"),
+        "auditor": ref(Path(__file__).resolve()),
+        "verified_utc": datetime.now(UTC).isoformat(),
+    }
+    save("reception-premier-demarrage-verifiee.json", receipt)
+    print(json.dumps({"verified": True, "receipt": ref(HERE / "reception-premier-demarrage-verifiee.json"),
+                      "first_start_receipt_sha256": receipt["first_start_receipt_sha256"],
+                      "first_evaluation_sha256": receipt["first_evaluation_sha256"],
+                      "first_boundary_calls": checks,
+                      "direct_refs_verified": 33, "extension_to_other_models_allowed": False}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

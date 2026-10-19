@@ -2,17 +2,28 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
 import re
+import stat
+from datetime import datetime
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from .article_r5 import verify as verify_article_r5
+from .full_snapshot import (
+    SnapshotError,
+    _digest_file,
+    _linked,
+    _relative,
+    _unlinked_ancestors,
+)
+from .full_snapshot import verify as verify_full_snapshot
 from .manifest import public_files
 from .native_first import verify as verify_native_first
 from .qualification import verify as verify_qualification
-from .received_r4 import HTMLReferences, verify as verify_received_r4
 from .received import verify as verify_received
+from .received_r4 import HTMLReferences
+from .received_r4 import verify as verify_received_r4
 from .recompute import ROOT, EvidenceError, compare, compute, load_json
 
 
@@ -43,8 +54,15 @@ def verify_manifest(root: Path):
 
 def verify_links(root: Path):
     checked = 0
+    # Historical source documents retain their original, machine-specific links.
+    # Their bytes are checked by the manifest; current documentation remains linked.
+    archived = (("code", "r1-historical"), ("code", "r1-comparison"),
+                ("code", "r2-native"), ("code", "operations"),
+                ("reproducibility", "reexecution-r1-r2-r2"))
     for path in root.rglob("*.md"):
-        if any(part.startswith(".") for part in path.relative_to(root).parts):
+        relative = path.relative_to(root).parts
+        if (any(part.startswith(".") for part in relative)
+                or any(relative[:len(prefix)] == prefix for prefix in archived)):
             continue
         for link in re.findall(r"!?\[[^\]]*\]\(([^\s)]+)\)", path.read_text(encoding="utf-8")):
             if re.match(r"[a-z][a-z0-9+.-]*:", link, re.IGNORECASE) or link.startswith("#"):
@@ -54,6 +72,98 @@ def verify_links(root: Path):
                 raise EvidenceError(f"Broken relative link in {path.name}: {link}")
             checked += 1
     return checked
+
+
+def verify_source_trees(root: Path):
+    """Hash the inert historical copies and require complete source coverage."""
+    root = root.resolve()
+    guide = "reproducibility/reexecution-r1-r2-r2"
+    edition_paths = {"code/r1-historical", "code/r1-comparison", "code/r2-native"}
+    code_prefixes = edition_paths | {"code/operations"}
+    excluded = {"code/README.md", "code/SOURCES.json"}
+
+    def require(condition, message):
+        if not condition:
+            raise EvidenceError("Published source trees: " + message)
+
+    def path_name(value):
+        try:
+            return _relative(value)
+        except SnapshotError as exc:
+            raise EvidenceError("Published source trees: unsafe path") from exc
+
+    def files_under(folder):
+        result, pending = set(), [root / folder]
+        while pending:
+            current = pending.pop()
+            _unlinked_ancestors(current)
+            require(current.is_dir(), "missing source directory")
+            for target in current.iterdir():
+                info = target.lstat()
+                require(not _linked(info), "linked source entry")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(target)
+                else:
+                    require(stat.S_ISREG(info.st_mode), "non-regular source entry")
+                    result.add(target.relative_to(root).as_posix())
+        return result
+
+    _unlinked_ancestors(root / "code/SOURCES.json")
+    data = load_json((root / "code/SOURCES.json").read_text(encoding="utf-8"))
+    require(isinstance(data, dict) and set(data) == {"schema", "experiments_paused", "historical_editions",
+                                                   "operation_files", "files", "scope"}, "invalid inventory fields")
+    require(data["schema"] == "hpc-forest-published-source-trees-v1" and data["experiments_paused"] is True,
+            "invalid schema or paused state")
+    require(isinstance(data["scope"], str) and data["scope"], "missing scope")
+    require(isinstance(data["files"], list) and data["files"], "missing file inventory")
+    seen, references, prefixes = set(), {}, {}
+    for item in data["files"]:
+        require(isinstance(item, dict) and set(item) == {"path", "bytes", "sha256"}, "invalid file fields")
+        name = path_name(item["path"])
+        require(name not in excluded and (any(name.startswith(p + "/") for p in code_prefixes)
+                                         or name.startswith(guide + "/")), "out-of-scope source path")
+        folded = name.casefold()
+        require(folded not in seen, "duplicate source path")
+        seen.add(folded)
+        for length in range(1, len(name.split("/")) + 1):
+            prefix = "/".join(name.split("/")[:length])
+            key = prefix.casefold()
+            require(key not in prefixes or prefixes[key] == prefix, "case-colliding source path")
+            prefixes[key] = prefix
+        require(type(item["bytes"]) is int and item["bytes"] >= 0 and isinstance(item["sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]), "invalid file fingerprint")
+        target = root / name
+        _unlinked_ancestors(target)
+        digest, size, _ = _digest_file(target)
+        require(size == item["bytes"] and digest == item["sha256"], "source bytes differ")
+        references[name] = item
+    actual_code = files_under("code") - excluded
+    actual_guide = files_under(guide)
+    require(set(references) == actual_code | actual_guide, "source coverage differs")
+    editions = data["historical_editions"]
+    require(isinstance(editions, list) and len(editions) == len(edition_paths), "invalid historical edition inventory")
+    edition_seen, historical_count = set(), 0
+    for edition in editions:
+        require(isinstance(edition, dict) and set(edition) == {"path", "archive", "archive_sha256", "files"},
+                "invalid historical edition fields")
+        folder = path_name(edition["path"])
+        archive = path_name(edition["archive"])
+        require(folder in edition_paths and folder not in edition_seen and "/" not in archive and archive.endswith(".zip"),
+                "unknown or duplicate historical edition")
+        edition_seen.add(folder)
+        archive_reference = references.get(guide + "/archives/" + archive)
+        require(archive_reference is not None and archive_reference["sha256"] == edition["archive_sha256"],
+                "historical archive fingerprint differs")
+        count = sum(name.startswith(folder + "/") for name in actual_code)
+        require(type(edition["files"]) is int and edition["files"] > 0 and count == edition["files"],
+                "historical source count differs")
+        historical_count += count
+    operations = sum(name.startswith("code/operations/") for name in actual_code)
+    require(type(data["operation_files"]) is int and data["operation_files"] >= 0
+            and operations == data["operation_files"] and len(actual_code) == historical_count + operations,
+            "operational source count differs")
+    return {"files": len(references), "code_files": len(actual_code), "restoration_files": len(actual_guide),
+            "historical_editions": len(editions), "operation_files": operations}
 
 
 def verify_article_bundle(root: Path):
@@ -170,7 +280,7 @@ def verify_native_incidents(root: Path):
     require(sum(tokens) == data["astra_count"]["source_exact_tokens_announced"], "source-announced token sum differs")
     chronology = [data["sol_count"]["bootstrap_failed_at_utc"], data["article_source_cutoff_utc"], data["sol_count"]["original_admission_deadline_utc"], data["astra_count"]["scheduler_ended_at_utc"], data["observed_at_utc"]]
     moments = [datetime.fromisoformat(value) for value in chronology]
-    require(all(moment.utcoffset() is not None and moment.utcoffset().total_seconds() == 0 for moment in moments) and all(a < b for a, b in zip(moments, moments[1:])), "failure, deadline and receipt chronology differs")
+    require(all(moment.utcoffset() is not None and moment.utcoffset().total_seconds() == 0 for moment in moments) and all(a < b for a, b in pairwise(moments)), "failure, deadline and receipt chronology differs")
     sources = data["sources"]
     names = {"sol-bootstrap-result":"bootstrap-failed-755766.json", "astra-readonly-summary":"SYNTHESE-CAUSE-r1.json", "astra-original-archive":"results-755862.tar.gz", "astra-later-delivery-receipt":None, "sol-bootstrap-scp-receipt":"BOOTSTRAP-FAILED-SCP-REEL-r1.json", "sol-scheduler-summary":"JOB-EFFICIENCY-FAILED-REEL-r1.json", "astra-cache-worker-summary":"LOCAL-CACHE-AND-WORKER-SUMMARY-r1.json", "astra-scheduler-status":"JOB-STATUS-r1.json"}
     require(type(sources) is list and len(sources) == len(names), "source fingerprint inventory differs")
@@ -181,7 +291,7 @@ def verify_native_incidents(root: Path):
         require(type(name) is str and name in names and name not in seen and item["basename"] == names[name], "private or duplicate source name")
         require(type(item["bytes"]) is int and item["bytes"] > 0 and type(item["sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]), "invalid source fingerprint")
         seen.add(name)
-    require(not re.search(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]|/scratch/|/home/|Bearer\s|sk-[A-Za-z0-9]{16}", raw, re.I), "private path or credential pattern")
+    require(not re.search(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]|/scratch/|/home/|Bearer\s|sk-[A-Za-z0-9]{16}", raw, re.IGNORECASE), "private path or credential pattern")
     return coverage
 
 
@@ -195,6 +305,8 @@ def main():
     article = verify_article_r5(ROOT)
     article_files = verify_article_bundle(ROOT)
     incidents = verify_native_incidents(ROOT)
+    source_trees = verify_source_trees(ROOT)
+    full_snapshot = verify_full_snapshot(ROOT / "archive/full-2026-10-19")
     links = verify_links(ROOT)
     print(f"Verified {count} file hashes and {links} relative links.")
     print("Recomputed 144 controller series (2,400 measured cycles) and 200 CPU samples (40 configurations).")
@@ -209,6 +321,10 @@ def main():
           f"{article['r2_missing_cells']} R2 cells without measurements and zero scientifically admitted pairs.")
     print(f"Later technical supplement: {incidents['technical_incident_cells']} incidents, "
           f"{incidents['not_launched_cells']} unlaunched cells and {incidents['cells_without_included_scientific_measurement']} cells without included comparison measurements; no new performance result.")
+    print(f"Published source copies: {source_trees['code_files']} code files and "
+          f"{source_trees['restoration_files']} restoration files; historical programs were not executed.")
+    print(f"Full inert snapshot: {full_snapshot['roots']} roots, {full_snapshot['files']} files and "
+          f"{full_snapshot['unique_objects']} unique content objects.")
     print("This checks integrity and arithmetic; it does not execute or certify the evaluated programs.")
 
 

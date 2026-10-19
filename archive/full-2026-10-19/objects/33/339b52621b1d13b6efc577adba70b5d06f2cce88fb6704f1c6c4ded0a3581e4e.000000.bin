@@ -1,0 +1,251 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/* Allocation-failure fallback using the original traversal. */
+static void body_force_aos(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; j++) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+/*
+ * Pack positions separately from velocities, then cache-tile the
+ * interactions. Each target still accumulates sources in ascending order.
+ */
+void body_force(Body *p, float dt, int n) {
+  enum { TARGET_BLOCK = 64, SOURCE_BLOCK = 256 };
+
+  if (n <= 0) {
+    return;
+  }
+
+  float *positions = (float *)malloc((size_t)n * 3u * sizeof(float));
+  if (positions == NULL) {
+    body_force_aos(p, dt, n);
+    return;
+  }
+
+  float *const x = positions;
+  float *const y = x + n;
+  float *const z = y + n;
+  for (int i = 0; i < n; ++i) {
+    x[i] = p[i].x;
+    y[i] = p[i].y;
+    z[i] = p[i].z;
+  }
+
+  for (int base = 0; base < n; ) {
+    int count = n - base;
+    if (count > TARGET_BLOCK) {
+      count = TARGET_BLOCK;
+    }
+
+    float fx_tile[TARGET_BLOCK] = {0.0f};
+    float fy_tile[TARGET_BLOCK] = {0.0f};
+    float fz_tile[TARGET_BLOCK] = {0.0f};
+
+    for (int source = 0; source < n; ) {
+      int source_count = n - source;
+      if (source_count > SOURCE_BLOCK) {
+        source_count = SOURCE_BLOCK;
+      }
+      const int source_end = source + source_count;
+      int t = 0;
+
+      for (; t + 3 < count; t += 4) {
+        const int i = base + t;
+        const float x0 = x[i],     y0 = y[i],     z0 = z[i];
+        const float x1 = x[i + 1], y1 = y[i + 1], z1 = z[i + 1];
+        const float x2 = x[i + 2], y2 = y[i + 2], z2 = z[i + 2];
+        const float x3 = x[i + 3], y3 = y[i + 3], z3 = z[i + 3];
+        float fx0 = fx_tile[t],     fy0 = fy_tile[t],     fz0 = fz_tile[t];
+        float fx1 = fx_tile[t + 1], fy1 = fy_tile[t + 1], fz1 = fz_tile[t + 1];
+        float fx2 = fx_tile[t + 2], fy2 = fy_tile[t + 2], fz2 = fz_tile[t + 2];
+        float fx3 = fx_tile[t + 3], fy3 = fy_tile[t + 3], fz3 = fz_tile[t + 3];
+
+        for (int j = source; j < source_end; ++j) {
+          const float xj = x[j];
+          const float yj = y[j];
+          const float zj = z[j];
+
+          float dx = xj - x0;
+          float dy = yj - y0;
+          float dz = zj - z0;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+          fx0 += dx * inv_dist3;
+          fy0 += dy * inv_dist3;
+          fz0 += dz * inv_dist3;
+
+          dx = xj - x1;
+          dy = yj - y1;
+          dz = zj - z1;
+          sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          inv_dist = 1 / sqrt(sqrd_dist);
+          inv_dist3 = inv_dist * inv_dist * inv_dist;
+          fx1 += dx * inv_dist3;
+          fy1 += dy * inv_dist3;
+          fz1 += dz * inv_dist3;
+
+          dx = xj - x2;
+          dy = yj - y2;
+          dz = zj - z2;
+          sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          inv_dist = 1 / sqrt(sqrd_dist);
+          inv_dist3 = inv_dist * inv_dist * inv_dist;
+          fx2 += dx * inv_dist3;
+          fy2 += dy * inv_dist3;
+          fz2 += dz * inv_dist3;
+
+          dx = xj - x3;
+          dy = yj - y3;
+          dz = zj - z3;
+          sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          inv_dist = 1 / sqrt(sqrd_dist);
+          inv_dist3 = inv_dist * inv_dist * inv_dist;
+          fx3 += dx * inv_dist3;
+          fy3 += dy * inv_dist3;
+          fz3 += dz * inv_dist3;
+        }
+
+        fx_tile[t] = fx0;
+        fy_tile[t] = fy0;
+        fz_tile[t] = fz0;
+        fx_tile[t + 1] = fx1;
+        fy_tile[t + 1] = fy1;
+        fz_tile[t + 1] = fz1;
+        fx_tile[t + 2] = fx2;
+        fy_tile[t + 2] = fy2;
+        fz_tile[t + 2] = fz2;
+        fx_tile[t + 3] = fx3;
+        fy_tile[t + 3] = fy3;
+        fz_tile[t + 3] = fz3;
+      }
+
+      for (; t < count; ++t) {
+        const int i = base + t;
+        const float xi = x[i];
+        const float yi = y[i];
+        const float zi = z[i];
+        float fx = fx_tile[t];
+        float fy = fy_tile[t];
+        float fz = fz_tile[t];
+
+        for (int j = source; j < source_end; ++j) {
+          float dx = x[j] - xi;
+          float dy = y[j] - yi;
+          float dz = z[j] - zi;
+          float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+          float inv_dist = 1 / sqrt(sqrd_dist);
+          float inv_dist3 = inv_dist * inv_dist * inv_dist;
+          fx += dx * inv_dist3;
+          fy += dy * inv_dist3;
+          fz += dz * inv_dist3;
+        }
+
+        fx_tile[t] = fx;
+        fy_tile[t] = fy;
+        fz_tile[t] = fz;
+      }
+
+      source = source_end;
+    }
+
+    for (int t = 0; t < count; ++t) {
+      p[base + t].vx += dt*fx_tile[t];
+      p[base + t].vy += dt*fy_tile[t];
+      p[base + t].vz += dt*fz_tile[t];
+    }
+    base += count;
+  }
+
+  free(positions);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /*
+   * At each simulation iteration, interbody forces are computed,
+   * and bodies' positions are integrated.
+   */
+  for (int iter = 0; iter < N_ITER; iter++) {
+    body_force(bodies, DT, nbodies);
+
+    for (int i = 0; i < nbodies; i++) {
+      bodies[i].x += bodies[i].vx * DT;
+      bodies[i].y += bodies[i].vy * DT;
+      bodies[i].z += bodies[i].vz * DT;
+    }
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

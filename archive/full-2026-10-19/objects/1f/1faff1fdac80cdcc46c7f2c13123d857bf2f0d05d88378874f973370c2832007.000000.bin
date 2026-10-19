@@ -1,0 +1,236 @@
+"""One immutable selected r2c MAX cell, bound only by actual received operator artifacts."""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+SCOPE_VALUE = "hpc-forest-primes-native-max-r2c"
+CELLS = {"gpt-6-astra": "979ef61f50d041639c1cd46e1942a3f3",
+         "gpt-5.6-terra": "a35692d6da3f46278fe3840f5c56984e",
+         "gpt-6.1-sol": "0fbe579c95f74ec7b90ebe702877434b"}
+# The launcher remains in its explicitly owned historical r2b directory; the source and remote root are r2c.
+CACHE_PARENT = "C:/Users/nicol/Documents/Codex/2026-10-15/cr/outputs/HPC-Forest-Primes-Natif-Lancement-r2b"
+SOURCE_VALUE = "ade344bfec4322e8aaecc99cfbf7bd502e6d39b55c62180e8f552a3d6391e680"
+PLAN_VALUE = "bac579fdb44850c636a6522c014175f95d4ce867bab502d86dd15c1bff31032e"
+PREPARATION = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+ARTIFACT_NAMES = {"allocated_contract_qualification", "allocated_contract_reception", "cli_identity",
+                  "extension_admission", "integration_review", "luna_closure", "luna_first_start", "plan",
+                  "preparation_manifest", "preparation_review", "session_freshness", "source_zip",
+                  "transport_admission", "worker_lane_admission"}
+AUTH_FIELDS = {"schema", "scope_id", "model", "effort", "session_id", "verified", "expires_at",
+               "user_messages", "old_candidates_imported", "operator_algorithm_advice",
+               "native_calls_started_at_authorization", "job_id", "remote_root", "artifacts"}
+_binding = None
+
+
+def need(value, message):
+    if not value:
+        raise ValueError("Immutable audit binding: " + message)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def json_file(path):
+    path = Path(path)
+    need(path.is_file() and not path.is_symlink() and path.stat().st_size <= 8 * 1024 * 1024,
+         "missing, linked or oversized proof")
+    return json.loads(path.read_bytes())
+
+
+def artifact(ref):
+    need(isinstance(ref, dict) and set(ref) == {"path", "sha256"}
+         and isinstance(ref["path"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]), "exact path/SHA ref required")
+    path = Path(ref["path"])
+    need(path.is_absolute() and path.is_file() and not path.is_symlink()
+         and sha(path.read_bytes()) == ref["sha256"], "real local artifact missing or changed")
+    return path
+
+
+@dataclass(frozen=True)
+class Binding:
+    model: str
+    session_id: str
+    job_id: str
+    remote_root: str
+    cache_source_root: str
+    expectation_sha256: str
+    protected_refs: tuple
+    cli_json: str
+    controller_artifacts_json: str = ""
+    worker_artifacts_json: str = ""
+    cli_namespace_proof_json: str = ""
+
+    @property
+    def cell(self):
+        return {"scope_id": SCOPE_VALUE, "model": self.model, "effort": "max", "session_id": self.session_id,
+                "job_id": self.job_id, "remote_root": self.remote_root,
+                "source_zip_sha256": SOURCE_VALUE, "plan_sha256": PLAN_VALUE}
+
+
+def validate_identity(value):
+    model = value.get("model")
+    session = value.get("session_id")
+    need(value.get("schema") == "hpc-forest-primes-r2c-native-cell-audit-expectation-v2"
+         and value.get("scope_id") == SCOPE_VALUE and model in CELLS
+         and value.get("effort") == "max" and session == CELLS.get(model)
+         and value.get("source_zip_sha256") == SOURCE_VALUE and value.get("plan_sha256") == PLAN_VALUE,
+         "wrong selected cell/source/plan/MAX")
+    job = value.get("job_id")
+    need(isinstance(job, str) and re.fullmatch(r"[1-9][0-9]{2,11}", job)
+         and job not in {"751926", "751975", "751992", "752087", "752128"},
+         "actual native selected-cell job required; no absent, closed Luna or mechanical qualification job")
+    expected_root = "/scratch_p/nimarano/" + SCOPE_VALUE + "-" + session
+    need(value.get("remote_root") == expected_root, "different full remote root")
+    cache = value.get("cache_source_root")
+    expected_cache = CACHE_PARENT + "/worker-" + session
+    need(isinstance(cache, str) and PureWindowsPath(cache).as_posix() == expected_cache,
+         "different full owned cache source root")
+    need(value.get("synthetic_fixture") is not True and value.get("stub") is not True,
+         "test fixture cannot bind production")
+    return job, expected_root, expected_cache, model, session
+
+
+def validate_lane(lane):
+    count = lane.get("active_native_workers_before_start")
+    need(type(count) is int and 0 <= count < 4 and lane.get("maximum_native_workers") == 4,
+         "actual selected-cell start must respect the explicit global four-worker cap")
+
+
+def authorization(value, copies, expected_cell):
+    need(isinstance(value, dict) and set(value) == AUTH_FIELDS
+         and value.get("schema") == "hpc-forest-primes-r2max-authorization-v2"
+         and value.get("verified") is True and all(value.get(k) == v for k, v in expected_cell.items()
+                                                   if k not in {"source_zip_sha256", "plan_sha256"})
+         and value.get("native_calls_started_at_authorization") == 0
+         and value.get("old_candidates_imported") is False and value.get("operator_algorithm_advice") is False
+         and isinstance(value.get("user_messages"), list) and value["user_messages"]
+         and type(value.get("expires_at")) in {int, float}, "wrong original immutable authorization")
+    refs = value.get("artifacts")
+    need(isinstance(refs, dict) and set(refs) == set(copies) == ARTIFACT_NAMES,
+         "all fourteen actual admission copies required")
+    parsed, protected = {}, []
+    for key in sorted(refs):
+        original, local = refs[key], copies[key]
+        need(isinstance(original, dict) and set(original) == {"path", "sha256"}
+             and isinstance(original["path"], str) and original["sha256"] == local.get("sha256"),
+             "admission original/local SHA mismatch: " + key)
+        path = artifact(local)
+        protected.append((str(path.resolve()), local["sha256"]))
+        if key != "source_zip":
+            parsed[key] = json_file(path)
+    need(refs["source_zip"]["sha256"] == SOURCE_VALUE and refs["plan"]["sha256"] == PLAN_VALUE
+         and refs["preparation_manifest"]["sha256"] == PREPARATION, "authorization source/plan/preparation differs")
+    for key in ARTIFACT_NAMES - {"source_zip", "plan", "preparation_manifest", "preparation_review", "luna_first_start", "luna_closure"}:
+        proof = parsed[key]
+        need(proof.get("verified") is True and proof.get("scope_id") == SCOPE_VALUE
+             and proof.get("source_zip_sha256") == SOURCE_VALUE and proof.get("plan_sha256") == PLAN_VALUE
+             and proof.get("preparation_manifest_sha256") == PREPARATION
+             and proof.get("synthetic_fixture") is not True and proof.get("stub") is not True,
+             "unverified or unrelated admission: " + key)
+    for key in ("transport_admission", "extension_admission", "session_freshness"):
+        need(all(parsed[key].get(k) == expected_cell[k] for k in ("model", "effort", "session_id", "job_id")),
+             "admission selected identity differs: " + key)
+    lane, extension = parsed["worker_lane_admission"], parsed["extension_admission"]
+    validate_lane(lane)
+    need(extension.get("maximum_native_workers") == 4 and extension.get("automatic_extension") is False
+         and extension.get("one_cell_only") is True and extension.get("human_max_only") is True
+         and extension.get("all_prior_calls_reconciled") is True,
+         "explicit closed single-cell MAX extension/cap4 required")
+    cli = parsed["cli_identity"]
+    need(cli.get("source_execution_allowed") is False and isinstance(cli.get("version"), str)
+         and cli["version"] and isinstance(cli.get("executable_path"), str)
+         and re.fullmatch(r"[0-9a-f]{64}", cli.get("executable_sha256", "")), "actual CLI identity missing")
+    return parsed, tuple(protected)
+
+
+def configure(path):
+    global _binding
+    need(_binding is None, "binding cannot be replaced in a running reader")
+    path = Path(path).resolve(strict=True)
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    job, remote, cache, model, session = validate_identity(value)
+    cell = {"scope_id": SCOPE_VALUE, "model": model, "effort": "max", "session_id": session,
+            "job_id": job, "remote_root": remote, "source_zip_sha256": SOURCE_VALUE, "plan_sha256": PLAN_VALUE}
+    observed = json_file(artifact(value.get("scheduler_observation")))
+    observed = observed.get("structuredContent", observed)
+    need(observed.get("job_id") == job and observed.get("finished") is True
+         and observed.get("observation", {}).get("current_state_observed") is True
+         and observed.get("state") in {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED", "OUT_OF_MEMORY"},
+         "fresh terminal observation for this actual native job required")
+    protected = [(str(path), sha(raw))]
+    parsed, original_authorizations = {}, {}
+    for side in ("controller", "worker"):
+        auth_ref = value.get(side + "_authorization")
+        auth_path = artifact(auth_ref)
+        original_authorizations[side] = json_file(auth_path)
+        parsed[side], refs = authorization(original_authorizations[side], value.get(side + "_admission_copies", {}), cell)
+        protected.extend(refs)
+        protected.append((str(auth_path.resolve()), auth_ref["sha256"]))
+    from audit_cli_namespaces import verify_cli_namespaces
+    namespace_refs, namespace_proof = verify_cli_namespaces(value, cell, parsed, original_authorizations)
+    protected.extend(namespace_refs)
+    source_ref = value["controller_admission_copies"]["source_zip"]
+    with zipfile.ZipFile(artifact(source_ref)) as source:
+        names = source.namelist()
+        need(len(names) == len(set(names)) == 103 and all(name.startswith("HPC-Forest/")
+             and ".." not in PurePosixPath(name).parts and "\\" not in name for name in names), "exact 103-source archive required")
+    plan = parsed["controller"]["plan"]
+    need(plan.get("schema") == "hpc-forest-primes-native-max-plan-v2" and plan.get("scope_id") == SCOPE_VALUE
+         and plan.get("source_zip_sha256") == SOURCE_VALUE and plan.get("efforts") == ["max"]
+         and plan.get("cells") == CELLS and plan["cells"].get(model) == session
+         and plan.get("maximum_native_workers_total") == 4
+         and plan.get("maximum_cells_per_authorization") == 1 and plan.get("automatic_extension") is False,
+         "closed plan differs")
+    protected.append((str(artifact(value["scheduler_observation"]).resolve()), value["scheduler_observation"]["sha256"]))
+    _binding = Binding(model, session, job, remote, cache, sha(raw), tuple(sorted(set(protected))),
+                       json.dumps(parsed["worker"]["cli_identity"], sort_keys=True),
+                       json.dumps(original_authorizations["controller"]["artifacts"], sort_keys=True),
+                       json.dumps(original_authorizations["worker"]["artifacts"], sort_keys=True),
+                       json.dumps(namespace_proof, sort_keys=True))
+    return _binding
+
+
+def recheck():
+    need(_binding is not None, "actual job/authorization binding has not been configured")
+    need(all(sha(Path(name).read_bytes()) == expected for name, expected in _binding.protected_refs),
+         "immutable expected authorization/admission/source/CLI changed during audit")
+    return _binding
+
+
+def runtime_evidence(output, cache):
+    binding = recheck()
+    need(json_file(cache / "CELL-BINDING.json") == binding.cell, "snapshot CELL-BINDING differs")
+    owner = json_file(output / "mailbox/OWNER.json")
+    need(all(owner.get(k) == v for k, v in binding.cell.items()), "controller OWNER full cell binding differs")
+    need(json_file(cache / "OWNER.json") == owner, "cache/controller OWNER differ")
+    worker = json_file(output / "worker-identity.json")
+    cli = json.loads(binding.cli_json)
+    expected = {**binding.cell, "owner": binding.job_id, "mode": "codex", "reasoning_effort": "max",
+                "codex_executable": cli["executable_path"], "codex_cli_version": cli["version"],
+                "codex_executable_sha256": cli["executable_sha256"]}
+    need(all(worker.get(k) == v for k, v in expected.items()), "worker ready/CLI/full cell differs")
+    return {"full_cell_binding_verified": True, "immutable_authorizations_rehashed": True,
+            "cli_effective_facts_and_namespaces": json.loads(binding.cli_namespace_proof_json),
+            "authorization_expiry_not_reexecuted_as_a_new_admission": True,
+            "external_cli_executable_bytes_independently_verified": False}
+
+
+def __getattr__(name):
+    names = {"SCOPE", "SESSION", "JOB", "MODEL", "SOURCE_SHA", "PLAN_SHA", "REMOTE", "REMOTE_ROOTS", "CAMPAIGN", "SOURCE_LOCK"}
+    if name not in names:
+        raise AttributeError(name)
+    binding = _binding
+    need(binding is not None, "actual native selected-cell job absent; no default context")
+    root = PurePosixPath(binding.remote_root)
+    fields = {"SCOPE": SCOPE_VALUE, "SESSION": binding.session_id, "JOB": binding.job_id, "MODEL": binding.model,
+              "SOURCE_SHA": SOURCE_VALUE, "PLAN_SHA": PLAN_VALUE, "REMOTE": root,
+              "REMOTE_ROOTS": (root, PurePosixPath("/gpfs/scratch/nimarano/" + root.name)),
+              "CAMPAIGN": "primes-max-" + binding.model, "SOURCE_LOCK": binding.cache_source_root + "/worker.lock"}
+    return fields[name]

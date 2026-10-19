@@ -1,0 +1,198 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using Sum = long long;
+
+class FastInput {
+    unsigned char buffer[1 << 16];
+    std::size_t position = 0;
+    std::size_t available = 0;
+
+    int nextChar() {
+        if (position == available) {
+            available = std::fread(buffer, 1, sizeof(buffer), stdin);
+            position = 0;
+            if (available == 0) return EOF;
+        }
+        return buffer[position++];
+    }
+
+public:
+    bool nextInt(int& value) {
+        int ch = nextChar();
+        while (ch != EOF && ch <= ' ') ch = nextChar();
+        if (ch == EOF) return false;
+        bool negative = false;
+        if (ch == '-' || ch == '+') {
+            negative = ch == '-';
+            ch = nextChar();
+        }
+        unsigned int magnitude = 0;
+        while (ch >= '0' && ch <= '9') {
+            magnitude = magnitude * 10u + static_cast<unsigned int>(ch - '0');
+            ch = nextChar();
+        }
+        value = negative
+            ? static_cast<int>(-static_cast<Sum>(magnitude))
+            : static_cast<int>(magnitude);
+        return true;
+    }
+};
+
+struct RowBlock {
+    std::unique_ptr<int[]> input;
+    std::unique_ptr<Sum[]> horizontal;
+};
+
+struct Stripe {
+    int begin = 0;
+    int columns = 0;
+    std::unique_ptr<Sum[]> sums;
+    std::unique_ptr<Sum[]> history;
+    Sum maximum = std::numeric_limits<Sum>::lowest();
+};
+
+static void horizontalSums(const int* input, Sum* output,
+                           int rows, int n, int s, int m) {
+    for (int r = 0; r < rows; ++r) {
+        const int* row = input + static_cast<std::size_t>(r) * n;
+        Sum* destination = output + static_cast<std::size_t>(r) * m;
+        Sum sum = 0;
+        #pragma omp simd reduction(+:sum)
+        for (int c = 0; c < s; ++c) sum += row[c];
+        destination[0] = sum;
+        for (int c = 1; c < m; ++c) {
+            sum += static_cast<Sum>(row[c + s - 1]) - row[c - 1];
+            destination[c] = sum;
+        }
+    }
+}
+
+static void consumeBlock(Stripe* stripe, const Sum* horizontal,
+                         int rows, int firstRow, int s, int m) {
+    const int columns = stripe->columns;
+    Sum* sums = stripe->sums.get();
+    Sum* history = stripe->history.get();
+    Sum best = stripe->maximum;
+    int ringRow = firstRow % s;
+
+    for (int r = 0; r < rows; ++r) {
+        const Sum* current = horizontal
+            + static_cast<std::size_t>(r) * m + stripe->begin;
+        Sum* previous = history + static_cast<std::size_t>(ringRow) * columns;
+        const int globalRow = firstRow + r;
+        if (globalRow < s) {
+            #pragma omp simd
+            for (int c = 0; c < columns; ++c) {
+                sums[c] += current[c];
+                previous[c] = current[c];
+            }
+            if (globalRow + 1 == s) {
+                #pragma omp simd reduction(max:best)
+                for (int c = 0; c < columns; ++c) {
+                    if (sums[c] > best) best = sums[c];
+                }
+            }
+        } else {
+            #pragma omp simd reduction(max:best)
+            for (int c = 0; c < columns; ++c) {
+                const Sum value = sums[c] + current[c] - previous[c];
+                sums[c] = value;
+                previous[c] = current[c];
+                if (value > best) best = value;
+            }
+        }
+        if (++ringRow == s) ringRow = 0;
+    }
+    stripe->maximum = best;
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.nextInt(n) || !input.nextInt(s)) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const int m = n - s + 1;
+    const int blockRows = std::min(64, n);
+    const int blockCount = (n + blockRows - 1) / blockRows;
+    const bool parallelWork = static_cast<std::size_t>(n) * n >= (1u << 16);
+    Sum answer = std::numeric_limits<Sum>::lowest();
+
+    #pragma omp parallel if(parallelWork)
+    {
+        #pragma omp single
+        {
+            int threads = 1;
+            #ifdef _OPENMP
+            threads = omp_get_num_threads();
+            #endif
+            const int stripeCount = std::min(m, threads);
+            const int slotCount = std::min(blockCount, std::min(8, 2 * threads));
+            std::vector<Stripe> stripes(stripeCount);
+            std::vector<RowBlock> blocks(slotCount);
+            std::vector<int> readyTokens(slotCount, 0);
+            std::vector<int> chainTokens(stripeCount, 0);
+            int* ready = readyTokens.data();
+            int* chains = chainTokens.data();
+
+            for (int k = 0; k < stripeCount; ++k) {
+                Stripe& stripe = stripes[k];
+                stripe.begin = m * k / stripeCount;
+                stripe.columns = m * (k + 1) / stripeCount - stripe.begin;
+                stripe.sums.reset(new Sum[stripe.columns]());
+                stripe.history.reset(new Sum[static_cast<std::size_t>(s)
+                                             * stripe.columns]);
+            }
+            for (int slot = 0; slot < slotCount; ++slot) {
+                blocks[slot].input.reset(new int[static_cast<std::size_t>(blockRows) * n]);
+                blocks[slot].horizontal.reset(new Sum[static_cast<std::size_t>(blockRows) * m]);
+            }
+
+            int nextRow = 0;
+            while (nextRow < n) {
+                for (int slot = 0; slot < slotCount && nextRow < n; ++slot) {
+                    const int firstRow = nextRow;
+                    const int rows = std::min(blockRows, n - firstRow);
+                    int* raw = blocks[slot].input.get();
+                    Sum* horizontal = blocks[slot].horizontal.get();
+                    const std::size_t values = static_cast<std::size_t>(rows) * n;
+                    for (std::size_t i = 0; i < values; ++i) input.nextInt(raw[i]);
+
+                    #pragma omp task firstprivate(raw, horizontal, rows, n, s, m) depend(out: ready[slot])
+                    {
+                        horizontalSums(raw, horizontal, rows, n, s, m);
+                    }
+
+                    for (int k = 0; k < stripeCount; ++k) {
+                        Stripe* stripe = &stripes[k];
+                        #pragma omp task firstprivate(stripe, horizontal, rows, firstRow, s, m) depend(in: ready[slot]) depend(inout: chains[k])
+                        {
+                            consumeBlock(stripe, horizontal, rows, firstRow, s, m);
+                        }
+                    }
+                    nextRow += rows;
+                }
+                #pragma omp taskwait
+            }
+
+            for (int k = 0; k < stripeCount; ++k) {
+                answer = std::max(answer, stripes[k].maximum);
+            }
+        }
+    }
+
+    std::printf("%lld\n", answer);
+    return 0;
+}

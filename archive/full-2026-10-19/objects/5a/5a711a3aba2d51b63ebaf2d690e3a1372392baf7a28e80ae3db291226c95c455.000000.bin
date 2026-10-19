@@ -1,0 +1,498 @@
+"""NEUTRAL Python fixtures only: no model, CLI, compiler, candidate or network."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import json
+import sqlite3
+import tarfile
+import zlib
+from pathlib import Path
+
+import audit_common as c
+import pytest
+from audit_campaign import feedback_evidence, harness_evidence, normal_sources
+from audit_evaluations import evaluation_evidence
+from audit_r2_native import audit, raw_evidence
+from audit_transport import mailbox_and_cache
+from git_loose_readonly import GitEvidenceError, LooseGit
+
+
+def put(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=True), encoding="utf8")
+    return path
+
+
+def test_sqlite_read_only_and_preserved(tmp_path):
+    path = tmp_path / "closed.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE test(value TEXT)")
+        db.execute("INSERT INTO test VALUES('NEUTRAL')")
+    before = c.inventory(tmp_path)
+    db = c.open_closed_database(path)
+    try:
+        assert db.execute("SELECT value FROM test").fetchone()[0] == "NEUTRAL"
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            db.execute("INSERT INTO test VALUES('forbidden')")
+    finally:
+        db.close()
+    assert c.inventory(tmp_path) == before
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_sqlite_sidecar_refused_before_connect(tmp_path, monkeypatch, suffix):
+    path = tmp_path / "closed.sqlite3"
+    path.write_bytes(b"NEUTRAL")
+    Path(str(path) + suffix).write_bytes(b"")
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: pytest.fail("connect must not run"))
+    with pytest.raises(c.AuditError, match="Nonconsolidated"):
+        c.open_closed_database(path)
+
+
+def archive_fixture(tmp_path, entries):
+    archive, root = tmp_path / "received.tar.gz", tmp_path / "restored"
+    root.mkdir()
+    with tarfile.open(archive, "w:gz") as stream:
+        for name, raw, kind in entries:
+            item = tarfile.TarInfo(name)
+            if kind == "link":
+                item.type, item.linkname = tarfile.SYMTYPE, "outside"
+                stream.addfile(item)
+            else:
+                item.size = len(raw)
+                stream.addfile(item, io.BytesIO(raw))
+                if ".." not in name:
+                    target = root / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(raw)
+    return archive, root
+
+
+def test_archive_exact_bytes_no_extraction(tmp_path):
+    archive, root = archive_fixture(tmp_path, [("results-751992/x", b"NEUTRAL", "file")])
+    before = c.inventory(root)
+    assert c.verify_archive(archive, root) == before
+    assert c.inventory(root) == before
+
+
+@pytest.mark.parametrize("entries", [
+    [("../escape", b"NEUTRAL", "file")],
+    [("results-751992/link", b"", "link")],
+    [("results-751992/x", b"x", "file"), ("results-751992/x", b"x", "file")],
+    [("wrong-root/x", b"x", "file")],
+])
+def test_archive_violations(tmp_path, entries):
+    archive, root = archive_fixture(tmp_path, entries)
+    with pytest.raises(c.AuditError):
+        c.verify_archive(archive, root)
+
+
+@pytest.mark.parametrize("mutation", ["changed", "extra", "missing"])
+def test_restoration_must_exactly_match_archive(tmp_path, mutation):
+    archive, root = archive_fixture(tmp_path, [("results-751992/x", b"NEUTRAL", "file")])
+    if mutation == "changed":
+        (root / "results-751992/x").write_bytes(b"changed")
+    elif mutation == "extra":
+        (root / "extra").write_bytes(b"extra")
+    else:
+        (root / "results-751992/x").unlink()
+    with pytest.raises(c.AuditError, match="Restoration"):
+        c.verify_archive(archive, root)
+
+
+@pytest.mark.parametrize("name", ["../x", "/x", "a/../x", "C:/x", "a\\x", "a//x", "./x"])
+def test_path_escape_rejected(name):
+    with pytest.raises(c.AuditError):
+        c.relative(name)
+
+
+def test_slot_cost_classes_not_combined():
+    rows = [{"usage_known": n, "tokens_used": n + 5, "tokens_reserved": 2} for n in (0, 1, 2)]
+    result = c.slot_costs(rows)
+    assert result["exact_known_tokens"] == 6
+    assert result["unknown_usage_charged_tokens"] == 5
+    assert result["upper_bound_charged_tokens"] == 7
+    assert result["reserved_tokens"] == 6
+
+
+@pytest.mark.parametrize("value", [-1, True, "12"])
+def test_invalid_ledger_tokens(value):
+    with pytest.raises(c.AuditError):
+        c.slot_costs([{"usage_known": 1, "tokens_used": value, "tokens_reserved": 0}])
+
+
+def git_object(repo, kind, payload):
+    raw = kind.encode() + b" " + str(len(payload)).encode() + b"\0" + payload
+    oid = hashlib.sha1(raw).hexdigest()
+    target = repo / ".git/objects" / oid[:2] / oid[2:]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(zlib.compress(raw))
+    return oid
+
+
+def git_fixture(tmp_path, mode=b"100644", name=b"x"):
+    repo = tmp_path / "repo"
+    blob = git_object(repo, "blob", b"NEUTRAL source\n")
+    tree = git_object(repo, "tree", mode + b" " + name + b"\0" + bytes.fromhex(blob))
+    commit = git_object(repo, "commit", ("tree " + tree + "\n\nNEUTRAL\n").encode())
+    return repo, blob, commit
+
+
+def test_git_objects_are_read_without_cli(tmp_path):
+    repo, _, commit = git_fixture(tmp_path)
+    before = c.inventory(repo)
+    assert LooseGit(repo).files_at(commit) == {"x": b"NEUTRAL source\n"}
+    assert c.inventory(repo) == before
+
+
+@pytest.mark.parametrize("mode,name", [(b"120000", b"x"), (b"160000", b"x"), (b"100644", b".."), (b"100644", b"a/b")])
+def test_git_nonregular_or_unsafe_tree(tmp_path, mode, name):
+    repo, _, commit = git_fixture(tmp_path, mode, name)
+    with pytest.raises(GitEvidenceError):
+        LooseGit(repo).files_at(commit)
+
+
+def test_git_object_hash_tamper(tmp_path):
+    repo, blob, commit = git_fixture(tmp_path)
+    (repo / ".git/objects" / blob[:2] / blob[2:]).write_bytes(zlib.compress(b"blob 7\0changed"))
+    with pytest.raises(GitEvidenceError, match="SHA-1"):
+        LooseGit(repo).files_at(commit)
+
+
+def test_git_packed_or_missing_blocks_no_fallback(tmp_path):
+    repo, blob, commit = git_fixture(tmp_path)
+    (repo / ".git/objects" / blob[:2] / blob[2:]).unlink()
+    with pytest.raises(GitEvidenceError, match="packed or missing"):
+        LooseGit(repo).files_at(commit)
+
+
+@pytest.fixture
+def finite(tmp_path, monkeypatch):
+    certified, trusted = tmp_path / "certified", tmp_path / "trusted"
+    trusted.mkdir()
+    contract = {"language": "c", "source_files": ["model-view/primetest.c"], "compiler_flags": c.FLAGS,
+                "comparison": {"mode": "bytes"}}
+    for phase, variant in (("search", 0), ("confirmation", 1)):
+        contract[phase] = []
+        for n, p in enumerate((1, 2, 4, 8, 16, 30), 1):
+            origin = f"p{p:02d}-v{variant}"
+            input_raw, expected = f"NEUTRAL input {origin}\n".encode(), f"NEUTRAL output {origin}\n".encode()
+            folder = certified / "data/private-audit-fixtures" / origin
+            folder.mkdir(parents=True)
+            (folder / "input.txt").write_bytes(input_raw)
+            (folder / "expected.txt").write_bytes(expected)
+            input_name = phase + f"-{n}.txt"
+            (trusted / input_name).write_bytes(input_raw)
+            contract[phase].append({"name": f"{phase}-case-{n}", "stdin": input_name, "argv": [], "files": [], "capture_files": [],
+                                    "expected": {"stdout": {"base64": base64.b64encode(expected).decode(), "sha256": c.sha(expected), "bytes": len(expected)}}})
+    contract["benchmark"] = {**contract["search"][-1], "name": "benchmark-case-1"}
+    manifest = put(certified / "prototype-manifest.json", c.inventory(certified))
+    monkeypatch.setattr(c, "PREPARATION_SHA", c.sha(manifest.read_bytes()))
+    put(trusted / "contract.json", contract)
+    return trusted, certified, contract
+
+
+def test_finite_certified_bytes_neutral(finite):
+    trusted, certified, contract = finite
+    assert c.finite_contract(trusted, certified) == contract
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "wrong-name", "wrong-expected", "wrong-input", "wrong-flags", "wrong-benchmark"])
+def test_finite_case_and_bytes_violations(finite, mutation):
+    trusted, certified, contract = finite
+    if mutation == "duplicate":
+        contract["search"][-1] = contract["search"][0]
+    elif mutation == "wrong-name":
+        contract["confirmation"][0]["name"] = "search-case-1"
+    elif mutation == "wrong-expected":
+        value = b"NEUTRAL incorrect"
+        contract["search"][0]["expected"]["stdout"] = {"base64": base64.b64encode(value).decode(), "sha256": c.sha(value), "bytes": len(value)}
+    elif mutation == "wrong-input":
+        (trusted / contract["search"][0]["stdin"]).write_bytes(b"changed")
+    elif mutation == "wrong-flags":
+        contract["compiler_flags"] = ["-O2"]
+    else:
+        contract["benchmark"] = {**contract["search"][0], "name": "benchmark-case-1"}
+    put(trusted / "contract.json", contract)
+    with pytest.raises(c.AuditError):
+        c.finite_contract(trusted, certified)
+
+
+def transport_fixture(tmp_path, error=None):
+    mailbox, cache = tmp_path / "mailbox", tmp_path / "cache"
+    nonce = "1" * 32
+    local = cache / nonce
+    request = {"kind": "source-proposal", "nonce": nonce, "model": c.MODEL, "reasoning_effort": "max", "session_id": c.SESSION, "mission_id": "NEUTRAL-h01"}
+    req = put(mailbox / "requests" / (nonce + ".request.json"), request)
+    request_sha = c.sha(req.read_bytes())
+    put(local / "generation-claimed.json", {"request_sha256": request_sha, "claimed_at": "NEUTRAL"})
+    (local / "downloaded-request.json").write_bytes(req.read_bytes())
+    argv = ["NEUTRAL-NOT-EXECUTABLE", "exec", "--model", c.MODEL, 'model_reasoning_effort="max"', 'forced_login_method="chatgpt"']
+    invocation = {"argv": argv, "model": c.MODEL, "reasoning_effort": "max", "request_sha256": request_sha, "source_execution_allowed": False}
+    event = {"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 4, "cached_input_tokens": 8}}
+    events = (json.dumps(event) + "\n").encode()
+    logs = mailbox / "logs"
+    logs.mkdir()
+    events_path = logs / (nonce + ".codex.jsonl")
+    events_path.write_bytes(events)
+    (local / "codex.jsonl").write_bytes(events)
+    response = {"nonce": nonce, "request_sha256": request_sha, "session_id": c.SESSION, "model": c.MODEL,
+                "reasoning_effort": "max", "error": error, "infrastructure_error": False,
+                "usage": {"token_accounting": "exact", "tokens": 24, "codex_jsonl_sha256": c.sha(events), "llm_calls": 1, "tool_events": []}}
+    res = put(mailbox / "responses" / (nonce + ".response.json"), response)
+    (local / "response.json").write_bytes(res.read_bytes())
+    ready = {"sha256": c.sha(res.read_bytes()), "bytes": res.stat().st_size}
+    delivery = {"scope_id": c.SCOPE, "session_id": c.SESSION, "job_id": c.JOB, "model": c.MODEL, "effort": "max",
+                "source_zip_sha256": c.SOURCE_SHA, "plan_sha256": c.PLAN_SHA,
+                "request_sha256": request_sha, "response_sha256": c.sha(res.read_bytes())}
+    process = {"argv": argv, "returncode": 0, "timed_out": False}
+    for remote_name, local_name, value in ((".ready.json", "response-ready.json", ready),
+                                         (".delivered.json", "delivered.json", delivery),
+                                         (".invocation.json", "invocation.json", invocation),
+                                         (".codex.jsonl.json", "codex.jsonl.json", process)):
+        remote = (mailbox / "responses" if remote_name == ".ready.json" else logs) / (nonce + remote_name)
+        put(remote, value)
+        (local / local_name).write_bytes(remote.read_bytes())
+    return mailbox, cache, nonce
+
+
+def test_transport_deduplicates_and_includes_cached_tokens_once(tmp_path):
+    mailbox, cache, _ = transport_fixture(tmp_path)
+    before = c.inventory(tmp_path)
+    result = mailbox_and_cache(mailbox, cache)
+    assert result["exact_known_tokens"] == 24
+    assert result["unique_session_nonce_pairs"] == result["exact_known_native_invocations"] == 1
+    assert result["unresolved_nonces"] == []
+    assert c.inventory(tmp_path) == before
+
+
+def test_known_model_negative_not_interface_failure(tmp_path):
+    mailbox, cache, _ = transport_fixture(tmp_path, error="NEUTRAL malformed known model response")
+    result = mailbox_and_cache(mailbox, cache)
+    assert result["nonce_records"][0]["known_model_negative"] is True
+    assert result["unresolved_nonces"] == []
+
+
+@pytest.mark.parametrize("mutation", ["extra-claim", "pending", "claim-sha", "ready-sha", "mixed-model", "tool", "usage"])
+def test_transport_violations(tmp_path, mutation):
+    mailbox, cache, nonce = transport_fixture(tmp_path)
+    local = cache / nonce
+    if mutation == "extra-claim":
+        (cache / ("2" * 32)).mkdir()
+    elif mutation == "pending":
+        (cache / "pending-call.json").write_bytes(b"NEUTRAL")
+    elif mutation == "claim-sha":
+        put(local / "generation-claimed.json", {"request_sha256": "0" * 64})
+    elif mutation == "ready-sha":
+        put(mailbox / "responses" / (nonce + ".ready.json"), {"sha256": "0" * 64, "bytes": 1})
+    elif mutation == "mixed-model":
+        request = mailbox / "requests" / (nonce + ".request.json")
+        data = c.read_json(request)
+        data["model"] = "gpt-6-astra"
+        put(request, data)
+    elif mutation == "tool":
+        extra = json.dumps({"type": "item.completed", "item": {"type": "command_execution"}}).encode() + b"\n"
+        remote = mailbox / "logs" / (nonce + ".codex.jsonl")
+        remote.write_bytes(remote.read_bytes() + extra)
+        (local / "codex.jsonl").write_bytes(remote.read_bytes())
+    else:
+        response = mailbox / "responses" / (nonce + ".response.json")
+        data = c.read_json(response)
+        data["usage"]["tokens"] = 999
+        put(response, data)
+        (local / "response.json").write_bytes(response.read_bytes())
+        # Rebind delivery/ready to the tampered response to reach the exact-usage check.
+        for folder, name, key in ((mailbox / "responses", ".ready.json", "sha256"), (mailbox / "logs", ".delivered.json", "response_sha256")):
+            path = folder / (nonce + name)
+            value = c.read_json(path)
+            value[key] = c.sha(response.read_bytes())
+            if name == ".ready.json":
+                value["bytes"] = response.stat().st_size
+            put(path, value)
+            (local / ("response-ready.json" if name == ".ready.json" else "delivered.json")).write_bytes(path.read_bytes())
+    with pytest.raises(c.AuditError):
+        mailbox_and_cache(mailbox, cache)
+
+
+def test_incomplete_delivery_is_unknown_and_not_replayed(tmp_path):
+    mailbox, cache, nonce = transport_fixture(tmp_path)
+    (cache / nonce / "delivered.json").unlink()
+    result = mailbox_and_cache(mailbox, cache)
+    assert result["unknown_native_invocations"] == 1
+    assert result["unresolved_nonces"] == [nonce]
+
+
+def test_raw_attribution_never_inferred_from_filename(tmp_path):
+    folder = tmp_path / "private-audit/executions/NEUTRAL-CANDIDATE-ID"
+    put(folder / "execution.json", {"case": "search-case-1", "returncode": 0, "timed_out": False, "never_model_input": True})
+    (folder / "stdout.bin").write_bytes(b"NEUTRAL output")
+    (folder / "stderr.bin").write_bytes(b"")
+    result = raw_evidence(tmp_path)
+    assert result["independent_raw_stdout_per_candidate_verified"] is False
+    record = c.read_json(folder / "execution.json")
+    record["independent_raw_stdout_per_candidate_verified"] = True
+    put(folder / "execution.json", record)
+    with pytest.raises(c.AuditError, match="Unsupported claim"):
+        raw_evidence(tmp_path)
+
+
+def test_stub_cannot_produce_admission(tmp_path):
+    root, cache = tmp_path / "root", tmp_path / "cache"
+    root.mkdir()
+    cache.mkdir()
+    source = tmp_path / "NEUTRAL-not-production.zip"
+    source.write_bytes(b"NEUTRAL")
+    before = c.inventory(tmp_path)
+    result = audit(root, cache, tmp_path / "missing", tmp_path / "missing2", source, source, root)
+    assert result["verified"] is result["native_research_admitted"] is result["independent_performance_audit_verified"] is False
+    assert result["independent_raw_stdout_per_candidate_verified"] is False
+    assert result["received_cohort_audited_with_explicit_raw_attribution_limit"] is False
+    assert result["audit_error"]
+    assert c.inventory(tmp_path) == before
+
+
+def test_explicit_synthetic_receipt_refused(tmp_path):
+    receipt = {"schema": "hpc-forest-primes-r2max-reception-for-audit-v1", "verified": True,
+               "scope_id": c.SCOPE, "session_id": c.SESSION, "job_id": c.JOB, "model": c.MODEL, "effort": "max",
+               "source_zip_sha256": c.SOURCE_SHA, "plan_sha256": c.PLAN_SHA, "preparation_manifest_sha256": c.PREPARATION_SHA, "synthetic_fixture": True}
+    with pytest.raises(c.AuditError, match="Synthetic/stub"):
+        c.validate_admissions(receipt, {}, tmp_path, tmp_path, tmp_path / "x")
+
+
+def test_source_newlines_follow_frozen_harness_semantics():
+    assert normal_sources({"src/x": "a\r\nb\rc\n"}) == {"src/x": "a\nb\nc\n"}
+
+
+def evaluation_fixture(tmp_path, repetitions=5):
+    root = tmp_path / "restored"
+    remote = str(c.REMOTE)
+    campaign = remote + "/results-751992/" + c.CAMPAIGN
+    worktree = campaign + "/worktrees/NEUTRAL"
+    build = campaign + "/builds/NEUTRAL"
+    history = campaign + "/logs/NEUTRAL/confirmation"
+    trusted = campaign + "/trusted"
+    build_path = c.rebased(build, root)
+    build_path.mkdir(parents=True)
+    binary = b"NEUTRAL NONEXECUTABLE BYTES"
+    (build_path / "solution").write_bytes(binary)
+    (build_path / "compiler.stdout").write_bytes(b"")
+    (build_path / "compiler.stderr").write_bytes(b"")
+    command = ["NEUTRAL-NOT-EXECUTABLE", "-I", worktree + "/src", worktree + "/src/model-view/primetest.c", *c.FLAGS, "-o", build + "/solution"]
+    put(build_path / "compiler-command.json", {"argv": command, "compiler_flags": c.FLAGS})
+    logs = []
+    for name, argv, seconds in [("build.log", ["NEUTRAL-PYTHON", trusted + "/contract_tool.py", "build", worktree, build], 1),
+                                ("correctness.log", ["NEUTRAL-PYTHON", trusted + "/contract_tool.py", "check", build + "/solution", "confirmation"], 1),
+                                *[(f"sample-{n}.log", ["/bin/sh", trusted + "/benchmark.sh", build + "/solution"], 1 + n / 10) for n in range(repetitions)]]:
+        path = c.rebased(history + "/" + name, root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name == "correctness.log":
+            put(path, {"correct": True, "cases": 6})
+        else:
+            path.write_bytes(b"NEUTRAL recorded process output")
+        put(Path(str(path) + ".json"), {"argv": argv, "returncode": 0, "timed_out": False, "seconds": seconds})
+        logs.append(history + "/" + name)
+    times = [1 + n / 10 for n in range(repetitions)]
+    outcome = {"status": "valid", "correct": True, "score": .5, "logs": logs, "times": times,
+               "mean_seconds": sum(times) / len(times), "binary_sha256": c.sha(binary)}
+    return root, outcome
+
+
+def test_five_recorded_samples_without_running_binary(tmp_path):
+    root, outcome = evaluation_fixture(tmp_path)
+    before = c.inventory(root)
+    assert evaluation_evidence(outcome, "confirmation", root, 5)["samples"] == 5
+    assert c.inventory(root) == before
+
+
+@pytest.mark.parametrize("mutation", ["only-four", "duplicate-log", "wrong-phase", "wrong-source", "wrong-flags", "wrong-binary", "wrong-mean", "wrong-count", "wrong-typed-checker"])
+def test_confirmation_violations_without_candidate_execution(tmp_path, mutation):
+    root, outcome = evaluation_fixture(tmp_path, 4 if mutation == "only-four" else 5)
+    build_record = c.read_json(Path(str(c.rebased(outcome["logs"][0], root)) + ".json"))
+    build_path = c.rebased(build_record["argv"][4], root)
+    checker = c.rebased(outcome["logs"][1], root)
+    if mutation == "duplicate-log":
+        outcome["logs"].append(outcome["logs"][-1])
+    elif mutation == "wrong-phase":
+        record = c.read_json(Path(str(checker) + ".json"))
+        record["argv"][-1] = "search"
+        put(Path(str(checker) + ".json"), record)
+    elif mutation in {"wrong-source", "wrong-flags"}:
+        record = c.read_json(build_path / "compiler-command.json")
+        if mutation == "wrong-source":
+            record["argv"][3] = "NEUTRAL-other-source"
+        else:
+            record["compiler_flags"] = ["-O2"]
+        put(build_path / "compiler-command.json", record)
+    elif mutation == "wrong-binary":
+        (build_path / "solution").write_bytes(b"NEUTRAL other nonexecutable")
+    elif mutation == "wrong-mean":
+        outcome["mean_seconds"] = 99
+    elif mutation == "wrong-count":
+        put(checker, {"correct": True, "cases": 1})
+    elif mutation == "wrong-typed-checker":
+        put(checker, {"correct": "true", "cases": 6})
+    with pytest.raises(c.AuditError):
+        evaluation_evidence(outcome, "confirmation", root, 5)
+
+
+def test_failed_candidate_build_remains_known_negative(tmp_path):
+    root, outcome = evaluation_fixture(tmp_path)
+    build_log = Path(str(c.rebased(outcome["logs"][0], root)) + ".json")
+    record = c.read_json(build_log)
+    record["returncode"] = 1
+    put(build_log, record)
+    outcome.update(status="build_failed", correct=False, score=0, times=[], mean_seconds=None)
+    assert evaluation_evidence(outcome, "confirmation", root, 5) == {"status": "build_failed", "evaluated": True}
+
+
+@pytest.mark.parametrize("attempt", [
+    {"measured_diagnostics": [{"status": "failed", "code": "output_mismatch", "stderr": "PRIVATE"}]},
+    {"measured_diagnostics": [{"status": "failed", "code": "PRIVATE"}]},
+    {"measured_diagnostics": [{"status": "failed", "code": "output_mismatch", "case": "PRIVATE INPUT"}]},
+    {"measured_diagnostics": [{"status": "failed", "code": "output_mismatch", "returncode": "PRIVATE"}]},
+    {"development_outcome": {"status": "PRIVATE OUTPUT"}},
+    {"development_outcome": {"status": "valid", "score": 1.0}},
+])
+def test_private_feedback_exfiltration_rejected(attempt):
+    with pytest.raises(c.AuditError):
+        feedback_evidence(attempt)
+
+
+def test_typed_closed_feedback_accepted_neutrally():
+    feedback_evidence({"development_outcome": {"status": "incorrect", "correct": False},
+                       "measured_diagnostics": [{"status": "failed", "code": "output_mismatch", "case": "search-case-2", "returncode": 1}]})
+
+
+@pytest.mark.parametrize("field,value", [("parent", "NEUTRAL-WRONG-PARENT"), ("source", "NEUTRAL-WRONG-SOURCE")])
+def test_candidate_parent_or_model_source_tamper_rejected(tmp_path, field, value):
+    # This fake object reader is a unit-test double, never a production receipt.
+    class NeutralGit:
+        def sources_at(self, commit):
+            return {"src/x": "NEUTRAL source" if commit == "base" else value}
+
+        def commit(self, commit):
+            return {"parents": [value if field == "parent" else "base"]}
+
+    mission = {"id": "NEUTRAL", "parent_id": None, "base_commit": "base"}
+    put(tmp_path / "logs/NEUTRAL/node-harness.json", {"mission_id": "NEUTRAL", "parent_id": None,
+        "holdout_access": False, "outer_tree_reward_assigned": False, "attempts": [], "state": "finished"})
+    with pytest.raises(c.AuditError, match="Git parent|Committed source"):
+        harness_evidence(tmp_path, mission, {"commit": "child"}, NeutralGit(), tmp_path, {"mission_ids": []})
+
+
+def test_orphan_ready_cannot_disappear_from_reconciliation(tmp_path):
+    mailbox, cache, _ = transport_fixture(tmp_path)
+    put(mailbox / "responses" / ("f" * 32 + ".ready.json"), {"sha256": "0" * 64, "bytes": 1})
+    with pytest.raises(c.AuditError, match="Orphan"):
+        mailbox_and_cache(mailbox, cache)
+
+
+def test_corrupt_closed_sqlite_never_creates_new_file(tmp_path):
+    path = tmp_path / "corrupt.sqlite3"
+    path.write_bytes(b"NEUTRAL corrupt bytes")
+    before = c.inventory(tmp_path)
+    with pytest.raises(sqlite3.DatabaseError):
+        c.open_closed_database(path)
+    assert c.inventory(tmp_path) == before

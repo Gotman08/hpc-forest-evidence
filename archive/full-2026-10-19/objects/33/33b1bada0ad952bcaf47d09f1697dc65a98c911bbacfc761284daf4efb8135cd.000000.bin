@@ -1,0 +1,59 @@
+"""Reproduce unknown-worker census handling using invented rows only."""
+
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+LAUNCH = HERE.parent / "lancement-modeles-max-r2"
+source = LAUNCH / "assemble_admissions.py"
+assert hashlib.sha256(source.read_bytes()).hexdigest() == "2c854db401fabdeba52f99eaec58a8650e41985c0a2d46c15bc4b994fab93cbc"
+spec = importlib.util.spec_from_file_location("reviewed_static_factory_neutral_census", source)
+factory = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(factory)
+
+
+def row(pid, command):
+    return {"ProcessId": pid, "ParentProcessId": 100, "ExecutablePath": "C:/NEUTRAL/python.exe",
+            "CommandLine": command, "CreationDate": "2026-10-18T00:00:00.1234567Z"}
+
+
+def fixture(command):
+    so = [row(pid, "python -m hpc_forest.ablation_worker --session-id 665743a02b824021a697b6a4884a667c") for pid in (37900, 37848)]
+    rows = so + [row(999, command)]
+    census = {"schema": "hpc-forest-dynamic-r4b-full-cim-v1", "complete_census": True,
+              "strict_utf8_decoding": True, "captured_at_utc": 1000, "rows": rows, "rows_count": len(rows),
+              "other_native_groups": []}
+    closure = {"schema": "hpc-forest-r2c-owned-main-only-stop-receipt-v1", "verified": True,
+               "all_three_main_identities_absent": True, "source_only_identities_preserved": True,
+               "source_only": so, "actions": [{"identity": row(pid, "NEUTRAL absent prior main")} for pid in (1, 2, 3)]}
+    return census, closure
+
+
+cases = []
+for name, command in (
+    ("known_codex_worker", "python -m hpc_forest.codex_worker --session-id unknown"),
+    ("unknown_hpc_worker", "python -m hpc_forest.unrecognized_worker --session-id unknown"),
+    ("uppercase_windows_bootstrap", '"C:/NEUTRAL/python.exe" "C:/NEUTRAL/BOOTSTRAP_WORKER.PY" "--session-id" "unknown"'),
+):
+    census, closure = fixture(command)
+    try:
+        _, count = factory.check_census(census, closure, now=1000)
+    except ValueError as exc:
+        cases.append({"case": name, "rejected": True, "exception_class": type(exc).__name__})
+    else:
+        cases.append({"case": name, "rejected": False, "reported_active_workers_before_start": count})
+assert cases[0]["rejected"] is True and cases[1]["rejected"] is False and cases[2]["rejected"] is False
+result = {"schema": "hpc-forest-neutral-census-unknown-worker-reproduction-v1", "verified": True,
+          "scope": "pure fixture reproduction only; no live census or admission",
+          "factory": {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
+          "cases": cases, "blocking_finding": "The factory census detector misses undeclared hpc_forest.*worker names and uppercase Windows bootstrap filenames.",
+          "live_actions": 0, "model_calls": 0, "source_edited": False}
+path = HERE / "REFUS-CENSUS-INCONNU.json"
+with path.open("x", encoding="utf8", newline="\n") as stream:
+    json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    stream.write("\n")
+print(json.dumps({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "cases": cases}))

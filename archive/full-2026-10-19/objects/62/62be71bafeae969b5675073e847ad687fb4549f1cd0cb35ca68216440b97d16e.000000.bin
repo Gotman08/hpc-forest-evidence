@@ -1,0 +1,61 @@
+"""Conclude from archived census metadata only; no live inspection or correction."""
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+diagnostic_path = HERE / "DIAGNOSTIC-NULLS-ETRANGERS.json"
+diagnostic = load(diagnostic_path)
+baseline = {r["ProcessId"]: r for r in load(Path(diagnostic["baseline"]["path"]))["rows"]}
+parent_metadata = []
+for item in diagnostic["censuses"]:
+    rows = {r["ProcessId"]: r for r in load(Path(item["census"]["path"]))["rows"]}
+    for pid in (33540, 2104):
+        current = rows.get(pid)
+        previous = baseline.get(pid)
+        parent_metadata.append({"census_sha256": item["census"]["sha256"], "pid": pid,
+            "present_current_and_baseline": current is not None and previous is not None,
+            "all_five_raw_observed_values_unchanged": current is not None and previous is not None
+                and all(current.get(k) == previous.get(k) for k in ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")),
+            "null_field_names": [k for k in ("ExecutablePath", "CommandLine", "CreationDate") if current is not None and current.get(k) is None],
+            "creation_date": None if current is None else current.get("CreationDate")})
+nominal = datetime.fromtimestamp(1792271202.023 + 33267, timezone.utc).isoformat()
+report = {"schema": "hpc-forest-source-only-stop-offline-null-diagnostic-conclusion-v1", "verified": True,
+    "verification_scope": "diagnostic only from two frozen private censuses; no execution admission",
+    "diagnostic": {"path": str(diagnostic_path), "sha256": sha(diagnostic_path)},
+    "cause": "identity(row) rejects newly observed foreign candidates with null ExecutablePath and CommandLine before their baseline parent can be considered.",
+    "candidate_vs_anchor": "candidate in both snapshots, not a pre-existing baseline anchor",
+    "null_candidates": [{"census_sha256": item["census"]["sha256"], "candidate_pid": trace["candidate_pid"],
+        "parent_pid": trace["parent_pid"], "creation_date": trace["creation_date"],
+        "null_fields": trace["invalid_or_unavailable_fields"]}
+        for item in diagnostic["censuses"] for trace in item["traces"] if trace["status"] == "strict_identity_failure"],
+    "baseline_parent_metadata": parent_metadata,
+    "nine_targets_observed_unchanged_in_both_archived_censuses": all(r["present"] and r["full_identity_equal"]
+        for item in diagnostic["censuses"] for r in item["nine_owned_identity_checks"]),
+    "baseline_anchor_check_reordering_alone_sufficient": False,
+    "smallest_correction_for_this_actual_failure": "Would require a separate rule about opaque new foreign candidates, not merely accepting unchanged nullable baseline anchors. No such change is implemented or proposed for execution here.",
+    "recommended_action": "Preserve all refusals; leave closure pending and allow the original bounded worker to exit naturally as instructed by the parent. No fourth stop revision or repeated preflight.",
+    "nominal_only_deadline_estimate": {"launch_epoch_supplied_by_parent": 1792271202.023,
+        "original_max_seconds": 33267, "arithmetic_utc": nominal,
+        "actual_exit_proved": False, "limit": "The loop deadline starts after startup/hello; arithmetic is neither an exact observed end nor proof of absence."},
+    "next_wake_read_only_recommendation": ["Obtain a fresh full census and compare complete five-field original SO and observer identities; report present, naturally absent or PID reused separately.",
+        "Read the passive observer's final state/logs; an elapsed deadline or reader refusal alone does not establish original worker absence.",
+        "Only after real absence evidence may the parent preserve the complete cold cache/lock and independently clear routing; no replay or new generation follows from this diagnostic."],
+    "foreign_processes_not_claimed_fully_inspectable": True, "global_worker_absence_or_exclusivity_claimed": False,
+    "new_generation_admitted": False, "closure_verified": False, "lane_released": False,
+    "live_CIM_or_process_or_preflight_or_cache_or_stop_calls": 0, "code_or_guards_modified": False}
+path = HERE / "CONCLUSION-NULLS-ETRANGERS-ATTENTE-NATURELLE.json"
+with path.open("x", encoding="utf8", newline="\n") as stream:
+    stream.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+print(json.dumps({"path": str(path), "sha256": sha(path), "parents_metadata": parent_metadata}))

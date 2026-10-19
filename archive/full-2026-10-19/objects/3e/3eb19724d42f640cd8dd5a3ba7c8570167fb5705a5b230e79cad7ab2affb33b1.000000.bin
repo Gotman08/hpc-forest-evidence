@@ -1,0 +1,292 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using std::int32_t;
+using std::int64_t;
+using std::uint32_t;
+using std::uint64_t;
+
+class FastInput {
+    unsigned char buffer_[65536];
+    std::size_t position_ = 0;
+    std::size_t length_ = 0;
+
+    int next() {
+        if (position_ == length_) {
+            length_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (length_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    bool read_int(int32_t& result) {
+        int c;
+        do {
+            c = next();
+            if (c == EOF) return false;
+        } while (c <= ' ');
+        const bool negative = c == '-';
+        if (negative || c == '+') c = next();
+        uint32_t value = 0;
+        while (static_cast<unsigned>(c - '0') <= 9u) {
+            value = value * 10u + static_cast<unsigned>(c - '0');
+            c = next();
+        }
+        result = negative
+            ? static_cast<int32_t>(-static_cast<int64_t>(value))
+            : static_cast<int32_t>(value);
+        return true;
+    }
+};
+
+template<class T>
+inline void add_row(T* columns, const int32_t* row, int n) {
+    for (int j = 0; j < n; ++j)
+        columns[j] = static_cast<T>(static_cast<int64_t>(columns[j]) + row[j]);
+}
+
+template<class T>
+inline void advance_columns(T* columns, const int32_t* leaving,
+                            const int32_t* entering, int n) {
+    for (int j = 0; j < n; ++j)
+        columns[j] = static_cast<T>(static_cast<int64_t>(columns[j])
+                                   - leaving[j] + entering[j]);
+}
+
+template<class T>
+int64_t scalar_maximum_row(const T* columns, int width, int s, int64_t first) {
+    int64_t current = first;
+    int64_t best = first;
+    for (int j = 1; j < width; ++j) {
+        current += static_cast<int64_t>(columns[j + s - 1])
+                   - static_cast<int64_t>(columns[j - 1]);
+        best = std::max(best, current);
+    }
+    return best;
+}
+
+template<class T>
+int64_t maximum_row(const T* columns, int n, int s, int64_t first) {
+    return scalar_maximum_row(columns, n - s + 1, s, first);
+}
+
+#if defined(__aarch64__)
+template<>
+inline void add_row<int32_t>(int32_t* columns, const int32_t* row, int n) {
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        vst1q_s32(columns + j,
+                  vaddq_s32(vld1q_s32(columns + j), vld1q_s32(row + j)));
+    }
+    for (; j < n; ++j)
+        columns[j] = static_cast<int32_t>(static_cast<int64_t>(columns[j]) + row[j]);
+}
+
+template<>
+inline void advance_columns<int32_t>(int32_t* columns, const int32_t* leaving,
+                                     const int32_t* entering, int n) {
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        int32x4_t value = vsubq_s32(vld1q_s32(columns + j), vld1q_s32(leaving + j));
+        value = vaddq_s32(value, vld1q_s32(entering + j));
+        vst1q_s32(columns + j, value);
+    }
+    for (; j < n; ++j)
+        columns[j] = static_cast<int32_t>(static_cast<int64_t>(columns[j])
+                                         - leaving[j] + entering[j]);
+}
+
+template<>
+inline void add_row<int64_t>(int64_t* columns, const int32_t* row, int n) {
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        const int32x4_t input = vld1q_s32(row + j);
+        vst1q_s64(columns + j,
+                  vaddq_s64(vld1q_s64(columns + j), vmovl_s32(vget_low_s32(input))));
+        vst1q_s64(columns + j + 2,
+                  vaddq_s64(vld1q_s64(columns + j + 2), vmovl_s32(vget_high_s32(input))));
+    }
+    for (; j < n; ++j) columns[j] += row[j];
+}
+
+template<>
+inline void advance_columns<int64_t>(int64_t* columns, const int32_t* leaving,
+                                     const int32_t* entering, int n) {
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        const int32x4_t old_row = vld1q_s32(leaving + j);
+        const int32x4_t new_row = vld1q_s32(entering + j);
+        int64x2_t low = vsubq_s64(vld1q_s64(columns + j),
+                                   vmovl_s32(vget_low_s32(old_row)));
+        int64x2_t high = vsubq_s64(vld1q_s64(columns + j + 2),
+                                    vmovl_s32(vget_high_s32(old_row)));
+        low = vaddq_s64(low, vmovl_s32(vget_low_s32(new_row)));
+        high = vaddq_s64(high, vmovl_s32(vget_high_s32(new_row)));
+        vst1q_s64(columns + j, low);
+        vst1q_s64(columns + j + 2, high);
+    }
+    for (; j < n; ++j)
+        columns[j] = columns[j] - leaving[j] + entering[j];
+}
+
+inline uint32x4_t differences32(const int32_t* columns, int s, int j) {
+    return vsubq_u32(vreinterpretq_u32_s32(vld1q_s32(columns + j + s)),
+                     vreinterpretq_u32_s32(vld1q_s32(columns + j)));
+}
+
+template<>
+int64_t maximum_row<int32_t>(const int32_t* columns, int n, int s, int64_t first) {
+    const int width = n - s + 1;
+    if (width < 4) return scalar_maximum_row(columns, width, s, first);
+
+    int32_t initial[4];
+    int64_t current = first;
+    initial[0] = static_cast<int32_t>(current);
+    for (int k = 1; k < 4; ++k) {
+        current += static_cast<int64_t>(columns[s + k - 1]) - columns[k - 1];
+        initial[k] = static_cast<int32_t>(current);
+    }
+    uint32x4_t windows = vreinterpretq_u32_s32(vld1q_s32(initial));
+    int32x4_t maxima = vreinterpretq_s32_u32(windows);
+    int j = 4;
+    if (j + 4 <= width) {
+        const uint32x4_t d0 = differences32(columns, s, 0);
+        uint32x4_t d1 = differences32(columns, s, 4);
+        uint32x4_t pairs0 = vaddq_u32(d0, vextq_u32(d0, d1, 1));
+        for (; j + 4 <= width; j += 4) {
+            const uint32x4_t d2 = differences32(columns, s, j + 4);
+            const uint32x4_t pairs1 = vaddq_u32(d1, vextq_u32(d1, d2, 1));
+            const uint32x4_t increment =
+                vaddq_u32(pairs0, vextq_u32(pairs0, pairs1, 2));
+            windows = vaddq_u32(windows, increment);
+            maxima = vmaxq_s32(maxima, vreinterpretq_s32_u32(windows));
+            pairs0 = pairs1;
+            d1 = d2;
+        }
+    }
+    int64_t best = vmaxvq_s32(maxima);
+    current = vgetq_lane_s32(vreinterpretq_s32_u32(windows), 3);
+    for (; j < width; ++j) {
+        current += static_cast<int64_t>(columns[j + s - 1]) - columns[j - 1];
+        best = std::max(best, current);
+    }
+    return best;
+}
+
+inline int64x2_t differences64(const int64_t* columns, int s, int j) {
+    return vsubq_s64(vld1q_s64(columns + j + s), vld1q_s64(columns + j));
+}
+
+template<>
+int64_t maximum_row<int64_t>(const int64_t* columns, int n, int s, int64_t first) {
+    const int width = n - s + 1;
+    if (width < 2) return first;
+    const int64_t initial[2] = {first, first + columns[s] - columns[0]};
+    int64x2_t windows = vld1q_s64(initial);
+    int64x2_t maxima = windows;
+    int j = 2;
+    if (j + 2 <= width) {
+        int64x2_t d0 = differences64(columns, s, 0);
+        for (; j + 2 <= width; j += 2) {
+            const int64x2_t d1 = differences64(columns, s, j);
+            const int64x2_t increment = vaddq_s64(d0, vextq_s64(d0, d1, 1));
+            windows = vaddq_s64(windows, increment);
+            maxima = vbslq_s64(vcgtq_s64(windows, maxima), windows, maxima);
+            d0 = d1;
+        }
+    }
+    int64_t best = std::max(vgetq_lane_s64(maxima, 0), vgetq_lane_s64(maxima, 1));
+    int64_t current = vgetq_lane_s64(windows, 1);
+    for (; j < width; ++j) {
+        current += columns[j + s - 1] - columns[j - 1];
+        best = std::max(best, current);
+    }
+    return best;
+}
+#endif
+
+template<class T>
+int64_t solve(const int32_t* matrix, const std::vector<int64_t>& row_left,
+              int n, int s) {
+    // Initialized padding makes SIMD lookahead loads valid at the right edge.
+    std::vector<T> columns(static_cast<std::size_t>(n) + 16, T(0));
+    int64_t first = 0;
+    for (int row = 0; row < s; ++row) {
+        add_row(columns.data(), matrix + static_cast<std::size_t>(row) * n, n);
+        first += row_left[row];
+    }
+    int64_t best = maximum_row(columns.data(), n, s, first);
+    for (int top = 1; top + s <= n; ++top) {
+        const int leaving = top - 1;
+        const int entering = top + s - 1;
+        advance_columns(columns.data(),
+                        matrix + static_cast<std::size_t>(leaving) * n,
+                        matrix + static_cast<std::size_t>(entering) * n, n);
+        first += row_left[entering] - row_left[leaving];
+        best = std::max(best, maximum_row(columns.data(), n, s, first));
+    }
+    return best;
+}
+
+int main() {
+    FastInput input;
+    int32_t input_n, input_s;
+    if (!input.read_int(input_n) || !input.read_int(input_s)) return 0;
+    const int n = input_n;
+    const int s = input_s;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::unique_ptr<int32_t[]> matrix(new int32_t[static_cast<std::size_t>(n) * n]);
+    std::vector<int64_t> row_left(n);
+    uint64_t maximum_magnitude = 0;
+    for (int row = 0; row < n; ++row) {
+        int32_t* destination = matrix.get() + static_cast<std::size_t>(row) * n;
+        int64_t left = 0;
+        for (int col = 0; col < s; ++col) {
+            int32_t value;
+            if (!input.read_int(value)) return 0;
+            destination[col] = value;
+            left += value;
+            const uint64_t magnitude = value < 0
+                ? static_cast<uint64_t>(-static_cast<int64_t>(value))
+                : static_cast<uint64_t>(value);
+            maximum_magnitude = std::max(maximum_magnitude, magnitude);
+        }
+        for (int col = s; col < n; ++col) {
+            int32_t value;
+            if (!input.read_int(value)) return 0;
+            destination[col] = value;
+            const uint64_t magnitude = value < 0
+                ? static_cast<uint64_t>(-static_cast<int64_t>(value))
+                : static_cast<uint64_t>(value);
+            maximum_magnitude = std::max(maximum_magnitude, magnitude);
+        }
+        row_left[row] = left;
+    }
+
+    const uint64_t area = static_cast<uint64_t>(s) * s;
+    const uint64_t narrow_limit =
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) / area;
+    int64_t answer;
+    if (maximum_magnitude <= narrow_limit)
+        answer = solve<int32_t>(matrix.get(), row_left, n, s);
+    else
+        answer = solve<int64_t>(matrix.get(), row_left, n, s);
+    std::printf("%lld\n", static_cast<long long>(answer));
+    return 0;
+}

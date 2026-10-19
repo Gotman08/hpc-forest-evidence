@@ -1,0 +1,129 @@
+"""Build a new isolated execution package; preserve all previous campaigns."""
+
+import hashlib
+import json
+import shutil
+import tarfile
+from importlib import metadata
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+workspace = here.parents[1]
+project = workspace / "outputs/HPC-Forest"
+payload = here / "payload"
+payload.mkdir(exist_ok=False)
+for name in ["prepare_problem.py", "evidence_pack.py", "romeo_marathon.py"]:
+    shutil.copyfile(here / name, payload / name)
+shutil.copyfile(
+    workspace / "work/romeo-long/payload/detect_resources.py",
+    payload / "detect_resources.py",
+)
+shutil.copyfile(
+    workspace / "work/marathon22/payload/neutral_backend.py",
+    payload / "neutral_backend.py",
+)
+wheel = next((here / "dist").glob("*.whl"))
+(payload / "payload-r4").mkdir()
+shutil.copyfile(wheel, payload / "payload-r4" / wheel.name)
+checksum = hashlib.sha256(wheel.read_bytes()).hexdigest()
+base = (workspace / "work/marathon22/payload/romeo_base.py").read_text(encoding="utf-8")
+base = base.replace(
+    "dbd7c504d70db392ebb615a6900c2ca848a944d87fb0bbc7c031b70b97eea0a1", checksum
+)
+base = base.replace(
+    '"hpc-forest-marathon22-autonomous-v1"', '"hpc-forest-marathon22-interface-v3"'
+)
+base = base.replace("import hpc_forest", "import hpc_forest\nimport evidence_pack", 1)
+base = base.replace(
+    '        with tarfile.open(archive, "w:gz") as bundle:\n            bundle.add(output, arcname=output.name)',
+    '        evidence_pack.make(output, base / "sources-officielles", archive)',
+)
+base = base.replace(
+    '        atomic_json(output / "allocation.json", metadata)',
+    '        atomic_json(output / "allocation.json", metadata)\n        shutil.copyfile(base / "preflight-tests.log", output / "preflight-tests.log")\n        shutil.copyfile(base / "assistance-protocol.json", output / "assistance-protocol.json")',
+)
+(payload / "romeo_base.py").write_text(base, encoding="utf-8")
+shutil.copytree(
+    project / "tests",
+    payload / "tests",
+    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+)
+# Pure Python test dependencies, from the already installed local environment.
+# No compiled Windows modules or environment mutation is carried to ROMEO.
+qa = payload / "qa-deps"
+qa.mkdir()
+for package in ["pytest", "pluggy", "iniconfig", "packaging", "pygments"]:
+    distribution = metadata.distribution(package)
+    tops = set()
+    for name in distribution.files:
+        if ".." not in name.parts:
+            tops.add(name.parts[0])
+    for name in tops:
+        source = Path(distribution.locate_file(name))
+        target = qa / name
+        if source.is_dir():
+            shutil.copytree(
+                source,
+                target,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                dirs_exist_ok=True,
+            )
+        elif source.is_file():
+            shutil.copyfile(source, target)
+if any(p.suffix in {".pyd", ".dll", ".so"} for p in qa.rglob("*")):
+    raise RuntimeError("Compiled host-specific module in pure Python QA dependencies")
+policy = {
+    "revision": 3,
+    "operator_owned": [
+        "hardware and toolchain",
+        "source import and compilation",
+        "input/output format",
+        "test data and calibration",
+        "reference-output oracle",
+        "launch and archive",
+    ],
+    "tree_owned": [
+        "all algorithm and optimization choices",
+        "all candidate source modifications",
+        "integration choices",
+    ],
+    "manual_algorithm_changes": 0,
+    "manual_candidate_repairs": 0,
+    "R_model_preparation_removed": True,
+    "correctness": "Exact bytes against unchanged official source; all test contracts frozen before search",
+    "fixtures": "Input records copied/subsampled from supplied official datasets; no manually computed expected result",
+    "runtime": "4 ARM CPU cores, OpenMP; one GPU exclusively for the local model; adapted local experiment, not an exact reproduction of the 2022 judge",
+}
+(payload / "assistance-protocol.json").write_text(
+    json.dumps(policy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+old = workspace / "outputs/Marathon22-autonome/sources-officielles"
+manifest = {
+    p.relative_to(payload).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+    for p in sorted(payload.rglob("*"))
+    if p.is_file()
+}
+manifest.update(
+    {
+        "sources-officielles/" + p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in old.iterdir()
+        if p.is_file()
+    }
+)
+(payload / "payload-manifest.json").write_text(
+    json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+)
+archive = here / "marathon22-interface-v3.tar.gz"
+with tarfile.open(archive, "w:gz") as t:
+    t.add(payload, arcname="hpc-forest-marathon22-20261015-r3")
+print(
+    json.dumps(
+        {
+            "archive": str(archive),
+            "bytes": archive.stat().st_size,
+            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "wheel_sha256": checksum,
+            "manifest_files": len(manifest),
+        }
+    )
+)

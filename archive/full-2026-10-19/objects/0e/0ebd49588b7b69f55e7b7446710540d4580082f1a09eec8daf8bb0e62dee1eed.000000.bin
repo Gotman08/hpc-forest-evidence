@@ -1,0 +1,146 @@
+"""Data-only local assembler for the separate allocated qualification wrapper r3."""
+from __future__ import annotations
+
+import difflib
+import gzip
+import hashlib
+import io
+import json
+import shlex
+import tarfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[2]
+OLD = HERE.parent / "revision-source-r4b/revision-r2"
+RECEPTION = HERE.parent / "qualification-allouee-r4b-r2/reception-752206"
+SOURCE_SHA = "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3"
+PLAN_SHA = "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b"
+OLD_PAYLOAD_SHA = "8d59cff41e5a4712549a557ef70cd4904a3aa40aba92e3b16b8148a892a5e2c9"
+REMOTE = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-qualification-20261018-r3-ede293f185e6"
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def json_bytes(value: object) -> bytes:
+    return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf8")
+
+
+def ref(path: Path) -> dict:
+    return {"path": str(path.resolve()), "sha256": sha(path.read_bytes())}
+
+
+def write_new(name: str, data: bytes) -> Path:
+    path = HERE / name
+    with path.open("xb") as stream:
+        stream.write(data)
+    return path
+
+
+def main() -> None:
+    old_payload = OLD / "hpc-forest-dynamic-r4b-max-qualification-light.tar.gz"
+    assert sha(old_payload.read_bytes()) == OLD_PAYLOAD_SHA
+    with tarfile.open(old_payload) as archive:
+        members = archive.getmembers()
+        assert len({m.name for m in members}) == len(members)
+        assert all(m.isfile() and m.name.startswith("payload/") for m in members)
+        data = {m.name.removeprefix("payload/"): archive.extractfile(m).read() for m in members}
+    previous_manifest = json.loads(data.pop("payload-manifest.json"))
+    assert previous_manifest == {k: sha(v) for k, v in data.items()}
+    assert sha(data["project.zip"]) == SOURCE_SHA and sha(data["dynamic-plan.json"]) == PLAN_SHA
+    project = BASE / "work/hpc-forest-mere-dynamique-r4b-max/project"
+    paths = sorted(project.rglob("*"))
+    assert not any(p.is_symlink() for p in paths)
+    actual_source = {p.relative_to(project).as_posix(): sha(p.read_bytes()) for p in paths if p.is_file()}
+    assert len(actual_source) == 103 and actual_source == json.loads(data["runtime-manifest.json"])
+    original = BASE / "work/hpc-forest-mere-dynamique-r4b-max/project/tests/test_r4b_allocated_contracts.py"
+    original_text = original.read_text(encoding="utf8")
+    external = HERE / "allocated-tests/test_r4b_allocated_contracts.py"
+    expected = original_text.replace("import platform\n", "import platform\nimport shutil\n").replace(
+        "    prepared = c.prepare(contract, source, root, probe_timeout=5)\n",
+        '    prepared = c.prepare(contract, source, root, probe_timeout=5)\n'
+        '    shutil.copytree(Path(prepared["validation"]), root / "trusted")\n')
+    assert external.read_bytes() == expected.encode("utf8")
+    predecessor_files = {
+        "receiving_audit": RECEPTION / "r2-AUDIT-QUALIFICATION-NEGATIVE.json",
+        "allocated_test_log": RECEPTION / "restauration-neuve-r2/allocated-contract-tests.log",
+        "allocated_test_junit": RECEPTION / "restauration-neuve-r2/allocated-contract-tests.xml",
+    }
+    negative = json.loads(predecessor_files["receiving_audit"].read_text(encoding="utf8"))
+    assert negative["verified"] is False and negative["job_id"] == "752206"
+    assert negative["source_zip_sha256"] == SOURCE_SHA and negative["plan_sha256"] == PLAN_SHA
+    assert negative["archive_sha256"] == "8cf60f31eff44cc2aa4ce0ec75009f518f0485b68e0d59d325ce3ba3cf754a11"
+    assert negative["native_model_calls"] == 0 and negative["actual_reference_preparation_reached"] is False
+    refs = {}
+    for key, path in predecessor_files.items():
+        payload_name = "predecessor-752206/" + path.name
+        data[payload_name] = path.read_bytes()
+        refs[key] = {**ref(path), "payload_path": payload_name}
+    predecessor = {
+        "schema": "hpc-forest-r4b-qualification-failed-predecessor-v1", "verified": False,
+        "job_id": "752206", "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+        "failure_preserved": True, "production_defect_established": False,
+        "cause": "external C plumbing fixture omitted validation-to-trusted copy before Evaluator",
+        "native_model_calls": 0, "evidence_refs": refs,
+    }
+    revision = {
+        "schema": "hpc-forest-r4b-qualification-wrapper-revision-v1", "verified": False,
+        "scope_id": "hpc-forest-dynamic-independent-roots-r4b-max", "revision": "qualification-wrapper-r3",
+        "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA, "source_files": 103,
+        "production_source_changed": False, "source_fixture_retained_unchanged": True,
+        "external_fixture_sha256": sha(external.read_bytes()), "original_fixture_sha256": sha(original.read_bytes()),
+        "only_fixture_changes": ["import shutil", "copy prepared validation bytes into trusted before protected_manifest and Evaluator"],
+        "C_or_contract_or_oracle_or_assertions_changed": False,
+        "failed_predecessor_job_id": "752206", "native_model_calls": 0,
+        "qualification_admitted": False, "native_generation_admitted": False,
+        "alias_policy": "lstat/readlink metadata only; regular files/directories archived without symbolic/hard links",
+        "mechanical_receiving_audit_required": True,
+    }
+    data.update({"qualifier-r4b.py": (HERE / "qualifier-r4b.py").read_bytes(),
+                 "archive_regular.py": (HERE / "archive_regular.py").read_bytes(),
+                 "allocated-tests/test_r4b_allocated_contracts.py": external.read_bytes(),
+                 "failed-predecessor.json": json_bytes(predecessor), "wrapper-revision.json": json_bytes(revision)})
+    data["payload-manifest.json"] = json_bytes({k: sha(v) for k, v in sorted(data.items())})
+    payload = io.BytesIO()
+    with gzip.GzipFile(fileobj=payload, mode="wb", filename="", mtime=0) as zipped, \
+            tarfile.open(fileobj=zipped, mode="w") as archive:
+        for name, value in sorted(data.items()):
+            info = tarfile.TarInfo("payload/" + name)
+            info.size = len(value)
+            info.mode = 0o600
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(value))
+    payload_path = write_new("hpc-forest-dynamic-r4b-max-qualification-wrapper-r3.tar.gz", payload.getvalue())
+    command = (OLD / "commande-qualification.sh").read_text(encoding="utf8")
+    old_remote = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-qualification-20261018-r1-ede293f185e6"
+    command = command.replace(old_remote, REMOTE).replace(OLD_PAYLOAD_SHA, sha(payload_path.read_bytes()))
+    command_path = write_new("commande-qualification.sh", command.encode("utf8"))
+    request = json.loads((OLD / "job-prepare-propose.json").read_text(encoding="utf8"))
+    request.update(name="forest-dynamic-r4b-max-qualification-wrapper-r3-0modeles", command="bash -lc " + shlex.quote(command))
+    request_path = write_new("job-prepare-propose.json", json_bytes(request))
+    write_new("failed-predecessor.json", json_bytes(predecessor))
+    write_new("wrapper-revision.json", json_bytes(revision))
+    write_new("diff-qualifier-r2-vers-wrapper-r3.patch", "".join(difflib.unified_diff(
+        (OLD / "qualifier-r4b.py").read_text(encoding="utf8").splitlines(True),
+        (HERE / "qualifier-r4b.py").read_text(encoding="utf8").splitlines(True),
+        fromfile="sealed-wrapper-r2/qualifier-r4b.py", tofile="external-wrapper-r3/qualifier-r4b.py")).encode())
+    projection = {
+        "schema": "hpc-forest-r4b-qualification-wrapper-proposal-v1", "verified": False,
+        "scope_id": revision["scope_id"], "source_zip_sha256": SOURCE_SHA, "plan_sha256": PLAN_SHA,
+        "payload": ref(payload_path), "command": ref(command_path), "job_prepare_request": ref(request_path),
+        "remote_archive": REMOTE + ".tar.gz", "remote_root": REMOTE,
+        "expected_remote_outputs": [REMOTE + "/qualification-envelope.json", REMOTE + "/qualification.json",
+                                    REMOTE + "/qualification-result.tar.gz"],
+        "no_overwrite_root_required": True, "native_model_calls": 0,
+        "mechanical_qualification_verified": False, "native_generation_admitted": False,
+        "predecessor": predecessor, "payload_members": len(data),
+    }
+    write_new("projection-qualification.json", json_bytes(projection))
+    print(json.dumps({"payload": ref(payload_path), "command": ref(command_path),
+                      "request": ref(request_path), "payload_members": len(data)}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

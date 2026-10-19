@@ -1,0 +1,203 @@
+#include "knn.h"
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    float distance;
+    char label;
+    size_t ordinal;
+} Neighbor;
+
+static int neighbor_is_worse(const Neighbor *a, const Neighbor *b) {
+    if (a->distance > b->distance) return 1;
+    if (a->distance < b->distance) return 0;
+    return a->ordinal > b->ordinal;
+}
+
+static void heap_sift_up(Neighbor *heap, size_t index) {
+    Neighbor value = heap[index];
+
+    while (index != 0) {
+        size_t parent = (index - 1) / 2;
+        if (!neighbor_is_worse(&value, &heap[parent])) break;
+        heap[index] = heap[parent];
+        index = parent;
+    }
+
+    heap[index] = value;
+}
+
+static void heap_sift_down(Neighbor *heap, size_t heap_size, size_t index) {
+    Neighbor value = heap[index];
+
+    while (2 * index + 1 < heap_size) {
+        size_t child = 2 * index + 1;
+        if (child + 1 < heap_size &&
+            neighbor_is_worse(&heap[child + 1], &heap[child])) {
+            child++;
+        }
+        if (!neighbor_is_worse(&heap[child], &value)) break;
+        heap[index] = heap[child];
+        index = child;
+    }
+
+    heap[index] = value;
+}
+
+static char vote_labels(char *labels, int k) {
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+    int i;
+
+    for (i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+static char knn_linear(int n_groups, Group *groups, int k, Point to_evaluate) {
+    char *labels = (char *)malloc(sizeof(char) * (size_t)k);
+    float *distances = (float *)malloc(sizeof(float) * (size_t)k);
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        const Group *g = &groups[i];
+
+        for (j = 0; j < g->length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g->points[j]);
+
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+
+                    distances[x] = d;
+                    labels[x] = g->label;
+                    break;
+                }
+            }
+        }
+    }
+
+    char result = vote_labels(labels, k);
+    free(distances);
+    free(labels);
+    return result;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    size_t total_points = 0;
+    int i, j;
+
+    for (i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            size_t group_length = (size_t)groups[i].length;
+            if (group_length > SIZE_MAX - total_points) {
+                return knn_linear(n_groups, groups, k, to_evaluate);
+            }
+            total_points += group_length;
+        }
+    }
+
+    size_t capacity = (size_t)k;
+    if (capacity > total_points) capacity = total_points;
+
+    char *labels = (char *)malloc(sizeof(char) * (size_t)k);
+    if (capacity > SIZE_MAX / sizeof(Neighbor)) {
+        free(labels);
+        return knn_linear(n_groups, groups, k, to_evaluate);
+    }
+
+    Neighbor *heap = capacity == 0
+        ? NULL
+        : (Neighbor *)malloc(sizeof(Neighbor) * capacity);
+    if (capacity != 0 && heap == NULL) {
+        free(labels);
+        return knn_linear(n_groups, groups, k, to_evaluate);
+    }
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+    }
+
+    size_t heap_size = 0;
+    size_t ordinal = 0;
+
+    for (i = 0; i < n_groups; i++) {
+        const Group *g = &groups[i];
+
+        for (j = 0; j < g->length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g->points[j]);
+            if (d != d) {
+                free(heap);
+                free(labels);
+                return knn_linear(n_groups, groups, k, to_evaluate);
+            }
+
+            Neighbor candidate;
+            candidate.distance = d;
+            candidate.label = g->label;
+            candidate.ordinal = ordinal;
+
+            if (heap_size < capacity) {
+                heap[heap_size] = candidate;
+                heap_sift_up(heap, heap_size);
+                heap_size++;
+            } else if (neighbor_is_worse(&heap[0], &candidate)) {
+                heap[0] = candidate;
+                heap_sift_down(heap, heap_size, 0);
+            }
+
+            ordinal++;
+        }
+    }
+
+    for (size_t x = 0; x < heap_size; x++) {
+        labels[x] = heap[x].label;
+    }
+
+    char result = vote_labels(labels, k);
+    free(heap);
+    free(labels);
+    return result;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+
+    Group *groups = (Group *)malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

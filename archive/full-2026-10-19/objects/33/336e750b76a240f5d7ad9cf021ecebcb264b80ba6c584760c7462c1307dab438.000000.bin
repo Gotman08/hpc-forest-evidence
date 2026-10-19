@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include \"knn.h\"\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\n/* Each point uses the low bit of a four-bit slot; count is in [1, 16]. */\nstatic inline unsigned long long knn_candidate_mask(const float *values,\n                                                     int count, float cutoff) {\n    if (cutoff == -1.0f) {\n        return 0x1111111111111111ULL >> (4 * (16 - count));\n    }\n\n#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__AARCH64EL__)\n    if (count == 16) {\n        const float32x4_t bound = vdupq_n_f32(cutoff);\n        uint8x16_t a = vreinterpretq_u8_u32(\n            vcgeq_f32(vld1q_f32(values), bound));\n        uint8x16_t b = vreinterpretq_u8_u32(\n            vcgeq_f32(vld1q_f32(values + 4), bound));\n        uint8x16_t c = vreinterpretq_u8_u32(\n            vcgeq_f32(vld1q_f32(values + 8), bound));\n        uint8x16_t d = vreinterpretq_u8_u32(\n            vcgeq_f32(vld1q_f32(values + 12), bound));\n\n        /* Pack one comparison byte per point, retaining unordered values. */\n        uint8x16_t ab = vuzp1q_u8(a, b);\n        uint8x16_t cd = vuzp1q_u8(c, d);\n        uint8x16_t rejected = vuzp1q_u8(ab, cd);\n\n        /* Narrow comparison bytes to nibbles instead of horizontally summing. */\n        uint8x8_t nibbles = vshrn_n_u16(\n            vreinterpretq_u16_u8(vmvnq_u8(rejected)), 4);\n        return vget_lane_u64(vreinterpret_u64_u8(nibbles), 0)\n               & 0x1111111111111111ULL;\n    }\n#endif\n\n    unsigned long long mask = 0;\n    for (int lane = 0; lane < count; lane++) {\n        if (!(values[lane] >= cutoff)) {\n            mask |= 1ULL << (4 * lane);\n        }\n    }\n    return mask;\n}\n\nchar knn(int n_groups, Group * groups, int k, Point to_evaluate) {\n    char * labels = (char *) malloc(sizeof(char) * k);\n    float * distances = (float *) malloc(sizeof(float) * k);\n    enum { DISTANCE_BLOCK = 256 };\n    float block_distances[DISTANCE_BLOCK];\n\n    int i, j, x, y;\n\n    for (i = 0; i < k; i++) {\n        labels[i] = -1;\n        distances[i] = -1;\n    }\n\n    for (i = 0; i < n_groups; i++) {\n        Group g = groups[i];\n\n        for (j = 0; j < g.length;) {\n            int count = g.length - j;\n            if (count > DISTANCE_BLOCK) count = DISTANCE_BLOCK;\n            const Point * restrict points = g.points + j;\n\n            /* Evaluate independent distances before the ordered top-k updates. */\n#if defined(_OPENMP)\n#pragma omp simd\n#endif\n            for (int lane = 0; lane < count; lane++) {\n                block_distances[lane] =\n                    euclidean_distance_no_sqrt(to_evaluate, points[lane]);\n            }\n\n            for (int first = 0; first < count; first += 16) {\n                int lanes = count - first;\n                if (lanes > 16) lanes = 16;\n                unsigned long long candidates = knn_candidate_mask(\n                    block_distances + first, lanes, distances[k - 1]);\n\n                /* Visit surviving points in their original encounter order. */\n                while (candidates != 0) {\n                    int lane = first + (__builtin_ctzll(candidates) >> 2);\n                    candidates &= candidates - 1ULL;\n                    float d = block_distances[lane];\n\n                    /* Earlier survivors may have tightened the cutoff. */\n                    if (distances[k - 1] != -1 && d >= distances[k - 1]) {\n                        continue;\n                    }\n\n                    for (x = 0; x < k; x++) {\n                        if (d < distances[x] || distances[x] == -1) {\n                            for (y = k - 1; y > x; y--) {\n                                distances[y] = distances[y - 1];\n                                labels[y] = labels[y - 1];\n                            }\n\n                            distances[x] = d;\n                            labels[x] = g.label;\n\n                            break;\n                        }\n                    }\n                }\n            }\n\n            j += count;\n        }\n    }\n\n    qsort(labels, k, sizeof(char), compare_for_sort);\n\n    char most_frequent = labels[0];\n    int most_frequent_count = 1;\n    int current_frequency = 1;\n\n    for (i = 1; i < k; i++) {\n        if (labels[i] != labels[i - 1]) {\n            if (current_frequency > most_frequent_count) {\n                most_frequent = labels[i - 1];\n                most_frequent_count = current_frequency;\n            }\n\n            current_frequency = 1;\n        } else {\n            current_frequency++;\n        }\n\n        if (i == k - 1 && current_frequency > most_frequent_count) {\n            most_frequent = labels[i - 1];\n            most_frequent_count = current_frequency;\n        }\n    }\n\n    free(distances);\n    free(labels);\n    return most_frequent;\n}\n\nint main() {\n    int n_groups = parse_number_of_groups();\n    \n    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);\n\n    for (int i = 0; i < n_groups; i++) {\n        groups[i] = parse_next_group();\n    }\n\n    int k = parse_k();\n\n    Point to_evaluate = parse_point();\n\n    printf(\"%c\", knn(n_groups, groups, k, to_evaluate));\n}\n",
+        "path": "src/knn.c"
+      }
+    ],
+    "hypothesis": "NEON shift-and-narrow mask extraction can reduce screening overhead by replacing weighted horizontal sums, without changing distance arithmetic or dependent top-k updates.",
+    "notes": "Preserves encounter order, unordered comparisons, scalar tails and existing input/output behavior. The nibble-packing path is little-endian ARM64 only. No commands executed; correctness and speed remain for controller evaluation.",
+    "sources_kept": [],
+    "transformations": [
+      "Represent candidates as a 64-bit sparse mask with one bit per four-bit slot.",
+      "Replace NEON weighted horizontal reductions with byte-to-nibble narrowing and scalar bit extraction.",
+      "Decode survivors with ctzll followed by a two-bit shift, retaining serial top-k updates."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "e9c1bd15fb744c7f8080da54a4919384",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "ca5603607d17b6efe77b951d7c3c5efb45d563b6f8f60674ad47a0db56328ca1",
+  "session_id": "e102a585de23492ca9019858dac5af4d",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "1254127227988c0d33d1147298f2bca257455113991883f5a6c4d6ef5272972a",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 16487,
+        "output_tokens": 7912,
+        "reasoning_output_tokens": 6214
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 24399,
+    "tool_events": []
+  }
+}

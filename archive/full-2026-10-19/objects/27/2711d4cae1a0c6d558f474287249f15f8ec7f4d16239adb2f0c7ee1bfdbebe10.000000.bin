@@ -1,0 +1,497 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+enum { PAIR_TILE = 32, PARALLEL_THRESHOLD = 256 };
+
+#if defined(__GNUC__) && !defined(__clang__)
+#define NO_MATH_ERRNO __attribute__((optimize("no-math-errno")))
+#else
+#define NO_MATH_ERRNO
+#endif
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+typedef struct {
+  float *storage;
+  float *cache;
+  float *x, *y, *z;
+  float *fx, *fy, *fz;
+  int ntiles;
+} Workspace;
+
+/* Original arithmetic for small systems and fallback paths. */
+NO_MATH_ERRNO
+static void body_force_scalar(Body *p, float dt, int n, int i) {
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  for (int j = 0; j < n; j++) {
+    float dx = p[j].x - p[i].x;
+    float dy = p[j].y - p[i].y;
+    float dz = p[j].z - p[i].z;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  p[i].vx += dt*fx;
+  p[i].vy += dt*fy;
+  p[i].vz += dt*fz;
+}
+
+static void workspace_init(Workspace *w, int n) {
+  const int ntiles = n / PAIR_TILE + (n % PAIR_TILE != 0);
+  if ((size_t)n > SIZE_MAX / (6 * sizeof(float)) ||
+      (size_t)ntiles > SIZE_MAX / (PAIR_TILE * PAIR_TILE * sizeof(float))) {
+    return;
+  }
+
+  w->storage = (float *)malloc((size_t)n * 6 * sizeof(float));
+  w->cache = (float *)malloc((size_t)ntiles * PAIR_TILE * PAIR_TILE * sizeof(float));
+  if (w->storage == NULL || w->cache == NULL) {
+    free(w->cache);
+    free(w->storage);
+    w->cache = NULL;
+    w->storage = NULL;
+    return;
+  }
+
+  w->x = w->storage;
+  w->y = w->storage + (size_t)n;
+  w->z = w->storage + 2 * (size_t)n;
+  w->fx = w->storage + 3 * (size_t)n;
+  w->fy = w->storage + 4 * (size_t)n;
+  w->fz = w->storage + 5 * (size_t)n;
+  w->ntiles = ntiles;
+}
+
+#if defined(__aarch64__)
+typedef struct { float32x4_t x, y, z; } Force4;
+
+static inline __attribute__((always_inline))
+float32x4_t reference_inverse_distance(float32x4_t d) {
+  float64x2_t lo = vcvt_f64_f32(vget_low_f32(d));
+  float64x2_t hi = vcvt_f64_f32(vget_high_f32(d));
+  const float64x2_t one = vdupq_n_f64(1.0);
+  lo = vdivq_f64(one, vsqrtq_f64(lo));
+  hi = vdivq_f64(one, vsqrtq_f64(hi));
+  return vcombine_f32(vcvt_f32_f64(lo), vcvt_f32_f64(hi));
+}
+
+static inline __attribute__((always_inline))
+float32x4_t certified_inverse_distance(float32x4_t d) {
+  float32x4_t estimate = vrsqrteq_f32(d);
+  estimate = vmulq_f32(estimate,
+      vrsqrtsq_f32(vmulq_f32(d, estimate), estimate));
+  estimate = vmulq_f32(estimate,
+      vrsqrtsq_f32(vmulq_f32(d, estimate), estimate));
+
+  const float64x2_t xlo = vcvt_f64_f32(vget_low_f32(d));
+  const float64x2_t xhi = vcvt_f64_f32(vget_high_f32(d));
+  float64x2_t ylo = vcvt_f64_f32(vget_low_f32(estimate));
+  float64x2_t yhi = vcvt_f64_f32(vget_high_f32(estimate));
+  ylo = vmulq_f64(ylo,
+      vrsqrtsq_f64(vmulq_f64(xlo, ylo), ylo));
+  yhi = vmulq_f64(yhi,
+      vrsqrtsq_f64(vmulq_f64(xhi, yhi), yhi));
+
+  /* Certify the residual and exclude float-rounding midpoint windows. */
+  const float64x2_t one = vdupq_n_f64(1.0);
+  const float64x2_t zero = vdupq_n_f64(0.0);
+  const float64x2_t bound = vdupq_n_f64(0x1p-40);
+  float64x2_t rlo = vfmsq_f64(one, vmulq_f64(xlo, ylo), ylo);
+  float64x2_t rhi = vfmsq_f64(one, vmulq_f64(xhi, yhi), yhi);
+  uint64x2_t safe_lo = vandq_u64(
+      vcltq_f64(vabsq_f64(rlo), bound), vcgtq_f64(ylo, zero));
+  uint64x2_t safe_hi = vandq_u64(
+      vcltq_f64(vabsq_f64(rhi), bound), vcgtq_f64(yhi, zero));
+
+  const uint64x2_t tail_mask = vdupq_n_u64(UINT64_C(0x1fffffff));
+  const uint64x2_t lower = vdupq_n_u64(UINT64_C(0x0fff0000));
+  const uint64x2_t width = vdupq_n_u64(UINT64_C(0x00020000));
+  uint64x2_t offset_lo = vsubq_u64(
+      vandq_u64(vreinterpretq_u64_f64(ylo), tail_mask), lower);
+  uint64x2_t offset_hi = vsubq_u64(
+      vandq_u64(vreinterpretq_u64_f64(yhi), tail_mask), lower);
+  safe_lo = vandq_u64(safe_lo, vcgtq_u64(offset_lo, width));
+  safe_hi = vandq_u64(safe_hi, vcgtq_u64(offset_hi, width));
+
+  uint32x4_t safe = vreinterpretq_u32_u64(vandq_u64(safe_lo, safe_hi));
+  if (__builtin_expect(vminvq_u32(safe) != UINT32_MAX, 0)) {
+    return reference_inverse_distance(d);
+  }
+  return vcombine_f32(vcvt_f32_f64(ylo), vcvt_f32_f64(yhi));
+}
+
+/* Lanes are independent targets, never a reduction over sources. */
+static inline __attribute__((always_inline))
+float32x4_t accumulate_computed_four(
+    float32x4_t tx, float32x4_t ty, float32x4_t tz,
+    float sx, float sy, float sz, Force4 *f) {
+  float32x4_t dx = vdupq_n_f32(sx) - tx;
+  float32x4_t dy = vdupq_n_f32(sy) - ty;
+  float32x4_t dz = vdupq_n_f32(sz) - tz;
+  float32x4_t sqrd_dist = dx*dx + dy*dy + dz*dz + vdupq_n_f32(SOFTENING);
+  float32x4_t inv_dist = certified_inverse_distance(sqrd_dist);
+  float32x4_t inv_dist3 = inv_dist * inv_dist * inv_dist;
+  f->x += dx * inv_dist3;
+  f->y += dy * inv_dist3;
+  f->z += dz * inv_dist3;
+  return inv_dist3;
+}
+
+static inline __attribute__((always_inline))
+void accumulate_cached_four(
+    float32x4_t tx, float32x4_t ty, float32x4_t tz,
+    float sx, float sy, float sz, float32x4_t inv_dist3, Force4 *f) {
+  /* Recompute reverse displacements, including their zero signs. */
+  float32x4_t dx = vdupq_n_f32(sx) - tx;
+  float32x4_t dy = vdupq_n_f32(sy) - ty;
+  float32x4_t dz = vdupq_n_f32(sz) - tz;
+  f->x += dx * inv_dist3;
+  f->y += dy * inv_dist3;
+  f->z += dz * inv_dist3;
+}
+
+static void complete_four_rows(
+    const Workspace *w, int band, int begin, int end, int first, int n) {
+  const float * restrict x = w->x;
+  const float * restrict y = w->y;
+  const float * restrict z = w->z;
+  float * restrict fx = w->fx;
+  float * restrict fy = w->fy;
+  float * restrict fz = w->fz;
+  const float32x4_t tx = vld1q_f32(x + first);
+  const float32x4_t ty = vld1q_f32(y + first);
+  const float32x4_t tz = vld1q_f32(z + first);
+  Force4 f = {vld1q_f32(fx + first), vld1q_f32(fy + first), vld1q_f32(fz + first)};
+
+  /* The diagonal remains directed and includes every self interaction. */
+  for (int j = begin; j < end; ++j) {
+    accumulate_computed_four(tx, ty, tz, x[j], y[j], z[j], &f);
+  }
+
+  for (int tile = band + 1; tile < w->ntiles; ++tile) {
+    const int source_begin = tile * PAIR_TILE;
+    const int source_end = n - source_begin < PAIR_TILE ? n : source_begin + PAIR_TILE;
+    const float *row0 = w->cache + (size_t)tile * PAIR_TILE * PAIR_TILE
+                      + (size_t)(first - begin) * PAIR_TILE;
+    const float *row1 = row0 + PAIR_TILE;
+    const float *row2 = row1 + PAIR_TILE;
+    const float *row3 = row2 + PAIR_TILE;
+    int j = source_begin;
+
+    for (; source_end - j >= 4; j += 4) {
+      const int k = j - source_begin;
+      const float32x4_t r0 = vld1q_f32(row0 + k);
+      const float32x4_t r1 = vld1q_f32(row1 + k);
+      const float32x4_t r2 = vld1q_f32(row2 + k);
+      const float32x4_t r3 = vld1q_f32(row3 + k);
+      const float32x4_t t0 = vtrn1q_f32(r0, r1);
+      const float32x4_t t1 = vtrn2q_f32(r0, r1);
+      const float32x4_t t2 = vtrn1q_f32(r2, r3);
+      const float32x4_t t3 = vtrn2q_f32(r2, r3);
+      const float32x4_t c0 = vcombine_f32(vget_low_f32(t0), vget_low_f32(t2));
+      const float32x4_t c1 = vcombine_f32(vget_low_f32(t1), vget_low_f32(t3));
+      const float32x4_t c2 = vcombine_f32(vget_high_f32(t0), vget_high_f32(t2));
+      const float32x4_t c3 = vcombine_f32(vget_high_f32(t1), vget_high_f32(t3));
+
+      accumulate_cached_four(tx, ty, tz, x[j], y[j], z[j], c0, &f);
+      accumulate_cached_four(tx, ty, tz, x[j + 1], y[j + 1], z[j + 1], c1, &f);
+      accumulate_cached_four(tx, ty, tz, x[j + 2], y[j + 2], z[j + 2], c2, &f);
+      accumulate_cached_four(tx, ty, tz, x[j + 3], y[j + 3], z[j + 3], c3, &f);
+    }
+
+    for (; j < source_end; ++j) {
+      const int k = j - source_begin;
+      const float32x4_t inv_dist3 = {row0[k], row1[k], row2[k], row3[k]};
+      accumulate_cached_four(tx, ty, tz, x[j], y[j], z[j], inv_dist3, &f);
+    }
+  }
+
+  vst1q_f32(fx + first, f.x);
+  vst1q_f32(fy + first, f.y);
+  vst1q_f32(fz + first, f.z);
+}
+#endif
+
+/* Produce one off-diagonal tile and advance its later rows by one band. */
+NO_MATH_ERRNO
+static void produce_pair_tile(
+    const Workspace *w, int begin, int end,
+    int target_begin, int target_end, float * restrict tile_cache) {
+  const float * restrict x = w->x;
+  const float * restrict y = w->y;
+  const float * restrict z = w->z;
+  float * restrict fx = w->fx;
+  float * restrict fy = w->fy;
+  float * restrict fz = w->fz;
+  int j = target_begin;
+
+#if defined(__aarch64__)
+  for (; target_end - j >= 4; j += 4) {
+    const float32x4_t tx = vld1q_f32(x + j);
+    const float32x4_t ty = vld1q_f32(y + j);
+    const float32x4_t tz = vld1q_f32(z + j);
+    Force4 f = {vld1q_f32(fx + j), vld1q_f32(fy + j), vld1q_f32(fz + j)};
+
+    for (int i = begin; i < end; ++i) {
+      float32x4_t inv_dist3 = accumulate_computed_four(
+          tx, ty, tz, x[i], y[i], z[i], &f);
+      vst1q_f32(tile_cache + (size_t)(i - begin) * PAIR_TILE
+                + (j - target_begin), inv_dist3);
+    }
+
+    vst1q_f32(fx + j, f.x);
+    vst1q_f32(fy + j, f.y);
+    vst1q_f32(fz + j, f.z);
+  }
+#endif
+
+  for (; j < target_end; ++j) {
+    const float tx = x[j];
+    const float ty = y[j];
+    const float tz = z[j];
+    float ax = fx[j];
+    float ay = fy[j];
+    float az = fz[j];
+
+    for (int i = begin; i < end; ++i) {
+      float dx = x[i] - tx;
+      float dy = y[i] - ty;
+      float dz = z[i] - tz;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      ax += dx * inv_dist3;
+      ay += dy * inv_dist3;
+      az += dz * inv_dist3;
+      tile_cache[(size_t)(i - begin) * PAIR_TILE + (j - target_begin)] = inv_dist3;
+    }
+
+    fx[j] = ax;
+    fy[j] = ay;
+    fz[j] = az;
+  }
+}
+
+NO_MATH_ERRNO
+static void complete_scalar_row(
+    const Workspace *w, int band, int begin, int end, int first, int n) {
+  const float * restrict x = w->x;
+  const float * restrict y = w->y;
+  const float * restrict z = w->z;
+  const float tx = x[first];
+  const float ty = y[first];
+  const float tz = z[first];
+  float ax = w->fx[first];
+  float ay = w->fy[first];
+  float az = w->fz[first];
+
+  for (int j = begin; j < end; ++j) {
+    float dx = x[j] - tx;
+    float dy = y[j] - ty;
+    float dz = z[j] - tz;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+    ax += dx * inv_dist3;
+    ay += dy * inv_dist3;
+    az += dz * inv_dist3;
+  }
+
+  for (int tile = band + 1; tile < w->ntiles; ++tile) {
+    const int source_begin = tile * PAIR_TILE;
+    const int source_end = n - source_begin < PAIR_TILE ? n : source_begin + PAIR_TILE;
+    const float *row = w->cache + (size_t)tile * PAIR_TILE * PAIR_TILE
+                     + (size_t)(first - begin) * PAIR_TILE;
+    for (int j = source_begin; j < source_end; ++j) {
+      float dx = x[j] - tx;
+      float dy = y[j] - ty;
+      float dz = z[j] - tz;
+      float inv_dist3 = row[j - source_begin];
+      ax += dx * inv_dist3;
+      ay += dy * inv_dist3;
+      az += dz * inv_dist3;
+    }
+  }
+
+  w->fx[first] = ax;
+  w->fy[first] = ay;
+  w->fz[first] = az;
+}
+
+static void simulate_steps(Body *p, float dt, int n, int steps, int update_positions) {
+  if (n <= 0 || steps <= 0) {
+    return;
+  }
+
+  Workspace w = {0};
+  if (n >= PARALLEL_THRESHOLD) {
+    workspace_init(&w, n);
+  }
+  int nonfinite = 0;
+
+  /* One team owns all steps; implicit barriers separate dependent phases. */
+  #pragma omp parallel if (n >= PARALLEL_THRESHOLD)
+  {
+    for (int iter = 0; iter < steps; ++iter) {
+      if (w.storage == NULL) {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          body_force_scalar(p, dt, n, i);
+        }
+      } else {
+        #pragma omp single
+        {
+          nonfinite = 0;
+        }
+
+        #pragma omp for schedule(static) reduction(|:nonfinite)
+        for (int i = 0; i < n; ++i) {
+          w.x[i] = p[i].x;
+          w.y[i] = p[i].y;
+          w.z[i] = p[i].z;
+          w.fx[i] = 0.0f;
+          w.fy[i] = 0.0f;
+          w.fz[i] = 0.0f;
+          if (!isfinite(w.x[i]) || !isfinite(w.y[i]) || !isfinite(w.z[i])) {
+            nonfinite |= 1;
+          }
+        }
+
+        if (nonfinite) {
+          #pragma omp for schedule(static)
+          for (int i = 0; i < n; ++i) {
+            body_force_scalar(p, dt, n, i);
+          }
+        } else {
+          /*
+           * Earlier bands have already contributed an ordered prefix to
+           * each row. Produce the next prefix for later rows, then finish
+           * this band's rows using the cached opposite interactions.
+           */
+          for (int band = 0; band < w.ntiles; ++band) {
+            const int begin = band * PAIR_TILE;
+            const int end = n - begin < PAIR_TILE ? n : begin + PAIR_TILE;
+
+            #pragma omp for schedule(static)
+            for (int tile = band + 1; tile < w.ntiles; ++tile) {
+              const int target_begin = tile * PAIR_TILE;
+              const int target_end = n - target_begin < PAIR_TILE
+                                   ? n : target_begin + PAIR_TILE;
+              float *tile_cache = w.cache + (size_t)tile * PAIR_TILE * PAIR_TILE;
+              produce_pair_tile(&w, begin, end, target_begin, target_end, tile_cache);
+            }
+
+            const int groups = (end - begin + 3) / 4;
+            #pragma omp for schedule(static)
+            for (int group = 0; group < groups; ++group) {
+              const int first = begin + 4 * group;
+#if defined(__aarch64__)
+              if (end - first >= 4) {
+                complete_four_rows(&w, band, begin, end, first, n);
+              } else
+#endif
+              {
+                int count = end - first;
+                if (count > 4) {
+                  count = 4;
+                }
+                for (int lane = 0; lane < count; ++lane) {
+                  complete_scalar_row(&w, band, begin, end, first + lane, n);
+                }
+              }
+            }
+          }
+
+          #pragma omp for schedule(static)
+          for (int i = 0; i < n; ++i) {
+            p[i].vx += dt*w.fx[i];
+            p[i].vy += dt*w.fy[i];
+            p[i].vz += dt*w.fz[i];
+          }
+        }
+      }
+
+      if (update_positions) {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          p[i].x += p[i].vx * dt;
+          p[i].y += p[i].vy * dt;
+          p[i].z += p[i].vz * dt;
+        }
+      }
+    }
+  }
+
+  free(w.cache);
+  free(w.storage);
+}
+
+/* Preserve the standalone force-update entry point. */
+void body_force(Body *p, float dt, int n) {
+  simulate_steps(p, dt, n, 1, 0);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+  simulate_steps(bodies, DT, nbodies, N_ITER, 1);
+
+  write_dataset(nbodies, bodies);
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

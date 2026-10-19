@@ -1,0 +1,189 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+static inline unsigned char key_byte(const char *strings, long int record,
+                                     int stride, int digit) {
+   return (unsigned char)strings[(size_t)record * (size_t)stride +
+                                 (size_t)digit];
+}
+
+static void radix_sort_indices(const char * restrict strings, int length,
+                               long int size, long int * restrict order,
+                               long int * restrict workspace,
+                               size_t * restrict histogram,
+                               size_t * restrict positions,
+                               int worker_slots) {
+#pragma omp parallel num_threads(worker_slots)
+   {
+#ifdef _OPENMP
+      const int thread_id = omp_get_thread_num();
+      const int thread_count = omp_get_num_threads();
+#else
+      const int thread_id = 0;
+      const int thread_count = 1;
+#endif
+      const long int begin = size / thread_count * thread_id +
+                             size % thread_count * thread_id / thread_count;
+      const long int end = size / thread_count * (thread_id + 1) +
+                           size % thread_count * (thread_id + 1) / thread_count;
+      size_t *local_histogram = histogram + (size_t)thread_id * 256U;
+      size_t *local_positions = positions + (size_t)thread_id * 256U;
+
+      for (int digit = length - 2; digit >= 0; --digit) {
+         const int pass = length - 2 - digit;
+         const long int *input = (pass & 1) != 0 ? workspace : order;
+         long int *output = (pass & 1) != 0 ? order : workspace;
+
+#pragma omp simd
+         for (int value = 0; value < 256; ++value)
+            local_histogram[value] = 0;
+
+         for (long int i = begin; i < end; ++i)
+            ++local_histogram[key_byte(strings, input[i], length, digit)];
+
+#pragma omp barrier
+#pragma omp single
+         {
+            size_t next = 0;
+
+            for (int value = 0; value < 256; ++value) {
+               for (int thread = 0; thread < thread_count; ++thread) {
+                  const size_t position = (size_t)thread * 256U +
+                                          (size_t)value;
+                  positions[position] = next;
+                  next += histogram[position];
+               }
+            }
+         }
+
+         for (long int i = begin; i < end; ++i) {
+            const long int record = input[i];
+            const unsigned char value = key_byte(strings, record, length, digit);
+            output[local_positions[value]++] = record;
+         }
+
+         if (digit != 0) {
+#pragma omp barrier
+         }
+      }
+   }
+
+   if (((length - 1) & 1) != 0)
+      memcpy(order, workspace, (size_t)size * sizeof(*order));
+}
+
+long int *bucket_sort(char *strings, int length, long int size,
+                      int offset, int nbuckets) {
+   long int *order;
+   long int *workspace;
+   size_t *histogram;
+   size_t *positions;
+   int worker_slots = 1;
+
+   (void)offset;
+   (void)nbuckets;
+
+   order = (long int *)malloc((size_t)size * sizeof(*order));
+
+#pragma omp simd
+   for (long int i = 0; i < size; ++i)
+      order[i] = i;
+
+   if (size < 2 || length < 2)
+      return order;
+
+#ifdef _OPENMP
+   worker_slots = omp_get_max_threads();
+#endif
+   if (worker_slots < 1)
+      worker_slots = 1;
+   if ((long int)worker_slots > size)
+      worker_slots = (int)size;
+
+   workspace = (long int *)malloc((size_t)size * sizeof(*workspace));
+   histogram = (size_t *)malloc((size_t)worker_slots * 256U *
+                                sizeof(*histogram));
+   positions = (size_t *)malloc((size_t)worker_slots * 256U *
+                               sizeof(*positions));
+
+   radix_sort_indices(strings, length, size, order, workspace, histogram,
+                      positions, worker_slots);
+
+   free(positions);
+   free(histogram);
+   free(workspace);
+   return order;
+}
+
+void load(char **vString, long int *N, int *l, int *os, int *nb) {
+   char *strings = NULL;
+   int len, offset, nbucket;
+   long int n;
+
+   if (fscanf(stdin, "%d", &len) != 1) {
+      printf("ERROR len\n");
+      exit(1);
+   }
+
+   if (fscanf(stdin, "%ld", &n) != 1) {
+      printf("ERROR n\n");
+      exit(1);
+   }
+
+   if (fscanf(stdin, "%d", &offset) != 1) {
+      printf("ERROR offset\n");
+      exit(1);
+   }
+
+   if (fscanf(stdin, "%d", &nbucket) != 1) {
+      printf("ERROR nbucket\n");
+      exit(1);
+   }
+
+   nbucket = nbucket + 1;
+   len = len + 1;
+   strings = (char *)calloc((size_t)n, (size_t)len);
+
+   for (long int i = 0; i < n; ++i) {
+      if (fscanf(stdin, "%s", strings + (size_t)i * (size_t)len) != 1) {
+         printf("ERROR %ld\n", i);
+         exit(1);
+      }
+   }
+
+   *vString = strings;
+   *N = n;
+   *l = len;
+   *os = offset;
+   *nb = nbucket;
+}
+
+void save(const char *strings, const long int *index, long int n, int len) {
+   for (long int i = 0; i < n; ++i)
+      printf("%s\n", strings + (size_t)index[i] * (size_t)len);
+}
+
+int main(int ac, char **av) {
+   char *strings = NULL;
+   long int N = 0;
+   long int *index = NULL;
+   int len = 0;
+   int offset;
+   int nbuckets;
+
+   (void)ac;
+   (void)av;
+
+   load(&strings, &N, &len, &offset, &nbuckets);
+   index = bucket_sort(strings, len, N, offset, nbuckets);
+   save(strings, index, N, len);
+
+   free(strings);
+   free(index);
+   return EXIT_SUCCESS;
+}

@@ -1,0 +1,141 @@
+"""Read-only Astra xhigh receipt checks using the admitted R1 and selection readers."""
+from __future__ import annotations
+
+import collections
+import hashlib
+import importlib.util
+import json
+import math
+import sqlite3
+import statistics
+import sys
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+WORKSPACE = STUDY.parents[1]
+ROOT = HERE / "restauration-neuve/results-750205"
+WORKER = STUDY / "runs/coverage-gpt-6-astra-xhigh/worker"
+SOURCE = STUDY / "HPC-Forest-Archives-Modele-Mere-r1.zip"
+PROJECT = WORKSPACE / "work/marathon-archive-mother-r1/project"
+GROUP = {"job_id": "750205", "session_id": "2bd8b683b45b41c8b48ec38708f46bab",
+         "model": "gpt-6-astra", "effort": "xhigh"}
+
+
+def load(p):
+    return json.loads(p.read_text(encoding="utf-8-sig"))
+
+
+def sha(p):
+    with p.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def save(name, data):
+    with (HERE / name).open("x", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=True, indent=2)
+        f.write("\n")
+
+
+def dependency(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def inventory(folder):
+    return {p.relative_to(folder).as_posix(): {"bytes": p.stat().st_size, "sha256": sha(p)}
+            for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
+def main():
+    native = load(HERE / "audit-initial.json")
+    assert native["coverage_and_final_confirmations_verified"]
+    assert native["read_only_file_verification_before_and_after"]
+    before = load(HERE / "inventaire-apres-audit.json")
+    assert inventory(ROOT.parent) == before
+    helpers = {
+        "r1": HERE / "reconcilier-r1-interruption.py",
+        "selection": WORKSPACE / "outputs/Marathon22-DeepSeek-v11/receptions/confirmation_audit.py",
+    }
+    r1 = dependency("astra_xhigh_reconciliation_r1", helpers["r1"])
+    selection = dependency("astra_xhigh_confirmation", helpers["selection"])
+    deliveries = r1.reconcile(ROOT, WORKER, GROUP)
+    assert deliveries["all_published_requests_accounted_for"]
+    if (HERE / "reconciliation-livraisons.json").exists():
+        assert load(HERE / "reconciliation-livraisons.json") == deliveries
+    else:
+        save("reconciliation-livraisons.json", deliveries)
+    with zipfile.ZipFile(SOURCE) as z:
+        manifest = json.loads(z.read("HPC-Forest/FILES.sha256.json"))
+        files = {n.removeprefix("HPC-Forest/") for n in z.namelist() if not n.endswith("/")}
+        assert files == set(manifest) | {"FILES.sha256.json"} and len(files) == 90
+        assert (PROJECT / "FILES.sha256.json").read_bytes() == z.read("HPC-Forest/FILES.sha256.json")
+    assert all(sha(PROJECT / name) == expected for name, expected in manifest.items())
+    details = []
+    statuses = collections.Counter()
+    for subject in native["subjects"]:
+        slug = subject["subject"]
+        campaign = ROOT / slug
+        with sqlite3.connect((campaign / "registry.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as db:
+            meta = {k: json.loads(v) for k, v in db.execute("SELECT key,value FROM metadata")}
+            config = meta["config"]
+            assert config["codex"]["model"] == GROUP["model"]
+            assert config["codex"]["reasoning_effort"] == GROUP["effort"]
+            assert config["codex"]["session_id"] == GROUP["session_id"] and config["seed"] == 23
+            assert config["harness"]["enabled"] is True
+            confirmations = [{"experiment_id": exp, "outcome": json.loads(raw)} for exp, raw in
+                             db.execute("SELECT experiment_id,payload FROM evaluations WHERE phase='confirmation'")]
+            plan = meta["confirmation_plan:1"]
+            assert {p["id"] for p in plan} == {p["experiment_id"] for p in confirmations}
+            commits = {exp: json.loads(raw).get("commit") for exp, raw in db.execute("SELECT id,result FROM trials")}
+            commits["baseline-e1"] = next(p["commit"] for p in plan if p["id"] == "baseline-e1")
+            for row in confirmations:
+                assert commits[row["experiment_id"]] == row["outcome"]["commit"]
+            contract = load(campaign / "trusted/contract.json")
+            checked = selection.verify_final_selection(confirmations, meta["best_confirmed"], contract, ROOT, .03)
+            for row in confirmations:
+                outcome = row["outcome"]
+                if outcome["correct"]:
+                    folder = campaign / "logs/e1" / row["experiment_id"] / "confirmation/attempt-001"
+                    assert load(folder / "correctness.log")["correct"] is True
+                    for i, seconds in enumerate(outcome["times"]):
+                        sample = load(folder / f"sample-{i}.log.json")
+                        assert sample["returncode"] == 0 and sample["timed_out"] is False
+                        assert math.isclose(sample["seconds"], seconds, rel_tol=1e-12)
+            winner = meta["best_confirmed"]
+            baseline = next(c["outcome"] for c in confirmations if c["experiment_id"] == "baseline-e1")
+            selected = next(c["outcome"] for c in confirmations if c["experiment_id"] == winner["experiment_id"])
+            statuses.update(subject["statuses"])
+            details.append({"subject": slug, "confirmation_selection": checked,
+                "baseline_confirmation_times": baseline["times"], "retained_confirmation_times": selected["times"],
+                "baseline_mean_seconds": statistics.mean(baseline["times"]),
+                "retained_mean_seconds": statistics.mean(selected["times"]),
+                "speedup_within_this_allocation": baseline["mean_seconds"] / selected["mean_seconds"],
+                "reduction_fraction_within_this_allocation": 1 - selected["mean_seconds"] / baseline["mean_seconds"],
+                "retained_binary_sha256": selected["binary_sha256"], "retained_reference": winner["is_baseline"],
+                "trials": subject["trials"], "statuses": subject["statuses"], "topology": subject["topology"],
+                "finite_contract_only": True, "universal_algorithmic_or_official_rank_claim": False})
+    assert inventory(ROOT.parent) == before
+    result = {"schema": "hpc-forest-astra-xhigh-supplemental-readonly-audit-v1", **GROUP,
+        "verified_utc": datetime.now(UTC).isoformat(), "read_only_evidence_verified": True,
+        "all_restored_bytes_unchanged": True, "restored_file_count_including_manifest": len(before),
+        "frozen_source_manifest_entries_verified": len(manifest), "frozen_source_files_verified": len(files),
+        "source_zip_sha256": sha(SOURCE),
+        "helper_sha256": {str(p): sha(p) for p in helpers.values()},
+        "all_planned_finalists_accounted_for": True, "all_final_confirmations_verified": True,
+        "actual_deliveries": {k: v for k, v in deliveries.items() if k not in ("records", "local_delivery_attachment_sha256")},
+        "trials": sum(p["trials"] for p in details), "statuses": dict(statuses),
+        "modified_programs_confirmed": sum(not p["retained_reference"] for p in details),
+        "references_retained": sum(p["retained_reference"] for p in details), "subjects": details,
+        "candidate_execution_or_compilation": False, "new_model_calls": 0}
+    save("audit-complementaire.json", result)
+    print(json.dumps({k: v for k, v in result.items() if k not in ("subjects", "helper_sha256")}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

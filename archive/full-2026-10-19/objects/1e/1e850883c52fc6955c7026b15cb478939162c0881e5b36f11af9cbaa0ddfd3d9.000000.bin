@@ -1,0 +1,96 @@
+"""Actual cold review/binding consumer; stop before any source110 import or projection."""
+import copy
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parents[1]
+OLD = HERE.with_name('revision-r5-G-recu-avant-Q')
+BASE = HERE.parents[3]
+OWN = (BASE / 'outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3/'
+       'operations-parent-premier-roots-source110-r1/preparation-roots-operationnelle-r1')
+ACTUAL_BINDING = OWN / 'revision-source-state-binding-r2/SOURCE-STATE-BINDING-R2-CANDIDAT-NON-ADMIS.json'
+ACTUAL_REVIEW = OWN / 'revision-source-state-binding-r2/REVUE-SOURCE-STATE-564-ED888-PREPARATION.json'
+REVIEW_SHA = '1a65d2c23b12a14768bc9367d09f519623a7d6ed0c8bb27cfef8d3d7bfb9712a'
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ref(path):
+    return {'path': str(path), 'sha256': sha(path)}
+
+
+def load(root, name):
+    spec = importlib.util.spec_from_file_location(name, root / 'reader_bridge.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ActualReviewAcceptedBeforeSourceImport(Exception):
+    """Only a test boundary, never a positive projection or admission."""
+
+
+def stop_before_source():
+    raise ActualReviewAcceptedBeforeSourceImport
+
+
+def test_actual_review_reader_and_current_verifier_reach_source_boundary(monkeypatch):
+    assert sha(ACTUAL_REVIEW) == REVIEW_SHA
+    bridge = load(HERE, 'real_review_r6')
+    monkeypatch.setattr(bridge, 'source_modules', stop_before_source)
+    # All dependency hashes, actual review bytes and exact reader/verifier bytes
+    # are validated by the real production facade before this deliberate stop.
+    with pytest.raises(ActualReviewAcceptedBeforeSourceImport):
+        bridge.produce_projection({}, {}, ref(ACTUAL_BINDING), now=0)
+
+
+def test_actual_r5_consumer_rejects_same_real_binding(monkeypatch):
+    bridge = load(OLD, 'real_review_old_r5')
+    monkeypatch.setattr(bridge, 'source_modules', stop_before_source)
+    with pytest.raises(ValueError, match='Only the exact independently reviewed reader'):
+        bridge.produce_projection({}, {}, ref(ACTUAL_BINDING), now=0)
+
+
+def test_old_unmodified_review_binding_remains_refused(monkeypatch):
+    bridge = load(HERE, 'real_old_review_refused_r6')
+    monkeypatch.setattr(bridge, 'source_modules', stop_before_source)
+    old_binding = OWN / 'SOURCE-STATE-BINDING-REEL-CODE-SEULEMENT.json'
+    with pytest.raises(ValueError, match='Only the exact independently reviewed reader'):
+        bridge.produce_projection({}, {}, ref(old_binding), now=0)
+
+
+@pytest.mark.parametrize('change', ['reader_sha', 'verifier_sha', 'review_sha', 'review_path', 'revision', 'extra'])
+def test_mutations_of_real_binding_refused_before_source(change, tmp_path, monkeypatch):
+    binding = copy.deepcopy(json.loads(ACTUAL_BINDING.read_text(encoding='utf8')))
+    if change == 'reader_sha':
+        binding['reader']['sha256'] = '0' * 64
+    elif change == 'verifier_sha':
+        binding['current_verifier']['sha256'] = '0' * 64
+    elif change == 'review_sha':
+        binding['independent_review']['sha256'] = '0' * 64
+    elif change == 'review_path':
+        binding['independent_review']['path'] = str(ACTUAL_BINDING)
+    elif change == 'revision':
+        binding['revision'] = 'not-reviewed'
+    else:
+        binding['verified'] = True
+    path = tmp_path / 'mutated-binding.json'
+    path.write_text(json.dumps(binding), encoding='utf8')
+    bridge = load(HERE, 'real_mutation_' + change)
+    monkeypatch.setattr(bridge, 'source_modules', stop_before_source)
+    with pytest.raises(ValueError):
+        bridge.produce_projection({}, {}, ref(path), now=0)
+
+
+def test_old_actual_qualification_cannot_qualify_new_components():
+    bridge = load(HERE, 'real_old_q_refused_r6')
+    actual_q = (BASE / 'outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3/'
+                'qualification-allouee-source110-G-recu-r1/RECEPTION-MECANIQUE-SOURCE110-VERIFIEE.json')
+    with pytest.raises(ValueError, match='Actual allocated derivative and integration qualification required'):
+        bridge.check_qualification(ref(actual_q))

@@ -1,0 +1,202 @@
+[CmdletBinding()]
+param(
+ [Parameter(Mandatory=$true)][string]$ColdInput,
+ [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ColdInputSha256,
+ [Parameter(Mandatory=$true)][string]$OrchestrationReview,
+ [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-f]{64}$')][string]$OrchestrationReviewSha256,
+ [string]$ArchiveCim,
+ [ValidatePattern('^[0-9a-f]{64}$')][string]$ArchiveCimSha256,
+ [switch]$Execute
+)
+$ErrorActionPreference='Stop'
+if($PSVersionTable.PSEdition -cne 'Core' -or $PSVersionTable.PSVersion.ToString() -cne '7.6.5'){throw 'ROOT must select the qualified Core7.6.5 host itself; never nest pwsh'}
+$base='C:\Users\nicol\Documents\Codex\2026-10-15\cr'
+$op=Join-Path $base 'outputs\HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3\operations-parent-premier-roots-source110-r1'
+$live=Join-Path $op 'preparation-parcours-vivant-R8-r1'
+$preparedRoot=Join-Path $live 'reprise-passive-externe-R8-r1\revision-r2-terminal-distinct'
+$own=Join-Path $preparedRoot 'orchestration-root-preparee-r1'
+$code=Join-Path $live 'reprise-passive-externe-R8-r1\revision-r3-archive-win32-qualified'
+$obs=Join-Path $op 'preparation-observation-R8-r1'
+$chain=Join-Path $base 'outputs\HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r3\adaptateurs-source110-r1\revision-r8-racines-techniques-neuves'
+$metaPython='C:\Users\nicol\AppData\Local\Programs\Python\Python313\python.exe'
+$launcher=Join-Path $base 'work\.venv\Scripts\python.exe'
+$utf8=[Text.UTF8Encoding]::new($false,$true)
+$run=Join-Path $obs 'execution-root-02'
+$absence=Join-Path $obs 'execution-root-02-absence'
+$policy=Join-Path $obs 'execution-root-02-policy'
+$archiveDir=Join-Path $obs 'archive-runtime-reprise-02'
+$archiveReceipt=Join-Path $archiveDir 'ARCHIVAGE-RUNTIME-POST-CLOTURE.json'
+$copies=Join-Path $obs 'copies-demarrage-root-02'
+$pairOut=Join-Path $obs 'reception-paire-root-02'
+$intent=Join-Path $obs 'INTENTION-UNIQUE-OBS4-R8-REPRISE-02.json'
+$execution=Join-Path $own 'execution-root-01'
+$orchestrationIntent=Join-Path $own 'INTENTION-UNIQUE-ORCHESTRATION-PASSIVE-ROOT-01.json'
+$aliasReview=Join-Path $obs 'REVUE-QUATRE-CODES-REPRISE-02-COPIE-FROIDE.json'
+$aliasReceipt=Join-Path $obs 'RECU-COPIE-REVUE-QUATRE-CODES-REPRISE-02.json'
+$lifecycleFile=Join-Path $obs 'ENTREE-CYCLE-REPRISE-02-REELLE.json'
+$copyInputFile=Join-Path $obs 'ENTREE-COPIES-REPRISE-02-REELLE.json'
+$pairInputFile=Join-Path $obs 'ENTREE-PAIRE-REPRISE-02-REELLE.json'
+$preArchiveLegacyProof=Join-Path $obs 'ABSENCE-R5-R7-AVANT-ARCHIVE-REPRISE-02.json'
+
+function Ordinary([string]$path){
+ if(-not [IO.Path]::IsPathFullyQualified($path) -or $path.StartsWith('\\') -or $path -match '(^|[\\/])\.\.([\\/]|$)'){throw 'Exact absolute non-UNC path required'}
+ $full=[IO.Path]::GetFullPath($path)
+ if($full -cne $path -or $full.Substring(3).Contains(':')){throw 'Canonical path without ADS required'}
+ foreach($part in $full.Substring(3).Split('\')){if($part -cne $part.TrimEnd([char[]]' .')){throw 'Trailing Windows alias refused'}}
+ $part=$full
+ while($part){
+  try{$attrs=[IO.File]::GetAttributes($part);if(($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Reparse entry or parent refused'}}catch{
+   $errorObject=$_.Exception;while($null -ne $errorObject.InnerException){$errorObject=$errorObject.InnerException}
+   if($errorObject -isnot [IO.FileNotFoundException] -and $errorObject -isnot [IO.DirectoryNotFoundException]){throw}
+  }
+  $parent=[IO.Path]::GetDirectoryName($part);if($parent -eq $part){break};$part=$parent
+ }
+ return $full
+}
+function Missing([string]$path){
+ Ordinary $path|Out-Null
+ try{[IO.File]::GetAttributes($path)|Out-Null}catch{
+  $errorObject=$_.Exception;while($null -ne $errorObject.InnerException){$errorObject=$errorObject.InnerException}
+  if($errorObject -is [IO.FileNotFoundException] -or $errorObject -is [IO.DirectoryNotFoundException]){return};throw
+ }
+ throw 'Existing destination, including a dangling alias, is never reused'
+}
+function Sha([string]$path){Ordinary $path|Out-Null;return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+function Ref([string]$path){return [ordered]@{path=$path;sha256=(Sha $path)}}
+function Read-Ref($reference){
+ if($null -eq $reference -or ((@($reference.PSObject.Properties.Name|Sort-Object)) -join '|') -cne 'path|sha256' -or $reference.sha256 -cnotmatch '^[0-9a-f]{64}$'){throw 'Missing/malformed actual cold reference'}
+ if((Sha $reference.path) -cne $reference.sha256){throw 'Actual cold reference changed'}
+ $bytes=[IO.File]::ReadAllBytes($reference.path)
+ if(([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()) -cne $reference.sha256){throw 'Cold bytes changed before decode'}
+ return ($utf8.GetString($bytes)|ConvertFrom-Json -Depth 60)
+}
+function Save-New([string]$path,$value){
+ Missing $path
+ $bytes=$utf8.GetBytes(($value|ConvertTo-Json -Depth 60))
+ $stream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+ try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
+}
+function Native-Step([string]$name,[string]$script,[object[]]$arguments){
+ $script:stage=$name
+ & $metaPython -I -B $script @arguments
+ $nativeExit=$LASTEXITCODE
+ if($nativeExit -ne 0){throw ('Qualified helper refused at '+$name+'; preserve its outputs, no retry')}
+}
+function Check-Review($value,[string]$schema,$expected){
+ if($value.schema -cne $schema -or $value.verified_source_preparation_only -ne $true -or $null -eq $value.blocking_findings -or @($value.blocking_findings).Count -ne 0 -or $value.native_generation_admitted -ne $false){throw 'Missing actual independent source review'}
+ $actualNames=@($value.reviewed_files.PSObject.Properties.Name|Sort-Object)
+ if(($actualNames -join '|') -cne (($expected.Keys|Sort-Object) -join '|')){throw 'Review has the wrong exact file set'}
+ foreach($name in $expected.Keys){if($value.reviewed_files.$name -cne $expected[$name]){throw 'Review code/test pin changed'}}
+}
+function Check-Tests($value,[string]$schema,[int]$count,[string]$codeKey,[string]$codeSha,[string]$testKey,[string]$testSha){
+ if($value.schema -cne $schema -or $value.$codeKey -cne $codeSha -or $value.$testKey -cne $testSha -or $value.tests_run -isnot [long] -and $value.tests_run -isnot [int] -or $value.tests_run -ne $count){throw 'Actual new ROOT neutral completion required'}
+ foreach($name in @('exit_code','failures','errors','skipped')){if(($value.$name -isnot [int] -and $value.$name -isnot [long]) -or $value.$name -ne 0){throw 'A neutral failure/error/skip forbids effects'}}
+}
+
+if($PSScriptRoot -cne $own){throw 'Exact owned orchestration source directory required'}
+$reviewRef=[pscustomobject]@{path=$OrchestrationReview;sha256=$OrchestrationReviewSha256}
+$ownReview=Read-Ref $reviewRef
+Check-Review $ownReview 'hpc-forest-r8-direct-passive-orchestration-preparation-review-v1' @{ 'orchestrer-reprise-passive-R8-ROOT.ps1'=(Sha $PSCommandPath) }
+if($ownReview.direct_same_host_passive_only -ne $true){throw 'Only same-host passive orchestration is reviewed'}
+$inputRef=[pscustomobject]@{path=$ColdInput;sha256=$ColdInputSha256};$cold=Read-Ref $inputRef
+$coldNames=@('schema','approved_bindings','closure','closure_review','terminal','terminal_cold_review','qualification','qualification_consumer','lifecycle_review','passive_four_review','lifecycle_tests','copier_review','copier_tests','receiver_review','receiver_tests')
+if($cold.schema -cne 'hpc-forest-r8-direct-passive-orchestration-actual-cold-input-v1' -or ((@($cold.PSObject.Properties.Name|Sort-Object)) -join '|') -cne (($coldNames|Sort-Object) -join '|')){throw 'Closed cold input only; null/preparation inputs refuse'}
+$documents=@{}
+foreach($name in $coldNames|Where-Object {$_ -ne 'schema'}){$documents[$name]=Read-Ref $cold.$name}
+if($null -eq $ownReview.reviewed_bindings -or $ownReview.reviewed_bindings.path -cne $cold.approved_bindings.path -or $ownReview.reviewed_bindings.sha256 -cne $cold.approved_bindings.sha256){throw 'Orchestration review must bind the ACTUAL qualified R3 binding bytes; no future receipt accepted'}
+$bindings=$documents.approved_bindings
+if($bindings.schema -cne 'hpc-forest-r8-passive-orchestration-received-r3-source-bindings-v1' -or $bindings.code_directory -cne $code -or $bindings.source_pins_are_actual_prepared_bytes -ne $true -or $bindings.neutral_completion_claimed -ne $false -or $bindings.native_generation_admitted -ne $false){throw 'Actual canonical R3 source pins required; neutral qualification is separately checked, null refuses'}
+$sourceNames=@('cycle-passif-externe-R8.py','lancer-observateur-R8-r2.ps1','copier-quatre-sources-reprise-R8-parent.py','recevoir-paire-observateur-R8-reprise-02.py','test_cycle_passif_externe_R8.py','test_copie_quatre_sources_reprise_R8_neutre.py','test_reception_paire_R8_reprise_02.py')
+if(((@($bindings.code_pins.PSObject.Properties.Name|Sort-Object)) -join '|') -cne (($sourceNames|Sort-Object) -join '|')){throw 'Exact seven reviewed R3 source pins required'}
+$pins=@{};foreach($item in $bindings.code_pins.PSObject.Properties){if($item.Value -cnotmatch '^[0-9a-f]{64}$'){throw 'Missing future code pin'};$pins[$item.Name]=$item.Value}
+if($pins['cycle-passif-externe-R8.py'] -ceq 'd2400f7a3dbbbb63b86739b3b35745ae4f9f68ffdb9f932945228573edd459c5'){throw 'Known failed R2 archive17pass/2error is never admitted'}
+if($bindings.neutral_counts.lifecycle -ne 22 -or $bindings.neutral_counts.copier -ne 26 -or $bindings.neutral_counts.receiver -ne 47){throw 'Exact R3 22/26/47 actual qualifications required; a changed source contract needs new review'}
+foreach($name in $pins.Keys){if((Sha (Join-Path $code $name)) -cne $pins[$name]){throw 'Qualified R3 code/test changed'}}
+if((Sha $metaPython) -cne '5ef72c30ca3b82df7c7e186c9220bde665be9a335edbd4a371a4b19d0ac76644' -or (Sha $launcher) -cne '819c07dbf55c179f77a71d6f041c74c57b18d86f637f5f5e76ea882a50c9ed8b'){throw 'Qualified metadata Python/launcher changed'}
+if($cold.closure.sha256 -cne 'c91d5d5ea1115b4c152211bc3d89565dad668be50214229f82f53b58b17dabb7' -or $cold.closure_review.sha256 -cne '14fbbae32ff2a629e3beab60d03d9671df1e1f2d4f7d034908e78d2ae5e5818f' -or $cold.terminal.sha256 -cne 'eafc12c79c2bf4f8da22a8a0ec0f81a4a49889e8d47b590f902289a7eab728ab' -or $cold.terminal_cold_review.sha256 -cne 'c667b2e63257fe27af1990c21f410db24a54fb48d5d36d33a61ef2011e590b50'){throw 'Only the actually received closure/terminal branch is prepared'}
+if($cold.qualification.sha256 -cne '234a4ad3b058167c42190c5721985424ca8223de0e52d1a74c83a002247ff9e1' -or $cold.qualification_consumer.sha256 -cne 'b4fe3624b7ac32373133484de01348b30c2567267f289a8bd2bb87c8f99aef6d'){throw 'Actual R8 Q and consumer only'}
+Check-Review $documents.lifecycle_review 'hpc-forest-r8-external-passive-lifecycle-preparation-review-v1' @{ 'cycle-passif-externe-R8.py'=$pins['cycle-passif-externe-R8.py'];'test_cycle_passif_externe_R8.py'=$pins['test_cycle_passif_externe_R8.py'] }
+Check-Review $documents.copier_review 'hpc-forest-r8-startup-four-cold-copy-independent-preparation-review-v1' @{ 'copier-quatre-sources-reprise-R8-parent.py'=$pins['copier-quatre-sources-reprise-R8-parent.py'];'test_copie_quatre_sources_reprise_R8_neutre.py'=$pins['test_copie_quatre_sources_reprise_R8_neutre.py'] }
+Check-Review $documents.receiver_review 'hpc-forest-r8-dynamic-pair-receiver-independent-preparation-review-v1' @{ 'recevoir-paire-observateur-R8-reprise-02.py'=$pins['recevoir-paire-observateur-R8-reprise-02.py'];'test_reception_paire_R8_reprise_02.py'=$pins['test_reception_paire_R8_reprise_02.py'] }
+Check-Review $documents.passive_four_review 'hpc-forest-r8-observation-preparation-review-v1' @{ 'cycle-passif-externe-R8.py'=$pins['cycle-passif-externe-R8.py'];'lancer-observateur-R8-r2.ps1'=$pins['lancer-observateur-R8-r2.ps1'];'preparer-observation-froide-R8.py'='39effdfd8183f7878ae4d428a304b1cfdd95a257269ee7f0c1f34cc3980e8754';'preparer-policy-routes-R8.py'='ddfbbac0be1fb0f579c6f4ad1f94d6e199ae4dd85f07dab371a20ca36ea42a97' }
+if($documents.passive_four_review.passive_observer_only -ne $true){throw 'Passive-only exact4 review required'}
+Check-Tests $documents.lifecycle_tests 'hpc-forest-r8-external-passive-lifecycle-neutral-completion-v1' 22 'code_sha256' $pins['cycle-passif-externe-R8.py'] 'test_sha256' $pins['test_cycle_passif_externe_R8.py']
+Check-Tests $documents.copier_tests 'hpc-forest-r8-startup-four-cold-copy-neutral-test-completion-v1' 26 'helper_sha256' $pins['copier-quatre-sources-reprise-R8-parent.py'] 'test_source_sha256' $pins['test_copie_quatre_sources_reprise_R8_neutre.py']
+Check-Tests $documents.receiver_tests 'hpc-forest-r8-dynamic-pair-neutral-test-completion-v1' 47 'receiver_sha256' $pins['recevoir-paire-observateur-R8-reprise-02.py'] 'test_source_sha256' $pins['test_reception_paire_R8_reprise_02.py']
+if($documents.lifecycle_tests.live_runtime_read_or_changed -ne $false -or $documents.copier_tests.copy_main_executed -ne $false -or $documents.copier_tests.live_source_payload_read -ne $false -or $documents.receiver_tests.receiver_main_executed -ne $false -or $documents.receiver_tests.fixture_results_are_live_observation -ne $false){throw 'Neutral results never authorize a fabricated live observation'}
+if($documents.copier_tests.source62_before_after_equal -ne $true -or $documents.copier_tests.helper_and_test_before_after_equal -ne $true -or $documents.receiver_tests.source_observer_before_after_equal -ne $true -or $documents.receiver_tests.receiver_and_test_before_after_equal -ne $true){throw 'Actual neutral before/after preservation flags required before every effect'}
+foreach($name in @('copier_review','receiver_review')){if(-not $cold.$name.path.StartsWith((Join-Path $code 'revue-preparation-independante-r1')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Consumer preparation review lies outside its literal accepted CODE boundary'}}
+foreach($name in @('copier_tests','receiver_tests')){if(-not $cold.$name.path.StartsWith($code+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Consumer actual completion lies outside its literal accepted CODE boundary'}}
+# Check the whole frozen62 and read-only consumer paths BEFORE the startup T0.
+if((Sha (Join-Path $chain 'COMPONENTS.json')) -cne 'd7d7d240198fc487efbede15c1328a366bc0c5bd59614d5064e19d81d1cf7122'){throw 'Frozen62 manifest changed'}
+$components=Read-Ref (Ref (Join-Path $chain 'COMPONENTS.json'))
+if(@($components.code_pins.PSObject.Properties).Count -ne 62){throw 'Exactly62 immutable components required'}
+foreach($item in $components.code_pins.PSObject.Properties){if($item.Name -match '(^|/)\.\.(/|$)' -or (Sha (Join-Path $chain $item.Name)) -cne $item.Value){throw 'A frozen component changed'}}
+if((Sha (Join-Path $obs 'verifier-absence-ancien-OBS4-R8.py')) -cne '6483d35f9dd928f1a4c1451cca88b0a87355138c4b144c992c89274393369139'){throw 'Historical closure/current absence helper changed'}
+foreach($path in @($execution,$orchestrationIntent,$archiveDir,$intent,$run,$absence,$policy,$copies,$pairOut,$aliasReview,$aliasReceipt,$lifecycleFile,$copyInputFile,$pairInputFile,$preArchiveLegacyProof,(Join-Path $code 'INTENTION-UNIQUE-ARCHIVE-RUNTIME-REPRISE-02.json'))){Missing $path}
+# Bound inputs/outputs are assembled as paths now; no future SHA or observation is invented.
+$r5=Join-Path $live 'reception-paire-dynamique-r1\revision-r5-snapshots-passifs-sources'
+$legacyRefs=@{
+ receiver_code=[ordered]@{path=(Join-Path $r5 'recevoir-paire-observateur-R8-froide-r5.py');sha256='16ce4d969be705e2ec1192331d094a45473c4f165faa7f92ac05ea665ce90eb8'}
+ receiver_review=[ordered]@{path=(Join-Path $r5 'revue-preparation-independante-r1\REVUE-RECEPTEUR-DYNAMIQUE-R8-R5-PREPARATION.json');sha256='05bed4a91046889d422107fc7e3a765337cacfcfe62843a79d004ed2775b628a'}
+ receiver_neutral_completion=[ordered]@{path=(Join-Path $r5 'TESTS-NEUTRES-ROOT-01.json');sha256='0dd4a7c930e31424f5b00ae118c696841323308d3015ed87b6b0cf708f40f8af'}
+}
+foreach($reference in $legacyRefs.Values){if((Sha $reference.path) -cne $reference.sha256){throw 'Frozen R5 ancestry changed; no new pair promoted from it'}}
+if(-not $Execute){[ordered]@{preflight_only=$true;captured_or_archived_or_started=$false;all_cold_gates_present=$true;native_generation_admitted=$false}|ConvertTo-Json -Compress;return}
+if(-not $ArchiveCim -or -not $ArchiveCimSha256){throw 'Fresh ROOT-supplied archive CIM+SHA required after preflight; no collector added'}
+if((Sha $ArchiveCim) -cne $ArchiveCimSha256){throw 'Archive CIM bytes changed'}
+New-Item -ItemType Directory -Path $execution -ErrorAction Stop|Out-Null
+$stage='exclusive-orchestration-intent';$failure=$null;$completed=$false
+Save-New $orchestrationIntent ([ordered]@{schema='hpc-forest-r8-direct-passive-orchestration-intent-v1';created_at_utc=[DateTime]::UtcNow.ToString('o');cold_input=$inputRef;orchestration_review=$reviewRef;archive_cim=(Ref $ArchiveCim);one_attempt_only=$true;unknown_forbids_retry=$true;native_or_job_submission_permitted=$false})
+try{
+ $stage='cold-exact4-review-alias'
+ $originalSha=Sha $cold.passive_four_review.path
+ $reviewBytes=[IO.File]::ReadAllBytes($cold.passive_four_review.path)
+ if($originalSha -cne $cold.passive_four_review.sha256 -or ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($reviewBytes)).ToLowerInvariant()) -cne $originalSha){throw 'Exact4 review changed before cold alias'}
+ Missing $aliasReview;$stream=[IO.File]::Open($aliasReview,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+ try{$stream.Write($reviewBytes,0,$reviewBytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
+ if((Sha $aliasReview) -cne $originalSha -or (Sha $cold.passive_four_review.path) -cne $originalSha){throw 'Cold exact4 review alias differs'}
+ Save-New $aliasReceipt ([ordered]@{schema='hpc-forest-r8-cold-review-byte-exact-alias-v1';source=$cold.passive_four_review;received=(Ref $aliasReview);two_hashes_and_bytes_equal=$true;copied_before_startup_T0=$true;no_runtime_file_read=$true})
+ Native-Step 'historical-R5-R7-current-absence-before-archive' (Join-Path $obs 'verifier-absence-ancien-OBS4-R8.py') @('--full-cim',$ArchiveCim,'--full-cim-sha256',$ArchiveCimSha256,'--old-observer-review',(Join-Path $op 'fermeture-observateur-r5-preparee-r1\revue-fermeture-reelle-r3-r1\REVUE-FERMETURE-OBS4-REELLE-R3.json'),'--old-observer-review-sha256','7d2ba9c37b3a811d59039073608ff95f95c12473fa3156f60e79afe85c9a0a66','--output',$preArchiveLegacyProof)
+ $cycleArguments=@('--mode','archive','--closure',$cold.closure.path,'--closure-sha256',$cold.closure.sha256,'--closure-review',$cold.closure_review.path,'--closure-review-sha256',$cold.closure_review.sha256,'--previous-sequence-terminal',$cold.terminal.path,'--previous-sequence-terminal-sha256',$cold.terminal.sha256,'--full-cim',$ArchiveCim,'--full-cim-sha256',$ArchiveCimSha256,'--helper-review',$cold.lifecycle_review.path,'--helper-review-sha256',$cold.lifecycle_review.sha256,'--neutral-completion',$cold.lifecycle_tests.path,'--neutral-completion-sha256',$cold.lifecycle_tests.sha256,'--output',$archiveDir)
+ Native-Step 'archive-postclosure-runtime' (Join-Path $code 'cycle-passif-externe-R8.py') $cycleArguments
+ $archiveValue=Read-Ref (Ref $archiveReceipt)
+ if($archiveValue.schema -cne 'hpc-forest-r8-owned-passive-runtime-archive-v1' -or $archiveValue.verified_archived_runtime_only -ne $true){throw 'No actual successful runtime archive'}
+ Save-New $lifecycleFile ([ordered]@{schema='hpc-forest-r8-new-external-passive-lifecycle-actual-input-v1';closure=$cold.closure;closure_review=$cold.closure_review;archive=(Ref $archiveReceipt);previous_sequence_terminal=$cold.terminal;helper_review=$cold.lifecycle_review;neutral_completion=$cold.lifecycle_tests})
+ $startArguments=@{PreparationReview=$aliasReview;PreparationReviewSha256=(Sha $aliasReview);QualificationReception=$cold.qualification.path;QualificationReceptionSha256=$cold.qualification.sha256;LifecycleInput=$lifecycleFile;LifecycleInputSha256=(Sha $lifecycleFile);RunName='execution-root-02';Execute=$true}
+ $stage='direct-same-host-passive-start'
+ # CRITICAL: same ROOT PowerShell host, named hashtable; never &pwsh -File.
+ & (Join-Path $code 'lancer-observateur-R8-r2.ps1') @startArguments
+ $directSucceeded=$?
+ if(-not $directSucceeded){throw 'Direct PS preparation failed; preserve UNKNOWN and never retry'}
+ $observedPath=Join-Path $run 'LANCEMENT-OBSERVE.json';$observed=Read-Ref (Ref $observedPath)
+ $initial=Read-Ref (Ref (Join-Path $run 'CIM-PRIVE-AVANT-PREPARATION.json'))
+ $immediate=Read-Ref (Ref (Join-Path $run 'CIM-PRIVE-IMMEDIAT-AVANT-START.json'))
+ $after=Read-Ref (Ref (Join-Path $run 'CIM-PRIVE-APRES.json'))
+ $deadline=@([DateTimeOffset]::Parse($initial.captured_at_utc).UtcDateTime.AddSeconds(120),[DateTimeOffset]::Parse($immediate.captured_at_utc).UtcDateTime.AddSeconds(120),[DateTimeOffset]::Parse($after.captured_at_utc).UtcDateTime.AddSeconds(120),[DateTimeOffset]::Parse($observed.observed_at_utc).UtcDateTime.AddSeconds(120))|Sort-Object|Select-Object -First 1
+ $stage='wait-bounded-state-metadata-only'
+ $statePath=Join-Path $chain 'observer\observer-state.json'
+ while($true){
+  if([DateTime]::UtcNow -ge $deadline){throw 'Original startup120 expired; never refresh, rebase or retry'}
+  Ordinary $statePath|Out-Null
+  try{$attrs=[IO.File]::GetAttributes($statePath);if(($attrs -band [IO.FileAttributes]::Directory) -ne 0){throw 'State is not an ordinary file'};break}catch{
+   $errorObject=$_.Exception;while($null -ne $errorObject.InnerException){$errorObject=$errorObject.InnerException}
+   if($errorObject -isnot [IO.FileNotFoundException] -and $errorObject -isnot [IO.DirectoryNotFoundException]){throw}
+  }
+  Start-Sleep -Milliseconds 100
+ }
+ $copyInput=[ordered]@{schema='hpc-forest-r8-ROOT-four-cold-copies-actual-input-v1';start_intent=(Ref $intent);start_observed=(Ref $observedPath);receiver_code=$legacyRefs.receiver_code;receiver_review=$legacyRefs.receiver_review;receiver_neutral_completion=$legacyRefs.receiver_neutral_completion;resumed_receiver_code=[ordered]@{path=(Join-Path $code 'recevoir-paire-observateur-R8-reprise-02.py');sha256=$pins['recevoir-paire-observateur-R8-reprise-02.py']};resumed_receiver_review=$cold.receiver_review;resumed_receiver_neutral_completion=$cold.receiver_tests}
+ Save-New $copyInputFile $copyInput
+ Native-Step 'four-cold-copies' (Join-Path $code 'copier-quatre-sources-reprise-R8-parent.py') @('--input',$copyInputFile,'--input-sha256',(Sha $copyInputFile),'--helper-review',$cold.copier_review.path,'--helper-review-sha256',$cold.copier_review.sha256,'--neutral-test-receipt',$cold.copier_tests.path,'--neutral-test-receipt-sha256',$cold.copier_tests.sha256,'--output-directory',$copies)
+ $coldState=Read-Ref (Ref (Join-Path $copies 'ETAT-PASSIF-COPIE-FROIDE.json'))
+ $stateTime=[DateTimeOffset]::FromUnixTimeMilliseconds([long]($coldState.updated_at*1000)).UtcDateTime
+ if([DateTime]::UtcNow -ge $deadline -or ([DateTime]::UtcNow-$stateTime).TotalSeconds -lt 0 -or ([DateTime]::UtcNow-$stateTime).TotalSeconds -gt 90){throw 'Current cold state90/startup120 boundary expired; no date rewrite'}
+ $receiverInput=[ordered]@{schema='hpc-forest-r8-actual-observer-startup-cold-input-v1';start_intent=(Ref $intent);start_observed=(Ref $observedPath);startup_census_before=(Ref (Join-Path $run 'CIM-PRIVE-AVANT-PREPARATION.json'));startup_census_after=(Ref (Join-Path $run 'CIM-PRIVE-APRES.json'));policy=(Ref (Join-Path $policy 'POLICY-OBS4.json'));routes_initial_copy=(Ref (Join-Path $copies 'ROUTES-INITIALES-COPIE-FROIDE.json'));routes_initial_copy_receipt=(Ref (Join-Path $copies 'RECU-COPIE-ROUTES-INITIALES.json'));transition=(Ref (Join-Path $absence 'TRANSITION-OBS3-OBS4.json'));source_only_absence=(Ref (Join-Path $absence 'ABSENCE-source-only.json'));observer3_absence=(Ref (Join-Path $absence 'ABSENCE-observer3.json'));prior_observer_current_absence=(Ref (Join-Path $run 'ABSENCE-OBS4-R5-ET-R7-IMMEDIATE.json'));cold_state=(Ref (Join-Path $copies 'ETAT-PASSIF-COPIE-FROIDE.json'));cold_state_receipt=(Ref (Join-Path $copies 'RECU-COPIE-ETAT-PASSIF.json'));cold_logs_receipt=(Ref (Join-Path $copies 'RECU-DEUX-LOGS-COPIES-FROIDES.json'));external_preparation_review=(Ref $aliasReview)}
+ Save-New $pairInputFile $receiverInput
+ Native-Step 'receive-passive-pair-fifteen-refs' (Join-Path $code 'recevoir-paire-observateur-R8-reprise-02.py') @('--input',$pairInputFile,'--input-sha256',(Sha $pairInputFile),'--helper-review',$cold.receiver_review.path,'--helper-review-sha256',$cold.receiver_review.sha256,'--neutral-test-receipt',$cold.receiver_tests.path,'--neutral-test-receipt-sha256',$cold.receiver_tests.sha256,'--output-directory',$pairOut)
+ $received=Read-Ref (Ref (Join-Path $pairOut 'RECEPTION-PAIRE-PASSIVE-METADATA-SEULEMENT.json'))
+ if($received.schema -cne 'hpc-forest-r8-actual-passive-pair-cold-reception-v1' -or $received.verified_metadata_only -ne $true -or $received.native_generation_admitted -ne $false){throw 'No actual passive-pair metadata receipt'}
+ $completed=$true;$stage='passive-pair-metadata-received-await-independent-cold-review'
+}catch{$failure=$_.Exception.ToString();throw}finally{
+ Save-New (Join-Path $execution 'EXECUTION-ORCHESTRATION-PASSIVE-ROOT.json') ([ordered]@{schema='hpc-forest-r8-direct-passive-orchestration-actual-execution-v1';ended_at_utc=[DateTime]::UtcNow.ToString('o');last_stage=$stage;failure=$failure;passive_pair_metadata_received=$completed;independent_actual_pair_review_received=$false;current_or_future_presence_promised=$false;native_or_model_or_root600_started=$false;automatic_retry_performed=$false;source110_62_plan_Q_modified=$false})
+}

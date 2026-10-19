@@ -7,6 +7,12 @@ _A public protocol and evidence record for evaluating program optimization._
 
 [Français](README.fr.md) · [Protocol](docs/PROTOCOL.md) · [Results](docs/RESULTS.md) · [Reproduce the calculations](docs/REPRODUCIBILITY.md)
 
+## Complete source and received-data publication
+
+The owner-requested complete publication adds [separate R1/R2 source trees](code/README.md), operational scripts and tests, received raw result archives, logs and historical documents. The [capture and restoration guide](reproducibility/README.md) documents the full path inventory, SHA-256 deduplication, bounded object parts and exclusions for authentication, installed dependencies and caches. Previously private records keep their original dated wording; this later publication expands access without rewriting their bytes or scientific claims.
+
+**Experiments remain paused.** Cloning, verifying or restoring files does not start a model, worker or cluster job. Failed and prepared artifacts remain historical records, with no additional admitted performance result.
+
 ## Received evidence and article · 19 October 2026
 
 The current r5 [research article](docs/article/ARTICLE.pdf) and [technical appendices](docs/article/ANNEXES-TECHNIQUES.pdf) integrate the received R2 observations into the abstract, section 3.9 and Appendix L, with three new R1/R2 figures. Read the [article in HTML](docs/article/ARTICLE.html), the [appendices in HTML](docs/article/ANNEXES-TECHNIQUES.html), and the [numeric comparison](docs/article/donnees-r1-r2/comparison.json) at the 19 October 2026, 11:40:35.931 UTC source cutoff. It covers 60 historical R1 cells and one R2 cell with source-confirmed final timings; 59 R2 cells lack scientific measurements. There are **zero scientifically admitted R2 gains and zero admitted R1/R2 pairs**. The timing and cost comparisons are descriptive: the searches differ, and the audit pause consumed the existing wall-clock budget.
@@ -25,7 +31,7 @@ The later [technical-incident supplement](evidence/native-incidents-2026-10-19/R
 
 HPC Forest studies a practical question: **can a system produce correct programs that run faster under a fixed search budget?** The evaluation uses frozen starting programs, external correctness checks, raw timings and a separate final confirmation. Another system can follow the same contract without disclosing its internal implementation.
 
-This repository publishes the evaluation method, selected audited observations and the tools needed to recalculate them. It is the **public evidence repository**; the internal optimization engine and protected evaluation inputs are not distributed here.
+This repository publishes the evaluation method, audited observations and their verification tools. The complete-source publication additionally releases the available historical engine code, operational tools, received raw data and benchmark materials. The frozen scientific projections and the full archival snapshot have separate scopes.
 
 ## What is measured so far
 
@@ -44,7 +50,7 @@ The controller and CPU observations are **separate experiments**. The CPU curves
 
 ![Core-scaling curves for all four largest cases in the released CPU subset; N-body reaches 14.38 times its one-core performance while the other curves remain close to one.](docs/assets/cpu-scaling.png)
 
-## Verify in under a minute
+## Verify the release
 
 Python **3.11 or later** is sufficient. The verification tools and tests use the standard library, work offline and do not call models, compile candidates or execute evaluated binaries.
 
@@ -95,6 +101,6 @@ Read the [full protocol](docs/PROTOCOL.md), [limitations](docs/LIMITATIONS.md), 
 
 The first release is **0.1.0**, dated 16 October 2026; the current checkout also includes the received evidence update and article r5 of 19 October. Cite the exact commit for that update. The native campaign plan covers fifteen subjects and four models, all at MAX, after the completed primes pilot and baseline qualification. The current article distinguishes one source-confirmed R2 cell from 59 cells without measurements and from scientifically admitted comparisons, whose count remains zero. Weight-learning experiments remain future work. See the [roadmap](docs/ROADMAP.md) and [changelog](CHANGELOG.md).
 
-Authors: **Nicolas Marano and Romain Despoullain**. Use [CITATION.cff](CITATION.cff) and include the exact commit or release when citing a result. Code, original documentation and the published timing projection are provided under the [MIT license](LICENSE). Third-party benchmark statements and programs are not redistributed.
+Authors: **Nicolas Marano and Romain Despoullain**. Use [CITATION.cff](CITATION.cff) and include the exact commit or release when citing a result. Original code, documentation and timing projections use the [MIT license](LICENSE). Archived third-party materials retain their existing notices and terms; see [NOTICE](NOTICE.md).
 
 Contributions should preserve the boundary between observed, recalculated and proposed claims. See [CONTRIBUTING.md](CONTRIBUTING.md).

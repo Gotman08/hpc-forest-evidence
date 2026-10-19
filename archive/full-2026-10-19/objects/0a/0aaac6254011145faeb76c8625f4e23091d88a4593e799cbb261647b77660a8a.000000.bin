@@ -1,0 +1,354 @@
+#include "knn.h"
+#include <stdint.h>
+#include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+typedef struct {
+    size_t order;
+    float distance;
+    char label;
+} NeighborCandidate;
+
+static int candidate_precedes(const NeighborCandidate * a, const NeighborCandidate * b) {
+    if (a->distance < b->distance) return 1;
+    if (a->distance > b->distance) return 0;
+    return a->order < b->order;
+}
+
+static void swap_candidates(NeighborCandidate * a, NeighborCandidate * b) {
+    NeighborCandidate temporary = *a;
+    *a = *b;
+    *b = temporary;
+}
+
+static int compare_candidates(const void * a, const void * b) {
+    const NeighborCandidate * first = (const NeighborCandidate *) a;
+    const NeighborCandidate * second = (const NeighborCandidate *) b;
+    if (candidate_precedes(first, second)) return -1;
+    if (candidate_precedes(second, first)) return 1;
+    return 0;
+}
+
+/* Retain the best prefix, with its worst element at keep - 1. */
+static void retain_best_candidates(NeighborCandidate * candidates, size_t length, size_t keep) {
+    if (keep == 0 || keep >= length) return;
+
+    size_t target = keep - 1;
+    size_t left = 0;
+    size_t right = length;
+    unsigned int depth = 0;
+    for (size_t remaining = length; remaining > 1; remaining >>= 1) {
+        depth += 2;
+    }
+
+    while (right - left > 24) {
+        if (depth == 0) {
+            qsort(candidates + left, right - left, sizeof(NeighborCandidate), compare_candidates);
+            return;
+        }
+        depth--;
+
+        size_t middle = left + (right - left) / 2;
+        if (candidate_precedes(candidates + middle, candidates + left)) {
+            swap_candidates(candidates + middle, candidates + left);
+        }
+        if (candidate_precedes(candidates + right - 1, candidates + middle)) {
+            swap_candidates(candidates + right - 1, candidates + middle);
+        }
+        if (candidate_precedes(candidates + middle, candidates + left)) {
+            swap_candidates(candidates + middle, candidates + left);
+        }
+        NeighborCandidate pivot = candidates[middle];
+
+        size_t lower = left;
+        size_t scan = left;
+        size_t upper = right;
+        while (scan < upper) {
+            if (candidate_precedes(candidates + scan, &pivot)) {
+                swap_candidates(candidates + lower, candidates + scan);
+                lower++;
+                scan++;
+            } else if (candidate_precedes(&pivot, candidates + scan)) {
+                upper--;
+                swap_candidates(candidates + scan, candidates + upper);
+            } else {
+                scan++;
+            }
+        }
+
+        if (target < lower) {
+            right = lower;
+        } else if (target >= upper) {
+            left = upper;
+        } else {
+            return;
+        }
+    }
+
+    for (size_t i = left + 1; i < right; i++) {
+        NeighborCandidate value = candidates[i];
+        size_t position = i;
+        while (position > left && candidate_precedes(&value, candidates + position - 1)) {
+            candidates[position] = candidates[position - 1];
+            position--;
+        }
+        candidates[position] = value;
+    }
+}
+
+static char choose_label(char * labels, int k) {
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    return most_frequent;
+}
+
+static char knn_reference_scan(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *) malloc(sizeof(char) * k);
+    float * distances = (float *) malloc(sizeof(float) * k);
+
+    int i, j, x, y;
+
+    for (i = 0; i < k; i++) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+
+        for (j = 0; j < g.length; j++) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+
+            for (x = 0; x < k; x++) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; y--) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    char result = choose_label(labels, k);
+    free(distances);
+    free(labels);
+    return result;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    if (k <= 0) {
+        return knn_reference_scan(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t total_points = 0;
+    for (int i = 0; i < n_groups; i++) {
+        total_points += (size_t) groups[i].length;
+    }
+
+    if (total_points == 0) {
+        return knn_reference_scan(n_groups, groups, k, to_evaluate);
+    }
+
+    int partitions = 1;
+#ifdef _OPENMP
+    if (!omp_in_parallel()) {
+        int maximum_threads = omp_get_max_threads();
+        size_t useful_partitions = total_points / 16384u;
+        if ((size_t) maximum_threads > useful_partitions) {
+            maximum_threads = (int) useful_partitions;
+        }
+        if (maximum_threads > 1) {
+            partitions = maximum_threads;
+        }
+    }
+#endif
+
+    size_t points_per_partition = total_points / (size_t) partitions;
+    size_t extra_points = total_points % (size_t) partitions;
+    size_t largest_partition = points_per_partition + (extra_points != 0);
+    size_t capacity = (size_t) k;
+    if (largest_partition < capacity) {
+        capacity = largest_partition;
+    }
+
+    size_t buffer_capacity;
+    if (capacity <= largest_partition / 2) {
+        buffer_capacity = capacity * 2;
+    } else {
+        buffer_capacity = largest_partition;
+    }
+
+    if ((size_t) partitions > SIZE_MAX / buffer_capacity / sizeof(NeighborCandidate)) {
+        return knn_reference_scan(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t slots = (size_t) partitions * buffer_capacity;
+    NeighborCandidate * buffers = (NeighborCandidate *) malloc(slots * sizeof(NeighborCandidate));
+    int * counts = (int *) malloc((size_t) partitions * sizeof(int));
+    char * labels = (char *) malloc((size_t) k * sizeof(char));
+
+    if (!buffers || !counts || !labels) {
+        free(buffers);
+        free(counts);
+        free(labels);
+        return knn_reference_scan(n_groups, groups, k, to_evaluate);
+    }
+
+    int has_nan = 0;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(partitions) if(partitions > 1) reduction(|:has_nan)
+#endif
+    {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int part = 0; part < partitions; part++) {
+            NeighborCandidate * candidates = buffers + (size_t) part * buffer_capacity;
+            size_t used = 0;
+            float cutoff = 0.0f;
+            size_t part_index = (size_t) part;
+            size_t begin = part_index * points_per_partition
+                         + (part_index < extra_points ? part_index : extra_points);
+            size_t end = begin + points_per_partition + (part_index < extra_points);
+            size_t local_limit = end - begin;
+            if (local_limit > (size_t) k) {
+                local_limit = (size_t) k;
+            }
+            size_t group_start = 0;
+
+            for (int i = 0; i < n_groups && group_start < end; i++) {
+                Group g = groups[i];
+                size_t group_end = group_start + (size_t) g.length;
+
+                if (group_end > begin) {
+                    size_t first = begin > group_start ? begin - group_start : 0;
+                    size_t last = end < group_end ? end - group_start : (size_t) g.length;
+
+                    for (size_t j = first; j < last; j++) {
+                        float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+                        if (d != d) {
+                            has_nan = 1;
+                            continue;
+                        }
+
+                        if (used < local_limit) {
+                            if (used == 0 || d > cutoff) {
+                                cutoff = d;
+                            }
+                        } else if (!(d < cutoff)) {
+                            /* Later equal-distance points cannot displace earlier ones. */
+                            continue;
+                        }
+
+                        candidates[used].order = group_start + j;
+                        candidates[used].distance = d;
+                        candidates[used].label = g.label;
+                        used++;
+
+                        if (used == buffer_capacity && used > local_limit) {
+                            retain_best_candidates(candidates, used, local_limit);
+                            used = local_limit;
+                            cutoff = candidates[local_limit - 1].distance;
+                        }
+                    }
+                }
+                group_start = group_end;
+            }
+
+            if (used > local_limit) {
+                retain_best_candidates(candidates, used, local_limit);
+                used = local_limit;
+            }
+            counts[part] = (int) used;
+        }
+
+        /* Each level operates on disjoint partition ranges; barriers protect the next level. */
+        for (size_t span = 1; span < (size_t) partitions; span *= 2) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (size_t left = 0; left < (size_t) partitions; left += 2 * span) {
+                size_t right = left + span;
+                if (right < (size_t) partitions) {
+                    size_t left_count = (size_t) counts[left];
+                    size_t right_count = (size_t) counts[right];
+                    NeighborCandidate * destination = buffers + left * buffer_capacity;
+                    NeighborCandidate * source = buffers + right * buffer_capacity;
+                    memmove(destination + left_count, source, right_count * sizeof(NeighborCandidate));
+
+                    size_t combined = left_count + right_count;
+                    size_t keep = combined < (size_t) k ? combined : (size_t) k;
+                    retain_best_candidates(destination, combined, keep);
+                    counts[left] = (int) keep;
+                }
+            }
+        }
+    }
+
+    if (has_nan) {
+        free(buffers);
+        free(counts);
+        free(labels);
+        return knn_reference_scan(n_groups, groups, k, to_evaluate);
+    }
+
+    int selected = total_points < (size_t) k ? (int) total_points : k;
+    for (int i = 0; i < selected; i++) {
+        labels[i] = buffers[i].label;
+    }
+    for (int i = selected; i < k; i++) {
+        labels[i] = -1;
+    }
+
+    char result = choose_label(labels, k);
+    free(buffers);
+    free(counts);
+    free(labels);
+    return result;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

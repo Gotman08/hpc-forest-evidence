@@ -1,0 +1,482 @@
+#include "knn.h"
+#include <limits.h>
+#include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+static char knn_histogram_vote(const size_t * histogram) {
+    char best = (char)-1;
+    size_t best_count = 0;
+
+    for (int value = CHAR_MIN; value <= CHAR_MAX; ++value) {
+        size_t count = histogram[(unsigned char)(char)value];
+        if (count > best_count) {
+            best = (char)value;
+            best_count = count;
+        }
+    }
+    return best;
+}
+
+static char knn_insertion(int n_groups, Group * groups, int k,
+                          Point to_evaluate) {
+    char * labels = (char *)malloc((size_t)k * sizeof(*labels));
+    float * distances = (float *)malloc((size_t)k * sizeof(*distances));
+    int ordered = 1;
+
+    for (int i = 0; i < k; ++i) {
+        labels[i] = (char)-1;
+        distances[i] = -1.0f;
+    }
+
+    for (int i = 0; i < n_groups; ++i) {
+        Group group = groups[i];
+        for (int j = 0; j < group.length; ++j) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, group.points[j]);
+            if (d != d) {
+                ordered = 0;
+            }
+
+            if (ordered && distances[k - 1] != -1.0f &&
+                d >= distances[k - 1]) {
+                continue;
+            }
+
+            int insertion = k;
+#ifdef _OPENMP
+            #pragma omp simd reduction(min:insertion)
+#endif
+            for (int x = 0; x < k; ++x) {
+                int candidate = (d < distances[x] || distances[x] == -1.0f)
+                              ? x : k;
+                if (candidate < insertion) {
+                    insertion = candidate;
+                }
+            }
+
+            if (insertion < k) {
+                size_t count = (size_t)(k - insertion - 1);
+                if (count != 0) {
+                    memmove(distances + insertion + 1, distances + insertion,
+                            count * sizeof(*distances));
+                    memmove(labels + insertion + 1, labels + insertion,
+                            count * sizeof(*labels));
+                }
+                distances[insertion] = d;
+                labels[insertion] = group.label;
+            }
+        }
+    }
+
+    size_t histogram[UCHAR_MAX + 1] = {0};
+    for (int i = 0; i < k; ++i) {
+        ++histogram[(unsigned char)labels[i]];
+    }
+    free(distances);
+    free(labels);
+    return knn_histogram_vote(histogram);
+}
+
+static void knn_sift_down(float * heap, size_t count, size_t root) {
+    float value = heap[root];
+    while (root < count / 2) {
+        size_t child = root * 2 + 1;
+        if (child + 1 < count && heap[child] < heap[child + 1]) {
+            ++child;
+        }
+        if (!(value < heap[child])) {
+            break;
+        }
+        heap[root] = heap[child];
+        root = child;
+    }
+    heap[root] = value;
+}
+
+static char knn_heap(int n_groups, Group * groups, int k, Point to_evaluate) {
+    size_t capacity = (size_t)k;
+    float * heap = (float *)malloc(capacity * sizeof(*heap));
+    if (heap == NULL) {
+        return knn_insertion(n_groups, groups, k, to_evaluate);
+    }
+    size_t used = 0;
+
+    for (int i = 0; i < n_groups; ++i) {
+        Group group = groups[i];
+        for (int j = 0; j < group.length; ++j) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, group.points[j]);
+            if (d != d) {
+                free(heap);
+                return knn_insertion(n_groups, groups, k, to_evaluate);
+            }
+
+            if (used < capacity) {
+                heap[used++] = d;
+                if (used == capacity) {
+                    for (size_t parent = used / 2; parent > 0; --parent) {
+                        knn_sift_down(heap, used, parent - 1);
+                    }
+                }
+            } else if (d < heap[0]) {
+                heap[0] = d;
+                knn_sift_down(heap, used, 0);
+            }
+        }
+    }
+
+    float cutoff = 0.0f;
+    size_t take_equal = 0;
+    if (used == capacity) {
+        cutoff = heap[0];
+        for (size_t i = 0; i < used; ++i) {
+            take_equal += (heap[i] == cutoff);
+        }
+    }
+    free(heap);
+
+    size_t histogram[UCHAR_MAX + 1] = {0};
+    if (used < capacity) {
+        for (int i = 0; i < n_groups; ++i) {
+            if (groups[i].length > 0) {
+                histogram[(unsigned char)groups[i].label] +=
+                    (size_t)groups[i].length;
+            }
+        }
+        histogram[(unsigned char)(char)-1] += capacity - used;
+    } else {
+        for (int i = 0; i < n_groups; ++i) {
+            Group group = groups[i];
+            for (int j = 0; j < group.length; ++j) {
+                float d = euclidean_distance_no_sqrt(to_evaluate,
+                                                      group.points[j]);
+                if (d < cutoff) {
+                    ++histogram[(unsigned char)group.label];
+                } else if (d == cutoff && take_equal != 0) {
+                    ++histogram[(unsigned char)group.label];
+                    --take_equal;
+                }
+            }
+        }
+    }
+    return knn_histogram_vote(histogram);
+}
+
+#ifdef _OPENMP
+
+typedef struct {
+    size_t begin;
+    size_t end;
+    size_t lo;
+    size_t hi;
+    size_t lower;
+    size_t upper;
+    size_t take_equal;
+    size_t histogram[UCHAR_MAX + 1];
+} KnnRankPart;
+
+static int knn_float_compare(const void * a, const void * b) {
+    float x = *(const float *)a;
+    float y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+static float knn_rank_pivot(const float * values, const KnnRankPart * parts,
+                            int part_count, int sorted) {
+    int chosen = 0;
+    size_t largest = 0;
+    for (int p = 0; p < part_count; ++p) {
+        size_t length = parts[p].hi - parts[p].lo;
+        if (length > largest) {
+            largest = length;
+            chosen = p;
+        }
+    }
+
+    size_t lo = parts[chosen].lo;
+    size_t hi = parts[chosen].hi;
+    float b = values[lo + (hi - lo) / 2];
+    if (sorted) {
+        return b;
+    }
+    float a = values[lo];
+    float c = values[hi - 1];
+    if (a > b) {
+        float temporary = a;
+        a = b;
+        b = temporary;
+    }
+    if (b > c) {
+        b = c;
+    }
+    if (a > b) {
+        b = a;
+    }
+    return b;
+}
+
+static char knn_parallel_rank(int n_groups, Group * groups, int k,
+                               Point to_evaluate, size_t total, int workers) {
+    if (total > (size_t)-1 / sizeof(float)) {
+        return knn_heap(n_groups, groups, k, to_evaluate);
+    }
+    float * values = (float *)malloc(total * sizeof(*values));
+    if (values == NULL) {
+        return knn_heap(n_groups, groups, k, to_evaluate);
+    }
+
+    KnnRankPart parts[4];
+    size_t block = total / (size_t)workers;
+    size_t extra = total % (size_t)workers;
+    size_t begin = 0;
+    for (int p = 0; p < workers; ++p) {
+        parts[p].begin = begin;
+        parts[p].end = begin + block + ((size_t)p < extra);
+        parts[p].lo = begin;
+        parts[p].hi = parts[p].end;
+        parts[p].take_equal = 0;
+        begin = parts[p].end;
+    }
+
+    size_t rank = (size_t)k < total ? (size_t)k : total;
+    size_t below_total = 0;
+    size_t equal_total = 0;
+    float cutoff = 0.0f;
+    int has_nan = 0;
+    int rounds = 0;
+    int sorted = 0;
+    int direction = 0;
+    int finished = 0;
+
+    #pragma omp parallel num_threads(workers)
+    {
+        #pragma omp for schedule(static) reduction(|:has_nan)
+        for (int p = 0; p < workers; ++p) {
+            KnnRankPart * part = &parts[p];
+            size_t offset = 0;
+            for (int g = 0; g < n_groups && offset < part->end; ++g) {
+                Group group = groups[g];
+                size_t length = group.length > 0 ? (size_t)group.length : 0;
+                size_t group_end = offset + length;
+                if (group_end > part->begin) {
+                    size_t first = part->begin > offset
+                                 ? part->begin - offset : 0;
+                    size_t last = part->end < group_end
+                                ? part->end - offset : length;
+                    for (size_t j = first; j < last; ++j) {
+                        float d = euclidean_distance_no_sqrt(to_evaluate,
+                                                              group.points[j]);
+                        values[offset + j] = d;
+                        has_nan |= (d != d);
+                    }
+                }
+                offset = group_end;
+            }
+        }
+
+        if (!has_nan) {
+            for (;;) {
+                if (rounds == 32) {
+                    #pragma omp for schedule(static)
+                    for (int p = 0; p < workers; ++p) {
+                        qsort(values + parts[p].lo,
+                              parts[p].hi - parts[p].lo,
+                              sizeof(*values), knn_float_compare);
+                    }
+                    #pragma omp single
+                    {
+                        sorted = 1;
+                    }
+                }
+
+                #pragma omp single
+                {
+                    cutoff = knn_rank_pivot(values, parts, workers, sorted);
+                    below_total = 0;
+                    equal_total = 0;
+                }
+
+                #pragma omp for schedule(static) reduction(+:below_total,equal_total)
+                for (int p = 0; p < workers; ++p) {
+                    KnnRankPart * part = &parts[p];
+                    if (sorted) {
+                        size_t first = part->lo;
+                        size_t last = part->hi;
+                        while (first < last) {
+                            size_t middle = first + (last - first) / 2;
+                            if (values[middle] < cutoff) {
+                                first = middle + 1;
+                            } else {
+                                last = middle;
+                            }
+                        }
+                        part->lower = first;
+                        last = part->hi;
+                        while (first < last) {
+                            size_t middle = first + (last - first) / 2;
+                            if (values[middle] <= cutoff) {
+                                first = middle + 1;
+                            } else {
+                                last = middle;
+                            }
+                        }
+                        part->upper = first;
+                    } else {
+                        size_t lower = part->lo;
+                        size_t current = part->lo;
+                        size_t upper = part->hi;
+                        while (current < upper) {
+                            float value = values[current];
+                            if (value < cutoff) {
+                                values[current] = values[lower];
+                                values[lower] = value;
+                                ++lower;
+                                ++current;
+                            } else if (value > cutoff) {
+                                --upper;
+                                values[current] = values[upper];
+                                values[upper] = value;
+                            } else {
+                                ++current;
+                            }
+                        }
+                        part->lower = lower;
+                        part->upper = upper;
+                    }
+                    below_total += part->lower - part->lo;
+                    equal_total += part->upper - part->lower;
+                }
+
+                #pragma omp single
+                {
+                    if (rank <= below_total) {
+                        direction = -1;
+                    } else if (rank > below_total + equal_total) {
+                        rank -= below_total + equal_total;
+                        direction = 1;
+                    } else {
+                        finished = 1;
+                        size_t remaining = rank - below_total;
+                        for (int p = 0; p < workers; ++p) {
+                            size_t count = parts[p].upper - parts[p].lower;
+                            size_t take = count < remaining ? count : remaining;
+                            parts[p].take_equal = take;
+                            remaining -= take;
+                        }
+                    }
+                    ++rounds;
+                }
+
+                if (finished) {
+                    break;
+                }
+                #pragma omp for schedule(static)
+                for (int p = 0; p < workers; ++p) {
+                    if (direction < 0) {
+                        parts[p].hi = parts[p].lower;
+                    } else {
+                        parts[p].lo = parts[p].upper;
+                    }
+                }
+            }
+
+            #pragma omp for schedule(static)
+            for (int p = 0; p < workers; ++p) {
+                KnnRankPart * part = &parts[p];
+                memset(part->histogram, 0, sizeof(part->histogram));
+                size_t remaining = part->take_equal;
+                size_t offset = 0;
+                for (int g = 0; g < n_groups && offset < part->end; ++g) {
+                    Group group = groups[g];
+                    size_t length = group.length > 0 ? (size_t)group.length : 0;
+                    size_t group_end = offset + length;
+                    if (group_end > part->begin) {
+                        size_t first = part->begin > offset
+                                     ? part->begin - offset : 0;
+                        size_t last = part->end < group_end
+                                    ? part->end - offset : length;
+                        size_t below = 0;
+                        size_t equal = 0;
+                        #pragma omp simd reduction(+:below,equal)
+                        for (size_t j = first; j < last; ++j) {
+                            float d = euclidean_distance_no_sqrt(to_evaluate,
+                                                                  group.points[j]);
+                            below += (d < cutoff);
+                            equal += (d == cutoff);
+                        }
+                        size_t take = equal < remaining ? equal : remaining;
+                        part->histogram[(unsigned char)group.label] += below + take;
+                        remaining -= take;
+                    }
+                    offset = group_end;
+                }
+            }
+        }
+    }
+
+    free(values);
+    if (has_nan) {
+        return knn_insertion(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t histogram[UCHAR_MAX + 1] = {0};
+    if ((size_t)k > total) {
+        histogram[(unsigned char)(char)-1] = (size_t)k - total;
+    }
+    for (int p = 0; p < workers; ++p) {
+        for (int label = 0; label <= UCHAR_MAX; ++label) {
+            histogram[label] += parts[p].histogram[label];
+        }
+    }
+    return knn_histogram_vote(histogram);
+}
+
+#endif
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    if (k <= 0) {
+        return (char)-1;
+    }
+    if (k <= 64) {
+        return knn_insertion(n_groups, groups, k, to_evaluate);
+    }
+
+#ifdef _OPENMP
+    size_t total = 0;
+    for (int i = 0; i < n_groups; ++i) {
+        if (groups[i].length > 0) {
+            total += (size_t)groups[i].length;
+        }
+    }
+    int workers = omp_get_max_threads();
+    if (workers > 4) {
+        workers = 4;
+    }
+    size_t useful_threads = total / 32768;
+    if ((size_t)workers > useful_threads) {
+        workers = (int)useful_threads;
+    }
+    if (workers > 1) {
+        return knn_parallel_rank(n_groups, groups, k, to_evaluate, total, workers);
+    }
+#endif
+
+    return knn_heap(n_groups, groups, k, to_evaluate);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

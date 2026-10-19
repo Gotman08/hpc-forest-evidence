@@ -1,0 +1,116 @@
+#include <iostream>
+#include <vector>
+#include <cstdio>
+#include <cassert>
+#include <algorithm>
+#include <limits>
+#include <cstdint>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+
+static inline int64x2_t maximumPair(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+static inline std::int64_t horizontalMaximum(const std::int64_t* columns,
+                                            int n, int s) {
+    std::int64_t sum = 0;
+    #pragma omp simd reduction(+:sum)
+    for (int c = 0; c < s; ++c)
+        sum += columns[c];
+
+#if defined(__aarch64__)
+    const std::int64_t firstDifference = columns[s] - columns[0];
+    int64x2_t windows = vdupq_n_s64(sum);
+    windows = vsetq_lane_s64(sum + firstDifference, windows, 1);
+    int64x2_t previousDifference = vdupq_n_s64(firstDifference);
+    int64x2_t best0 = windows;
+    int64x2_t best1 = windows;
+    int c = s + 1;
+
+    // Each lane advances two windows using two adjacent differences.
+    for (; c + 3 < n; c += 4) {
+        const int64x2_t difference0 = vsubq_s64(
+            vld1q_s64(columns + c), vld1q_s64(columns + c - s));
+        const int64x2_t difference1 = vsubq_s64(
+            vld1q_s64(columns + c + 2), vld1q_s64(columns + c + 2 - s));
+        const int64x2_t step0 = vaddq_s64(
+            vextq_s64(previousDifference, difference0, 1), difference0);
+        const int64x2_t step1 = vaddq_s64(
+            vextq_s64(difference0, difference1, 1), difference1);
+        const int64x2_t next = vaddq_s64(windows, step0);
+        windows = vaddq_s64(next, step1);
+        best0 = maximumPair(best0, next);
+        best1 = maximumPair(best1, windows);
+        previousDifference = difference1;
+    }
+    for (; c + 1 < n; c += 2) {
+        const int64x2_t difference = vsubq_s64(
+            vld1q_s64(columns + c), vld1q_s64(columns + c - s));
+        const int64x2_t step = vaddq_s64(
+            vextq_s64(previousDifference, difference, 1), difference);
+        windows = vaddq_s64(windows, step);
+        best0 = maximumPair(best0, windows);
+        previousDifference = difference;
+    }
+
+    best0 = maximumPair(best0, best1);
+    std::int64_t rowMax = std::max(vgetq_lane_s64(best0, 0),
+                                  vgetq_lane_s64(best0, 1));
+    if (c < n) {
+        const std::int64_t last = vgetq_lane_s64(windows, 1)
+                                + columns[c] - columns[c - s];
+        rowMax = std::max(rowMax, last);
+    }
+    return rowMax;
+#else
+    std::int64_t rowMax = sum;
+    for (int c = s; c < n; ++c) {
+        sum += columns[c] - columns[c - s];
+        rowMax = std::max(rowMax, sum);
+    }
+    return rowMax;
+#endif
+}
+
+int main() {
+    int n, s;
+    std::cin >> n >> s;
+    std::vector<std::vector<int> > matrix(n, std::vector<int>(n));
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            scanf("%d", &(matrix[i][j]));
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    std::vector<std::int64_t> columnSums(n, 0);
+    std::int64_t* columns = columnSums.data();
+    for (int r = 0; r < s; ++r) {
+        const int* row = matrix[r].data();
+        #pragma omp simd
+        for (int c = 0; c < n; ++c)
+            columns[c] += static_cast<std::int64_t>(row[c]);
+    }
+
+    std::int64_t mxSum = std::numeric_limits<std::int64_t>::lowest();
+    for (int top = 0; top + s <= n; ++top) {
+        const std::int64_t rowMax = horizontalMaximum(columns, n, s);
+        mxSum = std::max(mxSum, rowMax);
+
+        if (top + s < n) {
+            const int* leaving = matrix[top].data();
+            const int* entering = matrix[top + s].data();
+            #pragma omp simd
+            for (int c = 0; c < n; ++c)
+                columns[c] += static_cast<std::int64_t>(entering[c])
+                            - static_cast<std::int64_t>(leaving[c]);
+        }
+    }
+
+    printf("%lld\n", static_cast<long long>(mxSum));
+}

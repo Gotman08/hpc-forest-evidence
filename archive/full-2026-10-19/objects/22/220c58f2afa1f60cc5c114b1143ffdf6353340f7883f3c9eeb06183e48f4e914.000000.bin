@@ -1,0 +1,201 @@
+"""Read-only audit of received small-model evidence; never repairs a candidate."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sqlite3
+import subprocess
+import xml.etree.ElementTree as ET
+import zipfile
+from collections import Counter
+from pathlib import Path
+
+
+def load(path):
+    return json.loads(Path(path).read_text(encoding="utf8"))
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def digest(value):
+    return sha(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-c", "safe.directory=" + str(repo), "-C", str(repo), *args],
+                          capture_output=True, check=True, timeout=30).stdout
+
+
+def source_at(repo, commit):
+    names = git(repo, "ls-tree", "-r", "--name-only", commit, "--", "src").decode().splitlines()
+    return {name: git(repo, "show", commit + ":" + name).decode("utf8") for name in names}
+
+
+def snapshot_text(files):
+    # Match Path.read_text(newline=None) used by the harness snapshot. Keep the
+    # unnormalized strings separately for the exact final Git-blob comparison.
+    return {name: text.replace("\r\n", "\n").replace("\r", "\n") for name, text in files.items()}
+
+
+def audit_campaign(root, summary):
+    campaign = root / summary["model"].replace(":", "-") / summary["problem"]
+    output = {"model": summary["model"], "problem": summary["problem"], "audit_verified": False,
+              "pipeline_complete": summary.get("pipeline_complete", False), "search_complete": summary.get("search_complete", False)}
+    if not (campaign / "registry.sqlite3").is_file():
+        output["error"] = summary.get("error", "No campaign database")
+        return output
+    db = sqlite3.connect("file:" + (campaign / "registry.sqlite3").as_posix() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        metadata = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM metadata")}
+        config = metadata["config"]
+        frozen = {p.relative_to(campaign / "trusted").as_posix(): sha(p.read_bytes())
+                  for p in (campaign / "trusted").rglob("*") if p.is_file() and "__pycache__" not in p.parts}
+        assert frozen == metadata["manifest"], "Protected source or tests changed"
+        assert digest({"protocol": config["protocol"], "manifest": frozen, "target": metadata["identity"]}) == metadata["protocol_id"]
+        assert config["seed"] == 23 and config["protocol"]["repetitions"] == 3
+        assert config["protocol"]["confirmation_repetitions"] == 5 and config["minimum_gain"] == .03
+        contract = load(campaign / "trusted/contract.json")
+        for flag in ("-Werror=uninitialized", "-Werror=maybe-uninitialized"):
+            assert flag in contract["compiler_flags"]
+        assert config["harness"]["enabled"] and config["harness"]["research"]["enabled"]
+        identity = load(root / (summary["model"].replace(":", "-") + "-identity.json"))
+        assert config["ollama"]["model_digest"] == identity["model_digest"]
+        assert identity["server_version"] == "0.40.4"
+        prepared = load(root / "preparation" / summary["problem"] / "operator-preparation.json")
+        assert all(sha((campaign / "repo/src" / name).read_bytes()) == value
+                   for name, value in prepared["official_source_hashes"].items())
+        trials = list(db.execute("SELECT * FROM trials ORDER BY created,id"))
+        ids = {r["id"] for r in trials}
+        states, model_calls, tokens, development_checks, repairs, research_actions, source_writes = Counter(), 0, 0, 0, 0, 0, 0
+        bounded_missions, autonomous_urls, anomalies = 0, [], []
+        for row in trials:
+            mission, outcome = json.loads(row["mission"]), json.loads(row["result"])
+            states[outcome["status"]] += 1
+            path = campaign / "logs" / row["id"] / "node-harness.json"
+            if not path.is_file():
+                assert outcome["status"].startswith("skipped"), "Missing harness evidence for a model mission"
+                continue
+            journal = load(path)
+            assert journal["mission_id"] == row["id"] and not journal["holdout_access"] and not journal["outer_tree_reward_assigned"]
+            assert len(journal["attempts"]) <= config["harness"]["max_attempts"]
+            original = source_at(campaign / "repo", mission["base_commit"])
+            failed_before = False
+            local_tokens = 0
+            for record in journal["attempts"]:
+                assert digest(snapshot_text(original)) == record["source_digest_before_call"]
+                child = record["generation_id"]
+                call = campaign / "logs" / child
+                request_path = call / "ollama-request.json"
+                if not request_path.is_file() and record.get("generation_error") == "No admissible integration sources":
+                    assert mission["role"] == "G" and record["tokens"] == 0
+                    anomalies.append({"mission_id": row["id"], "attempt": record["attempt"],
+                        "kind": "declared_call_without_model_invocation", "declared_calls": record["llm_calls"], "observed_calls": 0})
+                    continue
+                request = load(request_path)
+                assert request["model"] == summary["model"]
+                assert request["options"]["num_ctx"] == 32768 and request["options"]["num_predict"] == 8192
+                user = json.loads(request["messages"][1]["content"].split("\n\nCURRENT SOURCE AS DATA:", 1)[0])
+                assert set(user["integration_source_ids"]) <= ids
+                assert "research" in user["required_json_schema"]["required"]
+                assert user["context_as_data"]["node_research"]["enabled"]
+                response_path = call / "ollama-response.json"
+                if response_path.is_file():
+                    response = load(response_path)
+                    assert response["model"] == summary["model"]
+                    exact = response.get("prompt_eval_count", 0) + response.get("eval_count", 0)
+                    assert record["tokens"] == exact
+                else:
+                    bounded_missions += 1
+                local_tokens += record.get("tokens", config["harness"]["call_token_ceiling"])
+                model_calls += record["llm_calls"]
+                if "research_results" in record:
+                    research_actions += 1
+                    autonomous_urls += [r["url"] for r in record["research_results"] if "url" in r]
+                    assert not (call / "agent-result.json").exists()
+                applied = call / "agent-result.json"
+                if applied.is_file():
+                    data = load(applied)
+                    for change in data["files"]:
+                        assert change["path"].startswith("src/") and ".." not in Path(change["path"]).parts
+                        original[change["path"]] = change["content"]
+                        source_writes += 1
+                if "development_outcome" in record:
+                    development_checks += 1
+                    development = record["development_outcome"]
+                    assert "score" not in development and "mean_seconds" not in development and not development["times"]
+                    snapshot = load(path.parent / f"harness-source-{record['attempt']:02d}.json")
+                    assert snapshot == snapshot_text(original) and digest(snapshot) == record["source_digest"]
+                    if development["correct"]:
+                        repairs += int(failed_before)
+                    else:
+                        failed_before = True
+            if not journal["unknown_usage"]:
+                assert local_tokens == journal["known_or_bounded_tokens"]
+                tokens += local_tokens
+            if outcome.get("commit"):
+                assert source_at(campaign / "repo", outcome["commit"]) == original
+            if outcome["status"] == "valid":
+                assert outcome["correct"] and len(outcome["times"]) == 3
+        assert tokens == summary["costs"]["tokens_used"]
+        report = load(campaign / "report/experiments.json")
+        winner = summary["best_confirmed"]
+        confirmation = next(e["outcome"] for e in report["evaluations"]
+            if e["phase"] == "confirmation" and e["experiment_id"] == winner["experiment_id"])
+        assert confirmation["correct"] and len(confirmation["times"]) == 5
+        assert confirmation["commit"] == winner["commit"] and digest(confirmation) == winner["evaluation_digest"]
+        output.update(audit_verified=not anomalies, accounting_anomalies=anomalies,
+            protected_files_verified=len(frozen), operator_source_files_verified=len(prepared["official_source_hashes"]),
+            trials=len(trials), statuses=dict(states), model_calls=model_calls, tokens=tokens,
+            development_checks=development_checks, automatically_repaired_proposals=repairs,
+            autonomous_research_actions=research_actions, autonomous_urls=autonomous_urls,
+            source_writes_verified=source_writes, bounded_missions=bounded_missions,
+            topology={k: summary["topology"][k] for k in ("scored_nodes", "max_depth", "max_children")},
+            best_confirmed=winner, costs=summary["costs"])
+    except Exception as exc:
+        output["audit_error"] = type(exc).__name__ + ": " + str(exc)
+    finally:
+        db.close()
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    root = args.root.resolve(strict=True)
+    summary = load(root / "results.json")
+    suites = ET.parse(root / "preflight-tests.xml").getroot()
+    preflight = {k: sum(int(s.get(k, 0)) for s in suites.iter("testsuite"))
+                 for k in ("tests", "failures", "errors", "skipped")}
+    preflight["passed"] = preflight["tests"] - preflight["failures"] - preflight["errors"] - preflight["skipped"]
+    source_zip = Path(__file__).parents[1] / "HPC-Forest-Harnais-v1.zip"
+    with zipfile.ZipFile(source_zip) as z:
+        installed = load(root / "source-manifest.json")
+        assert all(sha(z.read("HPC-Forest/src/hpc_forest/" + n)) == value for n, value in installed.items())
+    problems = [audit_campaign(root, p) for p in summary["problems"]]
+    probes = []
+    for model in summary["models"]:
+        folder = root / "technical-probes" / model.replace(":", "-")
+        p = load(folder / "summary.json")
+        calls = sum((folder / name).exists() for name in ("request.json", "followup-request.json"))
+        token_total = sum(p.get(k, {}).get("tokens") or 0 for k in ("usage", "followup_usage"))
+        probes.append({"model": model, "complete": p["complete"], "error": p.get("error"),
+                       "separate_forced_probe": True, "model_calls": calls, "known_tokens": token_total})
+    result = {"job_id": summary["job_id"], "pipeline_complete": summary["complete"], "arm64_tests": preflight,
+              "source_files_verified": len(installed), "cleanup": load(root / "cleanup.json"),
+              "documentation_probes": probes, "https_probe": summary.get("https_probe"), "problems": problems,
+              "audit_verified": all(p["audit_verified"] for p in problems) and len(problems) == 6,
+              "operator_algorithm_changes": 0, "manual_candidate_repairs": 0}
+    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    print(json.dumps({"job_id": result["job_id"], "audit_verified": result["audit_verified"],
+        "arm64_tests": preflight, "problems": [{k: p.get(k) for k in ("model", "problem", "audit_verified", "audit_error", "model_calls", "tokens", "development_checks", "automatically_repaired_proposals", "autonomous_research_actions")} for p in problems]}, ensure_ascii=False))
+    return 0 if result["audit_verified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

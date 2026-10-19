@@ -1,0 +1,49 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "/*\n * Parallel integer sorting for the quicksort benchmark.\n */\n#include <stdio.h>\n#include <stdlib.h>\n#include <limits.h>\n#include <stddef.h>\n#include <string.h>\n#include <openssl/md5.h>\n\n#ifdef _OPENMP\n#include <omp.h>\n#endif\n\nvoid srandnum(int seed);\ndouble randnum(void);\nint *generate_case(int N);\ndouble drand(int xmin, int xmax);\nvoid quicksort(int *toorder, int N);\nint is_sorted(int *toorder, int N);\n\n#define MY_RAND_MAX 0x7FFFFFFF\n#define RANDNUM_W 521288629\n#define RANDNUM_Z 362436069\n\nunsigned int randum_w = RANDNUM_W;\nunsigned int randum_z = RANDNUM_Z;\n\nvoid srandnum(int seed)\n{\n    unsigned int w, z;\n    w = (seed * 104623) & 0xffffffff;\n    randum_w = (w) ? w : RANDNUM_W;\n    z = (seed * 48947) & 0xffffffff;\n    randum_z = (z) ? z : RANDNUM_Z;\n}\n\ndouble randnum(void)\n{\n    unsigned int u;\n    randum_z = 36969 * (randum_z & 65535) + (randum_z >> 16);\n    randum_w = 18000 * (randum_w & 65535) + (randum_w >> 16);\n    u = (randum_z << 16) + randum_w;\n    return (abs(u));\n}\n\nstatic int compare_ints(const void *left, const void *right)\n{\n    int a = *(const int *)left;\n    int b = *(const int *)right;\n    return (a > b) - (a < b);\n}\n\n#ifdef _OPENMP\n#define RADIX_BITS 8\n#define RADIX_BUCKETS (1u << RADIX_BITS)\n#define RADIX_PASSES 4\n#define PARALLEL_THRESHOLD (1 << 15)\n\n/*\n * A team remains active for every pass.  Each thread counts and scatters a\n * static contiguous range, while the single prefix phase gives that thread a\n * disjoint range in every bucket.\n */\nstatic int parallel_radix_sort(int *values, int count)\n{\n    int requested_threads = omp_get_max_threads();\n    int active_threads = 1;\n    int *workspace;\n    int *source = values;\n    int *target;\n    size_t slots;\n    size_t *positions;\n\n    if (requested_threads < 2)\n        return 0;\n    if (requested_threads > count)\n        requested_threads = count;\n    if (requested_threads < 2)\n        return 0;\n\n    if ((size_t)count > (size_t)-1 / sizeof(*workspace))\n        return 0;\n    if ((size_t)requested_threads > (size_t)-1 / RADIX_BUCKETS)\n        return 0;\n    slots = (size_t)requested_threads * RADIX_BUCKETS;\n    if (slots > (size_t)-1 / sizeof(*positions))\n        return 0;\n\n    workspace = (int *)malloc((size_t)count * sizeof(*workspace));\n    positions = (size_t *)malloc(slots * sizeof(*positions));\n    if (workspace == NULL || positions == NULL) {\n        free(workspace);\n        free(positions);\n        return 0;\n    }\n    target = workspace;\n\n#pragma omp parallel num_threads(requested_threads) default(none) shared(source, target, positions, count, active_threads)\n    {\n        int thread_id = omp_get_thread_num();\n\n#pragma omp single\n        {\n            active_threads = omp_get_num_threads();\n        }\n\n        for (int pass = 0; pass < RADIX_PASSES; ++pass) {\n            int shift = pass * RADIX_BITS;\n            size_t first = ((size_t)thread_id * (size_t)count) / (size_t)active_threads;\n            size_t last = ((size_t)(thread_id + 1) * (size_t)count) / (size_t)active_threads;\n            size_t *local_positions = positions + (size_t)thread_id * RADIX_BUCKETS;\n\n            memset(local_positions, 0, (size_t)RADIX_BUCKETS * sizeof(*local_positions));\n            for (size_t i = first; i < last; ++i) {\n                unsigned int key = ((((unsigned int)source[i]) ^ 0x80000000u) >> shift) & (RADIX_BUCKETS - 1u);\n                ++local_positions[key];\n            }\n\n#pragma omp barrier\n#pragma omp single\n            {\n                size_t next = 0;\n                for (unsigned int key = 0; key < RADIX_BUCKETS; ++key) {\n                    for (int thread = 0; thread < active_threads; ++thread) {\n                        size_t *position = positions + (size_t)thread * RADIX_BUCKETS + key;\n                        size_t amount = *position;\n                        *position = next;\n                        next += amount;\n                    }\n                }\n            }\n\n            for (size_t i = first; i < last; ++i) {\n                int value = source[i];\n                unsigned int key = ((((unsigned int)value) ^ 0x80000000u) >> shift) & (RADIX_BUCKETS - 1u);\n                target[local_positions[key]++] = value;\n            }\n\n#pragma omp barrier\n#pragma omp single\n            {\n                int *temporary = source;\n                source = target;\n                target = temporary;\n            }\n        }\n    }\n\n    free(positions);\n    free(workspace);\n    return 1;\n}\n#endif\n\nvoid quicksort(int *toorder, int N)\n{\n    if (N < 2)\n        return;\n\n#ifdef _OPENMP\n    if (N >= PARALLEL_THRESHOLD && parallel_radix_sort(toorder, N))\n        return;\n#endif\n\n    qsort(toorder, (size_t)N, sizeof(*toorder), compare_ints);\n}\n\nint main(int argc, char *argv[])\n{\n    int N = 0;\n    int *our_list = NULL;\n\n    scanf(\"%d\", &N);\n    if (N <= 0) {\n        printf(\"Error: please, provide the case size.\\n\");\n        return 1;\n    }\n\n    our_list = generate_case(N);\n    if (our_list == NULL) {\n        printf(\"Error: case instantiation failed.\\n\");\n        return 1;\n    }\n\n    quicksort(our_list, N);\n\n    if (is_sorted(our_list, N) == 1) {\n        printf(\"Error, for some reason list is still unsorted.\\n\");\n        free(our_list);\n        return 1;\n    }\n\n#ifdef COMPUTE_MD5_PROBLEM\n    {\n        MD5_CTX c;\n        unsigned char out[MD5_DIGEST_LENGTH];\n        MD5_Init(&c);\n        MD5_Update(&c, our_list, (size_t)N * sizeof(int));\n        MD5_Final(out, &c);\n        for (int n = 0; n < MD5_DIGEST_LENGTH; n++)\n            printf(\"%02x\", out[n]);\n    }\n#endif\n    printf(\"\\n\");\n\n    free(our_list);\n    return 0;\n}\n\nint is_sorted(int *toorder, int N)\n{\n    for (int i = 1; i < N; i++) {\n        if (toorder[i] < toorder[i - 1])\n            return 1;\n    }\n    return 0;\n}\n\nint *generate_case(int N)\n{\n    int *ret = NULL;\n\n    srandnum(0);\n    ret = (int *)malloc((size_t)N * sizeof(*ret));\n    if (ret == NULL) {\n        printf(\"Error: some malloc won't work.\\n\");\n        return NULL;\n    }\n\n    for (int i = 0; i < N; i++)\n        ret[i] = drand(0, INT_MAX);\n    return ret;\n}\n\ndouble drand(int xmin, int xmax)\n{\n    return xmin + (xmax - xmin) * randnum() / MY_RAND_MAX;\n}\n",
+        "path": "src/quicksort.c"
+      }
+    ],
+    "hypothesis": "Replacing the failure-prone 16-bit two-pass scatter with a persistent-team four-pass 8-bit radix sort keeps per-thread histograms cache-resident and bounds scatter fan-out, reducing synchronization and cache-miss cost on four cores while retaining a sequential fallback for small arrays.",
+    "notes": "Uses size_t bucket offsets and four passes so the final sorted data always resides in the caller array.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Replace the 16-bit histogram/scatter implementation with a four-pass 8-bit signed radix sort.",
+      "Retain one OpenMP team across all passes, with deterministic static contiguous work ranges and a single-thread prefix reduction per pass.",
+      "Use size_t for histogram counts and output offsets to avoid index-width overflow."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-5.6-terra",
+  "nonce": "7e7f8704ca4f400d89bf62e89ad26e65",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "xhigh",
+  "request_sha256": "280cc3086c6763395d5a3fb0efaec4eec2c347100310006afee1999bf9680f20",
+  "session_id": "bb34f01e2e114cf4a59ae51b02823166",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "868919beb4778c8807cac0c0943ed58fd04d45b2f25ebf2aa83f2943295e4b45",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 14825,
+        "output_tokens": 6368,
+        "reasoning_output_tokens": 4224
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-5.6-terra",
+    "reasoning_effort_requested": "xhigh",
+    "token_accounting": "exact",
+    "tokens": 21193,
+    "tool_events": []
+  }
+}

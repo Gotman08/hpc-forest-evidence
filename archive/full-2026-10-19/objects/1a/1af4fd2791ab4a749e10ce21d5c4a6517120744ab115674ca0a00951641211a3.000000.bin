@@ -1,0 +1,50 @@
+# CommitLast — prototype local non intégré
+
+`commit_last.py` définit une classe explicite `CommitLastTransfers`. Importer ce fichier ne lance rien. Il ne contient ni point d’entrée, ni commande CLI, ni appel de processus, ni import des modules scellés. Aucun fichier source existant, archive, plan, registre de capacité, opérateur ou worker n’a été modifié pour ce travail.
+
+## Contrat établi avant implémentation
+
+Le `RomeoFiles.upload` actuel renvoie le dictionnaire plat du transfert, après extraction de `structuredContent` ou du bloc JSON par `RomeoFiles.call`. Les champs utiles réels sont `ok`, **`verifie`**, `sent`, `to`, `bytes`, `transport`, `remote_sha256`, `empreinte_locale` et `empreinte_distante`. Il n’y a pas de champ public `verified` ou `sha256` à substituer à ces noms. La barrière exige `ok is True`, `verifie is True`, `transport == "scp"`, la destination exacte, le chemin local canonique, la taille entière exacte et les trois SHA256 égaux au fichier local haché avant puis après l’appel. `None`, `1` à la place d’un booléen, un reçu brut MCP ou un simple reçu anglais ne sont pas acceptés.
+
+`bytes` est la taille locale observée par la primitive ; ce n’est pas un deuxième comptage distant indépendant. Le SHA distant et les empreintes sont les preuves disponibles du transfert. Les chemins et SHA des sources inspectées sont consignés dans `CONTRAT-SOURCES.json`.
+
+## Composition prévue, sans intégration
+
+L’ordre explicite à examiner lors d’une intégration ultérieure est :
+
+```text
+LocalCliProjectionTransfers(
+    CommitLastTransfers(transfer_verifie, channel_exact, binding_attendu,
+                        policy_sha256=sha_politique),
+    channel_exact, sha_politique)
+```
+
+La barrière est **sous** la projection : elle contrôle les fichiers réellement envoyés, notamment `invocation.json.arm-projection.json` et `codex.jsonl.json.arm-projection.json`. Les destinations restent les noms usuels `logs/<nonce>.invocation.json` et `logs/<nonce>.codex.jsonl.json`. Les métadonnées CLI privées brutes ne peuvent pas emprunter ces chemins en contournant la projection.
+
+L’appel `upload(response-ready.json, channel/responses/<nonce>.ready.json)` conserve une référence locale dimensionnée, son SHA256 et le nonce. Il renvoie explicitement `deferred: true, verified: false`, sans appeler le transport. Cette déférence n’est jamais enregistrée comme un reçu distant réussi. Les vrais transferts continuent à être délégués et renvoient `deferred: false, verified: true` uniquement après vérification du payload réel, conservé séparément sous `receipt`.
+
+Le transfert réel de `READY` ne commence qu’après le transfert vérifié de `delivered.json`, avec une réponse et les deux projections déjà transférées et vérifiées pour le même nonce. Avant le commit, la barrière rehash les fichiers, vérifie les identités de réponse et d’invocation, la corrélation des deux projections, les douze champs du binding dans `delivered`, le SHA de réponse de `delivered`, puis le SHA et la taille décrits par `READY`. Elle conserve les échecs techniques comme tels : elle ne transforme pas un code de retour ou une réponse négative en réussite scientifique. Les événements ordonnés distinguent `deferred`, tentative réelle, payload réellement retourné et transfert vérifié.
+
+Un seul nonce actif et un seul `READY` différé sont permis. Toute destination déjà vue, même avec le même SHA, est refusée ; un nonce déjà committé ne peut pas être rejoué. Un échec verrouille l’instance sans retry. Les liens symboliques locaux et les jonctions locales, y compris dans les parents, sont refusés. Ces contrôles ne constituent pas une nouvelle admission de campagne.
+
+## Limites impératives
+
+Le transport existant peut remplacer un fichier régulier distant. Cette classe **n’ajoute aucune garantie atomique distante de no-overwrite ou de no-follow**. Une intégration exigerait un channel/session/nonce neuf, exclusivement possédé, et un préflight d’absence et de liens distant réalisé par un outil revu avant la première publication. Un simple préflight ne fournit pas un CAS atomique contre un autre écrivain ; la possession exclusive doit rester établie. La barrière n’observe ni capacité globale, ni registre, ni processus, ni état distant.
+
+Un échec de métadonnées avant `READY` empêche toute tentative de transfert de `READY`. Si le transfert de `READY` lui-même échoue ou renvoie un reçu invalide, le transport peut avoir déjà publié des octets : l’événement d’échec conserve alors `ready_publication_may_be_unknown: true`. Il n’y a ni rollback supposé, ni retry, ni affirmation d’absence distante. De même, les vérifications locales avant/après ne constituent pas une primitive atomique contre un écrivain local hostile.
+
+L’état différé est en mémoire ; aucune reprise après crash n’est autorisée par ce prototype. Une instance ou un cache ne doit pas être réutilisé pour déduire une permission de retransmission. La réconciliation froide des artefacts réellement existants reste nécessaire.
+
+Il manque encore une **nouvelle attestation revue de composition/source et un guard d’argv** compatibles avec ce module supplémentaire, ainsi que la preuve du code réellement chargé, les contrôles d’admission existants et la validation de bout en bout sur le runtime autorisé. Les contrôles de projection ici servent à corréler les transferts ; ils ne remplacent pas le validateur CLI complet existant. Aucun helper n’a été injecté, aucun hook ou monkeypatch ajouté, aucun des 127 fichiers scellés modifié, aucun worker lancé et aucune nouvelle campagne créée.
+
+## Tests hors ligne
+
+Les tests utilisent uniquement des fichiers neufs sous ce dossier et un faux transport asynchrone. Le retard de métadonnées est simulé par une horloge virtuelle avançant de 20 secondes par métadonnée, sans sommeil réel. Le test de liens utilise soit un lien créé dans le dossier temporaire, soit la jonction Windows existante `My Documents` en lecture seule lorsque le privilège de création de symlinks est absent. Il ne crée ni ne modifie cette jonction.
+
+Commande locale de test, sans serveur ni modèle :
+
+```text
+python -I -B -m unittest discover -s work/matrix15-delivery-barrier-r1 -p test_commit_last.py -v
+```
+
+Un succès de ces tests établit seulement les propriétés locales de ce prototype. Il ne clôt pas l’incident Astra et ne prouve ni intégration ni validation du runtime.

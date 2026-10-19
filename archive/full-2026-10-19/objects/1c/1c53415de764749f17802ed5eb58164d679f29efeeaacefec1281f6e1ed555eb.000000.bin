@@ -1,0 +1,83 @@
+param([Parameter(Mandatory=$true)][string]$ReplacementProofPath,[switch]$Execute)
+$ErrorActionPreference='Stop'
+$taskBase='C:\Users\nicol\Documents\Codex\2026-10-15\cr'
+$taskDecision=Join-Path $taskBase 'outputs/HPC-Forest-Harnais-Comparaison-r1/reprises/r3-corrige-r4-parallele-20261018'
+$taskOldDir=Join-Path $taskDecision 'observateur-source-only-transition'
+$taskOldProof=Join-Path $taskOldDir 'reprise-effective-verifiee-parent.json'
+$taskOld=Get-Content -LiteralPath $taskOldProof -Raw | ConvertFrom-Json -DateKind String
+if((Get-FileHash -LiteralPath $taskOldProof -Algorithm SHA256).Hash.ToLowerInvariant() -cne '16a14ec7eed4e88a6602677830aeba9faef0a255f54e0bca0d96c22debda9aa5'){throw 'Old reader proof changed'}
+if($taskOld.verified -ne $true -or (@($taskOld.actual_observer_pair|ForEach-Object{$_.ProcessId}) -join ',') -cne '58116,28148'){throw 'Old reader scope differs'}
+$taskReplacementPath=(Resolve-Path -LiteralPath $ReplacementProofPath).Path
+if(-not $taskReplacementPath.StartsWith($taskDecision+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw 'Replacement proof outside scoped decision'}
+$taskNew=Get-Content -LiteralPath $taskReplacementPath -Raw | ConvertFrom-Json -DateKind String
+if($taskNew.schema -cne 'hpc-forest-mixed-reader-startup-verified-v1' -or $taskNew.verified -ne $true -or $taskNew.source_only_observation_verified -ne $true -or $taskNew.dynamic_native_worker_started -ne $false -or $taskNew.only_read_only_rpc -ne $true){throw 'Actual replacement not verified in SO-only shadow phase'}
+if(@($taskNew.reader_identities).Count -ne 2 -or [int]$taskNew.reader_identities[1].ParentProcessId -ne [int]$taskNew.reader_identities[0].ProcessId){throw 'Replacement pair identity invalid'}
+if(@($taskNew.reader_identities|Where-Object{$_.ProcessId -in @(58116,28148,37900,37848)}).Count -ne 0){throw 'Replacement overlaps preserved or old pair'}
+if(@($taskNew.source_only_identities).Count -ne 2 -or (@($taskNew.source_only_identities|ForEach-Object{$_.ProcessId}) -join ',') -cne '37900,37848'){throw 'Source-only scope changed'}
+foreach($taskRef in @($taskNew.code,$taskNew.policy,$taskNew.source_only_observation)){
+ if((Get-FileHash -LiteralPath $taskRef.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $taskRef.sha256){throw 'Replacement immutable evidence changed'}
+}
+$taskStateFile=Get-Item -LiteralPath $taskNew.source_only_observation.path
+if(([DateTime]::UtcNow-$taskStateFile.LastWriteTimeUtc).TotalSeconds -gt 180){throw 'Replacement observation stale'}
+function Write-NewTaskJson($value,[string]$path){
+ $taskBytes=[Text.UTF8Encoding]::new($false).GetBytes(($value|ConvertTo-Json -Depth 50)+[Environment]::NewLine)
+ $taskStream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+ try{$taskStream.Write($taskBytes,0,$taskBytes.Length)}finally{$taskStream.Dispose()}
+}
+function Test-TaskIdentity($actual,$expected){
+ if($null -eq $actual){return $false}
+ foreach($taskField in @('ProcessId','ParentProcessId','ExecutablePath','CommandLine','CreationDate')){if($null -eq $actual.$taskField -or $null -eq $expected.$taskField){return $false}}
+ if([int]$actual.ProcessId -le 0 -or [int]$expected.ProcessId -le 0 -or [string]::IsNullOrWhiteSpace([string]$actual.ExecutablePath) -or [string]::IsNullOrWhiteSpace([string]$expected.ExecutablePath) -or [string]::IsNullOrWhiteSpace([string]$actual.CommandLine) -or [string]::IsNullOrWhiteSpace([string]$expected.CommandLine)){return $false}
+ return ([int]$actual.ProcessId -eq [int]$expected.ProcessId -and [int]$actual.ParentProcessId -eq [int]$expected.ParentProcessId -and [string]$actual.ExecutablePath -ceq [string]$expected.ExecutablePath -and [string]$actual.CommandLine -ceq [string]$expected.CommandLine -and $actual.CreationDate.ToUniversalTime().Ticks -eq ([datetime]$expected.CreationDate).ToUniversalTime().Ticks)
+}
+function Test-TaskPreservedPair($pair){
+ foreach($taskExpected in $pair){
+  $taskCurrent=Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$taskExpected.ProcessId)"
+  if(-not(Test-TaskIdentity $taskCurrent $taskExpected)){throw 'Preserved pair changed; no stop admitted'}
+ }
+}
+function Save-TaskCensus([string]$label){
+ $taskRows=@(Get-CimInstance Win32_Process|ForEach-Object{[ordered]@{ProcessId=[int]$_.ProcessId;ParentProcessId=[int]$_.ParentProcessId;ExecutablePath=$_.ExecutablePath;CommandLine=$_.CommandLine;CreationDate=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')}else{$null})}})
+ $taskPath=Join-Path $PSScriptRoot ($label+'-'+[guid]::NewGuid().ToString('N')+'.json')
+ Write-NewTaskJson @{complete_census=$true;captured_at_utc=[DateTime]::UtcNow.ToString('o');rows=$taskRows} $taskPath
+ return @{path=$taskPath;sha256=(Get-FileHash -LiteralPath $taskPath -Algorithm SHA256).Hash.ToLowerInvariant()}
+}
+Test-TaskPreservedPair $taskNew.source_only_identities
+Test-TaskPreservedPair $taskNew.reader_identities
+$taskBefore=Save-TaskCensus 'cim-avant-transition'
+foreach($taskRef in @($taskOld.code,$taskOld.admission)){
+ if((Get-FileHash -LiteralPath $taskRef.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $taskRef.sha256){throw 'Old read-only code/admission changed'}
+}
+$taskTarget=$taskOld.actual_observer_pair[1]
+if([int]$taskTarget.ProcessId -ne 28148 -or $taskTarget.CommandLine -notlike '*observer-max4-r5.py*' -or $taskTarget.CommandLine -like '*hpc_forest.*worker*'){throw 'Target is not exactly the old passive main'}
+$taskLive=Get-CimInstance Win32_Process -Filter 'ProcessId=28148'
+if(-not(Test-TaskIdentity $taskLive $taskTarget)){throw 'Old passive main absent/reused/changed; reconcile before action'}
+$taskPreflight=@{schema='hpc-forest-passive-reader-replacement-stop-preflight-v1';verified=$true;execute_requested=[bool]$Execute;target_identity=$taskTarget;replacement_proof=@{path=$taskReplacementPath;sha256=(Get-FileHash -LiteralPath $taskReplacementPath -Algorithm SHA256).Hash.ToLowerInvariant()};fresh_cim=$taskBefore;source_only_preserved=$true;replacement_reader_preserved=$true;no_worker_stop=$true;recursive_stop=$false;stop_by_name=$false;at_utc=[DateTime]::UtcNow.ToString('o')}
+Write-NewTaskJson $taskPreflight (Join-Path $PSScriptRoot ('prevol-'+[guid]::NewGuid().ToString('N')+'.json'))
+if(-not $Execute){Write-Output 'Passive reader stop preflight passed; no process stopped';return}
+$taskArchive=Join-Path $PSScriptRoot 'ancienne-surveillance-preservee'
+[IO.Directory]::CreateDirectory($taskArchive)|Out-Null
+foreach($taskName in @('observer-max4-r5.py','admission-observateur-source-only.json','reprise-effective-verifiee-parent.json','derniere-observation.json','observer.stderr.log','observer.stdout.log')){
+ $taskSource=Join-Path $taskOldDir $taskName
+ [IO.File]::Copy($taskSource,(Join-Path $taskArchive $taskName),$false)
+}
+Write-NewTaskJson $taskPreflight (Join-Path $PSScriptRoot 'arret-passif-intention-exclusive.json')
+Test-TaskPreservedPair $taskNew.source_only_identities
+Test-TaskPreservedPair $taskNew.reader_identities
+$taskOwned=Get-Process -Id 28148
+try{
+ $taskHandle=$taskOwned.Handle
+ $taskDelta=[math]::Abs($taskOwned.StartTime.ToUniversalTime().Ticks-([datetime]$taskTarget.CreationDate).ToUniversalTime().Ticks)
+ if($taskDelta -ge 10 -or -not(Test-TaskIdentity (Get-CimInstance Win32_Process -Filter 'ProcessId=28148') $taskTarget)){throw 'Stable handle/full identity differ'}
+ Stop-Process -InputObject $taskOwned -Force
+ $taskOwned.WaitForExit(5000)|Out-Null
+}finally{$taskOwned.Dispose()}
+Start-Sleep -Milliseconds 700
+Test-TaskPreservedPair $taskNew.source_only_identities
+Test-TaskPreservedPair $taskNew.reader_identities
+$taskAfter=Save-TaskCensus 'cim-apres-transition'
+$taskOldRemaining=@($taskOld.actual_observer_pair|Where-Object{Test-TaskIdentity (Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$_.ProcessId)") $_})
+if($taskOldRemaining.Count -ne 0){throw 'Old reader identity remains; no closure receipt, reconcile'}
+Write-NewTaskJson @{schema='hpc-forest-passive-reader-replacement-stop-receipt-v1';verified=$true;at_utc=[DateTime]::UtcNow.ToString('o');stopped_individually=$taskTarget;stable_handle_opened=$true;start_delta_ticks=$taskDelta;old_pair_original_identities_absent=$true;source_only_preserved=$true;replacement_reader_preserved=$true;native_worker_or_cli_stopped=$false;model_workers_stopped=$false;recursive_stop=$false;stop_by_name=$false;before=$taskBefore;after=$taskAfter;replacement_proof=$taskPreflight.replacement_proof} (Join-Path $PSScriptRoot 'ancien-observateur-passif-absent-verifie.json')
+Write-Output 'Only the old passive Python main stopped individually; launcher exited naturally; source-only and replacement preserved'
+

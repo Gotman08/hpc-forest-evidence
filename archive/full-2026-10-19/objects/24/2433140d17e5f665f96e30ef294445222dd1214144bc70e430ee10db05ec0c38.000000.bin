@@ -1,0 +1,193 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+struct alignas(64) TokenCount {
+    std::size_t value;
+};
+
+int main() {
+    int n, s;
+    if (std::scanf("%d%d", &n, &s) != 2) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t cells = static_cast<std::size_t>(n) * n;
+    std::unique_ptr<int[]> matrix(new int[cells]);
+    int threads = 1;
+#ifdef _OPENMP
+    const int useful = static_cast<int>(
+        std::max<std::size_t>(1, cells / (64U * 1024U)));
+    threads = std::min(4, std::min(omp_get_max_threads(), useful));
+#endif
+
+    std::size_t capacity = std::min<std::size_t>(
+        4U * 1024U * 1024U,
+        std::max<std::size_t>(64U * 1024U, cells * 4U));
+    std::unique_ptr<unsigned char[]> input(new unsigned char[capacity + 1]);
+    TokenCount counts[4] = {};
+    std::size_t processed = 0;
+    std::size_t ready = 0;
+    std::size_t carry = 0;
+    bool done = false;
+    long long best = std::numeric_limits<long long>::lowest();
+
+#pragma omp parallel num_threads(threads) reduction(max:best)
+    {
+        int id = 0;
+        int team = 1;
+#ifdef _OPENMP
+        id = omp_get_thread_num();
+        team = omp_get_num_threads();
+#endif
+        for (;;) {
+#pragma omp single
+            {
+                std::size_t batch_tokens = 0;
+                for (int t = 0; t < team; ++t)
+                    batch_tokens += counts[t].value;
+                processed = std::min(cells, processed + batch_tokens);
+                done = (processed == cells);
+                if (!done) {
+                    if (carry != 0)
+                        std::memmove(input.get(), input.get() + ready, carry);
+                    std::size_t filled = carry;
+                    for (;;) {
+                        if (filled == capacity) {
+                            const std::size_t larger_capacity = capacity * 2;
+                            std::unique_ptr<unsigned char[]> larger(
+                                new unsigned char[larger_capacity + 1]);
+                            std::memcpy(larger.get(), input.get(), filled);
+                            input.swap(larger);
+                            capacity = larger_capacity;
+                        }
+                        const std::size_t wanted = capacity - filled;
+                        const std::size_t got = std::fread(
+                            input.get() + filled, 1, wanted, stdin);
+                        filled += got;
+                        if (got < wanted) {
+                            ready = filled;
+                            carry = 0;
+                            done = (ready == 0);
+                            break;
+                        }
+                        ready = filled;
+                        while (ready != 0 && input[ready - 1] > ' ')
+                            --ready;
+                        if (ready != 0) {
+                            carry = filled - ready;
+                            break;
+                        }
+                    }
+                    input[filled] = ' ';
+                }
+            }
+            if (done) break;
+
+            const unsigned char* raw = input.get();
+            std::size_t begin = ready * static_cast<std::size_t>(id) / team;
+            std::size_t end = ready * static_cast<std::size_t>(id + 1) / team;
+            if (id != 0)
+                while (begin < ready && raw[begin] > ' ') ++begin;
+            if (id + 1 != team)
+                while (end < ready && raw[end] > ' ') ++end;
+
+            unsigned int count = 0;
+            if (begin < end) {
+                count = static_cast<unsigned int>(raw[begin] > ' ');
+#pragma omp simd reduction(+:count)
+                for (std::size_t k = begin + 1; k < end; ++k)
+                    count += static_cast<unsigned int>(
+                        (raw[k] > ' ') & (raw[k - 1] <= ' '));
+            }
+            counts[id].value = count;
+#pragma omp barrier
+            std::size_t base = processed;
+            for (int t = 0; t < id; ++t) base += counts[t].value;
+            const std::size_t emit = base < cells
+                ? std::min<std::size_t>(counts[id].value, cells - base) : 0;
+            if (emit != 0) {
+                int* destination = matrix.get() + base;
+                const unsigned char* p = raw + begin;
+                for (std::size_t k = 0; k < emit; ++k) {
+                    while (*p <= ' ') ++p;
+                    const bool negative = (*p == '-');
+                    if (*p == '-' || *p == '+') ++p;
+                    unsigned int value = 0;
+                    while (*p > ' ') {
+                        value = value * 10U + static_cast<unsigned int>(*p - '0');
+                        ++p;
+                    }
+                    destination[k] = negative
+                        ? static_cast<int>(-static_cast<long long>(value))
+                        : static_cast<int>(value);
+                }
+            }
+#pragma omp barrier
+        }
+
+        if (processed == cells) {
+            const int windows = n - s + 1;
+            const int rows_per_thread = windows / team;
+            const int extra = windows % team;
+            const int first = id * rows_per_thread + std::min(id, extra);
+            const int last = first + rows_per_thread + (id < extra);
+            if (first < last) {
+                std::vector<long long> storage(n, 0);
+                long long* columns = storage.data();
+                for (int row = first; row < first + s; ++row) {
+                    const int* source = matrix.get()
+                        + static_cast<std::size_t>(row) * n;
+#pragma omp simd
+                    for (int col = 0; col < n; ++col)
+                        columns[col] += source[col];
+                }
+                long long first_sum = 0;
+#pragma omp simd reduction(+:first_sum)
+                for (int col = 0; col < s; ++col)
+                    first_sum += columns[col];
+
+                for (int row = first; row < last; ++row) {
+                    long long sum = first_sum;
+                    best = std::max(best, sum);
+                    for (int col = s; col < n; ++col) {
+                        sum += columns[col] - columns[col - s];
+                        best = std::max(best, sum);
+                    }
+                    if (row + 1 < last) {
+                        const int* exiting = matrix.get()
+                            + static_cast<std::size_t>(row) * n;
+                        const int* entering = matrix.get()
+                            + static_cast<std::size_t>(row + s) * n;
+                        long long delta = 0;
+#pragma omp simd reduction(+:delta)
+                        for (int col = 0; col < s; ++col) {
+                            const long long change =
+                                static_cast<long long>(entering[col]) - exiting[col];
+                            columns[col] += change;
+                            delta += change;
+                        }
+                        first_sum += delta;
+#pragma omp simd
+                        for (int col = s; col < n; ++col)
+                            columns[col] +=
+                                static_cast<long long>(entering[col]) - exiting[col];
+                    }
+                }
+            }
+        }
+    }
+    if (processed != cells) return 0;
+    std::printf("%lld\n", best);
+    return 0;
+}

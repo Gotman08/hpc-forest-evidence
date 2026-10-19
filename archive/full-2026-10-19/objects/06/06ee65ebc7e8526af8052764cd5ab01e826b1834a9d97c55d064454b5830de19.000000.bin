@@ -1,0 +1,231 @@
+"""Historical metadata reconciliation only; no watcher, census, RPC or stop."""
+import ast
+import calendar
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import time
+
+HERE = Path(__file__).resolve().parent
+OP = HERE.parent
+PREP = OP.parent
+BASE = PREP.parents[1]
+CHAIN = PREP / "adaptateurs-source110-r1/revision-r7-racines-techniques-neuves"
+OBS = CHAIN / "observer/observer-mixte.py"
+OBS_SHA = "5e5d3023ac538ed7197c6cd5da3e68a87e2b95228797af5b7ecbf6250579de95"
+START = OP / "preparation-observation-R7-r1/execution-root-01"
+FINAL = OP / "observations-R7-apres-expiration-01"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+RAW_PATH = PREP / "qualification-allouee-source110-G-recu-r1/revue-resultats-Q753709-r1/lecteur-r4b/auditer-restauration-existante-r4b.py"
+RAW_SHA = "5c1e1784574566a585e2d9cc50f85b52337d10d3109e449a4112581eae68f8d5"
+data = RAW_PATH.read_bytes()
+assert hashlib.sha256(data).hexdigest() == RAW_SHA
+held_names = {"need", "ordinary", "metadata", "open_nofollow_read", "cross_identity", "validate_windows_mode_views", "native_basic_info", "raw", "decode"}
+nodes = [node for node in ast.parse(data).body if isinstance(node, ast.FunctionDef) and node.name in held_names]
+assert {node.name for node in nodes} == held_names
+held = {"Path": Path, "os": os, "stat": stat, "Q": BASE, "json": json}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), str(RAW_PATH), "exec"), held)
+pins = {str(RAW_PATH): RAW_SHA}
+
+
+def raw(path):
+    path = Path(path)
+    assert path.name.casefold() not in {"observer.lock", "worker.lock"}
+    data = held["raw"](path)
+    digest = hashlib.sha256(data).hexdigest()
+    assert pins.get(str(path), digest) == digest
+    pins[str(path)] = digest
+    return data
+
+
+def read(path):
+    return held["decode"](raw(path))
+
+
+def ref(path):
+    path = Path(path)
+    raw(path)
+    return {"path": str(path), "sha256": pins[str(path)]}
+
+
+def bound(reference):
+    assert set(reference) == {"path", "sha256"}
+    data = raw(reference["path"])
+    assert hashlib.sha256(data).hexdigest() == reference["sha256"]
+    return held["decode"](data)
+
+
+def ticks(value):
+    match = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,7}))?(?:Z|\+00:00)", value)
+    assert match, "Unambiguous UTC timestamp with <=7 fractional digits required"
+    return calendar.timegm(time.strptime(match[1], "%Y-%m-%dT%H:%M:%S")) * 10_000_000 + int((match[2] or "").ljust(7, "0"))
+
+
+def identity(row):
+    assert set(row) == set(FIELDS)
+    assert all(type(row[key]) is int and row[key] >= 0 for key in FIELDS[:2])
+    assert all(isinstance(row[key], str) and row[key] for key in FIELDS[2:])
+    ticks(row["CreationDate"])
+    return tuple(row[key] for key in FIELDS)
+
+
+def census(path):
+    doc = read(path)
+    assert doc["schema"] == "hpc-forest-dynamic-r4b-full-cim-v1"
+    assert doc["complete_census"] is True and doc["strict_utf8_decoding"] is True
+    assert type(doc["rows_count"]) is int and doc["rows_count"] == len(doc["rows"])
+    capture = ticks(doc["captured_at_utc"])
+    assert abs(float(doc["observed_at"]) - capture / 10_000_000) <= 1
+    assert len({row["ProcessId"] for row in doc["rows"]}) == doc["rows_count"]
+    for row in doc["rows"]:
+        assert set(row) == set(FIELDS)
+        if row["CreationDate"] is not None:
+            assert ticks(row["CreationDate"]) <= capture
+    return {"ref": ref(path), "doc": doc, "ticks": capture}
+
+
+def save(path, value):
+    with Path(path).open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, indent=2)
+        stream.write("\n")
+    return {"path": str(path), "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+
+
+def copy_metadata(path, name):
+    data = raw(path)
+    target = HERE / "copies-metadata" / name
+    with target.open("xb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == pins[str(Path(path))]
+    return {"source": ref(path), "copy": {"path": str(target), "sha256": pins[str(Path(path))]}, "bytes": len(data)}
+
+
+observations_path = FINAL / "OBSERVATIONS-REELLES.json"
+observations = read(observations_path)
+assert pins[str(observations_path)] == "6bc1778852d4a7ae3a02c2e0aa747c2ded4590ce6a0f6058017e5a09df4602ca"
+startup_path = START / "DEMARRAGE-REEL-DIX-REFERENCES-R2.json"
+startup = read(startup_path)
+assert pins[str(startup_path)] == "70601b9b7e5cc6f58de1d8b2ff33894e82d61670921e28efaf50f112b4062031"
+assert len(startup["refs"]) == 10
+startup_docs = {name: bound(reference) for name, reference in startup["refs"].items()}
+pair = startup_docs["received_pair"]
+pair_review_path = OP / "preparation-observation-R7-r1/reception-paire-passive-reelle-r1/REVUE-PAIRE-PASSIVE-REELLE-R7.json"
+read(pair_review_path)
+assert len(pair) == 2 and {row["ProcessId"] for row in pair} == {49076, 28544}
+assert startup["refs"]["received_pair"]["sha256"] == "d97da515b4f3be17b2118f616e67ea37092771b854cf9f7a546c1e485982d16a"
+assert {identity(row) for row in pair} == {identity(row) for row in startup_docs["start_observed"]["five_fields"]}
+intent = startup_docs["start_intent"]
+assert intent["observer_sha256"] == OBS_SHA
+observer_bytes = raw(OBS)
+assert pins[str(OBS)] == OBS_SHA
+parser_names = {"require", "windows_argv", "flag", "worker_entry"}
+parser_nodes = [node for node in ast.parse(observer_bytes).body if isinstance(node, ast.FunctionDef) and node.name in parser_names]
+assert {node.name for node in parser_nodes} == parser_names
+parser = {"Path": Path}
+exec(compile(ast.Module(body=parser_nodes, type_ignores=[]), str(OBS), "exec"), parser)
+for row in pair:
+    assert parser["windows_argv"](row["CommandLine"]) == intent["argv"]
+    assert parser["worker_entry"](intent["argv"]) == ("script", str(OBS.resolve()))
+policy_ref = startup["refs"]["policy"]
+assert parser["flag"](intent["argv"], "--policy") == policy_ref["path"]
+assert parser["flag"](intent["argv"], "--routes") == intent["routes"]["path"]
+assert parser["flag"](intent["argv"], "--transition") == startup["refs"]["transition"]["path"]
+assert intent["argv"].count("--run") == 1
+paths = [START / "CIM-PRIVE-AVANT-PREPARATION.json", START / "CIM-PRIVE-IMMEDIAT-AVANT-START.json", START / "CIM-PRIVE-APRES.json", OP / "observations-R7-preracines-01/CIM-PRIVE-FRAIS.json", OP / "observations-R7-poststage-01/CIM-PRIVE-FRAIS.json", OP / "preparation-observation-R7-r1/execution-gpt-6.1-sol-roots-1792354142598526700/CIM-PRIVE-ADMISSION.json", OP / "observations-R7-poststage-02/CIM-PRIVE-FRAIS.json", FINAL / "CIM-PRIVE-FRAIS.json"]
+snapshots = sorted([census(path) for path in paths], key=lambda row: row["ticks"])
+assert observations["full_cim"] == snapshots[-1]["ref"] and snapshots[-1]["doc"]["rows_count"] == 487
+last = snapshots[-1]
+first_after = next(row for row in snapshots if row["ref"]["path"] == startup["refs"]["startup_census_after"]["path"])
+assert all(any(identity(actual) == identity(owned) for actual in first_after["doc"]["rows"] if actual["ProcessId"] == owned["ProcessId"]) for owned in pair)
+known = {identity(row): row for row in pair}
+attributions = {identity(row): [{"kind": "actual owned start intent and independent full pair receipt", "census": first_after["ref"]}] for row in pair}
+seen = {key: [] for key in known}
+for snapshot in snapshots:
+    rows = snapshot["doc"]["rows"]
+    current = {row["ProcessId"]: row for row in rows}
+    changed = True
+    while changed:
+        changed = False
+        for child in rows:
+            parent = current.get(child["ParentProcessId"])
+            if parent is None or any(parent[key] is None for key in FIELDS):
+                continue
+            parent_key = identity(parent)
+            if parent_key not in known:
+                continue
+            assert all(child[key] is not None for key in FIELDS), "Opaque candidate child cannot be attributed"
+            child_key = identity(child)
+            assert ticks(parent["CreationDate"]) <= ticks(child["CreationDate"]) <= snapshot["ticks"]
+            if child_key not in known:
+                known[child_key] = child
+                attributions[child_key] = []
+                seen[child_key] = []
+                changed = True
+            evidence = {"kind": "same full census contains this exact parent identity and child after parent creation", "parent_identity": parent, "census": snapshot["ref"]}
+            if evidence not in attributions[child_key]:
+                attributions[child_key].append(evidence)
+    for key in known:
+        if any(identity(row) == key for row in rows if row["ProcessId"] == key[0] and all(row[field] is not None for field in FIELDS)):
+            seen[key].append(snapshot)
+known_ids = {row["ProcessId"] for row in known.values()}
+assert known_ids == {49076, 28544, 36088, 38496, 15436, 28384, 52884, 46752}
+assert not any(row["ProcessId"] in known_ids or row["ParentProcessId"] in known_ids for row in last["doc"]["rows"])
+matching_final = []
+opaque_python_final = []
+ambiguous_R7_final = []
+for row in last["doc"]["rows"]:
+    if Path(row.get("ExecutablePath") or "").name.casefold() not in {"python.exe", "pythonw.exe"}:
+        continue
+    if not row.get("CommandLine"):
+        opaque_python_final.append(row["ProcessId"])
+        continue
+    try:
+        argv = parser["windows_argv"](row["CommandLine"])
+        if parser["worker_entry"](argv) == ("script", str(OBS.resolve())):
+            matching_final.append(row)
+    except ValueError:
+        if str(OBS).casefold() in row["CommandLine"].casefold() or policy_ref["path"].casefold() in row["CommandLine"].casefold():
+            ambiguous_R7_final.append(row)
+        continue
+assert not matching_final and not opaque_python_final and not ambiguous_R7_final
+records = []
+for key, row in sorted(known.items(), key=lambda item: ticks(item[1]["CreationDate"])):
+    present = seen[key]
+    assert present
+    final_absences = [snapshot for snapshot in snapshots if snapshot["ticks"] > present[-1]["ticks"] and not any(actual["ProcessId"] == row["ProcessId"] for actual in snapshot["doc"]["rows"])]
+    assert final_absences
+    name = Path(row["ExecutablePath"]).name.casefold()
+    role = "explicit observer pair" if row["ProcessId"] in {49076, 28544} else "conhost child metadata" if name == "conhost.exe" else "MCP Python chain metadata" if "romeo" in row["CommandLine"].casefold() else "ephemeral observer census PowerShell child metadata" if name == "powershell.exe" else "observed descendant metadata only"
+    records.append({"full_identity": row, "role_scope": role, "attribution_evidence": attributions[key], "first_seen": present[0]["ref"], "last_seen": present[-1]["ref"], "last_seen_at_utc": present[-1]["doc"]["captured_at_utc"], "first_later_absence": final_absences[0]["ref"], "first_later_absence_at_utc": final_absences[0]["doc"]["captured_at_utc"], "absent_in_final_complete_census": True, "installed_or_loaded_MCP_code_equality_claimed": False})
+graph_ref = save(HERE / "CONTEXTE-HISTORIQUE-HUIT-IDENTITES.json", {"schema": "hpc-forest-r7-observed-passive-context-eight-identities-v1", "metadata_only": True, "root_pair": startup["refs"]["received_pair"], "context": records, "historical_ancestor_outside_owned_context_pid": 53988, "foreign_ancestor_adopted_or_stopped": False, "SSH_identity_present_in_observed_context": False, "SSH_context_inferred_from_current_config": False, "unobserved_between_census_descendants_exhaustively_known": False, "final_census": last["ref"], "historical_absence_only": True})
+(HERE / "copies-metadata").mkdir()
+copies = []
+for path, name in [(START / "stdout.log", "stdout-after-exit.bin"), (START / "stderr.log", "stderr-after-exit.bin"), (START / "ETAT-PASSIF-COPIE-FROIDE-01.json", "state-initial-passive-received.json"), (START / "ROUTES-PREMIER-REFUS-METADATA-INCOMPLETES.json", "routes-faulty-received.json"), (CHAIN / "observer/observer-state.json", "state-after-exit.json"), (CHAIN / "observer/attention-required.json", "attention-after-exit.json")]:
+    copies.append(copy_metadata(path, name))
+for path in sorted((CHAIN / "observer").glob("refus-*.json")):
+    copies.append(copy_metadata(path, path.name))
+stderr = raw(START / "stderr.log").decode("utf8", errors="strict")
+state = read(CHAIN / "observer/observer-state.json")
+attention = read(CHAIN / "observer/attention-required.json")
+initial_state = read(START / "ETAT-PASSIF-COPIE-FROIDE-01.json")
+assert "KeyError: 'submission_observed'" in stderr
+assert state["policy_sha256"] == policy_ref["sha256"] and state["stage"] == "attention_required" and state["error"] == "'submission_observed'"
+assert attention["error"] == "'submission_observed'" and attention["consecutive"] == 3
+assert initial_state["observer_full_identities"] == pair and initial_state["active_native_workers"] == 0
+assert initial_state["transition_verified"] is True
+error_receipt = read(OP / "preparation-parents-R7-bout-en-bout-r1/sol-max/EXECUTION-ADMISSION-EXTERNE-REELLE-01.json")
+assert error_receipt["returncode"] == 1 and "KeyError: 'submission_observed'" in error_receipt["stderr"]
+faulty = read(START / "ROUTES-PREMIER-REFUS-METADATA-INCOMPLETES.json")
+assert len([row for row in faulty["routes"] if row["stage"] == "allocated_pending" and "submission_observed" not in row and "allocation_marker" not in row]) == 3
+frozen = dict(pins)
+after = {path: hashlib.sha256(held["raw"](path)).hexdigest() for path in frozen}
+assert frozen == after
+receipt = {"schema": "hpc-forest-r7-passive-observer-historical-natural-exit-metadata-reconciliation-v1", "verified_historical_metadata_only": True, "blocking_findings_for_observed_eight_identity_absence": [], "reviewed_at_utc": datetime.now(timezone.utc).isoformat(), "scope_id": "hpc-forest-dynamic-independent-roots-r4b-max", "source_zip_sha256": "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48", "plan_sha256": "5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70", "observer_code_sha256": OBS_SHA, "startup_evidence": ref(startup_path), "owned_pair": startup["refs"]["received_pair"], "observed_context": graph_ref, "observed_context_identity_count": 8, "all_eight_observed_identities_absent_in_final_census": True, "same_known_PIDs_or_direct_orphan_parent_PIDs_in_final_census": [], "matching_R7_observer_script_argv_in_final_census": [], "opaque_Python_commands_in_final_census": [], "final_CIM": last["ref"], "final_CIM_captured_at_utc": last["doc"]["captured_at_utc"], "final_CIM_rows": 487, "source_config_equality_with_historically_loaded_MCP_code_claimed": False, "historical_MCP_parent_child_lineage_proved_by_same_census": True, "historical_SSH_full_identity_proved": False, "no_SSH_identity_inferred_or_foreign_service_adopted": True, "failure_cause_metadata": {"type": "KeyError", "missing_key": "submission_observed", "confirmed_in_stable_watcher_stderr": True, "confirmed_in_independent_cell_admission_failure_receipt": True, "final_state": state["stage"], "consecutive_observer_failures": attention["consecutive"], "all_three_faulty_pending_routes_also_lack_allocation_marker": True, "OS_exit_code_or_exclusive_forensic_causation_proved": False}, "copies": copies, "initial_received_state_native_workers": 0, "worker_launch_or_request_delivery_claimed_by_this_receipt": False, "native_call_reconciliation_before_archives_claimed": False, "root_terminal_archive_reconciliation_is_separate": True, "stop_restart_or_other_process_action_by_reviewer": False, "CIM_or_MCP_or_CLI_model_call_by_reviewer": False, "cache_DB_or_lock_read": False, "observer_module_main_watch_or_census_imported_or_executed": False, "only_SHA_pinned_pure_Windows_command_parser_used_for_metadata": True, "source_or_original_received_files_modified": False, "inputs_before": frozen, "inputs_after": after, "inputs_before_after_identical": True, "future_absence_or_fresh_admission_promised": False, "native_generation_admitted": False, "limits": "Eight complete identities and their same-census temporal lineage are reconciled only at the supplied historical complete census. No uncaptured SSH identity, every possible process between censuses, loaded MCP source equality, OS exit status, or future absence is invented. No stop/restart or native-call reconciliation is authorized by this receipt."}
+receipt_ref = save(HERE / "RECONCILIATION-SORTIE-HISTORIQUE-OBS4-R7-METADATA-SEULEMENT.json", receipt)
+print(json.dumps({"receipt": receipt_ref, "context_identities": 8, "stable_inputs": len(frozen), "metadata_copies": len(copies), "historical_absence_only": True, "native_generation_admitted": False}))

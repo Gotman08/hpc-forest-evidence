@@ -1,0 +1,138 @@
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <thread>
+#include <cstring>
+#include <cstdint>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using namespace std;
+
+const uint32_t MOD = 1000000007;
+using Vec = uint32_t __attribute__((vector_size(16)));
+
+static inline Vec reduce(Vec x) {
+    const Vec modulus = {MOD, MOD, MOD, MOD};
+    return x - ((x >= modulus) & modulus);
+}
+
+static inline Vec prefix(Vec x) {
+    const Vec zero = {0, 0, 0, 0};
+    const Vec one = {4, 0, 1, 2};
+    const Vec two = {4, 4, 0, 1};
+    x = reduce(x + __builtin_shuffle(x, zero, one));
+    return reduce(x + __builtin_shuffle(x, zero, two));
+}
+
+static inline void open_run(vector<uint32_t>& dp, int begin, int end,
+                            uint32_t& carry) {
+    int j = begin;
+    const Vec last = {3, 3, 3, 3};
+    Vec incoming = {carry, carry, carry, carry};
+    for (; end - j >= 8; j += 8) {
+        Vec x, y;
+        memcpy(&x, dp.data() + j, sizeof(x));
+        memcpy(&y, dp.data() + j + 4, sizeof(y));
+        x = prefix(x);
+        y = prefix(y);
+        x = reduce(x + incoming);
+        y = reduce(y + __builtin_shuffle(x, last));
+        memcpy(dp.data() + j, &x, sizeof(x));
+        memcpy(dp.data() + j + 4, &y, sizeof(y));
+        incoming = __builtin_shuffle(y, last);
+    }
+    if (end - j >= 4) {
+        Vec x;
+        memcpy(&x, dp.data() + j, sizeof(x));
+        x = reduce(prefix(x) + incoming);
+        memcpy(dp.data() + j, &x, sizeof(x));
+        incoming = __builtin_shuffle(x, last);
+        j += 4;
+    }
+    carry = incoming[0];
+    for (; j < end; ++j) {
+        uint32_t value = dp[j] + carry;
+        if (value >= MOD) value -= MOD;
+        dp[j] = carry = value;
+    }
+}
+
+static inline uint32_t process_row(vector<uint32_t>& dp,
+                                   const vector<int>& obstacles,
+                                   int begin, int end, uint32_t carry) {
+    auto it = lower_bound(obstacles.begin(), obstacles.end(), begin);
+    int first = begin;
+    for (; it != obstacles.end() && *it < end; ++it) {
+        const int column = *it;
+        open_run(dp, first, column, carry);
+        dp[column] = 0;
+        carry = 0;
+        first = column + 1;
+    }
+    open_run(dp, first, end, carry);
+    return carry;
+}
+
+struct alignas(64) Progress {
+    atomic<int> rows;
+    Progress() : rows(0) {}
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+    int n, m;
+    if (!(cin >> n >> m)) return 0;
+    vector<vector<int>> blocked(n);
+    for (int c = 0; c < m; ++c) {
+        int i, j;
+        cin >> i >> j;
+        blocked[i].push_back(j);
+    }
+    for (auto& row : blocked) {
+        sort(row.begin(), row.end());
+        row.erase(unique(row.begin(), row.end()), row.end());
+    }
+
+    vector<uint32_t> dp(n, 0);
+    dp[0] = 1;
+    int requested = 1;
+#ifdef _OPENMP
+    requested = min(omp_get_max_threads(), max(1, n / 256));
+#endif
+    if (requested == 1) {
+        for (int i = 0; i < n; ++i)
+            process_row(dp, blocked[i], 0, n, 0);
+    } else {
+        vector<vector<uint32_t>> edges(requested, vector<uint32_t>(n));
+        unique_ptr<Progress[]> progress(new Progress[requested]);
+        #pragma omp parallel num_threads(requested)
+        {
+            int tid = 0, team = 1;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+            team = omp_get_num_threads();
+#endif
+            const int begin = static_cast<int>(static_cast<long long>(n) * tid / team);
+            const int end = static_cast<int>(static_cast<long long>(n) * (tid + 1) / team);
+            const int batch = 16;
+            for (int first = 0; first < n; first += batch) {
+                const int last = min(n, first + batch);
+                if (tid != 0) {
+                    while (progress[tid - 1].rows.load(memory_order_acquire) < last)
+                        this_thread::yield();
+                }
+                for (int i = first; i < last; ++i) {
+                    const uint32_t carry = tid == 0 ? 0 : edges[tid - 1][i];
+                    edges[tid][i] = process_row(dp, blocked[i], begin, end, carry);
+                }
+                progress[tid].rows.store(last, memory_order_release);
+            }
+        }
+    }
+    cout << dp[n - 1] << '\n';
+}

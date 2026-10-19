@@ -1,0 +1,191 @@
+"""Add only pinned, reconciled cold metadata to the scientific base exports."""
+from __future__ import annotations
+
+import csv
+import json
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+from normaliser import GROUP, HERE, INPUTS, ROOT, RX, read, ref, require, sha, write
+
+RECON = RX / "reconciliation-livraisons-r1"
+RECEIPT = RECON / "RECONCILIATION-LIVRAISONS.json"
+LEDGER = RECON / "LEDGER-PAR-NONCE.json"
+RECEIPT_SHA = "0ed5c437d3737ec9a970a4183b3e80ce996e87a7f655e5fba9965a979682def8"
+LEDGER_SHA = "e59648ab81c4ad5dd18a4332eecda57c136e7299afae501673df9b4dad913504"
+ROLE_GROUPS = {"mother-preparation": "mère", "mother-synthesis": "mère",
+               "A": "enfant", "B": "enfant", "C": "enfant", "G": "intégration"}
+USAGE_KEYS = {"input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+              "output_tokens", "reasoning_output_tokens"}
+COUNT_KEYS = ("requests", "native_invocations_observed", "expired_before_invocation",
+              "requests_with_unknown_consumption", "known_exact_tokens",
+              "completed_turns_with_exact_usage", "upper_bound_tokens_not_consumption",
+              "negative_responses_preserved")
+
+
+def closed_ref(item):
+    require(type(item) is dict and set(item) == {"path", "sha256"}, "Nonclosed payload ref")
+    path = Path(item["path"]).resolve(strict=True)
+    allowed = (ROOT, RECON / "capture-01/pieces-supplementaires")
+    require(any(path.is_relative_to(root) for root in allowed), "Payload ref outside cold roots")
+    require(sha(path) == item["sha256"], "Pinned cold bytes changed")
+    return ref(path)
+
+
+def summarize(records):
+    return {"requests": len(records),
+            "native_invocations_observed": sum(x["native_invocation_observed"] for x in records),
+            "expired_before_invocation": sum(x["not_called_before_expiry"] for x in records),
+            "requests_with_unknown_consumption": sum(x["unknown_consumption"] for x in records),
+            "known_exact_tokens": sum(x["known_exact_tokens"] for x in records
+                                      if x["known_exact_tokens"] is not None),
+            "completed_turns_with_exact_usage": sum(x["native_invocation_observed"]
+                                                     and x["usage_measured"] for x in records),
+            "upper_bound_tokens_not_consumption": sum(
+                x["reported_upper_bound_tokens_not_consumption"] or 0 for x in records),
+            "negative_responses_preserved": sum(x["response_error_class"] != "none"
+                                                 for x in records)}
+
+
+def validate_record(record):
+    for key in ("native_invocation_observed", "usage_measured", "not_called_before_expiry",
+                "unknown_consumption", "archived_response_present", "late_local_delivery_only"):
+        require(type(record[key]) is bool, "Boolean evidence required")
+    require(record["role"] in ROLE_GROUPS, "Unknown native role")
+    upper_bound = record["reported_upper_bound_tokens_not_consumption"]
+    require(upper_bound is None or type(upper_bound) is int and upper_bound >= 0,
+            "Invalid reservation/upper-bound field")
+    subdivisions = record.get("usage_subdivisions")
+    if record["not_called_before_expiry"]:
+        require(not record["native_invocation_observed"] and record["usage_measured"]
+                and type(record["known_exact_tokens"]) is int
+                and record["known_exact_tokens"] == 0 and not record["unknown_consumption"]
+                and record["response_error_class"] == "expired_before_invocation",
+                "Unproved zero-call expiry")
+        state = "expired_before_invocation_proven"
+    elif record["usage_measured"]:
+        require(record["native_invocation_observed"] and not record["unknown_consumption"]
+                and type(record["known_exact_tokens"]) is int
+                and record["known_exact_tokens"] >= 0, "Measured call lost its exact usage")
+        require(type(subdivisions) is dict and set(subdivisions) == USAGE_KEYS
+                and all(type(value) is int and value >= 0 for value in subdivisions.values()),
+                "Unknown or malformed token subdivision")
+        require(record["known_exact_tokens"] == subdivisions["input_tokens"]
+                + subdivisions["output_tokens"]
+                and subdivisions["cached_input_tokens"] <= subdivisions["input_tokens"]
+                and subdivisions["cache_write_input_tokens"] <= subdivisions["input_tokens"]
+                and subdivisions["reasoning_output_tokens"] <= subdivisions["output_tokens"],
+                "Token subdivisions were counted twice or contradict totals")
+        state = "exact"
+    else:
+        require(record["native_invocation_observed"] and record["unknown_consumption"]
+                and record["known_exact_tokens"] is None and subdivisions is None,
+                "Unknown invocation was converted into exact consumption")
+        state = "native_invocation_unmeasured"
+    require(record["normal_R3_admission_gate_applied"] is False,
+            "Source-only receipt was relabeled as R3 admission")
+    for item in record["payload_refs"].values():
+        closed_ref(item)
+    for key in ("archive_request", "subject_journal_request"):
+        closed_ref(record[key])
+    require(record["archive_request"]["sha256"] == record["request_sha256"],
+            "Archived request digest differs")
+    return state
+
+
+def main():
+    require(sha(RECEIPT) == RECEIPT_SHA and sha(LEDGER) == LEDGER_SHA,
+            "Reconciler pins changed")
+    receipt, ledger = read(RECEIPT), read(LEDGER)
+    require(receipt["schema"] == "hpc-forest-source-only-native-delivery-reconciliation-v1"
+            and receipt["verified"] is True and all(receipt[k] == v for k, v in GROUP.items())
+            and ledger["schema"] == "hpc-forest-source-only-nonce-ledger-v1"
+            and all(ledger[k] == GROUP[k] for k in ("session_id", "job_id")),
+            "Wrong reconciliation scope or identity")
+    for key in ("all_started_calls_reconciled", "all_published_requests_have_bound_local_delivery_receipt",
+                "all_archived_responses_match_preserved_local_bytes", "all_started_call_states_terminal",
+                "source_only_protocol94_verified", "all_mother_child_G_requested_model_effort_same",
+                "cache_and_reasoning_subdivisions_not_added_again", "reservations_are_not_consumption"):
+        require(receipt[key] is True, "Required reconciliation fact absent: " + key)
+    require(type(receipt["unknown_invocations"]) is int and receipt["unknown_invocations"] == 0
+            and receipt["unresolved"] == [] and receipt["source_frozen_files"] == 94
+            and receipt["total_exact_consumption_available"] is False
+            and receipt["exact_consumption_tokens_total"] is None
+            and receipt["complete_live_cache_snapshot"] is False,
+            "Unknown consumption or incomplete cache limitations lost")
+    require(ledger["records"] == receipt["records"], "Ledger and receipt records differ")
+    records = ledger["records"]
+    require(len(records) == len({x["nonce"] for x in records}) == 124,
+            "Session/nonce deduplication differs")
+    base = read(HERE / "resultats-source-only-sol-max.json")
+    require({x["subject"] for x in records} == {x["subject"] for x in base["rows"]},
+            "Reconciled subject set differs from scientific baseline")
+    calls = []
+    for record in records:
+        state = validate_record(record)
+        calls.append({"session_id": GROUP["session_id"], "job_id": GROUP["job_id"],
+                      "model": GROUP["model"], "effort": "max", "nonce": record["nonce"],
+                      "subject": record["subject"], "role": record["role"],
+                      "kind": ROLE_GROUPS[record["role"]], "state": state,
+                      "native_cli_invocation_observed": record["native_invocation_observed"],
+                      "backend_model_identity_attested": False,
+                      "usage_measured": record["usage_measured"],
+                      "exact_total": record["known_exact_tokens"],
+                      "usage_subdivisions": record.get("usage_subdivisions"),
+                      "upper_bound_tokens_not_consumption":
+                          record["reported_upper_bound_tokens_not_consumption"],
+                      "response_error_class": record["response_error_class"],
+                      "archived_response_present": record["archived_response_present"],
+                      "local_delivery_reconciled": True,
+                      "late_local_delivery_only": record["late_local_delivery_only"],
+                      "request_sha256": record["request_sha256"],
+                      "response_sha256": record["response_sha256"],
+                      "normal_R3_admission_gate_applied": False})
+    total = summarize(records)
+    require(all(total[k] == receipt[k] for k in COUNT_KEYS), "Recomputed cost totals differ")
+    by_subject = {slug: summarize([x for x in records if x["subject"] == slug])
+                  for slug in sorted({x["subject"] for x in records})}
+    by_role = {role: summarize([x for x in records if x["role"] == role])
+               for role in sorted(ROLE_GROUPS)}
+    require(by_subject == receipt["by_subject"] and by_role == receipt["by_role"],
+            "Recomputed subject/role accounting differs")
+    role_groups = {kind: summarize([x for x in records if ROLE_GROUPS[x["role"]] == kind])
+                   for kind in ("mère", "enfant", "intégration")}
+    for row in base["rows"]:
+        require(by_subject[row["subject"]]["requests"] == row["published_requests_archived"],
+                "Scientific baseline request count differs")
+    require(sum(x["late_local_delivery_only"] for x in records) == receipt["late_local_delivery_count"],
+            "Late local delivery limit changed")
+    for path, expected in INPUTS.items():
+        require(sha(path) == expected, "Pinned cold input changed")
+    value = {"schema": "hpc-forest-source-only-sol-max-reconciled-accounting-export-v1",
+             "observed_at": datetime.now(UTC).isoformat(), **GROUP,
+             "reconciliation": ref(RECEIPT), "nonce_ledger": ref(LEDGER),
+             "accounting_reconciled": True, "accounting": total,
+             "by_role": by_role, "by_role_group": role_groups, "by_subject": by_subject,
+             "calls": calls, "total_exact_consumption_available": False,
+             "exact_consumption_tokens_total": None, "cache_and_reasoning_already_included": True,
+             "upper_bounds_are_not_consumption": True,
+             "late_local_delivery_only_count": receipt["late_local_delivery_count"],
+             "complete_live_cache_snapshot": False, "worker_lock_read_or_copied": False,
+             "native_R3_admission": False, "backend_model_identity_attested": False,
+             "professional_edition_admission_done": False, "cohort_final_delivery_done": False,
+             "worker_or_live_cache_read_by_normalizer": False, "processes_stopped": 0}
+    write("couts-reconcilies-source-only-sol-max.json", value)
+    with (HERE / "jetons-par-appel-source-only-sol-max.csv").open(
+            "x", encoding="utf-8-sig", newline="") as output:
+        columns = [key for key in calls[0] if key != "usage_subdivisions"]
+        writer = csv.DictWriter(output, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows({key: row[key] for key in columns} for row in calls)
+    write("entrees-couts-verifiees.json", {"files": INPUTS,
+                                          "cold_payload_files_hashed_only": True})
+    print(json.dumps({"accounting": total, "by_role_group": role_groups,
+                      "late_local_delivery_only_count": value["late_local_delivery_only_count"],
+                      "unknowns_remain_null": True, "exact_global_total": None,
+                      "states": dict(Counter(x["state"] for x in calls))}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,213 @@
+"""Frozen terminal Astra/Sol metadata review; no received code or live cache access."""
+import hashlib
+import json
+import math
+import re
+import tarfile
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[2]
+REL = HERE.parent
+SOURCE = '13ccaf7c74d13db246d1127a25c511bc03d7989ba9097eb6ad7b4f681c0a0a46'
+PLAN = '5e052db689fc423720be60dab97fbca70c82b64487d02d3d8fe2d0f796d9c96c'
+SCOPE = 'hpc-forest-primes-native-max-r2d'
+SPECS = [
+    ('astra', '752650', 'gpt-6-astra', '26d58fc2d88f423d9b5fd241ade3d185',
+     '937d83aad2611bd815a98b6549232a277a91663a2629d1c351f9a3e800614286',
+     '7edd5eda53dcf4526a0b35443ec23af118014a24c73bfc834a3a39a4c0b9e377',
+     '2639aea00d9b00524b67851d8e59ab65151cd809ccc8ad1e35480ffaec5283ad', 98908, 137.04150759999902),
+    ('sol', '752652', 'gpt-6.1-sol', '182500fef7c546af87f14498de353581',
+     'ede9686b2907e7e81a94ab64e5b519030eceea4a15e62cb4b67177cd3bc80bce',
+     'c8e072d4a843c39e448b9be3f64db754094a0eebd27c7485b0aa923b8548de86',
+     '8e35b4672c4df8f816b2e6cca7152b810fa351585e5c5cc0eea9dcd7a5a5e903', 112912, 44.11900909999531)
+]
+TRACKED = {}
+CHECKS = 0
+
+
+def need(ok, message):
+    global CHECKS
+    CHECKS += 1
+    if not ok:
+        raise ValueError(message)
+
+
+def sha(path):
+    path = Path(path).resolve()
+    need(path.is_relative_to(BASE), 'Artifact escapes workspace')
+    with path.open('rb') as stream:
+        result = hashlib.file_digest(stream, 'sha256').hexdigest()
+    need(TRACKED.setdefault(str(path), result) == result, 'Input changed during review')
+    return result
+
+
+def load(path):
+    sha(path)
+    return json.loads(Path(path).read_text(encoding='utf8'))
+
+
+def ref(path):
+    return {'path': str(Path(path).resolve()), 'sha256': sha(path)}
+
+
+def artifact(value, root=None):
+    need(set(value) == {'path', 'sha256'}, 'Closed artifact reference required')
+    path = Path(value['path']).resolve()
+    need(root is None or path.is_relative_to(root.resolve()), 'Reference escapes frozen selected root')
+    need(ref(path) == value, 'Referenced artifact hash differs')
+    return path
+
+
+def payload(path):
+    value = load(path)
+    return value.get('structuredContent', value)
+
+
+def review(spec):
+    slug, job, model, session, receipt_sha, recon_sha, archive_sha, known_expected, timeout_expected = spec
+    incoming = REL / f'reception-{slug}-{job}'
+    audit = incoming / 'audit-metadata-r1'
+    root = audit / 'restauration-neuve'
+    mailbox = root / ('results-' + job) / 'mailbox'
+    receipt_path, recon_path = audit / 'RECEPTION-METADATA-BORNEE.json', audit / 'RECONCILIATION-METADATA-BORNEE.json'
+    need(sha(receipt_path) == receipt_sha and sha(recon_path) == recon_sha, 'Two metadata receipt pins differ')
+    receipt, recon = load(receipt_path), load(recon_path)
+    identity = dict(scope_id=SCOPE, model=model, effort='max', session_id=session, job_id=job, source_zip_sha256=SOURCE, plan_sha256=PLAN)
+    need(all(receipt.get(k) == recon.get(k) == v for k, v in identity.items()), 'Exact cell identity differs')
+    need(receipt['verified'] is False and recon['verified'] is True, 'Metadata/scientific distinction differs')
+    for key in ('RAW_scientific_or_Git_oracle_or_performance_audit', 'first_clean_NORMAL_admitted', 'research_admission', 'source_worker_or_cache_modified', 'lower_layer_or_backend_cause_established'):
+        need(receipt[key] is False, 'Scientific admission or causal overclaim')
+    archive = incoming / ('results-' + job + '.tar.gz')
+    need(sha(archive) == archive_sha, 'Archive SHA differs')
+    announced, transfer = load(incoming / 'annonce-archive.json'), payload(incoming / ('transfert-results-' + job + '-tar-gz.json'))
+    stem = SCOPE + '-' + session + '/results-' + job + '.tar.gz'
+    need(announced['path'] == '/gpfs/scratch/nimarano/' + stem and transfer['downloaded'] == '/scratch_p/nimarano/' + stem, 'Distinct actual archive path provenance differs')
+    need(transfer['ok'] is True and transfer['verifie'] is True and transfer['bytes'] == archive.stat().st_size
+         and transfer['to'] == str(archive.resolve()) and announced['sha256'] == transfer['remote_sha256']
+         == transfer['empreinte_locale'] == transfer['empreinte_distante'] == archive_sha, 'Archive announced/remote/local triple SHA differs')
+    before, after = load(audit / 'inventaire-restauration-avant.json'), load(audit / 'inventaire-restauration-apres.json')
+    need(before == after and len(before) == 885, '885-file restoration before/after differs')
+    inventory = {}
+    with tarfile.open(archive, 'r:gz') as tar:
+        members = tar.getmembers()
+        need(len(members) < 4000 and sum(m.size for m in members) < 64 * 1024 * 1024, 'Archive size bounds exceeded')
+        seen = set()
+        for m in members:
+            p = PurePosixPath(m.name)
+            need(not p.is_absolute() and '..' not in p.parts and '\\' not in m.name and p.as_posix() == m.name.rstrip('/')
+                 and p.parts[0] in {'results-' + job, 'runtime-preparation-private-audit'}
+                 and p.as_posix() not in seen and (m.isfile() or m.isdir()), 'Unsafe member/link/duplicate')
+            seen.add(p.as_posix())
+            if m.isfile():
+                with tar.extractfile(m) as stream:
+                    inventory[p.as_posix()] = {'bytes': m.size, 'sha256': hashlib.file_digest(stream, 'sha256').hexdigest()}
+    need(inventory == before, 'Whole archive opaque fingerprints differ from restoration')
+    actual = {p.relative_to(root).as_posix(): {'bytes': p.stat().st_size, 'sha256': sha(p)} for p in root.rglob('*') if p.is_file()}
+    need(actual == before, 'Frozen restoration current bytes differ')
+    for item in load(audit / 'PIECES-EPINGLEES.json')['files']:
+        artifact(item)
+    calls = recon['calls']
+    nonces = {c['nonce'] for c in calls}
+    need(len(calls) == len(nonces) == recon['archive_request_count'] == 6 and all(re.fullmatch('[0-9a-f]{32}', n) for n in nonces), 'Exactly six terminal calls required')
+    snapshots = load(artifact(recon['named_snapshot_inventory'], audit))
+    need(snapshots['named_files'] == len(snapshots['files']) == 80 and set(snapshots['nonces_from_archive_requests_only']) == nonces, '80 frozen named snapshots differ')
+    copies = {}
+    for row in snapshots['files']:
+        path = artifact(row['received'], audit / 'cache-nomme')
+        group, name = path.relative_to((audit / 'cache-nomme').resolve()).parts
+        need(group in nonces | {'root'} and (group, name) not in copies, 'Unexpected/duplicate named snapshot')
+        need(row['source']['sha256'] == row['received']['sha256'] and row['source']['bytes'] == path.stat().st_size
+             and type(row['source']['mtime_ns']) is int, 'Frozen source-stability record/copy mismatch')
+        copies[group, name] = path
+    need({n for g, n in copies if g == 'root'} == {'OWNER.json', 'worker-ready.json', 'CELL-BINDING.json'}, 'Three frozen root files differ')
+    mappings = {'request': ('requests', '.request.json', 'downloaded-request.json'), 'response': ('responses', '.response.json', 'response.json'),
+                'ready': ('responses', '.ready.json', 'response-ready.json'), 'invocation': ('logs', '.invocation.json', 'invocation.json'),
+                'delivered': ('logs', '.delivered.json', 'delivered.json'), 'process': ('logs', '.codex.jsonl.json', 'codex.jsonl.json'),
+                'codex_log': ('logs', '.codex.jsonl', 'codex.jsonl')}
+    known, unknown, timed_out, roles = 0, 0, [], []
+    for call in calls:
+        nonce = call['nonce']; values = {}
+        for key, (folder, suffix, mirror) in mappings.items():
+            need({p.name.removesuffix(suffix) for p in (mailbox / folder).glob('*' + suffix)} == nonces, 'Terminal call artifact set incomplete')
+            path = artifact(call[key], root)
+            need(path == (mailbox / folder / (nonce + suffix)).resolve() and sha(path) == sha(copies[nonce, mirror]), 'Exact archive/frozen mirror differs')
+            if key != 'codex_log':
+                values[key] = load(path)
+        request, response, ready, inv, delivered, process = (values[k] for k in ('request', 'response', 'ready', 'invocation', 'delivered', 'process'))
+        rh, sh = call['request']['sha256'], call['response']['sha256']
+        need(request['nonce'] == response['nonce'] == nonce and request['kind'] == 'source-proposal'
+             and request['model'] == response['model'] == model and request['session_id'] == response['session_id'] == session
+             and request['reasoning_effort'] == response['reasoning_effort'] == 'max', 'Call identity/MAX differs')
+        need(response['request_sha256'] == inv['request_sha256'] == delivered['request_sha256'] == rh
+             and ready['sha256'] == delivered['response_sha256'] == sh and ready['bytes'] == Path(call['response']['path']).stat().st_size
+             and all(delivered[k] == v for k, v in identity.items()), 'Request/ready/delivery graph differs')
+        need(load(copies[nonce, 'generation-claimed.json'])['request_sha256'] == rh
+             and load(copies[nonce, 'request.json']) == request, 'Started claim and actual request differ')
+        download = payload(copies[nonce, 'download-receipt.json'])
+        need(download['ok'] is True and download['verifie'] is True and download['remote_sha256'] == download['empreinte_locale'] == download['empreinte_distante'] == rh, 'Request download graph differs')
+        argv = inv['argv']
+        need(argv == process['argv'] and argv.count('--model') == 1 and argv[argv.index('--model') + 1] == model
+             and 'model_reasoning_effort="max"' in argv and 'forced_login_method="chatgpt"' in argv
+             and inv['hosted_inference'] is True and inv['source_execution_allowed'] is False, 'Exact recorded invocation differs')
+        need(type(process['returncode']) is int and type(process['timed_out']) is bool and math.isfinite(process['seconds'])
+             and process['returncode'] == call['process_returncode'] and process['timed_out'] == call['process_timed_out']
+             and process['seconds'] == call['recorded_process_seconds'], 'Finished process outcome differs')
+        usage = response['usage']
+        need(usage == call['usage'] and usage['codex_jsonl_sha256'] == call['codex_log']['sha256'] and usage['model_requested'] == model
+             and usage['reasoning_effort_requested'] == 'max' and type(usage['llm_calls']) is int and usage['llm_calls'] == 1, 'Usage/log binding differs')
+        role = 'mother' if request.get('meta_role') == 'mother-preparation' else 'normal_child'
+        need(role == call['role'], 'Recorded role differs')
+        roles.append(role)
+        expected_names = {v[2] for v in mappings.values()} | {'generation-claimed.json', 'request.json', 'download-receipt.json', 'instructions.txt', 'output-schema.json'}
+        if usage['token_accounting'] == 'exact':
+            expected_names.add('agent-result.json')
+            need(process['returncode'] == 0 and process['timed_out'] is False and response['error'] is None and response['infrastructure_error'] is False, 'Exact completion metadata differs')
+            need(usage['events'] and all(type(e[k]) is int and e[k] >= 0 for e in usage['events'] for k in ('input_tokens', 'output_tokens'))
+                 and sum(e['input_tokens'] + e['output_tokens'] for e in usage['events']) == usage['tokens'] == call['known_exact_tokens'], 'Typed exact recorded event sum differs')
+            known += usage['tokens']
+        else:
+            need(role == 'normal_child' and usage['token_accounting'] == 'upper_bound' and usage['events'] == []
+                 and usage['tokens'] == request['token_ceiling'] == 196608 and process['returncode'] == 1 and process['timed_out'] is True
+                 and response['infrastructure_error'] is True and response['error'] is not None and process['seconds'] == timeout_expected,
+                 'Preserved technical timeout/unknown consumption differs')
+            unknown += 1; timed_out.append(nonce)
+        need({n for g, n in copies if g == nonce} == expected_names, 'Exact per-call frozen snapshot files differ')
+    need(roles.count('mother') == 1 and roles.count('normal_child') == 5 and known == known_expected == recon['known_exact_tokens']
+         and unknown == recon['unknown_exact_consumption_invocations'] == 1 and recon['exact_total_tokens'] is None
+         and recon['upper_bound_or_reserved_tokens_not_added_to_known_exact'] == [196608], 'Non-totalized final accounting differs')
+    need(recon['all_archive_requests_delivered'] is True and recon['all_named_claim_request_invocation_response_ready_delivery_hashes_reconciled'] is True, 'Exhaustive bounded reconciliation not established')
+    terminal, efficiency = payload(incoming / 'statut-terminal.json'), payload(incoming / 'efficacite.json')
+    need(terminal['job_id'] == efficiency['job_id'] == job and terminal['state'] == efficiency['state'] == 'FAILED'
+         and terminal['exit_code'] == efficiency['exit_code'] == '1:0', 'Terminal FAILED1:0 differs')
+    need(load(root / ('results-' + job) / 'results.json')['pipeline_complete'] is False, 'Pipeline negative lost')
+    first = load(root / ('results-' + job) / 'premier-demarrage-verifie.json')
+    need(first['verified'] is True and first['technical_errors_found'] is False, 'Source first flag as recorded differs')
+    return {**identity, 'receipt': ref(receipt_path), 'reconciliation': ref(recon_path), 'archive_sha256': archive_sha,
+            'regular_files': 885, 'opaque_archive_restoration_before_after_equal': True, 'frozen_named_snapshots': 80,
+            'calls_received_and_delivered': 6, 'roles': {'mother': 1, 'normal_child': 5}, 'known_exact_tokens_recorded': known,
+            'unknown_exact_consumption_invocations': unknown, 'upper_bound_not_consumption': 196608, 'exact_total_consumption': None,
+            'timed_out_nonce': timed_out[0], 'timed_out_seconds_recorded': timeout_expected, 'source_first_verified_as_recorded': True,
+            'clean_NORMAL_or_RAW_scientific_or_performance_admission': False, 'terminal_state': 'FAILED', 'exit_code': '1:0'}
+
+
+def main():
+    results = [review(s) for s in SPECS]
+    for path, digest in list(TRACKED.items()):
+        need(sha(path) == digest, 'Tracked frozen artifact changed before seal')
+    report = {'schema': 'hpc-forest-terminal-as-independent-bounded-metadata-review-v1', 'verified': True,
+              'scope': 'Frozen terminal archive and named-copy metadata graph only; source/RAW/performance admission false',
+              'cohorts': results, 'known_exact_tokens_recorded': sum(r['known_exact_tokens_recorded'] for r in results),
+              'unknown_exact_consumption_invocations': 2, 'exact_total_consumption': None,
+              'all_frozen_bytes_identical_before_after': True, 'blocking_findings_within_metadata_scope': [], 'checks': CHECKS,
+              'raw_generation_C_DB_or_log_bodies_interpreted': False, 'live_cache_lock_CLI_model_MCP_or_process_action': False,
+              'no_backend_cause_inferred': True, 'scientific_performance_or_native_first_clean_admission': False}
+    target = HERE / 'REVUE-INDEPENDANTE-TERMINALE-ASTRA-SOL.json'
+    with target.open('x', encoding='utf8', newline='\n') as stream:
+        json.dump(report, stream, indent=2); stream.write('\n')
+    print(json.dumps({'report': ref(target), 'checks': CHECKS, 'known_exact_tokens_recorded': report['known_exact_tokens_recorded'],
+                      'unknown_exact_consumption_invocations': 2, 'exact_total_consumption': None}))
+
+
+if __name__ == '__main__':
+    main()

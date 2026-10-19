@@ -1,0 +1,105 @@
+--- sealed-r1/qualification-wrapper.py
++++ correction-chemins-r2/qualification-wrapper-r2.py
+@@ -1,4 +1,4 @@
+-"""Allocated mechanical envelope only. No native calls, transport, install or retry."""
++"""Isolated r2 envelope: exact resolved artifact identity; no historical replay."""
+ from __future__ import annotations
+ 
+ import hashlib
+@@ -246,6 +246,72 @@
+             and len(observed.get("affinity_cpu_ids", [])) == 4
+             and all(key not in qualified or qualified[key] == observed[key]
+                     for key in ("affinity_cpu_ids", "affinity_cpu_count")))
++
++
++def resolve_exact_artifact(announced, expected, *, directory=False):
++    """Allocation first; resolve both complete paths, never compare names alone."""
++    allocation_guard()
++    require(isinstance(announced, str) and announced and Path(announced).is_absolute()
++            and expected.is_absolute(), "Absolute original and expected artifact paths required")
++    announced_resolved = Path(announced).resolve(strict=True)
++    expected_resolved = expected.resolve(strict=True)
++    require(announced_resolved == expected_resolved, "Artifact alias resolves to a different object")
++    require(expected_resolved.is_dir() if directory else expected_resolved.is_file(),
++            "Resolved artifact has an unexpected type")
++    return expected_resolved, {"announced_path_original": announced,
++                               "expected_path_original": str(expected),
++                               "resolved_path": str(expected_resolved),
++                               "same_complete_resolved_path": True,
++                               "expected_type": "directory" if directory else "regular_file"}
++
++
++def regular_file_snapshot(path):
++    require(path.is_file(), "Regular artifact file required")
++    before = path.stat()
++    require(0 <= before.st_size <= MAX_BYTES, "Artifact file size exceeds the bounded receipt")
++    raw = path.read_bytes()
++    after = path.stat()
++    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
++    require(all(getattr(before, key) == getattr(after, key) for key in fields)
++            and len(raw) == before.st_size, "Artifact changed during the exact byte/size observation")
++    return {"sha256": digest(raw), "bytes": len(raw)}
++
++
++def verify_inner_archive_identity(sidecar, expected):
++    resolved, proof = resolve_exact_artifact(sidecar.get("path"), expected)
++    snapshot = regular_file_snapshot(resolved)
++    require(re.fullmatch(r"[a-f0-9]{64}", sidecar.get("sha256", ""))
++            and snapshot["sha256"] == sidecar["sha256"]
++            and type(sidecar.get("native_model_calls")) is int and sidecar["native_model_calls"] == 0,
++            "Inner qualification archive SHA or zero-inference proof differs")
++    declared_size = sidecar.get("bytes")
++    require(declared_size is None or (type(declared_size) is int and declared_size == snapshot["bytes"]),
++            "Inner qualification archive declared size differs")
++    # Original r1b sidecars have no size field. Record actual exact bytes without inventing one.
++    return {**proof, **snapshot, "sidecar_declared_bytes": declared_size,
++            "size_observed_from_exact_artifact": True, "verified": True}
++
++
++def verify_prepared_root_identity(qualification, expected):
++    resolved, proof = resolve_exact_artifact(qualification.get("prepared_root"), expected, directory=True)
++    files = qualification.get("prepared_files")
++    require(isinstance(files, dict) and 0 < len(files) <= 1000, "Exact prepared file inventory required")
++    actual = {}
++    total = 0
++    for path in sorted(resolved.rglob("*")):
++        require(not path.is_symlink(), "Linked member in prepared artifact refused")
++        if path.is_file():
++            require(path.resolve(strict=True).is_relative_to(resolved), "Prepared member escaped the exact root")
++            name = path.relative_to(resolved).as_posix()
++            canonical_name(name)
++            snapshot = regular_file_snapshot(path)
++            total += snapshot["bytes"]
++            require(total <= MAX_BYTES, "Prepared artifact total size exceeds its bounded receipt")
++            actual[name] = snapshot
++    require(set(actual) == set(files) and all(re.fullmatch(r"[a-f0-9]{64}", value)
++            and actual[name]["sha256"] == value for name, value in files.items()),
++            "Prepared file membership or exact SHA differs")
++    return {**proof, "files": actual, "total_bytes": total, "verified": True}
+ 
+ 
+ def preserve_envelope(root, receipt):
+@@ -310,10 +376,11 @@
+         receipt["qualification_allocation_original"] = qualification.get("allocation")
+         receipt["qualification_archive_sidecar_sha256"] = file_sha(root / "Q-archive.json")
+         inner_archive = json.loads((root / "Q-archive.json").read_text(encoding="utf8"))
+-        require(inner_archive.get("path") == str(root / "Q.tar.gz")
+-                and inner_archive.get("sha256") == file_sha(root / "Q.tar.gz")
+-                and inner_archive.get("native_model_calls") == 0, "Inner qualification archive proof differs")
++        receipt["qualification_archive_identity"] = verify_inner_archive_identity(inner_archive, root / "Q.tar.gz")
+         receipt["qualification_archive_sha256"] = inner_archive["sha256"]
++        prepared_identity = (verify_prepared_root_identity(qualification, output / "prepared")
++                             if qualification.get("verified") is True else None)
++        receipt["prepared_root_identity"] = prepared_identity
+         receipt["passed"] = (code == 0 and qualification.get("verified") is True
+                              and qualification.get("scope_id") == SCOPE
+                              and qualification.get("source_zip_sha256") == bindings["source_zip_sha256"]
+@@ -325,7 +392,7 @@
+                              and qualification.get("unique_certified_cases") == 12
+                              and qualification.get("native_model_calls") == 0
+                              and qualification.get("native_research_admitted") is False
+-                             and qualification.get("prepared_root") == str(output / "prepared")
++                             and prepared_identity is not None
+                              and qualification_allocation_matches(qualification.get("allocation"), allocation))
+     except (OSError, ValueError, RuntimeError, KeyError, TypeError, tarfile.TarError,
+             zipfile.BadZipFile, subprocess.SubprocessError) as exc:

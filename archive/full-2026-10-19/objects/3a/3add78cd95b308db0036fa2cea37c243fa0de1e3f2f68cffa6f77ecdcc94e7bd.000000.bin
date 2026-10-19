@@ -1,0 +1,349 @@
+"""Neutral privacy fixtures: mocked processes; no C, model or CLI execution."""
+import json
+import subprocess
+from types import SimpleNamespace
+
+import pytest
+
+from hpc_forest import contracts as c
+from hpc_forest import private_feedback as pf
+from hpc_forest.dynamic_mother import render_meta
+
+SECRET = "PRIVATE_INPUT_STDERR_CAPTURE_SENTINEL"
+
+
+def contaminated():
+    return {"status": "incorrect", "correct": False, "score": 0., "mean_seconds": None,
+            "reason": SECRET, "logs": [SECRET], "stderr": SECRET, "input_fingerprint": SECRET,
+            "raw": {"stdout": SECRET}, "runner_output": {"correct": True, "stdout": SECRET}}
+
+
+def test_closed_outcome_and_diagnostic_drop_arbitrary_json_text():
+    assert SECRET not in json.dumps(pf.public_outcome(contaminated()))
+    for value in (contaminated(), {"diagnostic": {"code": "execution_failed", "case": SECRET,
+                                                 "stderr": SECRET, "returncode": 1}}, SECRET, None):
+        assert SECRET not in json.dumps(pf.public_diagnostic(value))
+    value = {"diagnostic": {"code": "execution_failed", "case": "confirmation-case-2"}}
+    assert pf.public_diagnostic(value)["case"] == "confirmation-case-2"
+
+
+@pytest.mark.parametrize("value", [{"correct": True}, {"diagnostic": {"code": "execution_failed", "returncode": 1}},
+                                     {"diagnostic": {"code": "execution_timeout", "case": "search-case-1"}}]
+    + [{"correct": True, "diagnostic": {"code": code}} for code in sorted(pf.CODES - {"check_passed"})])
+def test_public_diagnostic_and_all_real_projection_layers_are_idempotent(value):
+    projected = pf.public_diagnostic(value)
+    assert pf.public_diagnostic(projected) == projected
+    observation = pf.public_observation({"experiment_id": "own", "outcome": {"status": "valid"}, "raw_logs": [projected]})
+    assert pf.public_observation(observation) == observation
+    context = pf.public_context({"automatic_observations": {"baseline": observation}})
+    assert pf.public_context(context) == context
+    advice = pf.public_meta_payload("advice", {"own_observations_as_data": context["automatic_observations"]})
+    assert pf.public_meta_payload("advice", advice) == advice
+
+
+@pytest.mark.parametrize("status", ["generation_failed", "contract_violation", "infrastructure_error",
+                                     "depth_limited", "cancelled_interrupted", "cancelled_budget"])
+def test_real_r4_status_is_retained_without_reason(status):
+    assert pf.public_outcome({"status": status, "reason": SECRET}) == {"status": status}
+
+
+def test_history_and_interaction_closed_but_model_ideas_remain():
+    item = {"experiment_id": "own", "hypothesis": "model chosen idea", "outcome": contaminated(),
+            "raw_logs": [{"text": SECRET}], "duplicate_of": {
+                "experiment_id": "own", "measured_outcome": contaminated()}}
+    context = {"automatic_observations": {"baseline": item, "selected_parent": item,
+        "recent_own_role": [item], "own_role_history": [{"experiment_id": "own", **contaminated()}],
+        "node_development": {"attempt": 2, "remaining_attempts": 1, "previous_attempts": [{
+            "attempt": 1, "generation_error": SECRET, "generation_usage": {"raw": SECRET},
+            "development_outcome": contaminated(), "measured_diagnostics": [{"text": SECRET}]}]}},
+        "interactions": [{"sources": ["own"], "outcome": contaminated()}], "operator_raw": SECRET,
+        "harvest_source_programs_as_data": [{"source_as_data": {"src/a.c": "MODEL CODE"},
+                                              "transformations": ["model idea"]}]}
+    safe = pf.public_context(context)
+    assert SECRET not in json.dumps(safe)
+    assert safe["automatic_observations"]["baseline"]["hypothesis"] == "model chosen idea"
+    assert safe["harvest_source_programs_as_data"] == context["harvest_source_programs_as_data"]
+    assert context["automatic_observations"]["baseline"]["outcome"]["reason"] == SECRET
+
+
+@pytest.mark.parametrize("phase", ["roots", "advice", "harvest"])
+def test_all_three_meta_boundaries_drop_private_measurement(phase):
+    payload = {"reference_measurement_as_data": contaminated(),
+               "own_observations_as_data": {"baseline": {"outcome": contaminated()}},
+               "operator_error": SECRET, "official_source_as_data": {"src/a.c": "MODEL CODE"}}
+    rendered = render_meta(phase, payload)
+    assert SECRET not in json.dumps(rendered)
+    assert set(rendered["schema"]["required"]) == set(rendered["schema"]["properties"])
+
+
+def fixture(tmp_path):
+    resources = tmp_path / "trusted"
+    resources.mkdir()
+    (resources / "stdin").write_bytes(SECRET.encode())
+    binary = tmp_path / "not-executed-binary"
+    binary.write_bytes(b"NEUTRAL NOT EXECUTED")
+    case = {"name": "private-name", "stdin": "stdin", "argv": ["--asset", "a"], "files": [],
+            "capture_files": ["answer.dat"], "input_fingerprint": "private-fingerprint",
+            "stdin_bytes": len(SECRET)}
+    return resources, binary, case
+
+
+@pytest.mark.parametrize("mode", ["success", "nonzero", "timeout", "missing"])
+def test_actual_streams_and_capture_bytes_are_audit_only(tmp_path, monkeypatch, mode):
+    resources, binary, case = fixture(tmp_path)
+    def fake(argv, **kw):
+        assert argv == [str(binary.resolve()), "--asset", "a"]
+        assert not any(k.startswith("HPC_FOREST_PRIVATE_") for k in kw["env"])
+        kw["stdout"].write(SECRET.encode())
+        kw["stderr"].write(SECRET.encode())
+        if mode != "missing":
+            (kw["cwd"] / "answer.dat").write_bytes(SECRET.encode())
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired(argv, 1)
+        return SimpleNamespace(returncode=1 if mode == "nonzero" else 0)
+    monkeypatch.setattr(c.subprocess, "run", fake)
+    monkeypatch.setenv("HPC_FOREST_PRIVATE_EXAMPLE", SECRET)
+    if mode == "success":
+        outputs, seconds = c.execute(binary, case, resources=resources)
+        assert c.unblob(outputs["answer.dat"]) == SECRET.encode() and seconds >= 0
+    else:
+        with pytest.raises(c.ContractError) as exc:
+            c.execute(binary, case, resources=resources)
+        assert SECRET not in json.dumps(exc.value.diagnostic)
+        assert "stderr" not in exc.value.diagnostic and "input_fingerprint" not in exc.value.diagnostic
+    records = list((tmp_path / "private-audit/executions").glob("*/execution-provenance.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert record["never_model_input"] and record["audit_work_outside_execution_timer"]
+    for key in ["stdout", "stderr"]:
+        assert (records[0].parent / record[key]["file"]).read_bytes() == SECRET.encode()
+    assert record["stdin_sha256"] == c.sha(resources / "stdin")
+    assert record["argv"][1:] == case["argv"]
+    if mode != "missing":
+        value = record["capture_files"]["answer.dat"]
+        assert (records[0].parent / value["file"]).read_bytes() == SECRET.encode()
+
+
+def test_new_audit_work_after_original_execute_timer(tmp_path, monkeypatch):
+    resources, binary, case = fixture(tmp_path)
+    ticks = []
+    monkeypatch.setattr(c.time, "perf_counter", lambda: ticks.append(len(ticks)) or ticks[-1])
+    def fake(argv, **kw):
+        (kw["cwd"] / "answer.dat").write_bytes(b"fixture")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(c.subprocess, "run", fake)
+    real = c._audit_execution
+    def audit(*args):
+        assert len(ticks) == 2
+        return real(*args)
+    monkeypatch.setattr(c, "_audit_execution", audit)
+    assert c.execute(binary, case, resources=resources)[1] == 1
+
+
+@pytest.mark.parametrize("capture", ["stdout", "stderr"])
+def test_capture_names_never_overwrite_actual_private_streams(tmp_path, monkeypatch, capture):
+    resources, binary, case = fixture(tmp_path)
+    case["capture_files"] = [capture]
+    def fake(argv, **kw):
+        kw["stdout"].write(b"ACTUAL STDOUT")
+        kw["stderr"].write(b"ACTUAL STDERR")
+        (kw["cwd"] / capture).write_bytes(b"CONTRACTED FILE")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(c.subprocess, "run", fake)
+    c.execute(binary, case, resources=resources)
+    path = next((tmp_path / "private-audit/executions").glob("*/execution-provenance.json"))
+    value = json.loads(path.read_text())
+    assert (path.parent / value["stdout"]["file"]).read_bytes() == b"ACTUAL STDOUT"
+    assert (path.parent / value["stderr"]["file"]).read_bytes() == b"ACTUAL STDERR"
+    assert (path.parent / value["capture_files"][capture]["file"]).read_bytes() == b"CONTRACTED FILE"
+
+
+def test_max_identity_requires_receipt_and_never_installs_default_generation():
+    from hpc_forest.core import InfrastructureError
+    from hpc_forest.native_matrix import MODELS, install_identity, validate_identity
+    for model in MODELS:
+        validate_identity(model, "max")
+        with pytest.raises(InfrastructureError):
+            install_identity(model, "max")
+        for effort in ("low", "medium", "high", "xhigh", "automatic"):
+            with pytest.raises(InfrastructureError):
+                validate_identity(model, effort)
+
+
+def test_false_admission_and_generic_native_request_are_refused(tmp_path):
+    from hpc_forest.core import InfrastructureError
+    from hpc_forest.dynamic_admission import SCOPE, guard_request, validate_authorization
+    path = tmp_path / "not-admitted.json"
+    path.write_text(json.dumps({"verified": False, "scope_id": SCOPE}))
+    with pytest.raises(InfrastructureError):
+        validate_authorization(path, {SCOPE})
+    authorization = {"model": "gpt-6-luna", "session_id": "a" * 32,
+                     "purpose": "technical-contract", "technical_phase": "roots",
+                     "allowed_request_sha256": "0" * 64}
+    with pytest.raises(InfrastructureError):
+        guard_request(authorization, {"model": "gpt-6-luna", "session_id": "a" * 32,
+                                      "reasoning_effort": "max", "meta_role": "mother-dynamic-roots"})
+
+
+def test_cli_verifier_checks_actual_argument_and_all_companion_bytes(tmp_path, monkeypatch):
+    from hpc_forest import dynamic_admission as admission
+    from hpc_forest.core import InfrastructureError, file_digest
+    files = {}
+    for name in admission.CLI_FILES:
+        path = tmp_path / name
+        path.write_bytes(("NEUTRAL NEVER EXECUTED " + name).encode())
+        files[name] = {"path": str(path), "sha256": file_digest(path)}
+    # Unit-only expected hashes; production pins remain fixed in the source.
+    monkeypatch.setattr(admission, "CLI_SHA256", files["codex.exe"]["sha256"])
+    monkeypatch.setattr(admission, "CLI_FILES", {k: v["sha256"] for k,v in files.items()})
+    metadata = tmp_path / "cli-unit-metadata.json"
+    metadata.write_text(json.dumps({"verified": False, "neutral_fixture_only": True,
+        "executable_path": str(tmp_path / "codex.exe"), "executable_sha256": files["codex.exe"]["sha256"], "files": files}))
+    auth = {"artifacts": {"cli_identity": {"path": str(metadata), "sha256": file_digest(metadata)}}}
+    assert admission.verify_local_cli(auth, tmp_path / "codex.exe")["verified_before_invocation"]
+    with pytest.raises(InfrastructureError):
+        admission.verify_local_cli(auth, tmp_path / "codex-command-runner.exe")
+    (tmp_path / "codex-command-runner.exe").write_bytes(b"REPLACED")
+    with pytest.raises(InfrastructureError):
+        admission.verify_local_cli(auth, tmp_path / "codex.exe")
+
+
+def test_wrong_publish_channel_does_not_consume_initial_freshness(tmp_path, monkeypatch):
+    from hpc_forest import codex_mailbox as mailbox
+    from hpc_forest import codex_process as process
+    from hpc_forest import codex_worker as worker
+    from hpc_forest import native_matrix as native
+    from hpc_forest.core import InfrastructureError
+    session, now = "a" * 32, [0]
+    auth = {"scope_id": native.SCOPE, "model": "gpt-6-luna", "effort": "max", "session_id": session,
+            "job_id": "999999", "purpose": "pilot",
+            "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session,
+            "canonical_remote_root": "/gpfs/scratch/nimarano/hpc-forest-dynamic-r4b-max-" + session}
+    def stub(path, jobs, *, initial=True):
+        if initial and now[0] > 600:
+            raise InfrastructureError("unit initial freshness expired")
+        return auth
+    monkeypatch.setattr(native, "validate_receipt", stub)
+    for module, names in [(mailbox, ["MODEL", "EFFORT", "publish_request"]),
+                          (process, ["MODEL", "EFFORT", "check_dependencies"]),
+                          (worker, ["MODEL", "EFFORT", "check_dependencies", "validate_request", "validate_remote_channel"])]:
+        for name in names:
+            monkeypatch.setattr(module, name, getattr(module, name))
+    calls = []
+    monkeypatch.setattr(mailbox, "publish_request", lambda *a: calls.append(a))
+    receipt = tmp_path / "unit-stub-only.json"
+    receipt.write_text('{"verified":false,"neutral_fixture_only":true}')
+    native.install_identity("gpt-6-luna", "max", receipt)
+    request = {"model": "gpt-6-luna", "reasoning_effort": "max", "session_id": session}
+    with pytest.raises(InfrastructureError, match="channel"):
+        mailbox.publish_request("/unrelated", request)
+    now[0] = 601
+    with pytest.raises(InfrastructureError, match="freshness"):
+        mailbox.publish_request(auth["remote_root"] + "/results-999999/mailbox", request)
+    assert not calls
+
+
+@pytest.mark.parametrize("verified", [None, False, True])
+def test_first_start_receiving_flag_never_overrides_missing_verification(verified):
+    from hpc_forest.dynamic_admission import first_start_reception_valid
+    identity = {"scope_id": "unit-only", "source_zip_sha256": "1" * 64, "plan_sha256": "2" * 64}
+    plan = {"pilot_configuration": {"model": "gpt-6-luna"}, "cells": {"gpt-6-luna": "a" * 32}}
+    first = {"schema": "hpc-forest-dynamic-r4b-first-start-reception-v1", **identity,
+        "model": "gpt-6-luna", "effort": "max", "session_id": "a" * 32,
+        "received_first_normal_delivery_and_real_evaluation": True, "unresolved_invocations": [],
+        "technical_errors": [], "global_admission_verified": False}
+    if verified is not None:
+        first["verified"] = verified
+    # Pure field predicate only; this is never a full deployable admission.
+    assert first_start_reception_valid(first, identity, plan) is (verified is True)
+
+
+@pytest.mark.parametrize("session", [None, "c" * 32, "b" * 32])
+def test_contract_session_must_be_the_exact_declared_phase_cell(session):
+    from hpc_forest.dynamic_admission import contract_session_valid
+    plan = {"contract_cells": {"gpt-6-luna": {"roots": "b" * 32, "advice": "c" * 32}}}
+    assert contract_session_valid(session, "gpt-6-luna", "roots", plan) is (session == "b" * 32)
+
+
+@pytest.mark.parametrize("violation", ["digest", "phase", "candidate"])
+def test_worker_rejects_unrelated_technical_request_before_claim(tmp_path, monkeypatch, violation):
+    from hpc_forest import codex_mailbox as mailbox
+    from hpc_forest import codex_process as process
+    from hpc_forest import codex_worker as worker
+    from hpc_forest import native_matrix as native
+    from hpc_forest.core import InfrastructureError, digest
+    session, nonce = "a" * 32, "b" * 32
+    request = {"protocol": mailbox.PROTOCOL, "kind": "source-proposal", "session_id": session,
+               "nonce": nonce, "model": "gpt-6-luna", "reasoning_effort": "max",
+               "meta_role": "mother-dynamic-roots"}
+    authorization = {"scope_id": native.SCOPE, "model": "gpt-6-luna", "effort": "max",
+                     "session_id": session, "job_id": "999999", "purpose": "technical-contract",
+                     "technical_phase": "roots", "allowed_request_sha256": digest(request),
+                     "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session,
+                     "canonical_remote_root": "/gpfs/scratch/nimarano/hpc-forest-dynamic-r4b-max-" + session}
+    # Explicit metadata unit stub only; no deployable ZIP/admission is fabricated.
+    monkeypatch.setattr(native, "validate_receipt", lambda *args, **kwargs: authorization)
+    for module, names in [(mailbox, ["MODEL", "EFFORT", "publish_request"]),
+                          (process, ["MODEL", "EFFORT", "check_dependencies"]),
+                          (worker, ["MODEL", "EFFORT", "check_dependencies", "validate_request", "validate_remote_channel"])]:
+        for name in names:
+            monkeypatch.setattr(module, name, getattr(module, name))
+    (tmp_path / "unit-stub-only.json").write_text(json.dumps({"verified": False, "unit_test_stub_only": True}))
+    native.install_identity("gpt-6-luna", "max", tmp_path / "unit-stub-only.json")
+    if violation == "digest":
+        request["arbitrary"] = "changed"
+    elif violation == "phase":
+        request["meta_role"] = "mother-dynamic-advice"
+    else:
+        request.pop("meta_role")
+    class Transfer:
+        async def download(self, remote, local):
+            local.write_bytes(mailbox.json_bytes(request))
+            return {"verifie": True}
+    calls = []
+    monkeypatch.setattr(worker, "run_codex", lambda *a: calls.append(a))
+    channel = authorization["remote_root"] + "/results-999999/mailbox"
+    instance = worker.Worker(Transfer(), channel, session, tmp_path / "cache",
+                             tmp_path / "unit-stub-only.json", {native.SCOPE})
+    coroutine = instance.handle(nonce + ".request.json")
+    try:
+        with pytest.raises(InfrastructureError):
+            coroutine.send(None)
+    finally:
+        coroutine.close()
+    assert not calls and not list((tmp_path / "cache").rglob("generation-claimed.json"))
+    assert not list((tmp_path / "cache").rglob("invocation.json"))
+
+
+def test_raw_candidate_json_cannot_become_runner_diagnostic(tmp_path):
+    raw = tmp_path / "checker.log"
+    raw.write_text(json.dumps({"correct": True, "diagnostic": {"code": SECRET}, "stdout": SECRET}))
+    value = pf.diagnostic_logs(tmp_path, {"logs": [str(raw)]})
+    assert value == [{"status": "completed", "code": "check_passed"}]
+
+
+def test_source_request_last_boundary_closes_context(tmp_path):
+    from hpc_forest.source_request import proposal_messages
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/a.c").write_text("MODEL CODE")
+    mission = SimpleNamespace(role="A", id="fixture", ordinal=1, sources=[])
+    context = {"interactions": [{"outcome": contaminated()}], "operator_private": SECRET}
+    rendered = proposal_messages(tmp_path, mission, context)
+    assert SECRET not in json.dumps(rendered)
+    assert "MODEL CODE" in rendered["messages"][1]["content"]
+
+
+def test_g_context_closes_interactions_before_early_return(monkeypatch):
+    import hpc_forest.dynamic_controller as dc
+    from hpc_forest.controller import Controller
+    monkeypatch.setattr(Controller, "_context", lambda *a: {"generation_deadline": 1000,
+        "interactions": [{"outcome": contaminated()}],
+        "automatic_observations": {"baseline": {"outcome": contaminated()}}})
+    monkeypatch.setattr(dc, "target_context", lambda config: {"verified": "target facts"})
+    obj = dc.DynamicController.__new__(dc.DynamicController)
+    obj.statement, obj.config = "official statement", {"budget": {"generation_seconds": 600}}
+    obj.db = SimpleNamespace(get=lambda key: {"objective": "model chosen harvest"})
+    obj._harvest_programs = lambda sources: [{"source_as_data": {"src/a.c": "MODEL CODE"}}]
+    value = obj._context(SimpleNamespace(role="G", epoch=1, ordinal=1), [])
+    assert SECRET not in json.dumps(value)
+    assert value["harvest_source_programs_as_data"][0]["source_as_data"]["src/a.c"] == "MODEL CODE"

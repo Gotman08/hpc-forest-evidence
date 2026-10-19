@@ -1,0 +1,112 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+static const uint32_t MOD = 1000000007u;
+
+#if defined(__aarch64__)
+static inline uint32x4_t add_mod4(uint32x4_t a, uint32x4_t b,
+                                uint32x4_t modulus) {
+    // Both inputs are below MOD, so the addition cannot overflow.
+    const uint32x4_t sum = vaddq_u32(a, b);
+    return vminq_u32(sum, vsubq_u32(sum, modulus));
+}
+#endif
+
+static inline void scan_open_span(uint32_t* dp, int begin, int end) {
+    // Every span begins at the left boundary or immediately after an obstacle.
+    uint32_t carry = 0;
+
+#if defined(__aarch64__)
+    const uint32x4_t zero = vdupq_n_u32(0);
+    const uint32x4_t modulus = vdupq_n_u32(MOD);
+    uint32x4_t carried = zero;
+
+    for (; end - begin >= 16; begin += 16) {
+        // Each lane represents a consecutive group of four cells:
+        // val[k] contains dp[begin + k + 4 * lane].
+        uint32x4x4_t values = vld4q_u32(dp + begin);
+
+        // Compute four independent local scans across the registers.
+        values.val[1] = add_mod4(values.val[0], values.val[1], modulus);
+        values.val[2] = add_mod4(values.val[1], values.val[2], modulus);
+        values.val[3] = add_mod4(values.val[2], values.val[3], modulus);
+
+        // Scan the four group totals before introducing the incoming carry.
+        uint32x4_t totals = values.val[3];
+        totals = add_mod4(totals, vextq_u32(zero, totals, 3), modulus);
+        totals = add_mod4(totals, vextq_u32(zero, totals, 2), modulus);
+        totals = add_mod4(totals, carried, modulus);
+
+        // Each group's offset is the preceding group's completed total.
+        const uint32x4_t offsets = vextq_u32(carried, totals, 3);
+        values.val[0] = add_mod4(values.val[0], offsets, modulus);
+        values.val[1] = add_mod4(values.val[1], offsets, modulus);
+        values.val[2] = add_mod4(values.val[2], offsets, modulus);
+        values.val[3] = totals;
+
+        vst4q_u32(dp + begin, values);
+        carried = vdupq_laneq_u32(totals, 3);
+    }
+
+    for (; end - begin >= 4; begin += 4) {
+        uint32x4_t values = vld1q_u32(dp + begin);
+
+        // Form local inclusive prefixes before introducing the incoming carry.
+        values = add_mod4(values, vextq_u32(zero, values, 3), modulus);
+        values = add_mod4(values, vextq_u32(zero, values, 2), modulus);
+        values = add_mod4(values, carried, modulus);
+
+        vst1q_u32(dp + begin, values);
+        carried = vdupq_laneq_u32(values, 3);
+    }
+    carry = vgetq_lane_u32(carried, 0);
+#endif
+
+    for (; begin < end; ++begin) {
+        carry += dp[begin];
+        if (carry >= MOD) carry -= MOD;
+        dp[begin] = carry;
+    }
+}
+
+int main() {
+    int n, m;
+    if (!(cin >> n >> m)) return 0;
+
+    vector<vector<int> > blocked_columns(n);
+    for (int c = 0; c < m; ++c) {
+        int row, column;
+        cin >> row >> column;
+        blocked_columns[row].push_back(column);
+    }
+
+    vector<uint32_t> dp(n, 0);
+    // A virtual incoming path seeds the origin; a blocked origin clears it.
+    dp[0] = 1;
+
+    for (int row = 0; row < n; ++row) {
+        vector<int>& columns = blocked_columns[row];
+        sort(columns.begin(), columns.end());
+
+        int begin = 0;
+        for (int column : columns) {
+            // Repeated coordinates describe the same blocked cell.
+            if (column < begin) continue;
+            scan_open_span(dp.data(), begin, column);
+            dp[column] = 0;
+            begin = column + 1;
+        }
+        scan_open_span(dp.data(), begin, n);
+    }
+
+    cout << dp[n - 1] << endl;
+    return 0;
+}

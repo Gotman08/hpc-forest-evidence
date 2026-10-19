@@ -1,0 +1,310 @@
+"""Cold metadata audit only: never import/execute received code or binaries."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import re
+import tarfile
+from pathlib import Path, PurePosixPath
+
+HERE = Path(__file__).resolve().parent
+REL = HERE.parent
+BASE = REL.parents[1]
+SOURCE = "f15b840cca876a4c465775f5553a0eaa539a9b98e56fe942136a1fcbde9b86b9"
+PLAN = "4b430e181948e55e463dfd1e60bdce96308a9190534734feb22354e4116ebde9"
+RUNTIME = "a4a9418edb8ea86aeb720259eca1a7ac246952d280648115be4c93cd0364800b"
+PREP = "d260af0a7b91cbe5fc7e3ab1ad9313723e385c21fdd75bd5c9623095683022fd"
+REFERENCE = "70e15be0d677eb40d700c3c09c20dc4d2db50132fbf9a2a4d30fb37bd3014f6d"
+SCOPE = "hpc-forest-primes-native-max-r2e"
+FLAGS = ["-O2", "-std=c11", "-Werror=uninitialized", "-Werror=maybe-uninitialized", "-lm"]
+CELLS = {"753317": ("gpt-6-astra", "f81b76a9bc484f669a210c476ae6f9b0"),
+         "753318": ("gpt-5.6-terra", "e3678f243ba54a9fadb57440641c0599"),
+         "753319": ("gpt-6.1-sol", "515db6fd166e4b68875f34cf2fe733fa")}
+INPUTS = {}
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def named(path, expected=None):
+    path = Path(path)
+    need(path.is_absolute() and path.is_file() and not any(
+        p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents)),
+        "Exact ordinary immutable input required")
+    raw = path.read_bytes()
+    checksum = digest(raw)
+    need(expected is None or checksum == expected, "Pinned input changed")
+    record = {"sha256": checksum, "bytes": len(raw)}
+    need(INPUTS.setdefault(str(path), record) == record, "Input changed during audit")
+    return raw
+
+
+def read(path, expected=None):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            need(key not in value, "Duplicate JSON field")
+            value[key] = item
+        return value
+    value = json.loads(named(path, expected).decode("utf-8-sig"), object_pairs_hook=unique,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+    need(isinstance(value, dict), "Metadata object required")
+    return value
+
+
+def ref(path):
+    return {"path": str(path), "sha256": digest(named(path))}
+
+
+def save(name, value):
+    path = HERE / name
+    with path.open("x", encoding="utf8", newline="\n") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    return {"path": str(path), "sha256": digest(path.read_bytes())}
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): {"sha256": digest(p.read_bytes()), "bytes": p.stat().st_size}
+            for p in root.rglob("*") if p.is_file()}
+
+
+def allocation(value, job):
+    need(value.get("job_id") == job and value.get("architecture") in {"aarch64", "arm64"}
+         and all(type(value.get(k)) is int and value[k] == v for k, v in
+                 {"nodes": 1, "tasks": 1, "cpus_per_task": 4, "memory_mib": 16384, "gpus": 0,
+                  "affinity_cpu_count": 4}.items())
+         and len(set(value.get("affinity_cpu_ids", []))) == 4, "Exact received ARM allocation required")
+
+
+def source_preparation():
+    sealed = REL / "qualification-zero-modele-r1/paquet-source-lie-r1"
+    named(sealed / "HPC-Forest-Primes-Natif-MAX-r2e.zip", SOURCE)
+    plan = read(sealed / "native-max-plan.json", PLAN)
+    need(plan.get("scope_id") == SCOPE and plan.get("efforts") == ["max"]
+         and plan.get("cells") == {model: session for model, session in CELLS.values()}, "Sealed R2e plan differs")
+    manifest = read(sealed / "runtime-manifest-r2max.json", RUNTIME)
+    need(len(manifest) == 108, "Exact source108 manifest required")
+    project = BASE / "work/hpc-forest-primes-natif-relance-r2e/project"
+    for name, checksum in manifest.items():
+        named(project / name, checksum)
+    certified = sealed / "certified-preparation"
+    prepared = read(certified / "prototype-manifest.json", PREP)
+    for name, item in prepared.items():
+        raw = named(certified / name, item["sha256"])
+        need(len(raw) == item["bytes"], "Certified official byte count changed")
+    return certified, prepared
+
+
+def incident_absence():
+    incident_path = REL / "operations-parent/incident-argv-20261018T1316/INCIDENT-VERIFIE-AVANT-INFERENCE.json"
+    value = read(incident_path, "9b01042e346e20a7cbc0d6849d5e7c9666c7d1ed47332ba16e04bd5f7ec4a086")
+    census_ref = value["current_census"]
+    need(census_ref["sha256"] == "738244aac7977ce02cfd1eec1e49575bdacda09683882b5df7d0d7b387092e89",
+         "Exact post-parser census required")
+    census = read(Path(census_ref["path"]), census_ref["sha256"])
+    rows = census.get("rows")
+    need(census.get("complete_census") is True and census.get("strict_utf8_decoding") is True
+         and isinstance(rows, list) and census.get("rows_count") == len(rows)
+         and len({r["ProcessId"] for r in rows}) == len(rows), "Complete cold census required")
+    fields = {"ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate"}
+    full = lambda row: tuple(row[key] for key in sorted(fields))
+    launch_ref = value["original_launch_receipt"]
+    launch = read(Path(launch_ref["path"]), launch_ref["sha256"])
+    workers = launch.get("workers", [])
+    need(len(workers) == 3 and {r["job_id"] for r in workers} == set(CELLS), "Exact historical three-worker launch required")
+    owned = [identity for row in workers for identity in row["full_identities"]]
+    need(len(owned) == len({full(row) for row in owned}) == 6
+         and not {full(row) for row in owned} & {full(row) for row in rows}, "All six exact initial identities must be absent")
+    need(value.get("verified") is True and value.get("six_owned_identities_absent") is True
+         and value.get("research_frontend_invocations") == 0
+         and value.get("version_login_MCP_worker_hello_not_reached") is True
+         and value.get("no_stop_or_restart_or_global_or_source_mutation") is True
+         and value.get("old_calls_or_nonce_or_candidates_replayed") is False, "Bounded no-invocation incident differs")
+    for row in value["records"]:
+        need(row.get("frontend_research_invocations") == 0 and row.get("cache_before_after_identical") is True
+             and row.get("all_two_owned_identities_absent_in_current_complete_census") is True
+             and row.get("readiness_or_OWNER_or_claim_or_response_present") is False, "Initial refusal metadata differs")
+        stderr_ref = row["stderr"]
+        raw = named(Path(stderr_ref["path"]), stderr_ref["sha256"])
+        need(b"unrecognized arguments: --cli-policy" in raw and b"--cli-policy-sha256" in raw,
+             "Exact inherited-parser argument rejection required")
+    return {"incident": ref(incident_path), "current_census": census_ref,
+            "original_launch_receipt": launch_ref, "six_exact_owned_identities_absent": True,
+            "no_intervention_recorded_by_incident": True, "live_observation_repeated_by_this_audit": False}
+
+
+def restore(job, archive, target):
+    target.mkdir(exist_ok=False)
+    with tarfile.open(archive, "r:gz") as source:
+        members = source.getmembers()
+        need(len(members) == 182 and len({m.name for m in members}) == 182, "Exact unique archive member count required")
+        total = 0
+        for item in members:
+            relative = PurePosixPath(item.name)
+            need(not relative.is_absolute() and ".." not in relative.parts and str(relative) == item.name
+                 and relative.parts[0] in {"results-" + job, "runtime-preparation-private-audit"}
+                 and not any(c in item.name for c in "\\:\r\n\0") and (item.isdir() or item.isfile()),
+                 "Archive has an unsafe name, link or special member")
+            path = target.joinpath(*relative.parts)
+            need(path.resolve().is_relative_to(target.resolve()), "Restore escaped its new audit root")
+            if item.isdir():
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                total += item.size
+                need(item.size <= 32 * 1024 * 1024 and total <= 64 * 1024 * 1024, "Bounded archive required")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                raw = source.extractfile(item).read()
+                need(len(raw) == item.size, "Truncated archive member")
+                with path.open("xb") as stream:
+                    stream.write(raw)
+    current = inventory(target)
+    need(len(current) == 127, "Exact 127 regular restored files required")
+    return current
+
+
+def official_reference(root, runtime, certified, prepared):
+    directory = root / "runtime-preparation-private-audit"
+    receipt = read(directory / "certified-preparation-receipt.json")
+    need(runtime.get("preparation") == receipt and receipt.get("ready") is True
+         and receipt.get("native_model_calls") == 0 and receipt.get("calibration") is False
+         and receipt.get("certified_expected_compared_byte_for_byte") is True,
+         "Exact archived certified official preparation required")
+    named(directory / "source/src/model-view/primetest.c", REFERENCE)
+    named(directory / "source/src/sources/primetest.c", prepared["data/sources/primetest.c"]["sha256"])
+    named(directory / "reference-build/solution", receipt["reference_binary_sha256"])
+    contract = read(directory / "validation/contract.json")
+    need(contract.get("language") == "c" and contract.get("source_files") == ["model-view/primetest.c"]
+         and contract.get("compiler_flags") == FLAGS and contract.get("comparison") == {"mode": "bytes"},
+         "Official reference contract changed")
+    expected_map = {**{f"search-case-{i}": f"p{n:02d}-v0" for i, n in enumerate((1, 2, 4, 8, 16, 30), 1)},
+                    **{f"confirmation-case-{i}": f"p{n:02d}-v1" for i, n in enumerate((1, 2, 4, 8, 16, 30), 1)},
+                    "benchmark-case-1": "p30-v0"}
+    cases = [*contract["search"], *contract["confirmation"], contract["benchmark"]]
+    rows = receipt["certified_expected_rows"]
+    need(len(cases) == len(rows) == 13 and {c["name"] for c in cases} == set(expected_map), "Exact 12 cases plus fixed benchmark required")
+    for case in cases:
+        name = case["name"]
+        origin = expected_map[name]
+        input_path = certified / "data/private-audit-fixtures" / origin / "input.txt"
+        expected_path = input_path.with_name("expected.txt")
+        stdin = PurePosixPath(case["stdin"])
+        need(not stdin.is_absolute() and ".." not in stdin.parts and case.get("argv") == []
+             and case.get("files") == [] and case.get("capture_files") == [], "Official input contract differs")
+        need(named(directory / "validation" / str(stdin)) == named(input_path), "Materialized official input differs")
+        blob = case["expected"]["stdout"]
+        raw = base64.b64decode(blob["base64"], validate=True)
+        need(raw == named(expected_path) and len(raw) == blob["bytes"] and digest(raw) == blob["sha256"],
+             "Certified official expected bytes differ")
+        declared = [r for r in rows if r.get("case") == name]
+        need(len(declared) == 1 and declared[0] == {"case": name, "origin": origin,
+             "expected_sha256": digest(raw), "input_sha256": digest(named(input_path)),
+             "allocated_reference_exact_bytes": True}, "Reference certification row differs")
+    return {"official_case_contracts_compared_by_hash_and_bytes": 13, "unique_case_origins": 12,
+            "fixed_benchmark_origin": "p30-v0", "reference_source_sha256": REFERENCE,
+            "reference_binary_sha256": receipt["reference_binary_sha256"], "reference_binary_executed_by_audit": False}
+
+
+def cell(job, model, session, certified, prepared):
+    incoming = REL / ("reception-echec-argv-" + job)
+    archive = incoming / ("results-" + job + ".tar.gz")
+    checksum = digest(named(archive))
+    announcement = read(incoming / "archive-annoncee.json")
+    transfer = read(incoming / "archive-transfert.json")["structuredContent"]
+    announced_transfer = read(incoming / "transfert-annonce.json")["structuredContent"]
+    need(announcement.get("sha256") == checksum and announcement.get("private_audit_only_never_model_context") is True
+         and all(transfer.get(k) == checksum for k in ("remote_sha256", "empreinte_locale", "empreinte_distante"))
+         and transfer.get("ok") is True and transfer.get("verifie") is True
+         and transfer.get("bytes") == archive.stat().st_size, "Announced/remote/local archive SHA or byte count differs")
+    need(announced_transfer.get("ok") is True and announced_transfer.get("verifie") is True
+         and announced_transfer.get("remote_sha256") == digest(named(incoming / "archive-annoncee.json")),
+         "Received announcement bytes are not verified")
+    target = HERE / ("restauration-neuve-" + job)
+    before = restore(job, archive, target)
+    before_ref = save("inventaire-avant-" + job + ".json", before)
+    result_root = target / ("results-" + job)
+    expected_files = {"channel.json", "mailbox/OWNER.json", "results.json", "runtime-reference-origin.json"}
+    need(set(inventory(result_root)) == expected_files, "Received result tree must have exactly four metadata files and no hello/request/claim/response")
+    result = read(result_root / "results.json")
+    runtime = read(result_root / "runtime-reference-origin.json")
+    owner = read(result_root / "mailbox/OWNER.json")
+    channel = read(result_root / "channel.json")
+    binding = {"scope_id": SCOPE, "model": model, "effort": "max", "session_id": session,
+               "job_id": job, "remote_root": "/scratch_p/nimarano/" + SCOPE + "-" + session,
+               "source_zip_sha256": SOURCE, "plan_sha256": PLAN}
+    need(owner == {"protocol": "hpc-forest-codex-mailbox-v1", "owner": job,
+                   "reasoning_effort": "max", **binding}, "Received mailbox ownership differs")
+    need(channel.get("session_id") == session and channel.get("job_id") == job
+         and channel.get("model") == model and channel.get("effort") == "max"
+         and channel.get("channel") == binding["remote_root"] + "/results-" + job + "/mailbox", "Channel differs")
+    need(all(result.get(k) == binding[k] for k in ("scope_id", "model", "effort", "session_id", "source_zip_sha256", "plan_sha256"))
+         and result.get("mother_model") == model and result.get("mother_effort") == "max"
+         and result.get("pipeline_complete") is False and result.get("extension_blocked") is True
+         and result.get("negative_outcomes_preserved") is True, "Bounded failed MAX result identity differs")
+    allocation(result["allocation"], job)
+    allocation(runtime["allocation"], job)
+    need(runtime.get("job_id") == job and runtime.get("source_zip_sha256") == SOURCE
+         and runtime.get("plan_sha256") == PLAN and runtime.get("preparation_manifest_sha256") == PREP
+         and runtime.get("reference_origin_is_current_allocation") is True
+         and runtime.get("qualification_timings_imported") is False
+         and runtime.get("native_model_calls") == 0 and runtime.get("new_inputs_or_candidates") == 0,
+         "Current-allocation official preparation provenance differs")
+    official = official_reference(target, runtime, certified, prepared)
+    for name in expected_files:
+        need(digest(named(incoming / "distant" / name)) == before["results-" + job + "/" + name]["sha256"],
+             "Separately downloaded terminal metadata differs from archive")
+    efficiency_path = REL / "operations-parent/incident-argv-20261018T1316" / ("efficacite-" + job + ".json")
+    efficiency = read(efficiency_path)["structuredContent"]
+    need(efficiency.get("ok") is True and efficiency.get("found") is True and efficiency.get("job_id") == job
+         and efficiency.get("state") == "FAILED" and efficiency.get("exit_code") == "1:0"
+         and efficiency.get("alloc_cpus") == 4 and efficiency.get("alloc_gpus") == 0
+         and efficiency.get("req_mem_mb") == 16384, "Actual failed terminal allocation receipt differs")
+    after = inventory(target)
+    need(before == after, "Fresh restoration changed during readonly metadata audit")
+    after_ref = save("inventaire-apres-" + job + ".json", after)
+    return {"model": model, "session_id": session, "job_id": job, "effort": "max",
+            "state": "FAILED", "exit_code": "1:0", "efficiency": ref(efficiency_path),
+            "archive": ref(archive), "announced_remote_local_sha256_identical": True,
+            "archive_regular_files": 127, "archive_members": 182, "result_metadata_files": 4,
+            "restoration_before": before_ref, "restoration_after": after_ref, "restoration_unchanged": True,
+            "mailbox_hello_worker_ready_requests_claims_responses": 0, "research_model_invocations": 0,
+            "known_research_tokens": 0, "official_reference": official,
+            "backend_elapsed_wait_seconds": result["elapsed_seconds"], "backend_error_type": result.get("error_type"),
+            "backend_error_sha256": digest(str(result.get("error", "")).encode()),
+            "clean_NORMAL_or_program_gain_or_scientific_admission": False}
+
+
+def main():
+    certified, prepared = source_preparation()
+    absence = incident_absence()
+    results = [cell(job, model, session, certified, prepared) for job, (model, session) in CELLS.items()]
+    before = dict(INPUTS)
+    after = {name: {"sha256": digest(Path(name).read_bytes()), "bytes": Path(name).stat().st_size}
+             for name in before}
+    need(before == after, "Named archived inputs changed during audit")
+    inputs = save("INVENTAIRE-ENTREES-STABLES.json", before)
+    receipt = save("RECEPTION-TERMINALE-METADATA-VERIFIEE.json", {
+        "schema": "hpc-forest-r2e-terminal-pre-readiness-zero-invocation-reception-v1", "verified": True,
+        "verification_scope": "Cold terminal metadata, archive provenance, official preparation hashes, and zero frontend research invocation only",
+        "source_zip_sha256": SOURCE, "plan_sha256": PLAN, "scope_id": SCOPE, "cells": results,
+        "stable_named_inputs": inputs, "initial_frontend_incident_and_owned_absence": absence,
+        "new_restored_regular_files": 381, "research_model_invocations": 0, "research_tokens": 0,
+        "received_code_or_binary_imported_or_executed": False,
+        "local_source_code_imported_or_model_or_transport_or_live_cache_used": False,
+        "processes_stopped_or_restarted": False, "old_sessions_or_claims_replayed": False,
+        "reference_preparation_time_is_not_a_program_gain": True,
+        "first_NORMAL_evaluation_performance_or_scientific_admission": False,
+        "independent_audit_is_a_separate_receipt": True})
+    print(json.dumps({"receipt": receipt, "cold_files_unchanged": 381,
+                      "research_invocations": 0, "scientific_admitted": False}))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,65 @@
+"""Freeze local DeepSeek execution helpers without changing search/runtime/prompts."""
+import hashlib,json,shlex,shutil,tarfile,zipfile
+from pathlib import Path
+here=Path(__file__).resolve().parent
+workspace=here.parents[1];project=workspace/'outputs/HPC-Forest'
+payload=here/'payload-v11b';shutil.copytree(here.parent/'marathon-v10b/payload',payload)
+for name in ['model-manifest.json','model-identity.json','config-verification.json']:
+ (payload/name).unlink()
+for name in ['romeo_base.py','romeo_marathon.py','local_model.py','neutral_backend.py','prepare_problem.py','evidence_pack.py']:
+ shutil.copyfile(project/'examples/marathon22'/name,payload/name)
+base=(payload/'romeo_base.py').read_text(encoding='utf8').replace('hpc-forest-marathon22-32b-v10b','hpc-forest-marathon22-deepseek-v11b')
+(payload/'romeo_base.py').write_text(base,encoding='utf8',newline='\n')
+for name in ['v4flash.json','v4flash0731.json']:shutil.copyfile(here/name,payload/name)
+for path in (project/'tests').glob('*.py'):shutil.copyfile(path,payload/'tests'/path.name)
+# Preserve the example layout used by the source-distribution import regression.
+(payload/'examples/marathon22').mkdir(parents=True)
+shutil.copyfile(payload/'local_model.py',payload/'examples/marathon22/local_model.py')
+wheel=payload/'payload-r4/hpc_forest-0.1.0-py3-none-any.whl'
+expected='e065b4b138ba927748616b1da402514f186fae669c58246fda47de7b96e5b6fd'
+assert hashlib.sha256(wheel.read_bytes()).hexdigest()==expected
+with zipfile.ZipFile(wheel) as z:
+ checked=[]
+ for name in z.namelist():
+  if name.startswith('hpc_forest/') and not name.endswith('/'):
+   assert z.read(name)==(project/'src'/name).read_bytes(),name
+   checked.append(name)
+policy={'revision':11,'models':[json.loads((payload/n).read_text()) for n in ['v4flash.json','v4flash0731.json']],
+ 'previous_candidate_code_imported':False,'previous_diagnostics_imported':False,
+ 'algorithm_suggestions_added':False,'manual_candidate_edits':0,'treequest_policy_changed':False,
+ 'controller_runtime_changed_since_v10b':False,'model_prompts_changed_since_v10b':False,
+ 'test_data_preparation_changed':False,'comparator_changed':False,'compiler_flags_changed_since_v10b':False,
+ 'model_changed':True,'cycles':4,'trials_per_role_per_cycle':6,'integrations_per_cycle':6,
+ 'planned_trials_per_problem':96,'token_budget_per_problem':4000000,'wall_seconds_per_problem':7200,
+ 'generation_seconds':300,'temperature':0.2,'repeat_penalty':1.1,'repeat_last_n':64,
+ 'weights_location':'owned ephemeral /dev/shm directory, native split-GGUF blobs without duplicate copy',
+ 'candidate_target':'4 ARM64 CPU cores, GPUs reserved for local model inference',
+ 'campaign_restarted_from_official_source':True,
+ 'operator_prepared':['immutable model shards, local import, hardware, compiler, inputs, official oracle, launches'],
+ 'source_quality_review_as_model_context':False}
+(payload/'assistance-protocol.json').write_text(json.dumps(policy,indent=2)+'\n',encoding='utf8')
+old_manifest=json.loads((here.parent/'marathon-v10b/payload/payload-manifest.json').read_text())
+manifest={p.relative_to(payload).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(payload.rglob('*')) if p.is_file() and p.name!='payload-manifest.json'}
+manifest.update({k:v for k,v in old_manifest.items() if k.startswith('sources-officielles/')})
+(payload/'payload-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n',encoding='utf8')
+archive=here/'marathon22-deepseek-v11b.tar.gz'
+with tarfile.open(archive,'w:gz') as t:t.add(payload,arcname='hpc-forest-deepseek-v11b')
+sha=hashlib.sha256(archive.read_bytes()).hexdigest()
+old_command=json.loads((here.parent/'marathon-v10b/commands.json').read_text())['nbody']
+inner=shlex.split(old_command)[2]
+inner=inner[:inner.index('exec "$py" "$root/romeo_marathon.py"')]
+inner=inner.replace('/scratch_p/nimarano/marathon22-32b-v10b-20261015.tar.gz','/scratch_p/nimarano/marathon22-deepseek-v11b-20261015.tar.gz')
+inner=inner.replace('7a309c112dd4da2eb37442d1982c66e091ba3d06863c913ab172c2f160e79737',sha)
+commands={}
+for slug in ['v4flash','v4flash0731']:
+ root=f'/scratch_p/nimarano/hpc-forest-marathon22-deepseek-20261015-v11b-{slug}'
+ script=inner.replace('/scratch_p/nimarano/hpc-forest-marathon22-20261015-r10b-nbody',root)
+ spec=json.loads((payload/(slug+'.json')).read_text())
+ script+=f'''exec "$py" "$root/romeo_marathon.py" --problems knn sum nbody --model {spec['model']} --local-model-spec "$root/{slug}.json" --cycles 4 --trials-per-role 6 --integrations 6 --wall-seconds 7200 --tokens 4000000 --generation-seconds 300 --temperature 0.2 --repeat-penalty 1.1 --repeat-last-n 64 --root "$root" --ollama /scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/tools/ollama-0.40.4/bin/ollama --detector "$root/detect_resources.py"\n'''
+ (here/(slug+'-command.sh')).write_text(script,encoding='utf8',newline='\n')
+ commands[slug]={'root':root,'model':spec['model'],'command':'bash -c '+shlex.quote(script)}
+(here/'commands-v11b.json').write_text(json.dumps(commands,indent=2)+'\n',encoding='utf8')
+receipt={'archive':str(archive),'sha256':sha,'bytes':archive.stat().st_size,'wheel_sha256':expected,'runtime_files_identical_to_wheel':checked,'manifest_files':len(manifest),'manual_candidate_edits':0}
+(here/'build-receipt-v11b.json').write_text(json.dumps(receipt,indent=2)+'\n',encoding='utf8')
+print(json.dumps(receipt))
+

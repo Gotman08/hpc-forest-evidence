@@ -1,0 +1,143 @@
+#include "knn.h"
+#include <string.h>
+#include <math.h>
+
+typedef struct {
+    float d;
+    char label;
+    int idx;
+} Cand;
+
+static int cand_cmp(const void *a, const void *b) {
+    const Cand *ca = (const Cand *) a;
+    const Cand *cb = (const Cand *) b;
+    if (ca->d < cb->d) return -1;
+    if (ca->d > cb->d) return 1;
+    return ca->idx - cb->idx;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    long total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        total += groups[i].length;
+    }
+
+    float *xs = (float *) malloc(sizeof(float) * (total > 0 ? total : 1));
+    float *ys = (float *) malloc(sizeof(float) * (total > 0 ? total : 1));
+    char *labs = (char *) malloc(sizeof(char) * (total > 0 ? total : 1));
+    Cand *all = (Cand *) malloc(sizeof(Cand) * (total > 0 ? total : 1));
+
+    if (!xs || !ys || !labs || !all) on_error();
+
+    int idx = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; j++) {
+            xs[idx] = g.points[j].x;
+            ys[idx] = g.points[j].y;
+            labs[idx] = g.label;
+            idx++;
+        }
+    }
+
+    int total_candidates = 0;
+
+#pragma omp parallel
+    {
+        Cand *local = (Cand *) malloc(sizeof(Cand) * (k > 0 ? k : 1));
+        if (!local) on_error();
+
+        for (int i = 0; i < k; i++) {
+            local[i].d = INFINITY;
+            local[i].label = -1;
+            local[i].idx = -1;
+        }
+
+#pragma omp for schedule(static)
+        for (int p = 0; p < total; p++) {
+            float dx = xs[p] - to_evaluate.x;
+            float dy = ys[p] - to_evaluate.y;
+            float d = dx * dx + dy * dy;
+
+            int pos;
+            for (pos = 0; pos < k; pos++) {
+                if (local[pos].idx == -1 || d < local[pos].d) break;
+            }
+
+            if (pos < k) {
+                for (int y = k - 1; y > pos; y--) {
+                    local[y] = local[y - 1];
+                }
+                Cand c;
+                c.d = d;
+                c.label = labs[p];
+                c.idx = p;
+                local[pos] = c;
+            }
+        }
+
+        int cnt = 0;
+        while (cnt < k && local[cnt].idx >= 0) cnt++;
+
+        if (cnt > 0) {
+#pragma omp critical
+            {
+                memcpy(all + total_candidates, local, sizeof(Cand) * cnt);
+                total_candidates += cnt;
+            }
+        }
+
+        free(local);
+    }
+
+    qsort(all, (size_t) total_candidates, sizeof(Cand), cand_cmp);
+
+    int nsel = k < total_candidates ? k : total_candidates;
+    char *labels = (char *) malloc(sizeof(char) * (nsel > 0 ? nsel : 1));
+    if (!labels && nsel > 0) on_error();
+
+    for (int i = 0; i < nsel; i++) {
+        labels[i] = all[i].label;
+    }
+
+    qsort(labels, (size_t) nsel, sizeof(char), compare_for_sort);
+
+    char most_frequent = -1;
+    int best_count = 0;
+
+    for (int i = 0; i < nsel;) {
+        int j = i + 1;
+        while (j < nsel && labels[j] == labels[i]) j++;
+        if (j - i > best_count) {
+            best_count = j - i;
+            most_frequent = labels[i];
+        }
+        i = j;
+    }
+
+    free(xs);
+    free(ys);
+    free(labs);
+    free(all);
+    free(labels);
+
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+    if (!groups && n_groups > 0) on_error();
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+    return 0;
+}

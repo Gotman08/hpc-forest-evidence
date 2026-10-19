@@ -1,0 +1,217 @@
+# HPC-Forest : évaluer l’optimisation de code par des modèles de langage
+
+*Recherche arborescente, correction observable et passage à l’échelle sur CPU ARM64*
+
+**Nicolas Marano · Romain Despoullain**
+
+Rapport de recherche expérimental · Version du 16 octobre 2026 · Données reçues arrêtées à {{CUTOFF}}
+
+## Résumé
+
+L’optimisation de code par un modèle de langage pose un problème de mesure autant que de génération : un programme apparemment rapide peut être faux, un avantage sur quelques entrées peut disparaître en confirmation, et une accélération séquentielle ne démontre pas l’utilisation de plusieurs cœurs. Nous présentons HPC-Forest, un dispositif expérimental qui associe la recherche AB-MCTS, des propositions de programmes, des contrôles de correction et une sélection confirmée. L’étude comprend vingt recherches sur count 2023, couvrant quatre identités de modèles et cinq niveaux d’effort, trois couvertures de quatorze autres sujets avec Luna, Astra et Terra MAX, deux campagnes DeepSeek et une comparaison de six recherches GPT avec ou sans harnais. Les expériences sont analysées dans leur protocole propre, sans classement global des modèles.
+
+Les vingt recherches count confirment une réduction du temps dans dix-neuf cellules sur vingt, comprise entre 39,78 % et 90,68 % pour les programmes modifiés retenus ; une cellule conserve la référence. Les couvertures Luna et Astra conservent la référence sur tropical et Sokoban ; Terra retient neuf programmes modifiés sur quatorze sujets et conserve cinq références. Dans la comparaison GPT, les meilleurs programmes des deux bras réduisent fortement les temps sur les trois charges, mais une seule recherche par bras et les incidents de transfert empêchent d’attribuer un avantage causal général au harnais. Une analyse postérieure, sans modification des exécutables, rassemble {{CPU_SAMPLES}} chronométrages sur {{CPU_BATCHES}} allocations et sept sujets. Elle révèle des comportements contrastés, dont une accélération de 15,27 fois entre un et seize cœurs pour un programme N-body, et des courbes presque plates pour d’autres programmes pourtant rapides. Les résultats documentent des gains locaux dont les calculs sont reproductibles à partir des traces conservées ; ils ne certifient ni la correction universelle, ni un rang de concours, ni une supériorité générale des modèles ou de l’architecture.
+
+**Mots-clés :** optimisation de programmes ; modèles de langage ; AB-MCTS ; benchmark ; OpenMP ; reproductibilité.
+
+## 1. Introduction
+
+Un modèle de langage peut proposer une modification plausible d’un programme sans fournir une amélioration utilisable. La proposition doit compiler, respecter le comportement attendu et accélérer une charge mesurée. Lorsque plusieurs propositions sont explorées, leur sélection ajoute un risque : retenir le meilleur temps de recherche favorise aussi les fluctuations de mesure et les erreurs que les premiers contrôles n’ont pas révélées. Un dispositif d’évaluation doit donc relier chaque résultat à son programme, à ses entrées, à son protocole et à une confirmation distincte.
+
+HPC-Forest étudie cette chaîne sur des programmes issus des archives du Marathon de programmation parallèle de la SBC [4]. Il utilise TreeQuest 0.3.2 et sa politique AB-MCTS-A. AB-MCTS organise l’exploration entre de nouvelles propositions et le raffinement de propositions existantes à partir d’un retour externe ; il constitue ici le mécanisme de recherche, et non une méthode nouvelle revendiquée par les auteurs [1, 2]. L’apport du présent travail réside dans l’instrumentation, la vérification et l’analyse conjointe des recherches, de leurs échecs et des exécutables finalement conservés.
+
+Trois questions guident l’analyse. Premièrement, quels gains sont effectivement confirmés sur les charges préparées, et quelles références restent préférables ? Deuxièmement, que peut-on observer lorsque la génération dispose d’un harnais de compilation, de tests de développement et de lecture documentaire ? Troisièmement, les programmes retenus profitent-ils de ressources CPU supplémentaires lorsque leurs octets et leurs entrées restent identiques ? Ces questions exigent des unités d’analyse différentes : une recherche indépendante, un appel de modèle, un sommet de l’arbre et une répétition de chronométrage ne constituent pas des observations interchangeables.
+
+L’article présente les résultats reçus et audités à une date explicite. La grille étendue et la référence GPT à 96 créneaux continuent au moment de cet instantané. Le protocole de mère dynamique R4 a passé ses contrôles mécaniques, mais n’a encore produit aucune recherche native validée. Ses propriétés attendues sont discutées comme une extension à tester. L’exhaustivité technique est assurée par les annexes et les exports associés, plutôt que par l’accumulation de bilans chronologiques dans le texte principal.
+
+## 2. Matériel et méthodes
+
+### 2.1. Périmètre, cohortes et unités d’analyse
+
+Les archives recensent dix-neuf sujets entre 2020 et 2023. Quinze sont admis dans la grille R1 après préparation ; quatre restent exclus pour un problème de domaine ou d’observabilité. Les pages consultées pour 2024 et 2025 ne fournissent pas de nouveaux sujets exploitables dans ce corpus. La grille admissible contient ainsi 300 cellules, obtenues par quinze sujets, quatre modèles et cinq efforts. À l’arrêté des données, 62 cellules ont été reçues et auditées : les vingt cellules count et quatorze autres sujets pour chacun de Luna, Astra et Terra MAX. Une cellule correspond à une recherche avec une seule graine, fixée à 23.
+
+Le tableau 1 définit les ensembles utilisés. Ils se recouvrent : les programmes d’une recherche peuvent ensuite apparaître dans une analyse CPU. Additionner les tailles des cohortes donnerait donc un nombre trompeur d’expériences indépendantes. Une campagne désigne une racine complète de résultats ; deux bras partageant un job et un sujet restent deux campagnes distinctes.
+
+{{TABLE_COHORTS}}
+
+Les identifiants GPT sont les identités exactes transmises et enregistrées par l’interface native. Les efforts max, xhigh, high, medium et low sont des paramètres de génération, pas des durées de calcul garanties. Les noms locaux DeepSeek et Qwen désignent les modèles chargés par Ollama dans les campagnes concernées. Ces identités documentent la configuration effective sans constituer une certification indépendante des poids d’un service hébergé.
+
+### 2.2. Forêt fixe et retour de mesure
+
+Dans R1, trois rôles d’exploration, A, B et C, disposent chacun d’un arbre AB-MCTS-A. Le rôle G produit des intégrations, elles-mêmes compilées, contrôlées et mesurées. Une mère modèle intervient au plus deux fois, pour la préparation et la synthèse ; elle propose les orientations à partir des données autorisées de la recherche. Les rôles sont fixes dans cette version. La génération variable d’axes et le conseil renouvelé branche par branche appartiennent à R4 et ne décrivent pas les résultats R1.
+
+L’interface ask/tell persiste les requêtes, les états et les retours de TreeQuest. Le code du parent enregistré constitue le point de départ d’un raffinement ; une intégration porte une liste distincte de programmes sources. Les liens de parenté MCTS, les indications de rôle et les sources d’intégration sont donc représentés différemment dans les figures. Le score fourni à la recherche vaut zéro pour un résultat incorrect ou non compilable. Pour un résultat valide, il est défini par q = 1 / (1 + T/T₀), où T est le temps moyen du programme et T₀ celui de la référence de recherche. Ce score borné n’est pas le pourcentage de réduction présenté dans les résultats. Une interruption d’infrastructure sans mesure utilisable ne reçoit pas artificiellement un score algorithmique nul.
+
+![Figure 1 — Protocole effectivement utilisé dans R1. Les trois arbres A/B/C sont fixes. La mère prépare des orientations puis une synthèse ; G constitue un programme neuf. Les contrôles de recherche, les confirmations et les diagnostics CPU sont des étapes distinctes. R4 est une extension préparée, sans résultat natif dans cet instantané.](edition-professionnelle/figures/protocole.png)
+
+R1 prévoit au plus huit missions de programme et deux épisodes de mère par cellule, avec 1 800 secondes et 1,5 million de jetons de budget. Une mission avec harnais peut répartir sa génération sur trois appels au maximum, dans une fenêtre totale de 600 secondes. Ces plafonds n’impliquent ni huit programmes valides, ni dix appels effectivement mesurés. Le tableau 2 situe les autres protocoles ; leurs différences empêchent de traiter toutes les campagnes comme une ablation unique.
+
+{{TABLE_PROTOCOLS}}
+
+### 2.3. Harnais, autonomie et contrôle de l’opérateur
+
+Le harnais fournit un environnement mécanique : compilation, tests de développement, diagnostics et accès HTTPS à des domaines préparés. Les lectures doivent être choisies par le modèle et laisser une trace. Les jeux réservés à la confirmation et le score interne de recherche ne sont pas communiqués comme outils de développement. Un programme correct termine l’épisode interne ; une correction autonome peut donc consommer plusieurs appels sans créer plusieurs sommets de recherche.
+
+L’opérateur prépare les sources, les formats, les oracles, les compilateurs et les ressources. Il n’écrit ni ne répare les candidats, ne choisit pas une solution à leur transmettre et ne réinjecte pas le présent rapport dans les recherches. Les pannes de transport sont traitées par une reprise documentée de la même session, avec registre des requêtes commencées et cache des réponses produites. Une recherche ne recommence pas pour effacer une sortie fausse, un doublon, une stagnation ou une expiration bornée.
+
+Les règles d’isolation ont une portée versionnée. R1 dispose de plans de préparation et de synthèse pour ses rôles fixes ; il ne démontre pas le conseil actif répété par branche demandé pour R4. Dans l’extension R4, chaque conseil local doit utiliser seulement l’histoire de la branche destinataire et les faits de cible. La récolte globale reste un canal séparé. Les tests mécaniques de cette propriété ne remplacent pas son observation au cours de recherches natives.
+
+### 2.4. Cibles matérielles et préparation des problèmes
+
+Les programmes candidats sont évalués sur ARM64, avec quatre cœurs CPU et zéro GPU pour les campagnes principales. Les modèles GPT utilisent une inférence hébergée, appelée par la CLI du PC ; leurs poids et leur vitesse interne de décodage ne sont pas observables ici. Les campagnes DeepSeek réservent quatre cœurs ARM64 et deux GPU pour l’inférence locale, tandis que les candidats restent exécutés sur CPU sans GPU. Les ressources de l’inférence, celles du programme optimisé et celles du processus de contrôle sont rapportées séparément dans les annexes.
+
+Les compilateurs et leurs options, les sources officielles, les contrats d’entrée/sortie et les variables d’environnement sont conservés avec leurs empreintes. Un nombre de CPU visible à l’échelle du nœud ne remplace pas l’allocation Slurm. De même, l’option de compilation OpenMP ne prouve pas le nombre de cœurs effectivement utilisés. Aucun temps d’inférence natif, prix d’API ou volume de mémoire GPU n’est déduit d’une donnée qui ne le mesure pas.
+
+Les sujets sont adaptés à une cible expérimentale contrôlée, ce qui impose des qualifications de conformité. N-body suit notamment le compteur d’en-tête présent dans la source C, mais absent de la description en prose. Les tests de permutations reçus utilisent des symboles distincts. La revue complémentaire de quicksort confirme les sorties MD5 sur les cas archivés, tout en identifiant un candidat hybride avec insertion et repli heapsort : sa fidélité stricte à l’algorithme demandé n’est pas certifiée. Les quatre exclusions de préparation et les domaines finis sont détaillés en annexe A.
+
+### 2.5. Correction, confirmation et sélection
+
+La correction observable repose sur un oracle exact pour les entrées préparées. Les jeux de recherche et de confirmation possèdent des empreintes distinctes. Le temps utilisé pour comparer les programmes est celui de la charge de benchmark du contrat, comprenant le lancement et les entrées/sorties prévus par le harnais. Il ne s’agit pas nécessairement du temps d’un noyau de calcul isolé. Les campagnes principales utilisent une chauffe, trois mesures pendant la recherche et cinq mesures en confirmation, intercalées entre les finalistes et la référence.
+
+Le gagnant admissible est sélectionné après confirmation. La référence est conservée si aucun candidat correct n’atteint la marge requise de 3 %. Les sorties fausses en confirmation restent des résultats négatifs : elles ne reçoivent pas de temps exploitable et ne peuvent pas gagner la sélection. Les temps de confirmation sont utilisés dans les tableaux de performance ; les temps de recherche servent à documenter le chemin de recherche.
+
+En notant T₀ la moyenne de la référence et T celle du programme retenu dans la même campagne, la réduction est g = 100 × (1 − T/T₀) %, l’accélération est S = T₀/T et le temps économisé est ΔT = T₀ − T. Ces quantités ne sont pas additives entre transformations ou entre sujets. Les tableaux donnent la moyenne et l’écart-type empirique des cinq chronométrages ; cet écart-type décrit la dispersion de mesure d’un exécutable, pas la variabilité de cinq recherches indépendantes. Les précautions de mesure et d’interprétation suivent les principes de transparence du benchmarking scientifique [3, 5].
+
+### 2.6. Mesures postérieures de montée en cœurs
+
+Les {{CPU_BATCHES}} lots CPU réexécutent uniquement des exécutables issus de campagnes reçues et auditées. Aucun candidat, oracle ou binaire n’est modifié ; il n’y a ni nouvel appel de modèle ni recompilation. Une allocation possède seize cœurs physiques ARM64, 16 Gio de mémoire et zéro GPU. Les affinités donnent successivement accès à 1, 2, 4, 8 et 16 cœurs. Chaque configuration reçoit une chauffe et cinq mesures, dans des ordres intercalés conservés.
+
+L’accélération de montée en cœurs vaut Sₚ = T₁/Tₚ pour le même binaire et la même entrée dans la même allocation ; son efficacité vaut Eₚ = Sₚ/p. Elle doit être distinguée de l’accélération par rapport au programme de référence à nombre de cœurs égal. Les rapports CPU/mural issus des compteurs du processus enfant servent de diagnostic d’occupation moyenne. Ils ne donnent pas une trace exacte du nombre de threads, et les coûts de lancement ou d’entrées/sorties restent inclus.
+
+L’unicité d’une mesure s’appuie sur le triplet empreinte du binaire, empreinte de l’entrée, nombre de cœurs. Les références partagées deviennent des alias, avec un reçu ; elles ne sont pas comptées comme des optimisations indépendantes. Les {{CPU_POINTS}} points comprennent {{CPU_UNIQUE}} combinaisons distinctes et {{CPU_REPEATED}} contrôles répétés entre allocations. Aucune moyenne ne fusionne ces allocations. Les grands jeux supplémentaires de count, dépourvus de sortie attendue dans le plan, sont comparés à la sortie de la référence canonique exécutée dans le lot ; les autres cas conservent leurs sorties attendues archivées. Cette différence de provenance de l’oracle reste visible dans les données d’audit.
+
+### 2.7. Comptabilité et audit de l’article
+
+La comptabilité native déduplique les appels par session et nonce. Le total exact connu est la somme des jetons d’entrée et de sortie ; les jetons d’entrée en cache sont déjà inclus dans l’entrée et les jetons de raisonnement dans la sortie. Une réservation ou une charge conservatrice d’expiration n’est jamais ajoutée à la consommation exacte. Les appels sans compteur final, les appels encore en cours et les sondes techniques restent identifiés. Les comptes Ollama sont conservés séparément des comptes natifs.
+
+La présente édition recalcule les résultats à partir de {{REGISTRY_COUNT}} registres SQLite ouverts en lecture seule et des {{CPU_BATCHES}} lots bruts. Elle vérifie les moyennes, les écarts-types, les médianes, les réductions, les rapports CPU/mural, les affinités, les tours intercalés et les identités d’entrée/binaire. Les empreintes des fichiers scientifiques sont contrôlées avant et après lecture. Cet audit documentaire n’exécute aucun programme candidat et n’ajoute aucune recherche. Les exports de calcul, le relevé des vérifications et l’index des sources permettent de distinguer les données reçues des résumés historiques.
+
+## 3. Résultats
+
+### 3.1. Vingt couples modèle–effort sur count 2023
+
+La figure 2 présente les vingt réductions confirmées. Les contrats et les entrées pertinents sont identiques entre cellules, mais chaque référence garde les chronométrages de son allocation. Dix-neuf cellules retiennent un programme modifié. Luna medium conserve la référence. Les résultats ne suivent pas une relation monotone simple avec l’effort : sur cette graine, Terra high dépasse Terra max, et Sol low dépasse Sol xhigh. Ces observations décrivent les recherches reçues ; elles ne permettent pas d’inférer une hiérarchie générale des efforts ou des modèles.
+
+![Figure 2 — Réduction confirmée du temps sur count 2023, en pourcentage de la référence de chaque cellule. Chaque case représente une seule recherche, graine 23. La référence conservée apparaît explicitement à 0 %. Les vingt contrats sont comparables ; les chronométrages de référence ne sont pas fusionnés. Les moyennes, écarts-types et coûts de chaque cellule figurent en annexe B.](edition-professionnelle/figures/count.png)
+
+{{TABLE_COUNT_SHORT}}
+
+Les 201 appels natifs de cette grille possèdent 3 311 561 jetons exacts connus ; sept appels restent non mesurés. Le nombre de sommets et les budgets effectivement consommés varient, notamment en présence d’interruptions ou de doublons. Ces différences limitent une lecture des gains comme un simple effet du modèle. L’ensemble LOW totalise cinquante appels et 743 280 jetons exacts ; les réparations internes éventuelles ne sont pas comptées comme de nouveaux sommets.
+
+### 3.2. Couvertures Luna, Astra et Terra MAX sur quatorze autres sujets
+
+Luna MAX et Astra MAX retiennent chacun un programme modifié sur douze des quatorze autres sujets ; tropical et Sokoban conservent leur référence. Les quatorze contrats sont identiques après exclusion du seul chronométrage de référence propre à chaque allocation. La figure 3 juxtapose les réductions confirmées des trois couvertures sans fusionner leurs temps ni calculer une moyenne de qualité générale. Chaque cellule possède une seule recherche et la graine 23 ; les écarts descriptifs ne constituent pas un classement des modèles. Les gains quicksort ne certifient pas la fidélité à l’algorithme demandé : la revue de l’hybride Luna ne qualifie pas automatiquement les programmes Astra ou Terra.
+
+![Figure 3 — Réductions confirmées des quatorze sujets pour Luna MAX, Astra MAX et Terra MAX. Les symboles ouverts indiquent une référence conservée. Chaque valeur vient d’une recherche distincte et de sa propre référence. Les barres ne représentent ni une probabilité de succès ni une significativité statistique ; les cinq temps sont disponibles en annexe. L’astérisque de quicksort signale la réserve de fidélité algorithmique.](edition-professionnelle/figures/luna.png)
+
+Luna compte 110 sommets notés et 154 appels, soit 3 774 478 jetons exacts ; neuf propositions sont réparées avec succès, avec deux doublons et un programme Jacobi 2021 incorrect conservés. Astra compte 40 sommets et 71 appels, soit 1 144 204 jetons exacts connus, avec 17 appels non mesurés et aucune réparation réussie. Ses 27 interruptions d’infrastructure, parmi 67 missions enregistrées, ne sont pas des programmes faux. La profondeur maximale des sommets notés est deux pour Luna et un pour Astra. Les plafonds de créneaux n’ont donc pas produit les mêmes parcours ni les mêmes dépenses ; une comparaison des seuls gains masquerait cette différence.
+
+Terra MAX confirme neuf programmes modifiés ; tropical, metrics 2021, Sokoban, somme 2023 et npbonacci conservent leur référence. Les réductions des programmes modifiés vont de 31,28 % à 98,80 % sur leurs charges préparées. Ses 47 missions comprennent 17 programmes valides, un incorrect et 29 interruptions d’infrastructure, pour 18 sommets mesurés. La réconciliation compte 58 invocations observées, 980 971 jetons exacts connus et 24 invocations sans compteur ; une requête expirée sans réponse n’a pas de consommation connue. La panne de transfert et la livraison tardive à octets identiques sont conservées, sans régénération. Les budgets maximaux, parcours effectifs et coûts incomplets empêchent d’en déduire un classement général. Aucun exécutable Terra de cette couverture n’a encore de mesure postérieure de montée en cœurs dans cette édition.
+
+L’exemple de la figure 4 montre la forêt reçue de k-NN Luna MAX. Les directions déclarées par les modèles et les transformations archivées sont des observations textuelles, et non une reconstruction de leur pensée interne. Les huit programmes notés ne sont pas les dix appels natifs de la cellule ; les épisodes de mère sont comptabilisés séparément.
+
+L’inspection des deux programmes retenus k-NN et N-body précise ce que ces gains recouvrent. Le premier remplace la maintenance linéaire des voisins par un tas maximal de taille bornée et utilise un ordinal pour conserver l’ordre des points à distance égale. Le second sépare les champs des particules en tableaux contigus et réutilise une région parallèle OpenMP entre les itérations, avec synchronisation des phases. Ces éléments sont présents dans le code conservé et cohérents avec les transformations déclarées. Ils décrivent les programmes produits ; aucune ablation ne permet d’attribuer une part du gain à chaque transformation isolée.
+
+![Figure 4 — Forêt réellement enregistrée pour k-NN 2022, Luna MAX. Les segments pleins représentent les parents de recherche ; les pointillés représentent les sources d’une intégration. Les racines A/B/C/G sont des rôles de structure. Chaque autre nœud correspond à un essai noté, identifié dans l’export JSON. Les couleurs indiquent le statut observable ; l’encadrement marque le programme retenu après confirmation. Les statuts des nœuds proviennent de la recherche ; la sélection encadrée provient de la confirmation.](edition-professionnelle/figures/arbre-exemple.png)
+
+### 3.3. DeepSeek : gains confirmés et rejets décisifs
+
+Les deux campagnes DeepSeek sont reçues et auditées sur k-NN, somme et N-body. Le tableau 4 donne leurs temps de confirmation. V4-Flash conserve un programme modifié sur les trois charges. Pour 0731, les deux finalistes k-NN échouent au premier cas de confirmation : la référence est donc gardée et le gain final vaut zéro. Présenter leur temps de recherche comme un gain final aurait inversé le sens du résultat.
+
+{{TABLE_DEEP}}
+
+Les deux campagnes totalisent 11 416 821 jetons exacts locaux. Le débit de décodage Ollama pondéré de 0731 est d’environ 62,35 jetons de sortie par seconde, calculé comme la somme des jetons de sortie divisée par la somme des durées de décodage. Il ne s’agit ni d’un débit entrée-plus-sortie, ni d’une mesure comparable à un décodage GPT hébergé non observé. Le premier auditeur supposait à tort tous les finalistes corrects ; son échec est conservé. Un lecteur séparé, testé positivement et négativement, a revérifié l’exclusion des candidats incorrects et la sélection du gagnant admissible sans modifier les programmes, l’oracle ou les seuils.
+
+### 3.4. Comparaison GPT avec et sans harnais
+
+Les six bras de la comparaison utilisent des recherches fraîches, avec vingt-quatre créneaux prévus par bras. Chaque paire possède les mêmes empreintes d’entrées. Les trois références sont toutefois chronométrées dans leurs bras respectifs. La figure 5 montre les temps des programmes finalement retenus ; le tableau 5 donne les réductions associées. Le bras avec harnais termine plus vite sur N-body, tandis que les deux autres paires présentent des résultats proches à l’échelle des gains relatifs.
+
+![Figure 5 — Temps de confirmation des programmes retenus dans les six bras GPT, en millisecondes. Les cinq points par bras sont les répétitions d’un même programme ; le trait et la barre indiquent moyenne et écart-type empirique. L’échelle est propre à chaque sujet. Une recherche par bras ne permet pas d’estimer la variabilité de la recherche ni un effet causal du harnais.](edition-professionnelle/figures/comparaison.png)
+
+{{TABLE_COMPARISON}}
+
+L’archive contient 126 requêtes livrées, dont 125 appels natifs et une expiration sans appel de génération. Le total exact connu est de 3 218 520 jetons, avec huit appels non mesurés. Cinquante-trois contrôles internes de développement sont enregistrés, sans réparation autonome réussie ni lecture documentaire spontanée. Trois intégrations G de somme avec harnais ont expiré lors de l’incident de transfert ; les événements, les réponses tardives et les livraisons depuis le cache sont conservés sans rejeu. D’autres expirations bornées du témoin somme restent également documentées.
+
+Cette comparaison démontre que les deux protocoles ont livré des programmes admissibles et mesurés sur les trois charges. Elle ne démontre pas que le harnais améliore généralement la recherche. L’absence de réplications indépendantes et l’exposition inégale aux incidents sont des facteurs de confusion explicites. Les écarts observés justifient des recherches répliquées ; ils ne constituent pas leur résultat.
+
+### 3.5. GPT96 : recherche sans harnais, bornée par ses budgets
+
+Les trois sujets de GPT96 sont reçus et audités avec cinq confirmations par référence et par finaliste admissible. Pour gpt-6.1-sol MAX sans assistance interne, les temps moyens de référence et du programme retenu sont respectivement 2,020260 et 0,014312 s sur k-NN, 0,126069 et 0,007741 s sur somme, puis 0,662318 et 0,061713 s sur N-body. Les réductions valent 99,29 %, 93,86 % et 90,68 %, sur les charges préparées de cette allocation. Les cinq temps, écarts-types, sources, parents et intégrations figurent en annexe D.1 et dans les trois forêts réelles de l’annexe G. Aucun nouveau diagnostic de montée en cœurs n’est ajouté pour ces exécutables.
+
+Chaque sujet atteint son budget avant de terminer les 96 créneaux prévus : 54, 54 et 75 missions sont effectivement enregistrées. Les 183 missions comprennent 153 valides, 23 erreurs d’infrastructure, quatre échecs de génération, deux échecs de compilation et une annulation au budget. Les 155 sommets notés incluent les deux compilations échouées et ne sont donc pas tous chronométrés. Le code de sortie Slurm FAILED 1:0 traduit le planning incomplet du lanceur figé ; les trois pipelines ont néanmoins achevé leurs confirmations reçues. Aucun résultat négatif n’est rejoué.
+
+Les 179 requêtes sont livrées et réconciliées, avec 177 invocations natives observées, 5 126 918 jetons exacts connus et 17 invocations sans compteur. Deux autres requêtes ont expiré avant toute invocation native établie. Le relais est arrêté après réception et audit. Le contexte natif de 65 536 et la réservation de 196 608 jetons par mission ne sont pas le paramètre de décodage des DeepSeek ; ces recherches ne forment pas une ablation strictement identique. Leur harnais désactivé ne correspond pas non plus au nouvel agent Codex avec outils, et elles ne comptent pas parmi les 300 nouvelles cellules source-only.
+
+### 3.6. Passage de un à seize cœurs
+
+Les {{CPU_BATCHES}} lots CPU couvrent {{CPU_CAMPAIGNS}} campagnes, dix identités de modèles, sept sujets et 47 entrées distinctes. Tous les points reçus passent leurs contrôles exacts dans ce périmètre fini. La figure 6 illustre trois comportements complémentaires : une montée en cœurs importante de N-body, une évolution presque plate du bucket sort Luna, et un changement de classement entre accélération relative et temps absolu pour les deux programmes N-body GPT.
+
+![Figure 6 — Diagnostics de montée en cœurs à binaire et entrée constants. À gauche, accélération par rapport à un cœur : N-body Luna et Astra, 4 096 particules, lots 07 et 10, et bucket sort Luna, 65 536 éléments, lot 07 ; les rapports sont descriptifs, sans intervalle d’incertitude estimé. À droite, temps absolus des deux programmes N-body GPT, 4 096 particules, lot 08, avec l’écart-type des cinq temps. Chaque courbe conserve son allocation.](edition-professionnelle/figures/coeurs.png)
+
+N-body Luna passe de 0,68080 s à un cœur à 0,04458 s à seize cœurs, soit S₁₆ = 15,27 et E₁₆ = 95,44 %. Son occupation moyenne CPU/mural atteint environ 14,84. Pour le bucket sort Luna, le programme retenu passe seulement de 0,00852 s à 0,00810 s : son gain important par rapport à la référence originale n’implique donc pas une montée en cœurs importante.
+
+Le lot 10 retrouve cette distinction sur les exécutables Astra reçus : N-body passe de 0,66747 s à 0,04643 s, soit S₁₆ = 14,38, avec une occupation moyenne d’environ 14,74 CPU. Aux plus grandes entrées respectives, les facteurs de k-NN, somme et bucket sort restent proches de un : 1,02, 1,06 et 1,04. Leurs gains contre la référence initiale ne suffisent donc pas à affirmer une utilisation efficace de seize cœurs. Ces rapports restent propres au lot 10 et ne constituent pas une comparaison de temps absolus avec le lot 07.
+
+Les deux programmes N-body GPT illustrent une autre distinction. Dans le lot 08, le programme du bras sans harnais passe de 0,61908 s à 0,04104 s, soit 15,09 fois. Celui du bras avec harnais passe de 0,30514 s à 0,02863 s, soit 10,66 fois. Le second reste le plus rapide à seize cœurs malgré une accélération relative inférieure, parce qu’il est déjà plus rapide à un cœur. Comparer seulement les facteurs de montée en cœurs aurait masqué ce résultat.
+
+Tropical et permutations sont beaucoup plus courts : leurs rapports T₁/T₁₆ valent respectivement environ 1,10 et 1,23 sur leurs entrées de benchmark. Leurs occupations moyennes restent inférieures à un cœur, et la dispersion de mesure est importante relativement à ces différences. Ces chiffres ne permettent pas d’affirmer une parallélisation effective. Les annexes fournissent toutes les tailles, les temps absolus, les écarts-types et les références correspondantes, y compris les comportements sans amélioration.
+
+### 3.7. Coût observé et résultats négatifs
+
+Le tableau 6 sépare les consommations exactes connues, les appels sans mesure et les protocoles. Pour les six ensembles natifs clos utilisés dans les résultats principaux, le total est de {{NATIVE_CLOSED_CALLS}} appels, dont {{NATIVE_CLOSED_UNKNOWN}} non mesurés, et de {{NATIVE_CLOSED_EXACT}} jetons exacts connus. Ce total est un minimum observé, pas une facture exhaustive. La requête Terra expirée sans réponse possède une consommation inconnue ; elle reste distincte des {{NATIVE_CLOSED_UNKNOWN}} appels observés sans mesure et des deux requêtes GPT96 expirées avant invocation. La figure 7 attribue ces jetons connus aux enfants, aux intégrations et à la mère, selon les rôles enregistrés.
+
+{{TABLE_COST}}
+
+![Figure 7 — Répartition des jetons natifs exacts connus dans les six ensembles clos. Les segments distinguent les enfants, les intégrations G et la mère modèle. Les parties inconnues ne sont pas remplacées par les réservations. L’absence de mère modèle dans les six bras de comparaison et GPT96 est une différence de protocole. Les reçus clos Terra et GPT96 remplacent leurs entrées historiques sans double compte. Cette figure décrit un coût observé ; elle ne classe pas l’efficacité générale des modèles.](edition-professionnelle/figures/couts.png)
+
+Les campagnes exploratoires restent disponibles sans être assimilées aux cohortes principales. Les six recherches Qwen 1,5B/3B avec harnais n’ont confirmé aucun gain, malgré 54 requêtes d’optimisation et 447 778 jetons. Les sondes documentaires imposées sont séparées des lectures spontanées. Les sélections corrigées Qwen 32B conservent la référence sur k-NN et des gains plus modestes sur somme et N-body. Le pilote GPT 747664 possède une archive de recherche reçue, mais aucune confirmation finale vérifiée dans les données conservées ; son meilleur temps de recherche n’est pas présenté comme un gain confirmé. L’annexe H conserve les 42 résumés historiques avec leur statut et leurs limites, sans les ajouter à un échantillon homogène.
+
+## 4. Discussion
+
+### 4.1. Ce que les observations établissent
+
+Les traces reçues montrent qu’une chaîne de génération, de recherche et de vérification peut produire des programmes sensiblement plus rapides que leurs références sur les charges préparées. Cette constatation dépend d’une sélection après confirmation : les résultats k-NN de DeepSeek 0731 montrent que le contrôle final peut supprimer entièrement un gain apparent de recherche. La conservation des références, des échecs et des finalistes exclus est donc une composante du résultat scientifique.
+
+Les diagnostics CPU montrent également que réduction de travail, accélération par rapport à une référence et utilisation de plusieurs cœurs sont trois dimensions distinctes. Une optimisation qui réduit fortement le travail séquentiel peut laisser peu de calcul parallélisable sur une petite entrée. Inversement, une bonne montée en cœurs ne garantit pas le meilleur temps absolu. Les figures de performance doivent permettre de lire ces deux aspects sans substituer un seul indicateur à l’autre.
+
+### 4.2. Limites de validité interne et statistique
+
+Une graine par cellule ne permet pas d’estimer la distribution des résultats d’une recherche stochastique. Les cinq mesures d’un finaliste réduisent l’incertitude sur son temps dans une allocation, mais ne créent pas cinq recherches indépendantes. Aucune valeur p, aucun intervalle de confiance entre modèles et aucun classement général ne sont donc calculés à partir de ces répétitions. Les écarts-types publiés restent descriptifs ; ils n’intègrent pas toute la variabilité entre jours, nœuds et décisions de recherche.
+
+La confirmation réduit certains biais de sélection sans constituer une preuve universelle. Les finalistes ont été choisis après exploration, et leurs performances peuvent encore dépendre du benchmark préparé. Le contrôle exact des cas finis ne prouve pas la correction pour toutes les entrées légales. L’utilisation de sources publiques expose aussi à une possible connaissance préalable des problèmes par les modèles ; les recherches fraîches et l’absence de candidats hérités n’éliminent pas cette possibilité.
+
+La comparaison du harnais possède en outre des incidents de transfert et des budgets effectivement consommés différents. Elle ne dispose ni de plusieurs graines ni d’un équilibrage expérimental suffisant pour isoler un effet causal. L’absence de consultation documentaire spontanée ou de réparation réussie dans ces six bras ne prouve pas que ces fonctions sont inutiles ; elle indique qu’elles n’ont pas contribué de manière observée dans ces recherches.
+
+### 4.3. Validité externe, conformité et reproductibilité
+
+Les entrées, les compilateurs et la cible ARM64 décrivent une expérience adaptée. Ils ne reproduisent pas intégralement les matériels, les jeux, les formules de score et les règles des concours historiques. Aucun rang officiel n’est déduit. Les traces statiques SIMD ou OpenMP ne constituent pas une preuve d’instructions exécutées ou de threads utiles. MPI reste conditionnel aux sujets et aux préparations, sans résultat multinœud ou GPU de candidat revendiqué ici.
+
+La conservation des sources, des empreintes, des registres et des réponses permet de reproduire les calculs et d’inspecter les décisions observables. Elle ne garantit pas qu’un service hébergé produira les mêmes programmes lors d’un nouvel appel. La reproductibilité documentaire, la répétabilité d’un chronométrage et la réplicabilité d’une recherche doivent donc rester distinguées. Les recommandations de benchmarking insistent précisément sur la description du contexte et des sources de variation [3, 5].
+
+### 4.4. Expériences restantes
+
+La comparaison préenregistrée suivante vise les quinze sujets admis et les vingt couples modèle–effort : 300 recherches fraîches en génération directe, puis 300 avec l’agent Codex et ses outils natifs, en regard de la référence R1 en cours. La génération directe conserve l’évaluation externe. Après clôture auditée de GPT96, le premier groupe source-only Luna MAX est lancé sous allocation 749843, avec déploiement vérifié ; aucun de ses résultats finaux n’est encore reçu. Le véritable adaptateur Codex reste non admis. L’ordre séquentiel, une seule graine par cellule et les conditions d’infrastructure limiteraient encore une interprétation causale. Des réplications avec plusieurs graines et distributions resteraient nécessaires pour établir une efficacité générale.
+
+R1 et source-only occupent les deux voies natives. La phase Codex attend les 300 issues directes reçues et auditées ainsi que ses preuves d’outils ARM64, d’isolation, de compteurs et de reprise. La couverture complète n’est pas garantie avant l’échéance exclusive du 31 octobre 2026 à 23 h UTC. La mère dynamique R4 reste conditionnelle aux voies et au temps disponibles, après les priorités de comparaison ; elle doit encore valider ses contrats natifs puis un pilote frais. Sa promesse est de choisir un nombre variable d’axes et de conseiller activement chaque branche à partir de son histoire propre, avec une récolte globale distincte. Les contrôles mécaniques reçus ne permettent pas d’anticiper son gain. Les statuts de ces travaux et des quarante idées du programme figurent dans les annexes, avec l’échéance de réception et de synthèse.
+
+## 5. Conclusion
+
+HPC-Forest met en évidence des améliorations confirmées sur des charges préparées, tout en montrant pourquoi la génération seule ne suffit pas à les établir. La sélection doit protéger les résultats négatifs, les références conservées et les rejets de confirmation. La comparaison des stratégies de recherche demande des réplications indépendantes ; la comparaison des exécutables demande des entrées, des binaires et des ressources précisément identifiés. Les {{CPU_BATCHES}} lots CPU complètent les gains de recherche par une mesure du comportement des programmes quand le nombre de cœurs augmente. L’ensemble fournit une base de preuves réanalysable pour les expériences suivantes, avec des conclusions limitées au périmètre effectivement reçu.
+
+## Disponibilité des données et transparence
+
+Cette édition comprend un article principal, des annexes techniques, les données de confirmation recalculées, les {{CPU_SAMPLES}} mesures CPU brutes et les comparaisons dérivées, ainsi qu’un index des sources et de leurs empreintes. Les archives antérieures restent conservées. Les données sont livrées avec le dossier de recherche local ; aucun dépôt public ou identifiant pérenne n’est revendiqué dans cette version. Les chemins techniques, identifiants de programmes, contrats détaillés et historiques se trouvent dans les annexes plutôt que dans le récit principal.
+
+Le rapport est un instantané d’une étude en cours. Les modèles et outils d’IA interviennent dans la génération expérimentale et dans l’assistance à la préparation éditoriale ; les calculs présentés sont produits par des scripts déterministes à partir des traces conservées. Les sorties de modèles sont traitées comme des données à vérifier. L’article et ses analyses ne sont pas fournis comme contexte aux modèles des campagnes.
+
+## Références
+
+[1] Inoue, Y., Misaki, K., Imajuku, Y., Kuroki, S., Nakamura, T. et Akiba, T. (2025). *Wider or Deeper? Scaling LLM Inference-Time Compute with Adaptive Branching Tree Search*. arXiv:2503.04412, version 5. [Texte et métadonnées](https://arxiv.org/abs/2503.04412v5).
+
+[2] Sakana AI. *TreeQuest — A Tree Search Library with Flexible API for LLM Inference-Time Scaling*. Implémentation utilisée : 0.3.2, vérifiée dans les environnements archivés. [Dépôt de référence](https://github.com/SakanaAI/treequest).
+
+[3] Hoefler, T. et Belli, R. (2015). *Scientific Benchmarking of Parallel Computing Systems*. Proceedings of SC ’15, article 73, 1–12. DOI : [10.1145/2807591.2807644](https://doi.org/10.1145/2807591.2807644). [Notice des auteurs](https://htor.inf.ethz.ch/publications/index.php?pub=222).
+
+[4] SBC, Marathon de programmation parallèle. *Archives des énoncés, sources, règles et environnements 2020–2023*. [2020](http://lspd.mackenzie.br/marathon/20/problems.html), [2021](http://lspd.mackenzie.br/marathon/21/problems.html), [2022](http://lspd.mackenzie.br/marathon/22/problems.html), [2023](http://lspd.mackenzie.br/marathon/23/problems.html). Les copies consultées et leurs empreintes sont indexées en annexe A ; les adaptations expérimentales restent explicites.
+
+[5] Kalibera, T. et Jones, R. (2013). *Rigorous Benchmarking in Reasonable Time*. Proceedings of ISMM ’13, 63–74. DOI : [10.1145/2464157.2464160](https://doi.org/10.1145/2464157.2464160). [Manuscrit et notice institutionnelle](https://kar.kent.ac.uk/33611/).

@@ -1,0 +1,203 @@
+"""Pure projections, static ordering, and negative neutral fixtures only.
+
+No source Worker.main, source matrix_worker.main, subprocess, CLI, or live cache
+is used. No positive authorization is fabricated or saved by these tests.
+"""
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+import bootstrap_worker as bootstrap
+
+
+@pytest.fixture
+def pins():
+    return bootstrap._load_pins()
+
+
+def arguments(tmp_path, pins, phase="roots"):
+    return {"phase": phase, "job_id": "999999", "output": str(tmp_path / "new-worker"), "pins": pins,
+            "authorization_ref": {"path": str(tmp_path / "not-admitted.json"), "sha256": "0" * 64},
+            "codex_config_ref": {"path": str(tmp_path / "private-config.toml"), "sha256": "1" * 64},
+            "owner_ref": {"path": str(tmp_path / "already-received-OWNER.json"), "sha256": "2" * 64}}
+
+
+def cli_args(values):
+    spec = bootstrap._spec(**values)
+    return ["--phase", values["phase"], "--job-id", values["job_id"], "--session-id", spec["session_id"],
+            "--channel", spec["channel"], "--output", values["output"],
+            "--authorization", values["authorization_ref"]["path"], "--authorization-sha256", values["authorization_ref"]["sha256"],
+            "--codex-config", values["codex_config_ref"]["path"], "--codex-config-sha256", values["codex_config_ref"]["sha256"],
+            "--owner", values["owner_ref"]["path"], "--owner-sha256", values["owner_ref"]["sha256"]]
+
+
+def forbid(*args, **kwargs):
+    raise AssertionError("Projection or refused fixture must never enter execution")
+
+
+def test_import_is_safe_without_reading_pins_config_or_source(monkeypatch):
+    source_path = Path(bootstrap.__file__)
+    before = {name for name in sys.modules if name == "hpc_forest" or name.startswith("hpc_forest.")}
+    monkeypatch.setattr(Path, "read_bytes", forbid)
+    monkeypatch.setattr(Path, "open", forbid)
+    monkeypatch.setattr(Path, "mkdir", forbid)
+    monkeypatch.setattr(bootstrap.importlib, "import_module", forbid)
+    spec = importlib.util.spec_from_file_location("neutral_import_only_bootstrap", source_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert callable(module.worker_argv)
+    assert before == {name for name in sys.modules if name == "hpc_forest" or name.startswith("hpc_forest.")}
+
+
+@pytest.mark.parametrize("phase", ["roots", "advice", "harvest", "pilot"])
+def test_argv_is_exact_native_abi_and_cell_without_io(tmp_path, pins, monkeypatch, phase):
+    values = arguments(tmp_path, pins, phase)
+    monkeypatch.setattr(Path, "read_bytes", forbid)
+    monkeypatch.setattr(Path, "open", forbid)
+    monkeypatch.setattr(Path, "mkdir", forbid)
+    monkeypatch.setattr(bootstrap, "_execute", forbid)
+    argv = bootstrap.worker_argv(**values)
+    session = bootstrap.SESSIONS[phase]
+    expected = ["--dependency-receipt", values["authorization_ref"]["path"], "--output", values["output"],
+                "--channel", "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session + "/results-999999/mailbox",
+                "--session-id", session, "--executable", pins["copied_cli_executable"],
+                "--codex-config", values["codex_config_ref"]["path"], "--required-jobs", bootstrap.SCOPE,
+                "--max-seconds", "3600" if phase == "pilot" else "900"]
+    assert argv == expected + ([] if phase == "pilot" else ["--once"])
+    assert not any(value in argv for value in ("--resume", "--transport-smoke", "--model", "--effort"))
+
+
+def test_dry_run_keeps_all_admission_claims_false_and_does_not_read_private_input(tmp_path, pins, monkeypatch, capsys):
+    values = arguments(tmp_path, pins)
+    config = Path(values["codex_config_ref"]["path"])
+    secret = b"NEUTRAL CONFIG BODY MUST NEVER BE PRINTED"
+    config.write_bytes(secret)
+    before = set(tmp_path.iterdir())
+    monkeypatch.setattr(bootstrap, "_load_pins", lambda: pins)
+    monkeypatch.setattr(bootstrap, "_hash_ref", forbid)
+    monkeypatch.setattr(bootstrap, "_read_ref", forbid)
+    monkeypatch.setattr(bootstrap, "_execute", forbid)
+    result = bootstrap.dry_run(**values)
+    assert result["verified"] is result["generation_admitted"] is result["execution_performed"] is False
+    assert result["model_calls"] == 0 and result["codex_config"] == values["codex_config_ref"]
+    assert bootstrap.main(cli_args(values)) == 0
+    printed = capsys.readouterr().out
+    assert secret.decode() not in printed and json.loads(printed)["verified"] is False
+    assert set(tmp_path.iterdir()) == before and config.read_bytes() == secret
+    assert not Path(values["output"]).exists()
+
+
+@pytest.mark.parametrize("violation", ["phase", "job", "session", "channel", "relative-output", "source-output",
+                                       "input-in-output", "relative-ref", "bad-sha", "extra-ref", "wrong-pins"])
+def test_projection_refuses_unrelated_or_ambiguous_arguments(tmp_path, pins, violation):
+    values = arguments(tmp_path, copy.deepcopy(pins))
+    if violation == "phase":
+        values["phase"] = "extension"
+    elif violation == "job":
+        values["job_id"] = "999999;not-a-job"
+    elif violation == "session":
+        values["session_id"] = bootstrap.SESSIONS["advice"]
+    elif violation == "channel":
+        values["channel"] = "/scratch_p/nimarano/unrelated/mailbox"
+    elif violation == "relative-output":
+        values["output"] = "relative-cache"
+    elif violation == "source-output":
+        values["output"] = str(bootstrap.SOURCE / "new-cache")
+    elif violation == "input-in-output":
+        values["owner_ref"]["path"] = str(Path(values["output"]) / "OWNER.json")
+    elif violation == "relative-ref":
+        values["codex_config_ref"]["path"] = "relative-config.toml"
+    elif violation == "bad-sha":
+        values["codex_config_ref"]["sha256"] = "missing"
+    elif violation == "extra-ref":
+        values["authorization_ref"]["verified"] = True
+    else:
+        values["pins"]["model"] = "gpt-6-astra"
+    with pytest.raises(bootstrap.BootstrapError):
+        bootstrap.worker_argv(**values)
+
+
+def test_execute_gate_is_never_implicit(tmp_path, pins, monkeypatch):
+    spec = bootstrap._spec(**arguments(tmp_path, pins))
+    monkeypatch.setattr(bootstrap, "_fresh_output", forbid)
+    monkeypatch.setattr(bootstrap, "_admission_module", forbid)
+    with pytest.raises(bootstrap.BootstrapError, match="explicit --execute"):
+        bootstrap._execute(spec)
+
+
+def test_explicit_execute_refuses_false_local_authorization_before_source_import(tmp_path, pins, monkeypatch, capsys):
+    values = arguments(tmp_path, pins)
+    path = Path(values["authorization_ref"]["path"])
+    raw = b'{"verified":false,"neutral_fixture_only":true,"secret":"NEVER PRINT THIS BODY"}'
+    path.write_bytes(raw)
+    values["authorization_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(bootstrap, "_load_pins", lambda: pins)
+    monkeypatch.setattr(bootstrap, "_verify_source", forbid)
+    monkeypatch.setattr(bootstrap, "_admission_module", forbid)
+    monkeypatch.setattr(bootstrap.importlib, "import_module", forbid)
+    assert bootstrap.main([*cli_args(values), "--execute"]) == 1
+    printed = capsys.readouterr().out
+    assert "NEVER PRINT THIS BODY" not in printed
+    assert json.loads(printed) == {"verified": False, "generation_admitted": False,
+                                  "execution_requested": True, "error": "BootstrapError"}
+    assert not Path(values["output"]).exists()
+
+
+def test_full_source_gate_refuses_fake_zip_without_importing_source(tmp_path, pins, monkeypatch):
+    fake = tmp_path / "neutral-fake-source.zip"
+    fake.write_bytes(b"NEUTRAL NOT AN ADMITTED ZIP")
+    selected = copy.deepcopy(pins)
+    selected["source_zip"]["path"] = str(fake)
+    monkeypatch.setattr(bootstrap, "_admission_module", forbid)
+    with pytest.raises(bootstrap.BootstrapError, match="Changed input bytes"):
+        bootstrap._verify_source(selected)
+
+
+@pytest.mark.parametrize("phase", ["roots", "advice", "harvest", "pilot"])
+def test_owner_schema_matches_actual_remote_stage_or_source_pilot(tmp_path, pins, phase):
+    spec = bootstrap._spec(**arguments(tmp_path, pins, phase))
+    marker = {"protocol": bootstrap.PROTOCOL, "session_id": spec["session_id"], "model": bootstrap.MODEL,
+              "reasoning_effort": "max", "owner" if phase == "pilot" else "job_id": "999999"}
+    bootstrap._owner(marker, spec)
+    for key, value in (("session_id", "0" * 32), ("model", "gpt-6-astra"), ("reasoning_effort", "high"),
+                       ("owner" if phase == "pilot" else "job_id", "1")):
+        wrong = {**marker, key: value}
+        with pytest.raises(bootstrap.BootstrapError):
+            bootstrap._owner(wrong, spec)
+    with pytest.raises(bootstrap.BootstrapError):
+        bootstrap._owner({**marker, "unexpected": True}, spec)
+
+
+def test_fresh_output_gate_does_not_reuse_or_create_cache(tmp_path, pins):
+    spec = bootstrap._spec(**arguments(tmp_path, pins))
+    bootstrap._fresh_output(spec)
+    output = Path(spec["output"])
+    assert not output.exists()
+    output.mkdir()
+    sentinel = output / "neutral-existing-cache.txt"
+    sentinel.write_text("PRESERVE")
+    with pytest.raises(bootstrap.BootstrapError, match="genuinely new"):
+        bootstrap._fresh_output(spec)
+    assert sentinel.read_text() == "PRESERVE"
+
+
+def test_source_identity_order_and_bootstrap_dispatch_are_static_contracts():
+    source = Path(bootstrap.__file__).read_text(encoding="utf8")
+    tree = ast.parse(source)
+    execute = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_execute")
+    execute_text = ast.get_source_segment(source, execute)
+    assert execute_text.index("_verify_source(") < execute_text.index("_admission_module()")
+    assert execute_text.index("validate_authorization(") < execute_text.index("verify_local_cli(")
+    assert execute_text.index("verify_local_cli(") < execute_text.index('import_module("hpc_forest.matrix_worker")')
+    assert execute_text.index("sys.argv =") < execute_text.index("return worker.main()")
+    matrix = (bootstrap.SOURCE / "src/hpc_forest/matrix_worker.py").read_text(encoding="utf8")
+    assert matrix.index('install_identity(identity["model"]') < matrix.index("from .codex_worker import main as run")
+    assert bootstrap._source_paths() == [str(bootstrap.SOURCE / "src"), str(bootstrap.SOURCE / "examples/marathon22")]

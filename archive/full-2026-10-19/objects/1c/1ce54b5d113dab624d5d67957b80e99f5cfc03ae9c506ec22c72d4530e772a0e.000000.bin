@@ -1,0 +1,152 @@
+"""Record local, bounded preparation evidence without measuring any candidate."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import random
+import subprocess
+import sys
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+from domain_review import input_domain
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent
+STUDY = ROOT / "outputs/HPC-Forest-Etude-2020-2024-r1"
+PROJECT = ROOT / "work/marathon-archive-mother-r1/project"
+SUBJECTS = ("2020-tropical", "2020-permutations")
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    observed = datetime.now(UTC)
+    target = HERE / "preuves" / observed.strftime("%Y%m%dT%H%M%S.%fZ")
+    target.mkdir(parents=True, exist_ok=False)
+    expected_zip = json.loads((STUDY / "coordinator-state.json").read_text(encoding="utf-8"))[
+        "source_zip_sha256"]
+    archive = STUDY / "HPC-Forest-Archives-Modele-Mere-r1.zip"
+    if sha(archive) != expected_zip:
+        raise RuntimeError("The frozen R1 source archive differs")
+    unchanged = {}
+    with zipfile.ZipFile(archive) as source:
+        for name in source.namelist():
+            if name.endswith("/"):
+                continue
+            member = Path(name)
+            if member.is_absolute() or ".." in member.parts:
+                raise RuntimeError("Unsafe frozen source member")
+            relative = member.relative_to("HPC-Forest")
+            path = PROJECT / relative
+            expected = hashlib.sha256(source.read(name)).hexdigest()
+            if not path.is_file() or sha(path) != expected:
+                raise RuntimeError("Frozen R1 source bytes differ: " + name)
+            unchanged[relative.as_posix()] = expected
+    pdf = ROOT / "outputs/HPC-Forest-Conformite-Sujets-r1/official-2020.pdf"
+    catalogue = json.loads((STUDY / "catalogue-sources.json").read_text(encoding="utf-8"))
+    expected_pdf = next(row["sha256"] for row in catalogue["files"]
+                        if row["year"] == 2020 and row["name"] == "problemset.pdf")
+    if sha(pdf) != expected_pdf:
+        raise RuntimeError("The dated official statement PDF differs")
+    archives = {}
+    for subject in (*SUBJECTS, "2020-quicksort"):
+        path = STUDY / "sources-officielles-restauration" / (subject + ".zip")
+        with zipfile.ZipFile(path) as stream:
+            archives[subject] = {"path": str(path), "sha256": sha(path),
+                                 "members": {name: hashlib.sha256(stream.read(name)).hexdigest()
+                                             for name in stream.namelist()}}
+    preparation = PROJECT / "examples/marathon22/archive_preparation.py"
+    tree = ast.parse(preparation.read_text(encoding="utf-8"))
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "text_input")
+    size_assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                           and any(isinstance(name, ast.Name) and name.id == "SIZES"
+                                   for name in node.targets))
+    sizes = ast.literal_eval(size_assignment.value)
+    namespace = {"random": random}
+    # Evaluate only the already-inspected input-format function. No compiler,
+    # prepare(), controller, model worker or candidate entry point is executed.
+    # All containing source bytes were checked against the frozen ZIP above;
+    # evaluate only this inspected input-format definition, not document text.
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(preparation), "exec"), namespace)  # noqa: S102
+    records = []
+    for subject in SUBJECTS:
+        calibration, tests = sizes[subject]
+        descriptions = [("calibration", n, 500 + i) for i, n in enumerate(calibration)]
+        descriptions += [("search", n, 1000 + i) for i, n in enumerate(tests)]
+        descriptions += [("confirmation", n + 1, 2000 + i) for i, n in enumerate(tests)]
+        for index, (phase, size, seed) in enumerate(descriptions):
+            raw = namespace["text_input"](subject, size, seed).encode("utf-8")
+            result = input_domain(subject, raw)
+            path = target / f"{subject}-{index:02d}-{phase}.in"
+            path.write_bytes(raw)
+            records.append({"subject": subject, "phase": phase, "size": size, "seed": seed,
+                            "path": str(path.relative_to(HERE)), "sha256": sha(path),
+                            "domain": result, "origin": "frozen R1 input-format function only",
+                            "received_campaign_input": False})
+    command = [sys.executable, "-m", "unittest", "-v", "test_domain_review"]
+    tests = subprocess.run(command, cwd=HERE, capture_output=True, text=True, encoding="utf-8", check=False)
+    (target / "tests.log").write_text(tests.stdout + tests.stderr, encoding="utf-8")
+    if tests.returncode != 0:
+        raise RuntimeError("Local reviewer tests failed; retain their diagnostic")
+    lint_command = [sys.executable, "-m", "ruff", "check", str(HERE)]
+    lint = subprocess.run(lint_command, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=False)
+    (target / "ruff.log").write_text(lint.stdout + lint.stderr, encoding="utf-8")
+    if lint.returncode != 0:
+        raise RuntimeError("Reviewer lint failed")
+    for name, expected in unchanged.items():
+        if sha(PROJECT / name) != expected:
+            raise RuntimeError("Frozen source changed during preparation review")
+    result = {"schema": "hpc-forest-posthoc-independent-domain-review-r3",
+              "observed_utc": observed.isoformat(), "local_preparation_checks_passed": True,
+              "test_count": 25, "test_command": command, "lint_command": lint_command,
+              "proof_directory": str(target.relative_to(HERE)), "prepared_subjects": list(SUBJECTS),
+              "input_format_fixtures_checked": len(records), "fixtures": records,
+              "official_statement": {"path": str(pdf), "sha256": expected_pdf,
+                                     "pages": {"2020-tropical": 4, "2020-permutations": 7,
+                                               "2020-quicksort": 5}},
+              "restoration_source_archives": archives,
+              "frozen_r1_source_zip_sha256": expected_zip,
+              "frozen_source_files_identical_before_after": len(unchanged),
+              "local_reviewer_source_sha256": {name: sha(HERE / name)
+                                                for name in ["domain_review.py", "test_domain_review.py",
+                                                             "verifier-preparation.py"]},
+              "actual_received_campaign_contracts_reviewed": 0,
+              "actual_reference_or_candidate_outputs_checked": 0,
+              "arm64_transport_validated": False, "new_measurement_submission_authorized": False,
+              "model_calls": 0, "candidate_edits": 0, "compilations": 0,
+              "new_measurements": 0, "reports_injected_into_models": False,
+              "remaining": ["Receive and audit the R1 coverage group before consuming its artifacts",
+                            "Check each actual frozen contract, input and reference output independently",
+                            "Retain exact-byte comparison alongside the additional semantic checks",
+                            "Build an isolated measurement preparation and dedicated audit extension",
+                            "Validate that extension under a real ARM64 allocation before measurement",
+                            "Exclude every earlier full campaign root and all six closed plans"]}
+    write(target / "validation.json", result)
+    write(HERE / "validation-preparation.json", result)
+    write(HERE / "MANIFEST-PREPARATION.json", {
+        "schema": "hpc-forest-local-preparation-manifest-v1", "observed_utc": observed.isoformat(),
+        "scope": "offline reviewer preparation only; not measurements or a model campaign",
+        "files": {path.relative_to(HERE).as_posix(): sha(path)
+                  for path in HERE.rglob("*") if path.is_file()
+                  and "__pycache__" not in path.parts
+                  and path.name != "MANIFEST-PREPARATION.json"}})
+    print(json.dumps({"local_preparation_checks_passed": True, "tests": 25,
+                      "input_format_fixtures_checked": len(records),
+                      "frozen_source_files_unchanged": len(unchanged),
+                      "actual_campaign_outputs_checked": 0,
+                      "new_measurement_submission_authorized": False,
+                      "validation": str(HERE / "validation-preparation.json")}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

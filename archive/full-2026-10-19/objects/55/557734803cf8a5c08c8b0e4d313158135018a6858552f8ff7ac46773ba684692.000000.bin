@@ -1,0 +1,160 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#define N_ITER 10
+#define DT 0.01f
+#define SOFTENING 1e-9f
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+void read_dataset(int *nbodies, float **px, float **py, float **pz,
+                  float **vx, float **vy, float **vz) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading nbodie value\n"); exit(EXIT_FAILURE); }
+  int n = *nbodies;
+  Body *tmp = (Body *)malloc((size_t)n * sizeof(Body));
+  b = fread(tmp, (size_t)n * sizeof(Body), 1, stdin);
+  if (b != 1) { fprintf(stderr,"\nError reading input values\n"); exit(EXIT_FAILURE); }
+  *px = (float*)malloc((size_t)n*sizeof(float));
+  *py = (float*)malloc((size_t)n*sizeof(float));
+  *pz = (float*)malloc((size_t)n*sizeof(float));
+  *vx = (float*)malloc((size_t)n*sizeof(float));
+  *vy = (float*)malloc((size_t)n*sizeof(float));
+  *vz = (float*)malloc((size_t)n*sizeof(float));
+  for (int i=0;i<n;i++){
+    (*px)[i] = tmp[i].x;
+    (*py)[i] = tmp[i].y;
+    (*pz)[i] = tmp[i].z;
+    (*vx)[i] = tmp[i].vx;
+    (*vy)[i] = tmp[i].vy;
+    (*vz)[i] = tmp[i].vz;
+  }
+  free(tmp);
+}
+
+void write_dataset(const int nbodies, float *px, float *py, float *pz,
+                   float *vx, float *vy, float *vz) {
+  Body *out = (Body*)malloc((size_t)nbodies*sizeof(Body));
+  for (int i=0;i<nbodies;i++){
+    out[i].x = px[i];
+    out[i].y = py[i];
+    out[i].z = pz[i];
+    out[i].vx = vx[i];
+    out[i].vy = vy[i];
+    out[i].vz = vz[i];
+  }
+  int b = fwrite(out, (size_t)nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) { fprintf(stderr,"\nError writing to output\n"); exit(EXIT_FAILURE); }
+  free(out);
+}
+
+static void compute_body(const float *restrict px,
+                         const float *restrict py,
+                         const float *restrict pz,
+                         float *restrict vx,
+                         float *restrict vy,
+                         float *restrict vz,
+                         int n, int i) {
+    float xi = px[i];
+    float yi = py[i];
+    float zi = pz[i];
+
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    int j = 0;
+
+    // Unroll the inner loop by 4 to reduce overhead and improve ILP.
+    for (; j + 3 < n; j += 4) {
+        // body j
+        float dx = px[j] - xi;
+        float dy = py[j] - yi;
+        float dz = pz[j] - zi;
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1.0f / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+
+        // body j+1
+        dx = px[j+1] - xi;
+        dy = py[j+1] - yi;
+        dz = pz[j+1] - zi;
+        sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        inv_dist = 1.0f / sqrt(sqrd_dist);
+        inv_dist3 = inv_dist * inv_dist * inv_dist;
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+
+        // body j+2
+        dx = px[j+2] - xi;
+        dy = py[j+2] - yi;
+        dz = pz[j+2] - zi;
+        sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        inv_dist = 1.0f / sqrt(sqrd_dist);
+        inv_dist3 = inv_dist * inv_dist * inv_dist;
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+
+        // body j+3
+        dx = px[j+3] - xi;
+        dy = py[j+3] - yi;
+        dz = pz[j+3] - zi;
+        sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        inv_dist = 1.0f / sqrt(sqrd_dist);
+        inv_dist3 = inv_dist * inv_dist * inv_dist;
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+    }
+
+    for (; j < n; ++j) {
+        float dx = px[j] - xi;
+        float dy = py[j] - yi;
+        float dz = pz[j] - zi;
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1.0f / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+        fx += dx * inv_dist3;
+        fy += dy * inv_dist3;
+        fz += dz * inv_dist3;
+    }
+
+    vx[i] += DT*fx;
+    vy[i] += DT*fy;
+    vz[i] += DT*fz;
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  float *px,*py,*pz,*vx,*vy,*vz;
+  read_dataset(&nbodies,&px,&py,&pz,&vx,&vy,&vz);
+
+#pragma omp parallel
+{
+    for (int iter = 0; iter < N_ITER; ++iter) {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < nbodies; ++i) {
+            compute_body(px, py, pz, vx, vy, vz, nbodies, i);
+        }
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < nbodies; ++i) {
+            px[i] += vx[i] * DT;
+            py[i] += vy[i] * DT;
+            pz[i] += vz[i] * DT;
+        }
+    }
+}
+
+  write_dataset(nbodies, px, py, pz, vx, vy, vz);
+
+  free(px); free(py); free(pz);
+  free(vx); free(vy); free(vz);
+  exit(EXIT_SUCCESS);
+}

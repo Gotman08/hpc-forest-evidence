@@ -1,0 +1,168 @@
+"""Interface-only R1 relay recovery; use the frozen worker and never replay claims."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+PROJECT = ROOT.parents[1] / "work/marathon-archive-mother-r1/project"
+sys.path.insert(0, str(PROJECT / "src"))
+
+from hpc_forest import codex_worker as original
+from hpc_forest.codex_mailbox import bounded_json, sha256
+from hpc_forest.core import InfrastructureError
+from hpc_forest.native_matrix import SCOPE, install_identity, validate_receipt
+
+OriginalWorker = original.Worker
+
+
+def frozen_source(archive: Path, project: Path, expected: str) -> int:
+    if archive.is_symlink() or sha256(archive.read_bytes()) != expected:
+        raise InfrastructureError("Frozen R1 archive changed")
+    count = 0
+    with zipfile.ZipFile(archive) as bundle:
+        for item in bundle.infolist():
+            if item.is_dir():
+                continue
+            if not item.filename.startswith("HPC-Forest/"):
+                raise InfrastructureError("Unexpected R1 archive root")
+            path = project / item.filename.removeprefix("HPC-Forest/")
+            if (not path.resolve().is_relative_to(project.resolve())
+                    or path.is_symlink() or not path.is_file()
+                    or path.read_bytes() != bundle.read(item)):
+                raise InfrastructureError("Frozen R1 file changed")
+            count += 1
+    return count
+
+
+def cache_state(output: Path, session: str) -> set[str]:
+    """Verify existing evidence before acknowledging already-delivered nonces."""
+    delivered = set()
+    if not output.exists():
+        raise InfrastructureError("Recovery requires the existing worker directory")
+    for folder in output.iterdir():
+        if not re.fullmatch(r"[0-9a-f]{32}", folder.name):
+            continue
+        if folder.is_symlink() or not folder.is_dir():
+            raise InfrastructureError("Unsafe cache directory")
+        request_file = folder / "downloaded-request.json"
+        if not request_file.exists():
+            if any(folder.iterdir()):
+                raise InfrastructureError("Cache evidence without request")
+            continue
+        request = bounded_json(request_file)
+        original.validate_request(request, session, folder.name)
+        digest = sha256(request_file.read_bytes())
+        claim = folder / "generation-claimed.json"
+        if claim.exists() and bounded_json(claim).get("request_sha256") != digest:
+            raise InfrastructureError("Claim does not match the saved request")
+        if (folder / "invocation.json").exists() and not claim.exists():
+            raise InfrastructureError("Invocation without a preserved claim")
+        response_file = folder / "response.json"
+        if not response_file.exists():
+            if (folder / "delivered.json").exists():
+                raise InfrastructureError("Delivered marker without response")
+            continue
+        response = bounded_json(response_file)
+        expected = {key: request[key] for key in
+                    ("protocol", "nonce", "session_id", "model", "reasoning_effort")}
+        expected["request_sha256"] = digest
+        if any(response.get(key) != value for key, value in expected.items()):
+            raise InfrastructureError("Response envelope differs from the saved request")
+        response_hash = sha256(response_file.read_bytes())
+        ready = folder / "response-ready.json"
+        if ready.exists() and bounded_json(ready) != {
+                "sha256": response_hash, "bytes": response_file.stat().st_size}:
+            raise InfrastructureError("Cached ready marker changed")
+        marker = folder / "delivered.json"
+        if marker.exists():
+            receipt = bounded_json(marker)
+            if (not ready.exists() or receipt.get("request_sha256") != digest
+                    or receipt.get("response_sha256") != response_hash):
+                raise InfrastructureError("Cached delivery marker changed")
+            delivered.add(folder.name)
+    return delivered
+
+
+def record(output: Path, event: str, **values) -> None:
+    with (output / "resume-events.jsonl").open("a", encoding="utf8") as stream:
+        stream.write(json.dumps({"utc_epoch": time.time(), "event": event, **values}) + "\n")
+
+
+class ResumedWorker(OriginalWorker):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.completed.update(cache_state(self.output, self.session_id))
+
+    async def handle(self, name: str):
+        nonce = name.split(".")[0]
+        if nonce in self.completed:
+            return False
+        saved = self.output / nonce / "response.json"
+        old_hash = sha256(saved.read_bytes()) if saved.exists() else None
+        claimed = (self.output / nonce / "generation-claimed.json").exists()
+        result = await super().handle(name)
+        if old_hash is not None and sha256(saved.read_bytes()) != old_hash:
+            raise InfrastructureError("A cached response changed during retransmission")
+        if result:
+            record(self.output, "request_delivered", nonce=nonce,
+                   had_response=old_hash is not None, was_claimed=claimed)
+        return result
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--resume", action="store_true", required=True)
+    parser.add_argument("--channel", required=True)
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--codex-config", type=Path, required=True)
+    parser.add_argument("--dependency-receipt", type=Path, required=True)
+    parser.add_argument("--required-jobs", nargs="+", default=[SCOPE])
+    parser.add_argument("--max-seconds", type=int, required=True)
+    parser.add_argument("--executable", default="codex")
+    parser.add_argument("--poll-seconds", type=float, default=2)
+    args = parser.parse_args()
+    if not 1 <= args.max_seconds <= 43200 or args.poll_seconds <= 0:
+        parser.error("Recovery must stay within the original relay time cap")
+    args.output = args.output.resolve()
+    args.transport_smoke = False
+    args.once = False
+    return args
+
+
+async def serve(args):
+    receipt = validate_receipt(args.dependency_receipt, set(args.required_jobs))
+    if receipt["session_id"] != args.session_id:
+        raise InfrastructureError("Recovery session differs from the authorization")
+    install_identity(receipt["model"], receipt["effort"], args.dependency_receipt)
+    frozen_source(Path(receipt["source_zip"]["path"]), PROJECT,
+                  receipt["source_zip"]["sha256"])
+    completed = cache_state(args.output, args.session_id)
+    record(args.output, "recovery_validated", delivered_cache=len(completed),
+           scope=SCOPE, session_id=args.session_id, source_modified=False)
+    original.Worker = ResumedWorker
+    deadline = time.monotonic() + args.max_seconds
+    failures = 0
+    while time.monotonic() < deadline:
+        args.max_seconds = max(1, int(deadline - time.monotonic()))
+        try:
+            return await original.main_async(args)
+        except Exception as exc:
+            failures += 1
+            record(args.output, "relay_failure", consecutive_failures=failures,
+                   exception_type=type(exc).__name__, error=str(exc)[:1600])
+            if failures >= 3:
+                raise
+            await asyncio.sleep(min(30, max(0, deadline - time.monotonic())))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(serve(parse_arguments())))

@@ -1,0 +1,97 @@
+"""Extract only explicitly authorized system error-item and loader-WARN diagnostics.
+
+Four immutable, SHA-bound received logs only. Never selects assistant, prompt,
+tool, reasoning, request or candidate fields. Never opens referenced global files.
+"""
+import hashlib
+import json
+import re
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[3]
+PRIOR = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2d/revue-etat-relance-0918/AUDIT-REFUS-STRICTS-SOL-ASTRA.json'
+PRIOR_SHA = '5efebd45cb6469c4587ac6178b028c51af66e7556b73d49232e3bdd2dec25aec'
+COLD = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2d/premier-demarrage-attempt2'
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def technical_only(text):
+    # Refuse a possible secret instead of writing or displaying its contents.
+    if re.search(r'(?i)Bearer\s+[A-Za-z0-9._~-]{16,}|sk-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}', text):
+        raise ValueError('Possible secret in system diagnostic; no verbatim export')
+    if not isinstance(text, str) or not text or len(text) > 16000:
+        raise ValueError('Unexpected system message size/type')
+    return text
+
+
+def main():
+    prior_bytes = PRIOR.read_bytes()
+    assert digest(prior_bytes) == PRIOR_SHA
+    prior = json.loads(prior_bytes)
+    unique = {}
+    calls = []
+    for row in prior['rows']:
+        for call in row['frozen_named_calls']:
+            received = call['received_stream']
+            assert set(received) == {'path', 'sha256'}
+            path = Path(received['path'])
+            assert path.resolve().is_relative_to(COLD.resolve()) and path.name == call['nonce'] + '.codex.jsonl'
+            raw = path.read_bytes()
+            assert digest(raw) == received['sha256'] == call['raw_stream']['sha256']
+            selected = []
+            errors = warnings = 0
+            for line_number, line_bytes in enumerate(raw.splitlines(keepends=True), 1):
+                line = line_bytes.rstrip(b'\r\n')
+                if b'codex_agent_roles::loader' in line and b'WARN' in line and not line.lstrip().startswith(b'{'):
+                    text = technical_only(line.decode('utf8'))
+                    kind = 'system_WARN_codex_agent_roles_loader'
+                    warnings += 1
+                elif re.search(rb'"type"\s*:\s*"error"', line):
+                    # Parse only candidate system-error lines, then require the exact
+                    # event/item discriminants and a closed error-item shape.
+                    event = json.loads(line)
+                    item = event.get('item')
+                    if event.get('type') != 'item.completed' or not isinstance(item, dict) or item.get('type') != 'error':
+                        continue
+                    assert set(item) <= {'id', 'type', 'message'}
+                    text = technical_only(item['message'])
+                    kind = 'system_item_type_error'
+                    errors += 1
+                else:
+                    # In particular no assistant/prompt/candidate/reasoning body is parsed.
+                    continue
+                key = (kind, text)
+                if key not in unique:
+                    unique[key] = {'id': 'D' + str(len(unique) + 1).zfill(2), 'kind': kind,
+                                   'verbatim_technical_message': text, 'message_utf8_sha256': digest(text.encode('utf8'))}
+                selected.append({'diagnostic_id': unique[key]['id'], 'line': line_number,
+                                 'original_line_bytes_sha256': digest(line_bytes)})
+            assert errors == 5 and warnings == 10
+            assert digest(path.read_bytes()) == received['sha256']
+            calls.append({'job_id': row['job_id'], 'nonce': call['nonce'], 'mother_call': call['mother_call'],
+                          'received_stream': received, 'system_error_items': errors, 'loader_WARN_lines': warnings,
+                          'selected_system_diagnostic_locations': selected})
+    assert len(calls) == 4 and digest(PRIOR.read_bytes()) == PRIOR_SHA
+    report = {'schema': 'hpc-forest-r3-frozen-system-diagnostic-extraction-v1', 'verified': True,
+              'scope': 'Only four prior-audited frozen logs and system error-item/loader-WARN messages',
+              'prior_audit': {'path': str(PRIOR), 'sha256': PRIOR_SHA}, 'calls': calls,
+              'unique_system_messages_including_per-line_timestamp': list(unique.values()),
+              'total_system_error_items': 20, 'total_loader_WARN_lines': 40,
+              'other_diagnostic_categories_not_opened_by_this_extraction': ['analytics warning'],
+              'assistant_prompt_tool_reasoning_candidate_fields_selected': False,
+              'global_role_config_credentials_or_instruction_files_opened': False,
+              'live_cache_worker_process_CLI_model_MCP_or_network_action': False,
+              'all_original_inputs_sha_unchanged': True, 'native_admission': False}
+    target = HERE / 'DIAGNOSTICS-SYSTEME-EXTRAITS.json'
+    with target.open('x', encoding='utf8', newline='\n') as stream:
+        json.dump(report, stream, indent=2); stream.write('\n')
+    print(json.dumps({'report_path': str(target), 'sha256': digest(target.read_bytes()),
+                      'system_messages_only': list(unique.values())}))
+
+
+if __name__ == '__main__':
+    main()

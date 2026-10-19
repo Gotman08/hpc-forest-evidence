@@ -1,0 +1,43 @@
+import hashlib,json,shlex,shutil,tarfile
+from pathlib import Path
+here=Path('work/marathon-deepseek'); payload=here/'smoke-payload-r2'; payload.mkdir()
+src=here/'sources'
+for slug,repo,revision,treefile in [
+ ('v4flash','ggml-org/DeepSeek-V4-Flash-GGUF','978ae54096b5c8fc08eaa7c2f0c35a15093bc963','v4flash-tree.json'),
+ ('v4flash0731','ggml-org/DeepSeek-V4-Flash-0731-GGUF','f559fd6005309e5f6bd650342ee8711ff189b3b8','v4-0731-gguf.txt')]:
+ tree=json.loads((src/treefile).read_text())
+ files=[{'name':x['path'],'bytes':x['size'],'sha256':x['lfs']['oid'],'url':f'https://huggingface.co/{repo}/resolve/{revision}/{x["path"]}'} for x in tree if '-MXFP4-' in x['path']]
+ spec={'format':'hpc-forest-local-gguf-v1','model':f'hpcforest-deepseek-{slug}:mxfp4','upstream':repo,'revision':revision,'glob':files[0]['name'].replace('00001-of-00002','*'),'files':files,'architecture':'deepseek4','quantization':'native MXFP4/FP8','operator_algorithm_assistance':False}
+ (here/(slug+'.json')).write_text(json.dumps(spec,indent=2)+'\n',encoding='utf8');shutil.copyfile(here/(slug+'.json'),payload/(slug+'.json'))
+for p in ['local_model.py','smoke.py']:shutil.copyfile(here/p,payload/p)
+wheel=Path('work/marathon-v10b/dist/hpc_forest-0.1.0-py3-none-any.whl');shutil.copyfile(wheel,payload/wheel.name)
+manifest={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in payload.iterdir()}
+(payload/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n',encoding='utf8')
+archive=here/'deepseek-smoke-r2.tar.gz'
+with tarfile.open(archive,'w:gz') as t:t.add(payload,arcname='payload')
+sha=hashlib.sha256(archive.read_bytes()).hexdigest()
+root='/scratch_p/nimarano/hpc-forest-deepseek-20261015-smoke-r2'
+inner=f'''set -euo pipefail
+archive=/scratch_p/nimarano/deepseek-smoke-20261015-r2.tar.gz
+root={root}
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+test ! -e "$root"
+printf '%s  %s\\n' '{sha}' "$archive" | sha256sum -c -
+mkdir "$root"
+tar -xzf "$archive" --strip-components=1 -C "$root"
+"$py" - "$root" <<'PY'
+import hashlib,json,sys,zipfile
+from pathlib import Path
+r=Path(sys.argv[1])
+for n,h in json.loads((r/'manifest.json').read_text()).items():
+ assert hashlib.sha256((r/n).read_bytes()).hexdigest()==h,n
+with zipfile.ZipFile(next(r.glob('*.whl'))) as z:z.extractall(r/'runtime')
+PY
+export PYTHONPATH="$root/runtime"
+export PYTHONDONTWRITEBYTECODE=1
+exec "$py" "$root/smoke.py" --spec "$root/v4flash0731.json" --root "$root/results-$SLURM_JOB_ID" --ollama /scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/tools/ollama-0.40.4/bin/ollama
+'''
+(here/'smoke-r2-command.sh').write_text(inner,encoding='utf8',newline='\n')
+(here/'smoke-r2-command.json').write_text(json.dumps({'command':'bash -c '+shlex.quote(inner),'root':root,'archive_sha256':sha},indent=2),encoding='utf8')
+print(json.dumps({'sha256':sha,'bytes':archive.stat().st_size}))
+

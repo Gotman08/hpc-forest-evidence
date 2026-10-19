@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n#include <stdint.h>\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n/* Evaluate the original double sqrt/divide before rounding to float. */\nstatic inline __attribute__((always_inline))\nfloat32x4_t reference_inv_dist4(float32x4_t distance) {\n  const float64x2_t one = vdupq_n_f64(1.0);\n  float64x2_t low = vcvt_f64_f32(vget_low_f32(distance));\n  float64x2_t high = vcvt_f64_f32(vget_high_f32(distance));\n  low = vdivq_f64(one, vsqrtq_f64(low));\n  high = vdivq_f64(one, vsqrtq_f64(high));\n  return vcombine_f32(vcvt_f32_f64(low), vcvt_f32_f64(high));\n}\n#endif\n\n/*\n * Compute the gravitational impact among all pairs of bodies in\n * the system.\n */\nvoid body_force(Body *p, float dt, int n) {\n  int i = 0;\n#if defined(__aarch64__) && defined(__ARM_NEON)\n  const int vector_end = n - n % 4;\n  const int source_end = n - n % 3;\n  const float32x4_t softening = vdupq_n_f32(SOFTENING);\n  for (; i < vector_end; i += 4) {\n    const float32x4_t x = {p[i].x, p[i+1].x, p[i+2].x, p[i+3].x};\n    const float32x4_t y = {p[i].y, p[i+1].y, p[i+2].y, p[i+3].y};\n    const float32x4_t z = {p[i].z, p[i+1].z, p[i+2].z, p[i+3].z};\n    float32x4_t fx = vdupq_n_f32(0.0f);\n    float32x4_t fy = vdupq_n_f32(0.0f);\n    float32x4_t fz = vdupq_n_f32(0.0f);\n\n    /* Independent targets occupy SIMD lanes; source sums stay ordered. */\n    int j = 0;\n    for (; j < source_end; j += 3) {\n      float32x4_t dx0 = vdupq_n_f32(p[j].x) - x;\n      float32x4_t dy0 = vdupq_n_f32(p[j].y) - y;\n      float32x4_t dz0 = vdupq_n_f32(p[j].z) - z;\n      float32x4_t distance0 =\n          dx0*dx0 + dy0*dy0 + dz0*dz0 + softening;\n\n      float32x4_t dx1 = vdupq_n_f32(p[j+1].x) - x;\n      float32x4_t dy1 = vdupq_n_f32(p[j+1].y) - y;\n      float32x4_t dz1 = vdupq_n_f32(p[j+1].z) - z;\n      float32x4_t distance1 =\n          dx1*dx1 + dy1*dy1 + dz1*dz1 + softening;\n\n      float32x4_t dx2 = vdupq_n_f32(p[j+2].x) - x;\n      float32x4_t dy2 = vdupq_n_f32(p[j+2].y) - y;\n      float32x4_t dz2 = vdupq_n_f32(p[j+2].z) - z;\n      float32x4_t distance2 =\n          dx2*dx2 + dy2*dy2 + dz2*dz2 + softening;\n\n      float32x4_t inv0 = reference_inv_dist4(distance0);\n      float32x4_t inv1 = reference_inv_dist4(distance1);\n      float32x4_t inv2 = reference_inv_dist4(distance2);\n      float32x4_t inv3_0 = inv0 * inv0 * inv0;\n      float32x4_t inv3_1 = inv1 * inv1 * inv1;\n      float32x4_t inv3_2 = inv2 * inv2 * inv2;\n\n      fx += dx0 * inv3_0;\n      fy += dy0 * inv3_0;\n      fz += dz0 * inv3_0;\n      fx += dx1 * inv3_1;\n      fy += dy1 * inv3_1;\n      fz += dz1 * inv3_1;\n      fx += dx2 * inv3_2;\n      fy += dy2 * inv3_2;\n      fz += dz2 * inv3_2;\n    }\n\n    for (; j < n; ++j) {\n      float32x4_t dx = vdupq_n_f32(p[j].x) - x;\n      float32x4_t dy = vdupq_n_f32(p[j].y) - y;\n      float32x4_t dz = vdupq_n_f32(p[j].z) - z;\n      float32x4_t sqrd_dist = dx*dx + dy*dy + dz*dz + softening;\n      float32x4_t inv_dist = reference_inv_dist4(sqrd_dist);\n      float32x4_t inv_dist3 = inv_dist * inv_dist * inv_dist;\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*vgetq_lane_f32(fx, 0);\n    p[i].vy += dt*vgetq_lane_f32(fy, 0);\n    p[i].vz += dt*vgetq_lane_f32(fz, 0);\n    p[i+1].vx += dt*vgetq_lane_f32(fx, 1);\n    p[i+1].vy += dt*vgetq_lane_f32(fy, 1);\n    p[i+1].vz += dt*vgetq_lane_f32(fz, 1);\n    p[i+2].vx += dt*vgetq_lane_f32(fx, 2);\n    p[i+2].vy += dt*vgetq_lane_f32(fy, 2);\n    p[i+2].vz += dt*vgetq_lane_f32(fz, 2);\n    p[i+3].vx += dt*vgetq_lane_f32(fx, 3);\n    p[i+3].vy += dt*vgetq_lane_f32(fy, 3);\n    p[i+3].vz += dt*vgetq_lane_f32(fz, 3);\n  }\n#endif\n\n  for (; i < n; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n\n  /*\n   * At each simulation iteration, interbody forces are computed,\n   * and bodies' positions are integrated.\n   */\n  for (int iter = 0; iter < N_ITER; iter++) {\n    body_force(bodies, DT, nbodies);\n\n    for (int i = 0; i < nbodies; i++) {\n      bodies[i].x += bodies[i].vx * DT;\n      bodies[i].y += bodies[i].vy * DT;\n      bodies[i].z += bodies[i].vz * DT;\n    }\n  }\n\n  write_dataset(nbodies, bodies);\n\n  free(bodies);\n\n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "Three-source unrolling across four independent NEON targets can overlap exact double sqrt/divide chains and eliminate guarded-estimate overhead without reordering force sums.",
+    "notes": "Scalar cleanup, repeated-call behavior, and I/O remain unchanged. Not executed locally.",
+    "sources_kept": [],
+    "transformations": [
+      "Replace guarded reciprocal-square-root estimates with NEON binary64 square roots and divisions followed by binary32 conversion.",
+      "Unroll the SIMD source loop by three while preserving ascending source accumulation order for every target.",
+      "Retain source and target remainder loops for arbitrary valid sizes."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "1dfe18e65a064e06a2141e546b67bdb6",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "f61bab9d949ea46ba0ab8e615d8e462ff41be89db8a5b55830df3af16d883cdf",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "1d29bac87a1c07e4369745f97d29e459fb1e1257ce5ef2019b65e3459b7d3ffd",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 19086,
+        "output_tokens": 10442,
+        "reasoning_output_tokens": 7881
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 29528,
+    "tool_events": []
+  }
+}

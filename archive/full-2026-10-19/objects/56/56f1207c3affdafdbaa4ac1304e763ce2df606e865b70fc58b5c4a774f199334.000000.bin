@@ -1,0 +1,46 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include \"knn.h\"\n#include <stddef.h>\n#ifdef _OPENMP\n#include <omp.h>\n#else\nstatic int omp_get_max_threads(void) { return 1; }\nstatic int omp_get_thread_num(void) { return 0; }\nstatic int omp_get_num_threads(void) { return 1; }\n#endif\n\ntypedef struct {\n    float distance;\n    size_t order;\n    char label;\n} Candidate;\n\nstatic int candidate_precedes(const Candidate *a, const Candidate *b) {\n    if (a->distance < b->distance) return 1;\n    if (a->distance > b->distance) return 0;\n    return a->order < b->order;\n}\n\nstatic int compare_candidates(const void *left, const void *right) {\n    const Candidate *a = (const Candidate *)left;\n    const Candidate *b = (const Candidate *)right;\n    if (candidate_precedes(a, b)) return -1;\n    if (candidate_precedes(b, a)) return 1;\n    return 0;\n}\n\n/* Keep the worst retained candidate at the root for inexpensive replacement. */\nstatic void heap_offer(Candidate *heap, size_t *count, size_t capacity,\n                      Candidate value) {\n    if (*count < capacity) {\n        size_t pos = (*count)++;\n        while (pos > 0) {\n            size_t parent = (pos - 1) / 2;\n            if (!candidate_precedes(&heap[parent], &value)) break;\n            heap[pos] = heap[parent];\n            pos = parent;\n        }\n        heap[pos] = value;\n    } else if (candidate_precedes(&value, &heap[0])) {\n        size_t pos = 0;\n        for (;;) {\n            size_t left = pos * 2 + 1;\n            if (left >= *count) break;\n            size_t worse = left;\n            size_t right = left + 1;\n            if (right < *count &&\n                candidate_precedes(&heap[left], &heap[right])) {\n                worse = right;\n            }\n            if (!candidate_precedes(&value, &heap[worse])) break;\n            heap[pos] = heap[worse];\n            pos = worse;\n        }\n        heap[pos] = value;\n    }\n}\n\nchar knn(int n_groups, Group *groups, int k, Point to_evaluate) {\n    size_t *offsets = (size_t *)malloc(((size_t)n_groups + 1) * sizeof(*offsets));\n    offsets[0] = 0;\n    for (int i = 0; i < n_groups; i++) {\n        offsets[(size_t)i + 1] = offsets[(size_t)i] + (size_t)groups[i].length;\n    }\n    size_t total_points = offsets[(size_t)n_groups];\n    size_t requested = (size_t)k;\n    size_t selected = total_points < requested ? total_points : requested;\n\n    char *labels = (char *)malloc(requested * sizeof(*labels));\n    for (size_t i = 0; i < requested; i++) labels[i] = (char)-1;\n\n    if (selected > 0) {\n        int max_threads = omp_get_max_threads();\n        if (max_threads < 1) max_threads = 1;\n        size_t thread_slots = (size_t)max_threads;\n        Candidate **heaps = (Candidate **)calloc(thread_slots, sizeof(*heaps));\n        size_t *counts = (size_t *)calloc(thread_slots, sizeof(*counts));\n        size_t *positions = (size_t *)calloc(thread_slots, sizeof(*positions));\n\n        /* Contiguous, balanced ranges give static scheduling without point-level\n           scheduling overhead; each worker reduces into its private top-k heap. */\n        #pragma omp parallel\n        {\n            int thread_id = omp_get_thread_num();\n            size_t team_size = (size_t)omp_get_num_threads();\n            size_t tid = (size_t)thread_id;\n            size_t quotient = total_points / team_size;\n            size_t remainder = total_points % team_size;\n            size_t begin = quotient * tid + (tid < remainder ? tid : remainder);\n            size_t local_length = quotient + (tid < remainder ? 1 : 0);\n            size_t local_capacity = local_length < selected ? local_length : selected;\n            Candidate *heap = local_capacity > 0\n                ? (Candidate *)malloc(local_capacity * sizeof(*heap))\n                : NULL;\n            size_t count = 0;\n\n            for (size_t flat = begin; flat < begin + local_length; flat++) {\n                size_t low = 0;\n                size_t high = (size_t)n_groups;\n                while (low < high) {\n                    size_t mid = low + (high - low) / 2;\n                    if (offsets[mid + 1] <= flat) low = mid + 1;\n                    else high = mid;\n                }\n\n                size_t group_index = low;\n                size_t point_index = flat - offsets[group_index];\n                Point point = groups[group_index].points[point_index];\n                Candidate candidate;\n                candidate.distance = euclidean_distance_no_sqrt(to_evaluate, point);\n                candidate.order = flat;\n                candidate.label = groups[group_index].label;\n                heap_offer(heap, &count, local_capacity, candidate);\n            }\n\n            heaps[thread_id] = heap;\n            counts[thread_id] = count;\n        }\n\n        for (int t = 0; t < max_threads; t++) {\n            if (counts[t] > 1) {\n                qsort(heaps[t], counts[t], sizeof(*heaps[t]), compare_candidates);\n            }\n        }\n\n        /* Merge the sorted private candidate lists by (distance, encounter order). */\n        for (size_t out = 0; out < selected; out++) {\n            int best_thread = -1;\n            for (int t = 0; t < max_threads; t++) {\n                if (positions[t] >= counts[t]) continue;\n                if (best_thread < 0 ||\n                    candidate_precedes(&heaps[t][positions[t]],\n                                       &heaps[best_thread][positions[best_thread]])) {\n                    best_thread = t;\n                }\n            }\n            if (best_thread < 0) break;\n            labels[out] = heaps[best_thread][positions[best_thread]].label;\n            positions[best_thread]++;\n        }\n\n        for (int t = 0; t < max_threads; t++) free(heaps[t]);\n        free(positions);\n        free(counts);\n        free(heaps);\n    }\n\n    qsort(labels, requested, sizeof(char), compare_for_sort);\n\n    char most_frequent = labels[0];\n    int most_frequent_count = 1;\n    int current_frequency = 1;\n\n    for (int i = 1; i < k; i++) {\n        if (labels[i] != labels[i - 1]) {\n            if (current_frequency > most_frequent_count) {\n                most_frequent = labels[i - 1];\n                most_frequent_count = current_frequency;\n            }\n\n            current_frequency = 1;\n        } else {\n            current_frequency++;\n        }\n\n        if (i == k - 1 && current_frequency > most_frequent_count) {\n            most_frequent = labels[i - 1];\n            most_frequent_count = current_frequency;\n        }\n    }\n\n    free(labels);\n    free(offsets);\n    return most_frequent;\n}\n\nint main() {\n    int n_groups = parse_number_of_groups();\n\n    Group *groups = (Group *)malloc(sizeof(Group) * n_groups);\n\n    for (int i = 0; i < n_groups; i++) {\n        groups[i] = parse_next_group();\n    }\n\n    int k = parse_k();\n    Point to_evaluate = parse_point();\n\n    printf(\"%c\", knn(n_groups, groups, k, to_evaluate));\n}\n",
+        "path": "src/knn.c"
+      }
+    ],
+    "hypothesis": "A balanced contiguous OpenMP partition of the flattened point set, combined with per-thread max-heaps and a deterministic merge, should remove shared updates and improve the scan cost from O(P*k) insertion work to O(P log k). It may help most when the point set and k are large enough to offset heap, sorting, and merge overhead.",
+    "notes": "Only src/knn.c is changed; no experiment source IDs were supplied. The local candidate storage can reach O(P) when k is large, and each point incurs a group-offset search. No commands or measurements were run; the controller should evaluate correctness and performance.",
+    "sources_kept": [],
+    "transformations": [
+      "Build group prefix offsets and statically divide the flattened points into balanced contiguous ranges across the OpenMP team.",
+      "Give each thread a private max-heap capped at min(k, its assigned point count), avoiding locks and retaining only its locally best candidates.",
+      "Order candidates by squared distance and encounter index, sort each private candidate list, then merge the lists deterministically before applying the existing label sort and vote behavior.",
+      "Preserve the baseline -1 label padding when fewer than k points are available and keep all per-call state local."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-luna",
+  "nonce": "df7c66cf31eb4994b4ae2b6a19778f92",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "c8bd4240a32f10c3a9207e19ebfcb5b8291c245cbc7eafd9bab75c96b40e3468",
+  "session_id": "bb7a58941e74486ba24267f2f526de8f",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "9044556723116c83e2607d0b8f6c1b2e972576c68eb56acbe5acece0e55840dc",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 11235,
+        "output_tokens": 22590,
+        "reasoning_output_tokens": 20446
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-luna",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 33825,
+    "tool_events": []
+  }
+}

@@ -1,0 +1,84 @@
+"""Neutral counterexample: possible owned child born after the prior census."""
+import copy
+import hashlib
+import importlib.util
+import json
+import subprocess
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def forbidden(*_args, **_kwargs):
+    raise AssertionError("No process/remote operation in neutral review")
+
+
+subprocess.run = forbidden
+subprocess.Popen = forbidden
+path = HERE.parent / "source_only_state.py"
+assert hashlib.sha256(path.read_bytes()).hexdigest() == "617816e7b028460a16a2bc301f81913d2c45001a0d856569306f9940d149d3d8"
+spec = importlib.util.spec_from_file_location("review_neutral_so_state", path)
+state = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(state)
+
+
+def stamp(when):
+    return datetime.fromtimestamp(when, UTC).isoformat().replace("+00:00", "Z")
+
+
+def census(rows, when):
+    return {"schema": "hpc-forest-dynamic-r4b-full-cim-v1", "complete_census": True,
+            "strict_utf8_decoding": True, "rows_count": len(rows), "rows": rows, "captured_at_utc": stamp(when)}
+
+
+def main():
+    out = HERE / "contre-exemple-descendant-post-prior"
+    out.mkdir(exist_ok=False)
+    now = float(int(time.time()))
+    command = "NEUTRAL ONLY worker " + state.SO_SESSION
+    pair = [{"ProcessId": pid, "ParentProcessId": parent, "ExecutablePath": "C:/NEUTRAL/python.exe",
+             "CommandLine": command, "CreationDate": stamp(now - 100)} for pid, parent in [(9001, 1), (9002, 9001)]]
+    foreign = {"ProcessId": 0, "ParentProcessId": 0, "ExecutablePath": None, "CommandLine": None, "CreationDate": None}
+
+    def save(name, value):
+        target = out / name
+        target.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        return {"path": str(target), "sha256": state.digest(target)}
+
+    prior = save("NEUTRAL-prior.json", census(pair, now - 20))
+    observations = []
+    for name, opaque in [("late_full_child", False), ("late_opaque_child", True)]:
+        child = {"ProcessId": 9003, "ParentProcessId": 9002,
+                 "ExecutablePath": None if opaque else "C:/NEUTRAL/ssh.exe",
+                 "CommandLine": None if opaque else "NEUTRAL ONLY transport without session in command",
+                 "CreationDate": stamp(now - 10)}
+        after = save("NEUTRAL-after-" + name + ".json", census([foreign, child], now - 2))
+        proof = {"schema": "hpc-forest-passive-owned-pair-absence-v1", "subject": "source-only", "verified": True,
+                 "no_stop_or_replay": True, "job_id": "751592", "session_id": state.SO_SESSION,
+                 "source_zip_sha256": state.SO_SOURCE, "owned_full_identities": pair, "owned_descendants": [],
+                 "prior_full_cim": prior, "fresh_full_cim": after, "observed_at": now - 1, "evidence_refs": [prior, after]}
+        current = census([foreign, copy.deepcopy(child)], now)
+        try:
+            actual = state.verify_absence(proof, pair, current, now=now)
+        except ValueError as exc:
+            observations.append({"case": name, "refused": True, "error": str(exc)})
+        else:
+            observations.append({"case": name, "refused": False, "accepted_owned_count": len(actual),
+                                 "still_present_possible_descendant": child,
+                                 "prior_captured": stamp(now - 20), "child_born": stamp(now - 10),
+                                 "after_captured": stamp(now - 2), "current_captured": stamp(now)})
+    result = {"schema": "neutral-owned-descendant-post-prior-counterexample-v1", "all_data_invented": True,
+              "reviewed_module": {"path": str(path), "sha256": state.digest(path)}, "cases": observations,
+              "counterexample_accepted": any(not r["refused"] for r in observations),
+              "live_process_CIM_CLI_RPC_model_calls": 0,
+              "scope": "Possible owned children born after prior census must not be adopted, but their unresolved presence cannot prove full owned-tree absence."}
+    target = HERE / "CONTRE-EXEMPLE-DESCENDANT-POST-PRIOR.json"
+    assert not target.exists()
+    target.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"path": str(target), "sha256": state.digest(target), "cases": observations}))
+
+
+if __name__ == "__main__":
+    main()

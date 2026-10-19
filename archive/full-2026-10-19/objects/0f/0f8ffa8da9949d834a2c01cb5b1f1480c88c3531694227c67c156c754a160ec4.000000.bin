@@ -1,0 +1,109 @@
+#include <iostream>
+#include <vector>
+#include <cstdio>
+#include <cassert>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+int main() {
+    int n, s;
+    if (!(std::cin >> n >> s)) return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const int width = n - s + 1;
+    std::vector<int> row(n);
+    std::vector<std::int64_t> horizontal_sums(width);
+    std::vector<long long> vertical_sums(width, 0);
+    std::unique_ptr<long long[]> history(
+        new long long[static_cast<std::size_t>(s) * width]);
+
+    long long max_sum = std::numeric_limits<long long>::lowest();
+    int slot_index = 0;
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j)
+            std::scanf("%d", &row[j]);
+
+        long long horizontal = 0;
+        #pragma omp simd reduction(+:horizontal)
+        for (int j = 0; j < s; ++j)
+            horizontal += static_cast<long long>(row[j]);
+
+        horizontal_sums[0] = horizontal;
+        int j = 1;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        const int64x2_t zero = vdupq_n_s64(0);
+        int64x2_t carry = vdupq_n_s64(horizontal);
+        for (; j + 3 < width; j += 4) {
+            const int32x4_t entering = vld1q_s32(row.data() + j + s - 1);
+            const int32x4_t leaving = vld1q_s32(row.data() + j - 1);
+            int64x2_t low = vsubl_s32(vget_low_s32(entering),
+                                      vget_low_s32(leaving));
+            int64x2_t high = vsubl_high_s32(entering, leaving);
+
+            // Inclusive scan of four widened deltas, independent of carry.
+            low = vaddq_s64(low, vextq_s64(zero, low, 1));
+            high = vaddq_s64(high, vextq_s64(zero, high, 1));
+            high = vaddq_s64(high, vdupq_laneq_s64(low, 1));
+
+            low = vaddq_s64(low, carry);
+            high = vaddq_s64(high, carry);
+            vst1q_s64(horizontal_sums.data() + j, low);
+            vst1q_s64(horizontal_sums.data() + j + 2, high);
+            carry = vdupq_laneq_s64(high, 1);
+        }
+        horizontal = vgetq_lane_s64(carry, 0);
+#endif
+        // Scalar remainder, also the fallback when NEON is unavailable.
+        for (; j < width; ++j) {
+            horizontal += static_cast<long long>(row[j + s - 1])
+                        - static_cast<long long>(row[j - 1]);
+            horizontal_sums[j] = horizontal;
+        }
+
+        long long* slot = history.get()
+                       + static_cast<std::size_t>(slot_index) * width;
+        long long* totals = vertical_sums.data();
+        const std::int64_t* incoming = horizontal_sums.data();
+
+        if (i < s) {
+            // Initialize each ring slot before it can be read.
+            #pragma omp simd
+            for (int j = 0; j < width; ++j) {
+                totals[j] += incoming[j];
+                slot[j] = incoming[j];
+            }
+
+            if (i == s - 1) {
+                #pragma omp simd reduction(max:max_sum)
+                for (int j = 0; j < width; ++j)
+                    max_sum = std::max(max_sum, totals[j]);
+            }
+        } else {
+            // Columns are independent; consume outgoing values before reuse.
+            #pragma omp simd reduction(max:max_sum)
+            for (int j = 0; j < width; ++j) {
+                const long long next = totals[j] - slot[j] + incoming[j];
+                totals[j] = next;
+                slot[j] = incoming[j];
+                max_sum = std::max(max_sum, next);
+            }
+        }
+
+        if (++slot_index == s) slot_index = 0;
+    }
+
+    std::printf("%lld\n", max_sum);
+    return 0;
+}

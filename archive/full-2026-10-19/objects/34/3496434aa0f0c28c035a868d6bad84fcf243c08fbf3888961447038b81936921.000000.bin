@@ -1,0 +1,157 @@
+"""Pure pre-start validation. Never starts a process, CLI, model or transport."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+
+HERE=Path(__file__).resolve().parent
+FACTORY=HERE.parent
+F_SHA='9449b360ed8608e3858d0e332db150cffc2e27b22421c412d3005fcc4c849715'
+FIELDS={'schema','source_bindings','factory_review','historical_r2d_closure','publication_readbacks','ready_upload_results','worker_argv'}
+
+
+def load(path,name):
+    spec=importlib.util.spec_from_file_location(name,path)
+    module=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def pinned(path,expected):
+    if not path.is_file() or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
+        raise ValueError('Changed local executable module before import')
+    return path
+
+
+pinned(FACTORY/'preparer-cellule-max.py','2e3b38c7b262f289ed27cbafb7b8741d6e01ea452f666cdaf12316ad9316985a')
+f=load(pinned(FACTORY/'assembler-admissions-cellule.py',F_SHA),'owned_attempt2_factory')
+m=f.m
+
+
+def option(argv,key):
+    m.require(argv.count(key)==1 and argv.index(key)+1<len(argv),'Exact one worker option required')
+    return argv[argv.index(key)+1]
+
+
+def verify_argv(spec,auth,argv_ref):
+    session=auth['session_id']
+    authorization=Path(argv_ref['path']).parent/'authorization-local.json'
+    policy_path=m.POLICY_DIRECTORY/('cli-policy-'+session+'.json')
+    policy_ref=m.ref(policy_path)
+    m.checked_task_cli_policy(policy_ref,auth['job_id'],m.read(m.artifact(auth['artifacts']['cli_identity'])))
+    expected=[str(m.PYTHON_LOCAL),'-B','-u','-m','hpc_forest.r2max_worker','--channel',
+        auth['remote_root']+'/results-'+auth['job_id']+'/mailbox','--session-id',session,
+        '--output',str(m.LAUNCH/('worker-'+session)),'--codex-config',str(m.CONFIG),
+        '--dependency-receipt',str(authorization),'--required-jobs',m.SCOPE,
+        '--max-seconds','10800','--executable',str(m.CLI),
+        '--cli-policy',str(policy_path),'--cli-policy-sha256',policy_ref['sha256']]
+    m.require(set(spec)=={'argv','cwd','environment','executed'} and spec['argv']==expected
+        and spec['cwd']==str(m.PROJECT) and spec['environment']=={'PYTHONPATH':str(m.PROJECT/'src'),
+            'PYTHONUTF8':'1','PYTHONDONTWRITEBYTECODE':'1'} and spec['executed'] is False,
+        'Worker argv/environment differs from the exact factory-produced command')
+    m.require(not any(re.search(r'[\s"\r\n]',arg) for arg in expected),
+        'This narrow workspace launcher requires exact generated arguments without whitespace/quotes')
+    cache=Path(option(expected,'--output'))
+    m.require(not cache.exists(),'Existing worker cache/claim forbids a fresh start; reconcile without replay')
+    return cache
+
+
+def validate(value,census_ref):
+    m.require(isinstance(value,dict) and set(value)==FIELDS
+        and value['schema']=='hpc-forest-r2e-owned-worker-launch-input-v1','Closed owned-launch input required')
+    m.require(m.sha(FACTORY/'assembler-admissions-cellule.py')==F_SHA,'Reviewed factory changed')
+    read=lambda ref:m.read(m.artifact(ref))
+    m.configure(value['source_bindings'],'gpt-6-astra')
+    review=read(value['factory_review']);f.check_factory_review(review)
+    lane=f.lane_module();state=lane.source_state()
+    m.require(value['historical_r2d_closure']==lane.verify_historical_r2d_closure(),
+        'Exact historical R2d closure required separately from fresh R2e evidence')
+    current=read(census_ref);rows,captured=state.complete_census(current,fresh=True)
+    cold_path=m.BASE/'outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r2/operations-parent-lane-close-20261018T0542/reception-sortie-naturelle/RECEPTION-COLD-METADONNEES.json'
+    m.require(m.sha(cold_path)==lane.COLD_RECEPTION_SHA,'Historical full ownership inventory changed')
+    cold=m.read(cold_path);prior_cim=read(cold['prior_full_cim']);cold_cim=read(cold['cold_full_cim'])
+    before,_=state.complete_census(prior_cim);cold_rows,_=state.complete_census(cold_cim)
+    owned=cold['ownership_inventory']
+    m.require(len(owned)==14 and not state._unresolved_descendants(owned,(before,cold_rows,rows),captured_at=[
+        prior_cim['captured_at_utc'],cold_cim['captured_at_utc'],current['captured_at_utc']]),'Unresolved prior possible descendants block start')
+    state._absent_owned(owned,rows)
+    for row in rows:
+        executable=Path(row.get('ExecutablePath') or '').name.casefold();command=row.get('CommandLine') or ''
+        m.require(not ((not executable or executable.startswith('python')) and
+            (re.search(r'hpc_forest(?:\.|[/\\])',command,re.IGNORECASE) or 'bootstrap_worker.py' in command.casefold())),
+            'A native worker is already present or opaque; no new three-worker start')
+    publication=load(pinned(FACTORY/'publication-locale.py','2054e0e6964408919aa06e117fb380275407a1b778601cb342c87eed0641df26'),'owned_r2e_publication')
+    report=read(value['publication_readbacks'])
+    m.require(report.get('schema')=='hpc-forest-max-cap4-cohort-readbacks-reconciled-v1'
+        and report.get('directory_readback_bytes_reconciled') is True and report.get('source_zip_sha256')==m.SOURCE
+        and report.get('plan_sha256')==m.PLAN and len(report.get('evidence',[]))==3,'Three actual complete readbacks required')
+    publications={}
+    for item in report['evidence']:
+        pub,_=publication.verify_one(item)
+        m.require(pub['model'] not in publications,'Duplicate cohort publication')
+        publications[pub['model']]=pub
+    m.require(set(publications)==set(value['ready_upload_results'])==set(value['worker_argv'])==set(m.CELLS),
+        'Exact three worker/readback/ready identities required')
+    jobs,workers,checks=set(),[],{}
+    for item in [value['source_bindings'],value['factory_review'],value['historical_r2d_closure'],value['publication_readbacks'],census_ref]:
+        m.artifact(item);checks[item['path']]={'sha256':item['sha256']}
+    for model in m.CELLS:
+        m.configure(value['source_bindings'],model);f.check_factory_review(review)
+        module=m.native()
+        argv_ref=value['worker_argv'][model];argv_path=m.artifact(argv_ref)
+        m.require(argv_path.name=='worker-argv-only.json' and argv_path.is_relative_to(FACTORY),'Only actual owned factory argv files allowed')
+        spec=m.read(argv_path);auth_path=argv_path.parent/'authorization-local.json'
+        auth=module.validate_receipt(auth_path,{m.SCOPE},runtime=False,prepared=False,initial_lane=True)
+        m.require(auth['model']==model and auth['session_id']==m.CELLS[model]
+            and auth['job_id'] not in {'752619','752620','752621','752650','752651','752652'},'Wrong or previous job/session')
+        cache=verify_argv(spec,auth,argv_ref)
+        ready=m.read(argv_path.parent/'authorization-ready.json');remote_auth=argv_path.parent/'authorization-remote.json'
+        pub=publications[model];remote='/scratch_p/nimarano/'+m.SCOPE+'-admission-'+m.CELLS[model]
+        m.require(pub['job_id']==auth['job_id'] and pub['remote_root']==remote
+            and pub['inventory']['authorization.json']['sha256']==m.sha(remote_auth)
+            and ready.get('sha256')==m.sha(remote_auth) and ready.get('job_id')==auth['job_id']
+            and ready.get('session_id')==m.CELLS[model],'Readback/auth/ready linkage differs')
+        result_ref=value['ready_upload_results'][model]
+        result=read(result_ref);checks[result_ref['path']]={'sha256':result_ref['sha256']}
+        result=result.get('structuredContent',result)
+        ready_sha=m.sha(argv_path.parent/'authorization-ready.json')
+        m.require(result.get('ok') is True and result.get('verifie') is True
+            and result.get('sent')==str(argv_path.parent/'authorization-ready.json')
+            and result.get('to')==remote+'/authorization-ready.json' and result.get('remote_sha256')==ready_sha,
+            'All three exact ready uploads must be verified before any worker start')
+        for name,pin in m.CLI_FILES.items():
+            path=m.CLI.parent/name
+            m.require(m.sha(path)==pin,'One of the four pinned CLI companions changed')
+            checks[str(path)]={'sha256':pin}
+        for item in [argv_ref,m.ref(auth_path),m.ref(remote_auth),m.ref(argv_path.parent/'authorization-ready.json')]:
+            checks[item['path']]={'sha256':item['sha256']}
+        policy_ref=m.ref(m.POLICY_DIRECTORY/('cli-policy-'+m.CELLS[model]+'.json'))
+        checks[policy_ref['path']]={'sha256':policy_ref['sha256']}
+        m.require(auth['job_id'] not in jobs,'Duplicate actual new job')
+        jobs.add(auth['job_id'])
+        workers.append({'model':model,'job_id':auth['job_id'],'session_id':m.CELLS[model],
+            'argv_ref':argv_ref,'spec':spec,'cache':str(cache),'intent_path':str(argv_path.parent/'worker-launch-intent.json'),
+            'expected_executable_paths':[str(m.PYTHON_LOCAL),str(Path(sys._base_executable).resolve())]})
+    return {'schema':'hpc-forest-r2e-owned-launch-plan-v1','validated':True,'executed':False,
+        'workers':workers,'immutable_file_checks':checks,'census':census_ref,'observed_at':captured,
+        'maximum_native_workers':4,'native_workers_before_start':0,'CLI_pins_verified':4,
+        'previous_owned_identities_absent':14,'unknown_native_workers_present':False,'model_calls_by_validator':0}
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    for flag in ('input','census','output'):parser.add_argument('--'+flag,type=Path,required=True)
+    for flag in ('input-sha256','census-sha256'):parser.add_argument('--'+flag,required=True)
+    args=parser.parse_args();value=m.read(m.artifact({'path':str(args.input.resolve()),'sha256':args.input_sha256}))
+    result=validate(value,{'path':str(args.census.resolve()),'sha256':args.census_sha256})
+    with args.output.open('x',encoding='utf8') as stream:json.dump(result,stream,indent=2)
+    print(json.dumps({'plan':m.ref(args.output),'workers_started':0}))
+    return 0
+
+
+if __name__=='__main__':raise SystemExit(main())

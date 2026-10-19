@@ -1,0 +1,209 @@
+"""Invented files only: portable parser/qualification guards, no models or census."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+c = load("NEUTRAL_portable_chain", HERE / "chain_contract.py")
+n = load("NEUTRAL_portable_normalisation", HERE / "reader/normalisation_native.py")
+audit = load("NEUTRAL_portable_auditor", HERE / "reader/receipt_native.py")
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf8")
+    return {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def neutral_q(tmp_path):
+    # These bytes are labelled as fixtures and can never be actual allocation
+    # evidence: only the pure contract checker is exercised here.
+    manifest = "a" * 64
+    archive = save(tmp_path / "NEUTRAL-archive.json", {"fixture_only": True})
+    record = {**c.BASE_IDENTITY, "verified": True, "native_model_calls": 0, "adapter_revision": c.Q_REVISION,
+              "source_file_count": 105, "allocated_contract_tests_returncode": 0,
+              "adapter_components_manifest_sha256": manifest,
+              "source_lane_contract_tests": {"passed": 26, "failed": 0},
+              "adapter_portable_tests": {"passed": 1, "failed": 0},
+              "allocation": {"architecture": "ARM64", "cpu_cores": 4, "tasks": 1, "nodes": 1,
+                             "allocated_memory_mib": 16384, "allocated_gpus": 0, "slurm_job_id": "999999"}}
+    report = save(tmp_path / "NEUTRAL-qualification.json", record)
+    audited = {**c.BASE_IDENTITY, "schema": "hpc-forest-dynamic-r4b-independent-mechanical-audit-v1",
+               "verified": True, "qualification_sha256": report["sha256"], "archive_sha256": archive["sha256"],
+               "adapter_components_manifest_sha256": manifest, "native_model_calls": 0,
+               "native_generation_admitted": False, "normal_first_start_verified": False}
+    audit_ref = save(tmp_path / "NEUTRAL-audit.json", audited)
+    reception = {**c.BASE_IDENTITY, "schema": "hpc-forest-dynamic-r4b-mechanical-reception-v1", "verified": True,
+                 "native_model_calls": 0, "source_files_exact": True, "privacy_neutral_tests_passed": True,
+                 "target_profile_verified": True, "reference_contracts_reviewed": True,
+                 "archive": archive, "qualification": report, "independent_audit": audit_ref}
+    return save(tmp_path / "NEUTRAL-reception.json", reception), reception, record, audited, manifest
+
+
+def rewrite_report(tmp_path, reception, record, audited):
+    report = save(tmp_path / "NEUTRAL-qualification.json", record)
+    audited["qualification_sha256"] = report["sha256"]
+    reception["qualification"] = report
+    reception["independent_audit"] = save(tmp_path / "NEUTRAL-audit.json", audited)
+    return save(tmp_path / "NEUTRAL-reception.json", reception)
+
+
+def test_portable_q_actual_closed_binding(tmp_path):
+    ref, reception, _, _, manifest = neutral_q(tmp_path)
+    assert c.qualification(ref, components_manifest_sha256=manifest) == reception
+
+
+@pytest.mark.parametrize("change", ["old_source", "old_plan", "calls", "count", "gpu", "cpu", "boolcpu", "tests", "failed", "manifest", "revision"])
+def test_portable_q_refuses_wrong_or_unqualified_record(tmp_path, change):
+    _, reception, record, audited, manifest = neutral_q(tmp_path)
+    if change == "old_source":
+        record["source_zip_sha256"] = "e" * 64
+    elif change == "old_plan":
+        record["plan_sha256"] = "e" * 64
+    elif change == "calls":
+        record["native_model_calls"] = 1
+    elif change == "count":
+        record["source_file_count"] = 103
+    elif change == "gpu":
+        record["allocation"]["allocated_gpus"] = 1
+    elif change == "cpu":
+        record["allocation"]["cpu_cores"] = 8
+    elif change == "boolcpu":
+        record["allocation"]["tasks"] = True
+    elif change == "tests":
+        record["source_lane_contract_tests"]["passed"] = 25
+    elif change == "failed":
+        record["adapter_portable_tests"]["failed"] = 1
+    elif change == "manifest":
+        record["adapter_components_manifest_sha256"] = "b" * 64
+    else:
+        record["adapter_revision"] = "old-r3-external-fixture-trusted-copy"
+    ref = rewrite_report(tmp_path, reception, record, audited)
+    with pytest.raises(ValueError):
+        c.qualification(ref, components_manifest_sha256=manifest)
+
+
+def test_portable_q_refuses_audit_digest_mismatch(tmp_path):
+    _, reception, _, audited, manifest = neutral_q(tmp_path)
+    audited["archive_sha256"] = "b" * 64
+    reception["independent_audit"] = save(tmp_path / "NEUTRAL-audit.json", audited)
+    ref = save(tmp_path / "NEUTRAL-reception.json", reception)
+    with pytest.raises(ValueError):
+        c.qualification(ref, components_manifest_sha256=manifest)
+
+
+def test_portable_duplicate_json_is_refused(tmp_path):
+    path = tmp_path / "NEUTRAL-duplicate.json"
+    path.write_bytes(b'{"verified":true,"verified":false}')
+    with pytest.raises(ValueError, match="Duplicate"):
+        c.read({"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+
+
+def test_portable_normalisation_does_not_coerce_booleans():
+    assert n.canonical({"value": True}) != n.canonical({"value": 1})
+
+
+def test_portable_reader_retains_closed_fourteen_and_eleven():
+    assert len(audit.REF_NAMES) == 14 and len(audit.EXPECTED_NAMES) == 11
+    assert "execution_sidecar" in audit.REF_NAMES and "request_downloaded" in audit.REF_NAMES
+    assert len(audit.SUPPORTED_CONTRACT_SESSIONS) == 3
+    assert all(set(v) == {"roots", "advice", "harvest"} for v in audit.SUPPORTED_CONTRACT_SESSIONS.values())
+    assert "gpt-6-luna" not in audit.SUPPORTED_CONTRACT_SESSIONS
+
+
+@pytest.mark.parametrize("raw", [b'2026-10-18T00:00:00.000000Z WARN unexpected\n', b'{"type":"error","message":"unexpected"}\n', b'{"type":"unknown"}\n'])
+def test_portable_non_normal_logs_refused(raw):
+    with pytest.raises(ValueError):
+        audit._events(raw, {"fixture_only": True})
+
+
+def historical_worker_fixture(tmp_path):
+    """The same pure source validator is available in allocated Q and locally."""
+    candidate = HERE.parent / "source/project/src/hpc_forest/lane_contract.py"
+    if not candidate.is_file():
+        pins = json.loads((HERE / "reader/pins-source-plan.json").read_text(encoding="utf8"))
+        candidate = Path(pins["source_project"]) / "src/hpc_forest/lane_contract.py"
+    lane_contract = load("NEUTRAL_actual_source_lane_for_existing_worker", candidate)
+    projection_module = load("NEUTRAL_existing_worker_projection", HERE / "lane_projection.py")
+    cells = load("NEUTRAL_existing_worker_cells", HERE / "launcher/cell_selection.py")
+    detection = load("NEUTRAL_existing_worker_detector", HERE / "launcher/native_worker_detection.py")
+    model, phase, job = "gpt-6-astra", "roots", "999998"
+    session = cells.select(model, phase, job_id=job)
+    cell = {**c.BASE_IDENTITY, "model": model, "effort": "max", "session_id": session,
+            "job_id": job, "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session}
+    evidence = {name: "a" * 64 for name in lane_contract.EVIDENCE_FIELDS}
+    evidence.update(scientific_reception=lane_contract.SCIENCE_SHA, reconciliation=lane_contract.RECON_SHA)
+    projected = {**cell, "schema": lane_contract.PROJECTION_SCHEMA, "verified": True,
+                 "source_only_state": "received_absent", "source_only_preserved": False,
+                 "source_only_active_workers": 0, "other_native_workers_count": 0,
+                 "active_native_workers_before_start": 0, "maximum_native_workers_total": 4,
+                 "observed_at": 1000.0, "observation_origin": "parent-private-Windows-census",
+                 "windows_census_observed_by_arm": False, "full_census_exported": False,
+                 "foreign_configuration_or_credentials_exported": False, "evidence_sha256": evidence}
+    projection_ref = save(tmp_path / "NEUTRAL-historical-projection.json", projected)
+    lane = {**cell, "schema": lane_contract.LANE_SCHEMA, "verified": True,
+            "maximum_native_workers_total": 4, "active_native_workers_before_start": 0,
+            "full_census_locally_verified": True, "source_only_preserved": False,
+            "source_only_state": "received_absent", "source_only_active_workers": 0,
+            "new_cache_registry_root": True, "native_calls_started": 0, "observed_at": 1000.0,
+            "private_full_census_sha256": "a" * 64, "minimal_owned_observations": projection_ref}
+    auth = {**cell, "purpose": "technical-contract", "technical_phase": phase, "NEUTRAL_lane": lane}
+    auth_ref = save(tmp_path / "NEUTRAL-existing-authorization.json", auth)
+    command = '"NEUTRAL-python.exe" "' + str(HERE / "launcher/bootstrap_worker.py") + '" --model ' + model + ' --session-id ' + session
+    fields = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+    rows = [{"ProcessId": 990001, "ParentProcessId": 0, "ExecutablePath": str(tmp_path / "NEUTRAL-python.exe"),
+             "CommandLine": command, "CreationDate": "2026-10-18T00:00:00.0000000Z"},
+            {"ProcessId": 990002, "ParentProcessId": 990001, "ExecutablePath": str(tmp_path / "NEUTRAL-python.exe"),
+             "CommandLine": command, "CreationDate": "2026-10-18T00:00:00.0000001Z"}]
+
+    def identity(row):
+        assert set(row) == set(fields)
+        return tuple(row[k] for k in fields)
+
+    state = SimpleNamespace(identity=identity, SO_SESSION="unused-in-received-absent-mode")
+    dependencies = {"cells": cells, "detection": detection, "source_state": state}
+    projection_module.dependency = dependencies.__getitem__  # Pure bounded fixtures only.
+    group = {"model": model, "phase": phase, "session_id": session, "job_id": job,
+             "full_identities": rows, "authorization": auth_ref}
+    return projection_module, cells, lane_contract, cell, lane, auth, group, rows
+
+
+def test_existing_owned_worker_over600s_is_counted_without_readmission(tmp_path):
+    projection, cells, lane_contract, cell, lane, auth, group, rows = historical_worker_fixture(tmp_path)
+    flags = []
+
+    def validate(path, jobs, *, initial=True):
+        actual = json.loads(path.read_text(encoding="utf8"))
+        assert actual == auth and jobs == {c.SCOPE}
+        flags.append(initial)
+        lane_contract.validate_lane_v2(lane, cell, c.artifact, initial=initial, now=1701.0)
+
+    count = projection.count_groups([group], rows, mode="received_absent",
+        selected_session=cells.select("gpt-6.1-sol", "roots"), binding=c.BASE_IDENTITY,
+        validate_authorization=validate)
+    assert count == 1 and flags == [False]
+
+
+def test_new_start_keeps_initial_true_and_refuses_the_same_stale_lane(tmp_path):
+    _, _, lane_contract, cell, lane, _, _, _ = historical_worker_fixture(tmp_path)
+    with pytest.raises(ValueError, match="stale"):
+        lane_contract.validate_lane_v2(lane, cell, c.artifact, initial=True, now=1701.0)
+    # The production constructor's proposed worker retains its initial gate.
+    factory_source = (HERE / "assemble_admissions.py").read_text(encoding="utf8")
+    bootstrap_source = (HERE / "launcher/bootstrap_worker.py").read_text(encoding="utf8")
+    assert 'admission.validate_authorization(artifact(draft_auth), {SCOPE})' in factory_source
+    assert 'initial=True)' in bootstrap_source

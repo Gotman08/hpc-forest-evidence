@@ -1,0 +1,304 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using Word = std::uint32_t;
+using Sum = std::int32_t;
+
+class FastInput {
+    static constexpr std::size_t capacity = 1u << 16;
+    unsigned char buffer_[capacity + 1];
+    std::size_t position_ = 0;
+    std::size_t available_ = 0;
+
+    void refill() {
+        available_ = std::fread(buffer_, 1, capacity, stdin);
+        position_ = 0;
+        buffer_[available_] = 0;
+    }
+
+    int next_byte() {
+        if (position_ == available_) {
+            refill();
+            if (available_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    bool read_int(int& value) {
+        int c = next_byte();
+        while (c != EOF && c <= ' ') c = next_byte();
+        if (c == EOF) return false;
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = next_byte();
+        Word magnitude = 0;
+        while (c >= '0' && c <= '9') {
+            magnitude = magnitude * 10u + static_cast<Word>(c - '0');
+            c = next_byte();
+        }
+        const std::int64_t wide = static_cast<std::int64_t>(magnitude);
+        value = static_cast<int>(negative ? -wide : wide);
+        return true;
+    }
+
+    bool read_words(Word* __restrict__ destination, std::size_t count) {
+        unsigned char* cursor = buffer_ + position_;
+        unsigned char* end = buffer_ + available_;
+        for (std::size_t i = 0; i < count; ++i) {
+            for (;;) {
+                while (cursor != end && *cursor <= ' ') ++cursor;
+                if (cursor != end) break;
+                refill();
+                cursor = buffer_;
+                end = buffer_ + available_;
+                if (available_ == 0) return false;
+            }
+
+            const bool negative = *cursor == '-';
+            if (*cursor == '-' || *cursor == '+') ++cursor;
+            Word magnitude = 0;
+            for (;;) {
+                unsigned digit = static_cast<unsigned>(*cursor)
+                               - static_cast<unsigned>('0');
+                while (digit < 10u) {
+                    magnitude = magnitude * 10u + digit;
+                    ++cursor;
+                    digit = static_cast<unsigned>(*cursor)
+                          - static_cast<unsigned>('0');
+                }
+                if (cursor != end) {
+                    ++cursor;
+                    break;
+                }
+                refill();
+                cursor = buffer_;
+                end = buffer_ + available_;
+                if (available_ == 0) break;
+            }
+            destination[i] = negative ? Word(0) - magnitude : magnitude;
+        }
+        position_ = static_cast<std::size_t>(cursor - buffer_);
+        return true;
+    }
+};
+
+static inline Sum signed_sum(Word bits) {
+    Sum value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static inline void horizontal_sums(Word* row, int n, int s) {
+    Word total = 0;
+    #pragma omp simd reduction(+:total)
+    for (int c = 0; c < s; ++c) total += row[c];
+
+    const int last = n - s;
+    for (int c = 0; c < last; ++c) {
+        const Word leaving = row[c];
+        const Word entering = row[c + s];
+        row[c] = total;
+        total += entering - leaving;
+    }
+    row[last] = total;
+}
+
+static inline void horizontal_four_rows(Word* data, int n, int s) {
+    Word* const row0 = data;
+    Word* const row1 = row0 + n;
+    Word* const row2 = row1 + n;
+    Word* const row3 = row2 + n;
+    Word total0 = 0;
+    Word total1 = 0;
+    Word total2 = 0;
+    Word total3 = 0;
+    #pragma omp simd reduction(+:total0,total1,total2,total3)
+    for (int c = 0; c < s; ++c) {
+        total0 += row0[c];
+        total1 += row1[c];
+        total2 += row2[c];
+        total3 += row3[c];
+    }
+
+    const int last = n - s;
+    for (int c = 0; c < last; ++c) {
+        const Word leaving0 = row0[c];
+        const Word leaving1 = row1[c];
+        const Word leaving2 = row2[c];
+        const Word leaving3 = row3[c];
+        const Word entering0 = row0[c + s];
+        const Word entering1 = row1[c + s];
+        const Word entering2 = row2[c + s];
+        const Word entering3 = row3[c + s];
+        row0[c] = total0;
+        row1[c] = total1;
+        row2[c] = total2;
+        row3[c] = total3;
+        total0 += entering0 - leaving0;
+        total1 += entering1 - leaving1;
+        total2 += entering2 - leaving2;
+        total3 += entering3 - leaving3;
+    }
+    row0[last] = total0;
+    row1[last] = total1;
+    row2[last] = total2;
+    row3[last] = total3;
+}
+
+static inline void advance_four_rows(
+        Word* __restrict__ column_sums,
+        Sum* __restrict__ column_maxima,
+        const Word* incoming0, const Word* outgoing0,
+        int n, int width) {
+    const Word* const incoming1 = incoming0 + n;
+    const Word* const incoming2 = incoming1 + n;
+    const Word* const incoming3 = incoming2 + n;
+    const Word* const outgoing1 = outgoing0 + n;
+    const Word* const outgoing2 = outgoing1 + n;
+    const Word* const outgoing3 = outgoing2 + n;
+    int c = 0;
+#if defined(__aarch64__)
+    for (; c + 4 <= width; c += 4) {
+        const uint32x4_t total0 = vaddq_u32(
+            vld1q_u32(column_sums + c),
+            vsubq_u32(vld1q_u32(incoming0 + c), vld1q_u32(outgoing0 + c)));
+        const uint32x4_t total1 = vaddq_u32(total0,
+            vsubq_u32(vld1q_u32(incoming1 + c), vld1q_u32(outgoing1 + c)));
+        const uint32x4_t total2 = vaddq_u32(total1,
+            vsubq_u32(vld1q_u32(incoming2 + c), vld1q_u32(outgoing2 + c)));
+        const uint32x4_t total3 = vaddq_u32(total2,
+            vsubq_u32(vld1q_u32(incoming3 + c), vld1q_u32(outgoing3 + c)));
+        const int32x4_t best01 = vmaxq_s32(
+            vreinterpretq_s32_u32(total0), vreinterpretq_s32_u32(total1));
+        const int32x4_t best23 = vmaxq_s32(
+            vreinterpretq_s32_u32(total2), vreinterpretq_s32_u32(total3));
+        const int32x4_t best = vmaxq_s32(
+            vld1q_s32(column_maxima + c), vmaxq_s32(best01, best23));
+        vst1q_u32(column_sums + c, total3);
+        vst1q_s32(column_maxima + c, best);
+    }
+#endif
+    #pragma omp simd
+    for (int j = c; j < width; ++j) {
+        Word total = column_sums[j];
+        Sum best = column_maxima[j];
+        total += incoming0[j] - outgoing0[j];
+        best = std::max(best, signed_sum(total));
+        total += incoming1[j] - outgoing1[j];
+        best = std::max(best, signed_sum(total));
+        total += incoming2[j] - outgoing2[j];
+        best = std::max(best, signed_sum(total));
+        total += incoming3[j] - outgoing3[j];
+        best = std::max(best, signed_sum(total));
+        column_sums[j] = total;
+        column_maxima[j] = best;
+    }
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.read_int(n) || !input.read_int(s)) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const std::size_t elements = static_cast<std::size_t>(n) * n;
+    std::unique_ptr<Word[]> matrix(new Word[elements]);
+    Word* const data = matrix.get();
+    constexpr std::size_t input_tile = 1u << 14;
+    for (std::size_t offset = 0; offset < elements;) {
+        const std::size_t count = std::min(input_tile, elements - offset);
+        if (!input.read_words(data + offset, count)) return 0;
+        offset += count;
+    }
+
+    const int windows = n - s + 1;
+    const int row_groups = (n + 3) / 4;
+    constexpr int max_stripe_width = 256;
+    int workers = 1;
+#ifdef _OPENMP
+    workers = omp_get_max_threads();
+#endif
+    const int stripe_width = std::min(max_stripe_width,
+        std::max(1, (windows + workers - 1) / workers));
+    const int stripes = (windows + stripe_width - 1) / stripe_width;
+    Sum maximum = std::numeric_limits<Sum>::lowest();
+
+    #pragma omp parallel if(elements >= 65536) reduction(max:maximum)
+    {
+        #pragma omp for schedule(static)
+        for (int group = 0; group < row_groups; ++group) {
+            const int first = 4 * group;
+            if (first + 4 <= n) {
+                horizontal_four_rows(data + static_cast<std::size_t>(first) * n, n, s);
+            } else {
+                for (int r = first; r < n; ++r) {
+                    horizontal_sums(data + static_cast<std::size_t>(r) * n, n, s);
+                }
+            }
+        }
+
+        alignas(64) Word column_sums[max_stripe_width];
+        alignas(64) Sum column_maxima[max_stripe_width];
+
+        #pragma omp for schedule(static) nowait
+        for (int block = 0; block < stripes; ++block) {
+            const int first = block * stripe_width;
+            const int width = std::min(stripe_width, windows - first);
+            #pragma omp simd
+            for (int c = 0; c < width; ++c) column_sums[c] = 0;
+
+            for (int r = 0; r < s; ++r) {
+                const Word* const row = data + static_cast<std::size_t>(r) * n + first;
+                #pragma omp simd
+                for (int c = 0; c < width; ++c) column_sums[c] += row[c];
+            }
+            #pragma omp simd
+            for (int c = 0; c < width; ++c) {
+                column_maxima[c] = signed_sum(column_sums[c]);
+            }
+
+            int r = s;
+            for (; r + 3 < n; r += 4) {
+                const Word* const entering = data + static_cast<std::size_t>(r) * n + first;
+                const Word* const leaving = data + static_cast<std::size_t>(r - s) * n + first;
+                advance_four_rows(column_sums, column_maxima, entering, leaving, n, width);
+            }
+            for (; r < n; ++r) {
+                const Word* const entering = data + static_cast<std::size_t>(r) * n + first;
+                const Word* const leaving = data + static_cast<std::size_t>(r - s) * n + first;
+                #pragma omp simd
+                for (int c = 0; c < width; ++c) {
+                    const Word total = column_sums[c] + entering[c] - leaving[c];
+                    column_sums[c] = total;
+                    column_maxima[c] = std::max(column_maxima[c], signed_sum(total));
+                }
+            }
+
+            Sum block_maximum = std::numeric_limits<Sum>::lowest();
+            #pragma omp simd reduction(max:block_maximum)
+            for (int c = 0; c < width; ++c) {
+                block_maximum = std::max(block_maximum, column_maxima[c]);
+            }
+            maximum = std::max(maximum, block_maximum);
+        }
+    }
+
+    std::printf("%d\n", static_cast<int>(maximum));
+    return 0;
+}

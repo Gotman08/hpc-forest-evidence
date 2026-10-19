@@ -1,0 +1,50 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <limits>\n#include <memory>\n#include <vector>\n\nclass FastInput {\n    static constexpr std::size_t capacity = 1u << 16;\n    unsigned char buffer[capacity];\n    std::size_t position = 0;\n    std::size_t available = 0;\n\n    int readByte() {\n        if (position == available) {\n            available = std::fread(buffer, 1, capacity, stdin);\n            position = 0;\n            if (available == 0) return EOF;\n        }\n        return buffer[position++];\n    }\n\npublic:\n    bool readInt(int& value) {\n        int c = readByte();\n        while (c != EOF && c <= ' ') c = readByte();\n        if (c == EOF) {\n            value = 0;\n            return false;\n        }\n        bool negative = false;\n        if (c == '-' || c == '+') {\n            negative = c == '-';\n            c = readByte();\n        }\n        std::int64_t magnitude = 0;\n        while (c >= '0' && c <= '9') {\n            magnitude = magnitude * 10 + (c - '0');\n            c = readByte();\n        }\n        value = static_cast<int>(negative ? -magnitude : magnitude);\n        return true;\n    }\n};\n\nint main() {\n    FastInput input;\n    int n, s;\n    if (!input.readInt(n) || !input.readInt(s)) return 0;\n    if (n <= 0 || n >= 8000 || s <= 0 || s >= n) return 0;\n\n    using Sum = std::int64_t;\n    constexpr int batchRows = 64;\n    constexpr int columnTile = 256;\n    const int m = n - s + 1;\n\n    std::unique_ptr<int[]> rawStorage(\n        new int[static_cast<std::size_t>(batchRows) * n]);\n    std::unique_ptr<Sum[]> horizontalStorage(\n        new Sum[static_cast<std::size_t>(batchRows) * m]);\n    std::unique_ptr<Sum[]> historyStorage(\n        new Sum[static_cast<std::size_t>(s) * m]);\n    std::vector<Sum> verticalStorage(m, 0);\n\n    int* const raw = rawStorage.get();\n    Sum* const horizontal = horizontalStorage.get();\n    Sum* const history = historyStorage.get();\n    Sum* const vertical = verticalStorage.data();\n    Sum best = std::numeric_limits<Sum>::lowest();\n\n#ifdef _OPENMP\n#pragma omp parallel if (static_cast<std::size_t>(n) * n >= 262144u) reduction(max: best)\n#endif\n    {\n        for (int first = 0; first < n; first += batchRows) {\n            const int rows = std::min(batchRows, n - first);\n\n#ifdef _OPENMP\n#pragma omp single\n#endif\n            {\n                const std::size_t count = static_cast<std::size_t>(rows) * n;\n                for (std::size_t i = 0; i < count; ++i) {\n                    input.readInt(raw[i]);\n                }\n            }\n\n#ifdef _OPENMP\n#pragma omp for schedule(static)\n#endif\n            for (int row = 0; row < rows; ++row) {\n                const int* source = raw + static_cast<std::size_t>(row) * n;\n                Sum* destination = horizontal + static_cast<std::size_t>(row) * m;\n                Sum sum = 0;\n#ifdef _OPENMP\n#pragma omp simd reduction(+: sum)\n#endif\n                for (int c = 0; c < s; ++c) {\n                    sum += static_cast<Sum>(source[c]);\n                }\n                destination[0] = sum;\n                for (int c = 1; c < m; ++c) {\n                    sum += static_cast<Sum>(source[c + s - 1])\n                         - static_cast<Sum>(source[c - 1]);\n                    destination[c] = sum;\n                }\n            }\n\n#ifdef _OPENMP\n#pragma omp for schedule(static)\n#endif\n            for (int block = 0; block < m; block += columnTile) {\n                const int end = std::min(block + columnTile, m);\n                int slot = first % s;\n                for (int row = 0; row < rows; ++row) {\n                    const int globalRow = first + row;\n                    const Sum* entering = horizontal + static_cast<std::size_t>(row) * m;\n                    Sum* previous = history + static_cast<std::size_t>(slot) * m;\n\n                    if (globalRow < s) {\n#ifdef _OPENMP\n#pragma omp simd\n#endif\n                        for (int c = block; c < end; ++c) {\n                            vertical[c] += entering[c];\n                            previous[c] = entering[c];\n                        }\n                        if (globalRow == s - 1) {\n                            Sum rowBest = std::numeric_limits<Sum>::lowest();\n#ifdef _OPENMP\n#pragma omp simd reduction(max: rowBest)\n#endif\n                            for (int c = block; c < end; ++c) {\n                                if (vertical[c] > rowBest) rowBest = vertical[c];\n                            }\n                            if (rowBest > best) best = rowBest;\n                        }\n                    } else {\n                        Sum rowBest = std::numeric_limits<Sum>::lowest();\n#ifdef _OPENMP\n#pragma omp simd reduction(max: rowBest)\n#endif\n                        for (int c = block; c < end; ++c) {\n                            const Sum next = entering[c];\n                            const Sum value = vertical[c] + next - previous[c];\n                            vertical[c] = value;\n                            previous[c] = next;\n                            if (value > rowBest) rowBest = value;\n                        }\n                        if (rowBest > best) best = rowBest;\n                    }\n\n                    if (++slot == s) slot = 0;\n                }\n            }\n        }\n    }\n\n    std::printf(\"%lld\\n\", static_cast<long long>(best));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Batched separable rolling sums with one persistent OpenMP team should reduce work to O(n²), amortize synchronization, and expose independent row and column-tile work.",
+    "notes": "Unmeasured. Uses the configured OpenMP thread count, serializes small matrices, and remains correct without OpenMP support.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Replace serpentine rescanning with horizontal rolling sums and an s-row circular buffer of vertical contributions.",
+      "Read 64-row batches through one bounded, signed-integer-aware fread parser.",
+      "Use static row work sharing followed by static column-tile work sharing within one persistent OpenMP region.",
+      "Use 64-bit intermediate sums, SIMD reductions, and a thread-private maximum reduction initialized for negative-only inputs."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "9e02a5bddcbc48149601f51e021c4279",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "a178bafba8907236f9f38da8d089cb78f3c27166948d64aa7f4e19afaff8f24a",
+  "session_id": "a80da638e1054b3a9d13f66e5787f89f",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "8426fc722fe75e12735fe2962590b0c84a137e50729b39bea3e7abb96b4a318e",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 11053,
+        "output_tokens": 10495,
+        "reasoning_output_tokens": 8804
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 21548,
+    "tool_events": []
+  }
+}

@@ -1,0 +1,166 @@
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define SUM_USE_NEON 1
+#else
+#define SUM_USE_NEON 0
+#endif
+
+class FastInput {
+    unsigned char buffer_[65536];
+    std::size_t position_;
+    std::size_t size_;
+
+    int next_char() {
+        if (position_ == size_) {
+            size_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (size_ == 0) return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    FastInput() : position_(0), size_(0) {}
+
+    bool read_int(int& result) {
+        int c;
+        do {
+            c = next_char();
+            if (c == EOF) return false;
+        } while (c <= ' ');
+        const bool negative = c == '-';
+        if (c == '-' || c == '+') c = next_char();
+        std::int64_t value = 0;
+        while (c >= '0' && c <= '9') {
+            value = value * 10 + (c - '0');
+            c = next_char();
+        }
+        result = static_cast<int>(negative ? -value : value);
+        return true;
+    }
+};
+
+static void read_prefix(FastInput& input, std::int64_t* prefix, int n) {
+    prefix[0] = 0;
+    for (int j = 0; j < n; ++j) {
+        int value = 0;
+        input.read_int(value);
+        prefix[j + 1] = prefix[j] + value;
+    }
+}
+
+#if SUM_USE_NEON
+static inline int64x2_t max_lanes(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+#endif
+
+int main() {
+    FastInput input;
+    int n = 0;
+    int s = 0;
+    if (!input.read_int(n) || !input.read_int(s)) return 0;
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const int width = n - s + 1;
+    std::vector<std::int64_t> prefix(n + 1);
+    std::vector<std::int64_t> sums(width, 0);
+    std::unique_ptr<std::int64_t[]> history(
+        new std::int64_t[static_cast<std::size_t>(s) * width]);
+
+    // Prefix differences make adjacent horizontal windows independent.
+    for (int row = 0; row < s; ++row) {
+        read_prefix(input, prefix.data(), n);
+        std::int64_t* saved = history.get() + static_cast<std::size_t>(row) * width;
+        int j = 0;
+#if SUM_USE_NEON
+        for (; j + 4 <= width; j += 4) {
+            const int64x2_t h0 = vsubq_s64(
+                vld1q_s64(prefix.data() + j + s),
+                vld1q_s64(prefix.data() + j));
+            const int64x2_t h1 = vsubq_s64(
+                vld1q_s64(prefix.data() + j + s + 2),
+                vld1q_s64(prefix.data() + j + 2));
+            vst1q_s64(saved + j, h0);
+            vst1q_s64(saved + j + 2, h1);
+            vst1q_s64(sums.data() + j,
+                vaddq_s64(vld1q_s64(sums.data() + j), h0));
+            vst1q_s64(sums.data() + j + 2,
+                vaddq_s64(vld1q_s64(sums.data() + j + 2), h1));
+        }
+#endif
+        for (; j < width; ++j) {
+            const std::int64_t horizontal = prefix[j + s] - prefix[j];
+            saved[j] = horizontal;
+            sums[j] += horizontal;
+        }
+    }
+
+    std::int64_t best = std::numeric_limits<std::int64_t>::min();
+    int j = 0;
+#if SUM_USE_NEON
+    int64x2_t best0 = vdupq_n_s64(best);
+    int64x2_t best1 = vdupq_n_s64(best);
+    for (; j + 4 <= width; j += 4) {
+        best0 = max_lanes(best0, vld1q_s64(sums.data() + j));
+        best1 = max_lanes(best1, vld1q_s64(sums.data() + j + 2));
+    }
+#endif
+    for (; j < width; ++j) best = std::max(best, sums[j]);
+
+    for (int row = s; row < n; ++row) {
+        read_prefix(input, prefix.data(), n);
+        std::int64_t* saved = history.get()
+            + static_cast<std::size_t>(row % s) * width;
+        int column = 0;
+#if SUM_USE_NEON
+        for (; column + 4 <= width; column += 4) {
+            const int64x2_t h0 = vsubq_s64(
+                vld1q_s64(prefix.data() + column + s),
+                vld1q_s64(prefix.data() + column));
+            const int64x2_t h1 = vsubq_s64(
+                vld1q_s64(prefix.data() + column + s + 2),
+                vld1q_s64(prefix.data() + column + 2));
+            const int64x2_t old0 = vld1q_s64(saved + column);
+            const int64x2_t old1 = vld1q_s64(saved + column + 2);
+            const int64x2_t current0 = vaddq_s64(
+                vld1q_s64(sums.data() + column), vsubq_s64(h0, old0));
+            const int64x2_t current1 = vaddq_s64(
+                vld1q_s64(sums.data() + column + 2), vsubq_s64(h1, old1));
+            vst1q_s64(saved + column, h0);
+            vst1q_s64(saved + column + 2, h1);
+            vst1q_s64(sums.data() + column, current0);
+            vst1q_s64(sums.data() + column + 2, current1);
+            best0 = max_lanes(best0, current0);
+            best1 = max_lanes(best1, current1);
+        }
+#endif
+        for (; column < width; ++column) {
+            const std::int64_t horizontal = prefix[column + s] - prefix[column];
+            sums[column] += horizontal - saved[column];
+            saved[column] = horizontal;
+            best = std::max(best, sums[column]);
+        }
+    }
+
+#if SUM_USE_NEON
+    best = std::max(best, static_cast<std::int64_t>(vgetq_lane_s64(best0, 0)));
+    best = std::max(best, static_cast<std::int64_t>(vgetq_lane_s64(best0, 1)));
+    best = std::max(best, static_cast<std::int64_t>(vgetq_lane_s64(best1, 0)));
+    best = std::max(best, static_cast<std::int64_t>(vgetq_lane_s64(best1, 1)));
+#endif
+    std::printf("%lld\n", static_cast<long long>(best));
+    return 0;
+}

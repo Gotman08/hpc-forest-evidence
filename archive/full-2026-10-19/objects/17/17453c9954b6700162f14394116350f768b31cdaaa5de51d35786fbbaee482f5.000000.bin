@@ -1,0 +1,57 @@
+"""R4 frozen phase+benchmark deduplication; pure recorded-data fixtures only."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import audit_common as c
+import pytest
+from audit_evaluations import evaluation_evidence, expected_checker_count
+from test_audit_neutral import evaluation_fixture, put
+
+
+def contract():
+    data = {phase: [{"name": f"{phase}-case-{n}", "input_fingerprint": f"{offset+n:064x}", "capture_files": []}
+                    for n in range(1, 7)] for phase, offset in (("search", 0), ("confirmation", 10))}
+    data["benchmark"] = {**data["search"][-1], "name": "benchmark-case-1"}
+    return data
+
+
+def test_six_research_seven_confirmation_from_same_twelve_global_inputs():
+    value = contract()
+    assert expected_checker_count(value, "search") == 6
+    assert expected_checker_count(value, "confirmation") == 7
+    assert len({case["input_fingerprint"] for case in [*value["search"], *value["confirmation"], value["benchmark"]]}) == 12
+    for phase in ("search", "confirmation"):
+        frozen_keys = {(case["input_fingerprint"], tuple(case["capture_files"])) for case in [*value[phase], value["benchmark"]]}
+        assert expected_checker_count(value, phase) == len(frozen_keys)
+
+
+@pytest.mark.parametrize("mutation", ["thirteenth-input", "collapsed-private-input", "different-capture", "wrong-p30"])
+def test_changed_deduplication_contract_refused(mutation):
+    value = contract()
+    if mutation == "thirteenth-input":
+        value["benchmark"]["input_fingerprint"] = "f" * 64
+    elif mutation == "collapsed-private-input":
+        value["confirmation"][0]["input_fingerprint"] = value["search"][0]["input_fingerprint"]
+    elif mutation == "different-capture":
+        value["benchmark"]["capture_files"] = ["OTHER"]
+    else:
+        value["benchmark"]["input_fingerprint"] = value["search"][0]["input_fingerprint"]
+    with pytest.raises(c.AuditError):
+        expected_checker_count(value, "confirmation")
+
+
+@pytest.mark.parametrize("phase,cases,accepted", [("search", 6, True), ("confirmation", 7, True), ("confirmation", 6, False), ("confirmation", 8, False), ("search", 7, False)])
+def test_exact_frozen_checker_counts_bound_to_typed_process_record(tmp_path, phase, cases, accepted):
+    root, outcome = evaluation_fixture(tmp_path)
+    check = c.rebased(outcome["logs"][1], root)
+    sidecar = Path(str(check) + ".json")
+    process = c.read_json(sidecar)
+    process["argv"][-1] = phase
+    put(sidecar, process)
+    put(check, {"correct": True, "cases": cases})
+    if accepted:
+        assert evaluation_evidence(outcome, phase, root, 5)["evaluated"] is True
+    else:
+        with pytest.raises(c.AuditError, match="Typed successful checker"):
+            evaluation_evidence(outcome, phase, root, 5)

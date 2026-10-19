@@ -1,0 +1,141 @@
+"""Pure data validation only; never invoke the helper, CIM, process API or stop."""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+spec = importlib.util.spec_from_file_location("owned_stop_data", Path(__file__).with_name("preparer-arret-possede.py"))
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+
+
+def audit_data():
+    return {"schema": "hpc-forest-primes-r2max-readonly-audit-v1", "scope_id": helper.SCOPE, "session_id": helper.SESSION,
+        "job_id": helper.JOB, "model": "gpt-6-luna", "effort": "max", "source_zip_sha256": helper.SOURCE,
+        "plan_sha256": helper.PLAN, "preparation_manifest_sha256": helper.PREP,
+        "verified": False, "native_research_admitted": False, "independent_raw_stdout_per_candidate_verified": False,
+        "independent_performance_audit_verified": False, "received_model_artifacts_audited_with_owned_lock_pending": True,
+        "received_cohort_audited_with_explicit_raw_attribution_limit": False, "evidence_inventory_before_after_identical": True,
+        "campaign": {"received_native_checker_protocol_verified": True, "lineage_and_five_confirmations_verified": True},
+        "transport_cost_reconciliation": {"unique_session_nonce_pairs": 10, "exact_known_tokens": 243141, "unknown_native_invocations": 0, "unresolved_nonces": []},
+        "cache_preservation": {"phase": "pre_stop_owned_lock_pending", "source_files_observed": 133, "readable_files_verified_before_stop": 132,
+        "snapshot_files_verified": 132, "total_cache_bytes_preservation_complete": False, "owned_operational_lock_pending": True, "worker_lock_sha256_before": None}}
+
+
+def test_global_false_audit_gate_allowed_as_pure_neutral_data():
+    helper.validate_audit(audit_data())
+
+
+@pytest.mark.parametrize("field,value", [("verified", True), ("job_id", "OTHER"), ("source_zip_sha256", "0" * 64),
+    ("audit_error", "NEUTRAL failure"), ("received_model_artifacts_audited_with_owned_lock_pending", False),
+    ("evidence_inventory_before_after_identical", False), ("native_research_admitted", True)])
+def test_audit_not_sufficient_for_stop(field, value):
+    data = audit_data()
+    data[field] = value
+    with pytest.raises(ValueError):
+        helper.validate_audit(data)
+
+
+@pytest.mark.parametrize("section,field,value", [("transport_cost_reconciliation", "unique_session_nonce_pairs", 9),
+    ("transport_cost_reconciliation", "exact_known_tokens", 243142), ("transport_cost_reconciliation", "unknown_native_invocations", 1),
+    ("transport_cost_reconciliation", "unresolved_nonces", ["NEUTRAL"]), ("campaign", "lineage_and_five_confirmations_verified", False),
+    ("cache_preservation", "worker_lock_sha256_before", "invented"), ("cache_preservation", "snapshot_files_verified", 131)])
+def test_protocol_ledger_or_lock_reserve_blocks(section, field, value):
+    data = audit_data()
+    data[section][field] = value
+    with pytest.raises(ValueError):
+        helper.validate_audit(data)
+
+
+def rows():
+    parents = {41808: 99999, 41724: 41808, 53536: 41808, 28424: 41724, 47416: 28424, 39392: 28424, 47264: 47416, 37900: 88888, 37848: 37900}
+    minute = {41808: 0, 41724: 1, 53536: 1, 28424: 2, 47416: 3, 39392: 3, 47264: 4, 37900: 0, 37848: 1}
+    return [{"ProcessId": pid, "ParentProcessId": parent, "ExecutablePath": "NEUTRAL-EXE-" + str(pid),
+        "CommandLine": "NEUTRAL-CMD-" + str(pid), "CreationDate": f"2026-10-17T20:{minute[pid]:02d}:00.0000000Z"} for pid, parent in parents.items()]
+
+
+def test_all_five_fields_and_complete_family_match_neutrally():
+    result = helper.classify(rows(), rows(), False)
+    assert set(result["present_owned"]) == set(helper.ORDER)
+    assert result["naturally_absent_owned"] == []
+
+
+@pytest.mark.parametrize("field,value", [("ProcessId", 50000), ("ParentProcessId", 50001), ("ExecutablePath", "OTHER"),
+    ("CommandLine", "OTHER"), ("CreationDate", "2026-10-17T20:01:00.0000001Z")])
+def test_owned_identity_change_in_any_field_blocks(field, value):
+    current = rows()
+    next(row for row in current if row["ProcessId"] == 41724)[field] = value
+    with pytest.raises(ValueError):
+        helper.classify(rows(), current, True)
+
+
+def test_numeric_parent_does_not_admit_unknown_descendant():
+    current = rows() + [{"ProcessId": 55555, "ParentProcessId": 47416, "ExecutablePath": "NEUTRAL UNKNOWN", "CommandLine": "NEUTRAL UNKNOWN", "CreationDate": "2026-10-17T20:05:00.0000000Z"}]
+    with pytest.raises(ValueError, match="Unknown/new descendant"):
+        helper.classify(rows(), current, True)
+
+
+def test_natural_exits_preserved_without_process_action():
+    result = helper.classify(rows(), [row for row in rows() if row["ProcessId"] in helper.PRESERVE], True)
+    assert set(result["naturally_absent_owned"]) == set(helper.ORDER)
+    assert result["present_owned"] == []
+
+
+@pytest.mark.parametrize("field,value", [("ProcessId", 99998), ("ParentProcessId", 12), ("ExecutablePath", "OTHER"), ("CommandLine", "OTHER"), ("CreationDate", "2026-10-17T20:00:00.0000001Z")])
+def test_source_only_identity_all_fields_preserved(field, value):
+    current = rows()
+    next(row for row in current if row["ProcessId"] == 37900)[field] = value
+    with pytest.raises(ValueError, match="Source-only"):
+        helper.classify(rows(), current, True)
+
+
+def test_cache_only_exact_root_lock_is_unread(tmp_path, monkeypatch):
+    monkeypatch.setattr(helper, "WORKER", tmp_path)
+    expected = {}
+    for number in range(132):
+        path = tmp_path / f"NEUTRAL-{number}"
+        path.write_bytes(str(number).encode())
+        expected[path.name] = {"bytes": path.stat().st_size, "sha256": helper.sha(path)}
+    lock = tmp_path / "worker.lock"
+    lock.write_bytes(b"X")
+    original = helper.sha
+    def safe_sha(path):
+        assert path != lock, "Lock bytes must never be read"
+        return original(path)
+    monkeypatch.setattr(helper, "sha", safe_sha)
+    assert helper.check_cache(expected) == expected
+    nested = tmp_path / "nested/worker.lock"
+    nested.parent.mkdir()
+    nested.write_bytes(b"NEUTRAL")
+    with pytest.raises(ValueError, match="cache changed"):
+        helper.check_cache(expected)
+
+
+def test_missing_root_lock_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(helper, "WORKER", tmp_path)
+    with pytest.raises(ValueError, match="lock is missing"):
+        helper.check_cache({})
+
+
+def test_no_production_plan_intent_or_stop_receipt_shipped():
+    root = Path(__file__).parent
+    assert not (root / "plan-arret-individuel.json").exists()
+    assert not (root / "arret-individuel-intention.json").exists()
+    assert not (root / "owned-worker-stopped.json").exists()
+
+
+def test_unknown_new_foreign_orphan_blocks():
+    current = rows() + [{"ProcessId": 55555, "ParentProcessId": 88887, "ExecutablePath": "NEUTRAL UNKNOWN", "CommandLine": "NEUTRAL UNKNOWN", "CreationDate": "2026-10-17T20:05:00.0000000Z"}]
+    with pytest.raises(ValueError, match="unknown/orphan"):
+        helper.classify(rows(), current, True)
+
+
+def test_new_source_only_child_classified_by_full_anchor_and_preserved():
+    current = rows() + [{"ProcessId": 55555, "ParentProcessId": 37900, "ExecutablePath": "NEUTRAL FOREIGN", "CommandLine": "NEUTRAL FOREIGN", "CreationDate": "2026-10-17T20:05:00.0000000Z"}]
+    result = helper.classify(rows(), current, True)
+    peer = result["foreign_new_or_changed_preserved"][0]
+    assert peer["identity"]["ProcessId"] == 55555
+    assert peer["baseline_anchor"]["ProcessId"] == 37900
+    assert 55555 not in result["present_owned"]

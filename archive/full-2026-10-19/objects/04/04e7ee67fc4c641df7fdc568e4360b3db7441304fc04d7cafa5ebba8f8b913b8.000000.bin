@@ -1,0 +1,196 @@
+/*
+    This program solves Laplace's equation on a regular 2D grid using simple Jacobi iteration.
+
+    The stencil calculation stops when  ( err >= CONV_THRESHOLD OR  iter > ITER_MAX )
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#define CONV_THRESHOLD 1.0e-5f // threshold of convergence
+
+// matrix to be solved
+double **grid;
+
+// auxiliary matrix
+double **new_grid;
+
+// size of each side of the grid
+int size;
+int iter_max_num;
+
+// return the absolute value of a number
+double absolute(double num){
+    if(num < 0)
+        return -1.0 * num;
+    return num;
+}
+
+// allocate memory for the grid
+void allocate_memory(){
+    grid = (double **) malloc(size * sizeof(double *));
+    new_grid = (double **) malloc(size * sizeof(double *));
+
+    for(int i = 0; i < size; i++){
+        grid[i] = (double *) malloc(size * sizeof(double));
+        new_grid[i] = (double *) malloc(size * sizeof(double));
+    }
+}
+
+// initialize the grid
+void initialize_grid(){
+    int center = size / 2;
+    int linf = center - (size / 10);
+    int lsup = center + (size / 10);
+    for (int i = 0; i < size; i++){
+        for (int j = 0; j < size; j++){
+            // inicializa região de calor no centro do grid
+            if ( i >= linf && i <= lsup && j >= linf && j <= lsup)
+                grid[i][j] = 100;
+            else
+                grid[i][j] = 0;
+            // Both buffers retain identical fixed boundary values.
+            new_grid[i][j] = grid[i][j];
+        }
+    }
+}
+
+// save the grid in a file
+void save_grid(){
+    for(int i = 0; i < size; i++){
+        for(int j = 0; j < size; j++){
+            fprintf(stdout, "%lf ", grid[i][j]);
+        }
+        fprintf(stdout, "\n");
+    }
+}
+
+// Space publications apart to limit cache-line contention.
+typedef struct {
+    int changed;
+    unsigned char padding[128 - sizeof(int)];
+} convergence_slot;
+
+static void solve_grid(void){
+    if(size <= 2 || iter_max_num <= 0)
+        return;
+
+    const size_t interior_rows = (size_t)(size - 2);
+    int workers = 1;
+#ifdef _OPENMP
+    const size_t cells = interior_rows * interior_rows;
+    const size_t useful_workers = cells / 2048;
+    if(useful_workers > 1){
+        const int maximum_workers = omp_get_max_threads();
+        workers = useful_workers < (size_t)maximum_workers
+                    ? (int)useful_workers : maximum_workers;
+    }
+#endif
+
+    convergence_slot *flags = NULL;
+    if(workers > 1){
+        flags = (convergence_slot *)malloc(
+            2 * (size_t)workers * sizeof(*flags));
+        if(flags == NULL)
+            workers = 1;
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(workers) if(workers > 1)
+#endif
+    {
+        int thread_id = 0;
+        int thread_count = 1;
+#ifdef _OPENMP
+        thread_id = omp_get_thread_num();
+        thread_count = omp_get_num_threads();
+#endif
+        const int first_row = 1 + (int)(
+            interior_rows * (size_t)thread_id / (size_t)thread_count);
+        const int last_row = 1 + (int)(
+            interior_rows * (size_t)(thread_id + 1) / (size_t)thread_count);
+        double **current = grid;
+        double **next = new_grid;
+
+        for(int iter = 0; iter < iter_max_num; iter++){
+            int local_changed = 0;
+            for(int i = first_row; i < last_row; i++){
+                const double *row = current[i];
+                const double *above = current[i - 1];
+                const double *below = current[i + 1];
+                double *out = next[i];
+#ifdef _OPENMP
+#pragma omp simd reduction(|:local_changed)
+#endif
+                for(int j = 1; j < size - 1; j++){
+                    double value = 0.25 * (row[j + 1] + row[j - 1] +
+                                          above[j] + below[j]);
+                    out[j] = value;
+                    local_changed |= absolute(value - row[j]) > CONV_THRESHOLD;
+                }
+            }
+
+            int any_changed = local_changed;
+            if(thread_count > 1){
+                const int epoch = iter & 1;
+                flags[2 * (size_t)thread_id + epoch].changed = local_changed;
+#ifdef _OPENMP
+#pragma omp barrier
+#endif
+                // This barrier publishes both the stencil and convergence flags.
+                // Alternating slots allow the next iteration to start while
+                // slower threads are still reading this iteration's flags.
+                any_changed = 0;
+                for(int t = 0; t < thread_count; t++)
+                    any_changed |= flags[2 * (size_t)t + epoch].changed;
+            }
+
+            double **tmp = current;
+            current = next;
+            next = tmp;
+            if(!any_changed)
+                break;
+        }
+
+        // All workers have the same buffer parity and stopping iteration.
+        if(thread_id == 0){
+            grid = current;
+            new_grid = next;
+        }
+    }
+    free(flags);
+}
+
+int main(int argc, char *argv[]){
+    fscanf(stdin, "%d", &size);
+    fscanf(stdin, "%d", &iter_max_num);
+
+    struct timeval time_start;
+    struct timeval time_end;
+
+    // allocate memory to the grid (matrix)
+    allocate_memory();
+
+    // set grid initial conditions
+    initialize_grid();
+
+    // get the start time
+    //gettimeofday(&time_start, NULL);
+
+    solve_grid();
+
+    // get the end time
+    //gettimeofday(&time_end, NULL);
+
+    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +
+    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;
+
+    //save the final grid in file
+    save_grid();
+
+    return 0;
+}

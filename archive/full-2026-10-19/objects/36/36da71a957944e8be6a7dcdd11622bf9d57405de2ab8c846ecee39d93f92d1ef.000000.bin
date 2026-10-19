@@ -1,0 +1,230 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+/* Reads input, allocates memory, and returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  FILE *fl;
+  int opened = 0;
+  char line[MAX * 4];
+  Node *data = NULL;
+
+  if (fname == NULL) {
+    fl = stdin;
+  } else {
+    fl = fopen(fname, "r");
+    opened = 1;
+  }
+
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  list[0] = '\0';
+  if (fgets(line, sizeof(line), fl) == NULL ||
+      sscanf(line, "%d %99[^\n]", n, list) < 1 || *n < 0) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  if (*n > 0) {
+    data = (Node*) calloc((size_t) *n, sizeof(Node));
+    if (data == NULL) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  for (int i = 0; i < *n; i++) {
+    if (fgets(line, sizeof(line), fl) == NULL ||
+        sscanf(line, "%d %f %99[^\n]", &data[i].id, &data[i].value,
+               data[i].neighbors) < 2) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  if (opened)
+    fclose(fl);
+
+  return data;
+}
+
+/* Returns the index of the first node with the given id, or -1 if absent. */
+static int find_by_id(Node g[], int id, int size) {
+  int i = 0;
+  while (i < size && g[i].id != id)
+    i++;
+  return i < size ? i : -1;
+}
+
+/* Selects the same successor as the original recursive computation. */
+static int select_successor(Node *g, int nd, int size) {
+  char aux[MAX];
+  char *saveptr = NULL;
+  char *token;
+  int best_node = -1;
+  float max = 0.0f;
+
+  strcpy(aux, g[nd].neighbors);
+  token = strtok_r(aux, " ", &saveptr);
+  while (token != NULL) {
+    int d = find_by_id(g, atoi(token), size);
+    if (d >= 0 && max < g[d].value) {
+      max = g[d].value;
+      best_node = d;
+    }
+    token = strtok_r(NULL, " ", &saveptr);
+  }
+
+  return best_node;
+}
+
+int main(void) {
+  char *fileN = NULL;
+  char computelist[MAX] = {0};
+  int n = -1;
+  Node *input = read_input(fileN, &n, computelist);
+  int *successor = NULL;
+  int *depth = NULL;
+  float *cost = NULL;
+  int max_level = -1;
+
+  if (n > 0) {
+    int *path = (int*) malloc((size_t) n * sizeof(int));
+    successor = (int*) malloc((size_t) n * sizeof(int));
+    depth = (int*) malloc((size_t) n * sizeof(int));
+    cost = (float*) malloc((size_t) n * sizeof(float));
+    if (path == NULL || successor == NULL || depth == NULL || cost == NULL) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+
+    for (int i = 0; i < n; i++) {
+      successor[i] = select_successor(input, i, n);
+      depth[i] = -1;
+    }
+
+    /* Determine each node's reverse topological level without recursion. */
+    for (int start = 0; start < n; start++) {
+      if (depth[start] != -1)
+        continue;
+
+      int path_len = 0;
+      int current = start;
+      while (current >= 0 && depth[current] == -1) {
+        depth[current] = -2;
+        path[path_len++] = current;
+        current = successor[current];
+      }
+
+      while (path_len > 0) {
+        int v = path[--path_len];
+        int next = successor[v];
+        if (next < 0)
+          depth[v] = 0;
+        else if (depth[next] >= 0)
+          depth[v] = depth[next] + 1;
+        else
+          depth[v] = 0;
+        if (depth[v] > max_level)
+          max_level = depth[v];
+      }
+    }
+    free(path);
+
+    int nlevels = max_level + 1;
+    int *level_count = (int*) calloc((size_t) nlevels, sizeof(int));
+    int *level_offset = (int*) malloc(((size_t) nlevels + 1) * sizeof(int));
+    int *level_cursor = (int*) malloc((size_t) nlevels * sizeof(int));
+    int *level_nodes = (int*) malloc((size_t) n * sizeof(int));
+    if (level_count == NULL || level_offset == NULL ||
+        level_cursor == NULL || level_nodes == NULL) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+
+    for (int i = 0; i < n; i++)
+      level_count[depth[i]]++;
+
+    level_offset[0] = 0;
+    for (int level = 0; level < nlevels; level++) {
+      level_offset[level + 1] = level_offset[level] + level_count[level];
+      level_cursor[level] = level_offset[level];
+    }
+    for (int i = 0; i < n; i++)
+      level_nodes[level_cursor[depth[i]]++] = i;
+
+    /* Process only sufficiently wide levels in parallel. */
+    if (level_count[max_level] >= 16) {
+      #pragma omp parallel
+      {
+        for (int level = max_level; level >= 0; level--) {
+          int start = level_offset[level];
+          int count = level_count[level];
+          if (count >= 16) {
+            #pragma omp for schedule(static)
+            for (int j = 0; j < count; j++) {
+              int v = level_nodes[start + j];
+              float result = input[v].value;
+              if (successor[v] >= 0)
+                result += cost[successor[v]];
+              cost[v] = result;
+            }
+          } else {
+            #pragma omp single
+            {
+              for (int j = 0; j < count; j++) {
+                int v = level_nodes[start + j];
+                float result = input[v].value;
+                if (successor[v] >= 0)
+                  result += cost[successor[v]];
+                cost[v] = result;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      for (int level = max_level; level >= 0; level--) {
+        int start = level_offset[level];
+        int count = level_count[level];
+        for (int j = 0; j < count; j++) {
+          int v = level_nodes[start + j];
+          float result = input[v].value;
+          if (successor[v] >= 0)
+            result += cost[successor[v]];
+          cost[v] = result;
+        }
+      }
+    }
+
+    free(level_count);
+    free(level_offset);
+    free(level_cursor);
+    free(level_nodes);
+  }
+
+  for (char *c = strtok(computelist, " "); c != NULL;
+       c = strtok(NULL, " ")) {
+    int nd = find_by_id(input, atoi(c), n);
+    float value = nd >= 0 ? cost[nd] : 0.0f;
+    printf("%s: %f\n", c, value);
+  }
+
+  free(successor);
+  free(depth);
+  free(cost);
+  free(input);
+  return 0;
+}

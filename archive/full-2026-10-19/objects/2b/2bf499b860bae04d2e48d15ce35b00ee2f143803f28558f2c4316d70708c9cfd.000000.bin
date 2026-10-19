@@ -1,0 +1,76 @@
+"""Local model I/O preflight only; no problem or candidate algorithms are supplied."""
+import argparse
+import json
+import os
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+import local_model
+from hpc_forest.core import atomic_json
+from hpc_forest.ollama_backend import request_json
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--spec", type=Path, required=True)
+parser.add_argument("--root", type=Path, required=True)
+parser.add_argument("--ollama", type=Path, required=True)
+args = parser.parse_args()
+job = os.environ["SLURM_JOB_ID"]
+args.root.mkdir(exist_ok=False)
+cache = Path(tempfile.mkdtemp(prefix=f"hpc-forest-{job}-", dir="/dev/shm"))
+(cache / "OWNER").write_text(job)
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+url = f"http://127.0.0.1:{port}"
+env = os.environ | {"HOME":str(cache),"OLLAMA_HOST":f"127.0.0.1:{port}",
+    "OLLAMA_MODELS":str(cache / "models"),"OLLAMA_NO_CLOUD":"1","OLLAMA_NUM_PARALLEL":"1",
+    "OLLAMA_MAX_LOADED_MODELS":"1","OLLAMA_FLASH_ATTENTION":"1","OLLAMA_CONTEXT_LENGTH":"32768",
+    "LLAMA_ARG_CACHE_RAM":"0"}
+result = {"job": job, "complete": False}
+process = None
+with (args.root / "server.log").open("w", encoding="utf8") as log:
+    try:
+        process = subprocess.Popen([str(args.ollama),"serve"],env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        atomic_json(args.root / "server-identity.json", {"pid":process.pid,"pgid":os.getpgid(process.pid),"url":url,"cache":str(cache)})
+        deadline=time.monotonic()+30
+        while True:
+            try:
+                result["version"] = request_json(url,"/api/version",None,2)
+                break
+            except Exception:
+                if time.monotonic()>deadline or process.poll() is not None:raise
+                time.sleep(.5)
+        result["identity"] = local_model.prepare(args.spec,args.ollama,url,cache,args.root,env)
+        schema={"type":"object","properties":{"ack":{"type":"string"}},"required":["ack"],"additionalProperties":False}
+        payload={"model":result["identity"]["model"],"stream":False,"format":schema,
+          "messages":[{"role":"user","content":"Return a JSON object with ack equal to romeo-ready."}],
+          "options":{"num_ctx":32768,"num_predict":256,"num_thread":4,"temperature":0},"keep_alive":"5m"}
+        atomic_json(args.root / "smoke-request.json",payload)
+        response=request_json(url,"/api/chat",payload,300)
+        atomic_json(args.root / "smoke-response.json",response)
+        result["residency"]=request_json(url,"/api/ps",None,10)
+        assert json.loads(response["message"]["content"])=={"ack":"romeo-ready"}, "Semantic JSON smoke failed"
+        result["complete"]=True
+    except Exception as exc:
+        result["error"]=f"{type(exc).__name__}: {exc}"
+        result["traceback"]=traceback.format_exc()
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                assert os.getpgid(process.pid)==process.pid
+                os.killpg(process.pid,signal.SIGTERM)
+                try:process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid,signal.SIGKILL); process.wait(timeout=10)
+        assert cache.parent==Path('/dev/shm') and not cache.is_symlink() and (cache/'OWNER').read_text()==job
+        import shutil
+        shutil.rmtree(cache)
+        result["owned_cache_removed"]=not cache.exists()
+atomic_json(args.root / "result.json",result)
+print(json.dumps(result),flush=True)
+raise SystemExit(0 if result['complete'] else 1)

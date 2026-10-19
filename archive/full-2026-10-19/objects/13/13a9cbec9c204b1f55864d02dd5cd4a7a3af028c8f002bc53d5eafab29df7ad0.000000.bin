@@ -1,0 +1,137 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+static constexpr int MOD = 1000000007;
+static constexpr int TILE = 128;
+static constexpr int LOCAL_BITS = 14;
+
+static inline int add_mod(int a, int b) {
+    int sum = a + b;
+    return sum >= MOD ? sum - MOD : sum;
+}
+
+#if defined(__aarch64__)
+static inline uint32x4_t add_mod4(uint32x4_t a, uint32x4_t b) {
+    const uint32x4_t modulus = vdupq_n_u32(MOD);
+    const uint32x4_t sum = vaddq_u32(a, b);
+    return vsubq_u32(sum, vandq_u32(vcgeq_u32(sum, modulus), modulus));
+}
+
+static inline uint32x4_t prefix_mod4(uint32x4_t values) {
+    const uint32x4_t zero = vdupq_n_u32(0);
+    values = add_mod4(values, vextq_u32(zero, values, 3));
+    return add_mod4(values, vextq_u32(zero, values, 2));
+}
+#endif
+
+static inline int advance_segment(int* row, int first, int last, int left) {
+    if (first >= last) return left;
+    int x = first;
+#if defined(__aarch64__)
+    uint32x4_t carry = vdupq_n_u32(static_cast<uint32_t>(left));
+    for (; x + 8 <= last; x += 8) {
+        uint32x4_t low = prefix_mod4(vld1q_u32(
+            reinterpret_cast<const uint32_t*>(row + x)));
+        uint32x4_t high = prefix_mod4(vld1q_u32(
+            reinterpret_cast<const uint32_t*>(row + x + 4)));
+        high = add_mod4(high, vdupq_laneq_u32(low, 3));
+        low = add_mod4(low, carry);
+        high = add_mod4(high, carry);
+        vst1q_u32(reinterpret_cast<uint32_t*>(row + x), low);
+        vst1q_u32(reinterpret_cast<uint32_t*>(row + x + 4), high);
+        carry = vdupq_laneq_u32(high, 3);
+    }
+    left = static_cast<int>(vgetq_lane_u32(carry, 0));
+#endif
+    for (; x < last; ++x) {
+        left = add_mod(row[x], left);
+        row[x] = left;
+    }
+    return left;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n, m;
+    if (!(cin >> n >> m)) return 0;
+    const int tiles = (n + TILE - 1) / TILE;
+
+    // Sort obstacles by tile wavefront, tile row, and local cell.
+    vector<uint64_t> blocked;
+    blocked.reserve(static_cast<size_t>(m));
+    for (int k = 0; k < m; ++k) {
+        int r, c;
+        cin >> r >> c;
+        const int tr = r / TILE;
+        const int tc = c / TILE;
+        const uint64_t key = static_cast<uint64_t>(tr + tc) * tiles + tr;
+        const uint64_t local = (r % TILE) * TILE + c % TILE;
+        blocked.push_back((key << LOCAL_BITS) | local);
+    }
+    sort(blocked.begin(), blocked.end());
+    blocked.erase(unique(blocked.begin(), blocked.end()), blocked.end());
+
+    // Retain one bottom boundary per tile column and one right boundary
+    // per tile row. Tiles on a wavefront access disjoint boundary slices.
+    vector<int> bottom(n, 0);
+    vector<int> right(n, 0);
+    bottom[0] = 1;
+
+    #pragma omp parallel if (n >= 1024)
+    {
+        alignas(64) int values[TILE];
+        for (int diagonal = 0; diagonal < 2 * tiles - 1; ++diagonal) {
+            const int first = max(0, diagonal - tiles + 1);
+            const int last = min(tiles - 1, diagonal);
+
+            #pragma omp for schedule(static)
+            for (int tr = first; tr <= last; ++tr) {
+                const int tc = diagonal - tr;
+                const int row_start = tr * TILE;
+                const int column_start = tc * TILE;
+                const int height = min(TILE, n - row_start);
+                const int width = min(TILE, n - column_start);
+                const uint64_t key = static_cast<uint64_t>(diagonal) * tiles + tr;
+                const uint64_t tile_base = key << LOCAL_BITS;
+                auto obstacle = lower_bound(blocked.cbegin(), blocked.cend(), tile_base);
+
+                for (int c = 0; c < width; ++c)
+                    values[c] = bottom[column_start + c];
+
+                for (int r = 0; r < height; ++r) {
+                    int left = right[row_start + r];
+                    int c = 0;
+                    const uint64_t row_end = tile_base + static_cast<uint64_t>(r + 1) * TILE;
+                    while (obstacle != blocked.cend() && *obstacle < row_end) {
+                        const int stop = static_cast<int>(*obstacle & (TILE - 1));
+                        left = advance_segment(values, c, stop, left);
+                        values[stop] = 0;
+                        left = 0;
+                        c = stop + 1;
+                        ++obstacle;
+                    }
+                    left = advance_segment(values, c, width, left);
+                    right[row_start + r] = left;
+                }
+
+                for (int c = 0; c < width; ++c)
+                    bottom[column_start + c] = values[c];
+            }
+            // The worksharing barrier publishes both boundaries before
+            // the next wavefront reads them.
+        }
+    }
+
+    cout << bottom[n - 1] << '\n';
+    return 0;
+}

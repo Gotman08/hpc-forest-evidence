@@ -1,0 +1,273 @@
+"""Descriptor doubles and synthetic proofs only: no source Q, CLI or subprocess."""
+import ast
+import copy
+import hashlib
+import importlib.util
+import json
+import stat
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('delivery_only_Q753709_neutral', HERE / 'livrer-qualification-existante.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+def row(mode, size=0, inode=1):
+    return SimpleNamespace(st_dev=1, st_ino=inode, st_mode=mode, st_nlink=1, st_uid=1, st_gid=1,
+        st_size=size, st_mtime_ns=1, st_ctime_ns=1)
+
+
+class Scan:
+    def __init__(self, names):
+        self.names = names
+
+    def __enter__(self):
+        return iter([SimpleNamespace(name=name) for name in self.names])
+
+    def __exit__(self, *_):
+        return False
+
+
+class DescriptorFS:
+    O_RDONLY, O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK = 0, 1, 2, 4, 8
+
+    def __init__(self):
+        self.nodes = {'': (row(stat.S_IFDIR | 0o700, inode=1), None),
+            'folder': (row(stat.S_IFDIR | 0o700, inode=2), None),
+            'folder/data': (row(stat.S_IFREG | 0o600, 3, 3), b'abc'),
+            'link-out': (row(stat.S_IFLNK | 0o777, 14, 4), '/FOREIGN/never'),
+            'loop': (row(stat.S_IFLNK | 0o777, 1, 5), '.')}
+        self.fds, self.offsets, self.opened, self.readlinks, self.closed = {10: ''}, {}, [], [], []
+        self.sequence = 10
+        self.race = None
+
+    def fstat(self, fd):
+        path = self.fds[fd]
+        value = self.nodes[path][0]
+        if self.race == 'fstat-file' and path == 'folder/data':
+            return row(value.st_mode, 3, 99)
+        return value
+
+    def stat(self, name, *, dir_fd, follow_symlinks):
+        assert follow_symlinks is False
+        path = (self.fds[dir_fd] + '/' + name).lstrip('/')
+        return self.nodes[path][0]
+
+    def scandir(self, fd):
+        prefix = self.fds[fd] + '/' if self.fds[fd] else ''
+        return Scan([path[len(prefix):] for path in self.nodes if path.startswith(prefix)
+            and path != prefix.rstrip('/') and '/' not in path[len(prefix):]])
+
+    def open(self, name, flags, *, dir_fd):
+        path = (self.fds[dir_fd] + '/' + name).lstrip('/')
+        self.opened.append((path, flags))
+        assert flags & self.O_NOFOLLOW
+        assert not stat.S_ISLNK(self.nodes[path][0].st_mode), 'Never open any symlink'
+        self.sequence += 1; self.fds[self.sequence] = path; self.offsets[self.sequence] = 0
+        return self.sequence
+
+    def read(self, fd, count):
+        path = self.fds[fd]
+        raw = self.nodes[path][1]
+        assert isinstance(raw, bytes)
+        offset = self.offsets[fd]; self.offsets[fd] += count
+        return raw[offset:offset + count]
+
+    def readlink(self, name, *, dir_fd):
+        path = (self.fds[dir_fd] + '/' + name).lstrip('/')
+        self.readlinks.append(path)
+        return self.nodes[path][1]
+
+    def close(self, fd):
+        self.closed.append(fd)
+
+    def dup(self, fd):
+        self.sequence += 1; self.fds[self.sequence] = self.fds[fd]
+        return self.sequence
+
+
+def test_descriptor_walk_never_follows_foreign_or_cyclic_link(monkeypatch):
+    filesystem = DescriptorFS(); monkeypatch.setattr(m, 'os', filesystem)
+    archived = {}
+    inventory = m.walk(10, on_regular=lambda name, raw: archived.update({name: raw}))
+    assert archived == {'folder/data': b'abc'}
+    assert filesystem.readlinks == ['link-out', 'loop']
+    assert all(name not in {'link-out', 'loop'} for name, _ in filesystem.opened)
+    assert inventory['link-out']['target_followed'] is False and inventory['loop']['tar_member'] is False
+    assert inventory['link-out']['bytes_read'] is False
+
+
+def test_all_regular_file_opens_require_nofollow_nonblock(monkeypatch):
+    filesystem = DescriptorFS(); monkeypatch.setattr(m, 'os', filesystem)
+    m.walk(10)
+    flags = next(flags for name, flags in filesystem.opened if name == 'folder/data')
+    assert flags & filesystem.O_NOFOLLOW and flags & filesystem.O_NONBLOCK
+
+
+def test_file_identity_race_refuses_and_closes_handle(monkeypatch):
+    filesystem = DescriptorFS(); filesystem.race = 'fstat-file'; monkeypatch.setattr(m, 'os', filesystem)
+    with pytest.raises(ValueError, match='identity changed'):
+        m.walk(10)
+    assert len(filesystem.closed) == 2
+
+
+@pytest.mark.parametrize('kind', [stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFCHR])
+def test_special_types_are_never_opened(monkeypatch, kind):
+    filesystem = DescriptorFS(); filesystem.nodes = {'': filesystem.nodes[''], 'special': (row(kind | 0o600), None)}
+    monkeypatch.setattr(m, 'os', filesystem)
+    with pytest.raises(ValueError, match='Special file refused'):
+        m.walk(10)
+    assert filesystem.opened == []
+
+
+def test_fixed_proof_parent_replacement_refuses_before_file_read(monkeypatch):
+    filesystem = DescriptorFS(); monkeypatch.setattr(m, 'os', filesystem)
+    inventory = m.walk(10)
+    filesystem.nodes['folder'] = (row(stat.S_IFDIR | 0o700, inode=88), None)
+    with pytest.raises(ValueError, match='parent differs'):
+        m.fixed_read(10, 'folder/data', inventory)
+
+
+def test_changed_link_during_readlink_refuses(monkeypatch):
+    filesystem = DescriptorFS(); monkeypatch.setattr(m, 'os', filesystem)
+    readlink = filesystem.readlink
+
+    def changed(name, **kwargs):
+        value = readlink(name, **kwargs)
+        filesystem.nodes['link-out'] = (row(stat.S_IFLNK | 0o777, 14, 99), '/FOREIGN/never')
+        return value
+
+    monkeypatch.setattr(filesystem, 'readlink', changed)
+    with pytest.raises(ValueError, match='Symlink changed'):
+        m.walk(10)
+
+
+def synthetic_proofs(monkeypatch):
+    rawjson = lambda value: json.dumps(value).encode()
+    files = {'qualification-wrapper.py': b'NEUTRAL wrapper never executed', 'source/project.zip': b'NEUTRAL zip',
+        'source/dynamic-plan.json': b'NEUTRAL plan'}
+    source = {f'file{i}': hashlib.sha256(b'NEUTRAL').hexdigest() for i in range(110)}
+    for name in source:
+        files['source/project/' + name] = b'NEUTRAL'
+    components = {f'code{i}': hashlib.sha256(b'NEUTRAL').hexdigest() for i in range(62)}
+    for name in components:
+        files['adapters/' + name] = b'NEUTRAL'
+    files['adapters/COMPONENTS.json'] = rawjson({'code_pins': components})
+    adapter = {name.removeprefix('adapters/'): hashlib.sha256(raw).hexdigest() for name, raw in files.items() if name.startswith('adapters/')}
+    for prefix, value in [('source', source), ('adapter', adapter)]:
+        for suffix in ('before', 'after'):
+            files[f'qualification-output/{prefix}-{suffix}.json'] = rawjson(value)
+    q = {'schema': 'hpc-forest-lane-r2-zero-model-allocated-qualification-v1', 'verified': True,
+        'scope_id': 'hpc-forest-dynamic-independent-roots-r4b-max', 'source_file_count': 110,
+        'allocated_contract_tests_returncode': 0, 'native_model_calls': 0, 'source_files_before_after_identical': True,
+        'adapter_files_before_after_identical': True, 'native_generation_admitted': False,
+        'normal_first_start_verified': False, 'independent_performance_audit_verified': False,
+        'allocation': {'slurm_job_id': '753709'}, 'suite_results': {}}
+    for label, count in m.SUITES.items():
+        junit = ('<testsuite>' + ''.join(f'<testcase classname="{label}" name="case{i}" />' for i in range(count)) + '</testsuite>').encode()
+        files[f'qualification-output/{label}-junit.xml'] = junit
+        details = {'junit_sha256': hashlib.sha256(junit).hexdigest(), 'testcases': count, 'skipped': 0}
+        files[f'qualification-output/{label}-execution.json'] = rawjson({'returncode': 0, 'run_count': 1, 'model_calls': 0, **details})
+        q['suite_results'][label] = {'returncode': 0, 'counts': {'passed': count, 'failed': 0}, 'details': details}
+    for name, path in [('WRAPPER', 'qualification-wrapper.py'), ('SOURCE', 'source/project.zip'),
+                       ('PLAN', 'source/dynamic-plan.json'), ('COMPONENTS', 'adapters/COMPONENTS.json')]:
+        monkeypatch.setattr(m, name, hashlib.sha256(files[path]).hexdigest())
+    q.update(source_zip_sha256=m.SOURCE, plan_sha256=m.PLAN, adapter_components_manifest_sha256=m.COMPONENTS)
+    files['qualification-output/qualification.json'] = rawjson(q)
+    monkeypatch.setattr(m, 'QUALIFICATION', hashlib.sha256(files['qualification-output/qualification.json']).hexdigest())
+    inventory = {name: {'kind': 'regular', 'sha256': hashlib.sha256(raw).hexdigest()} for name, raw in files.items()}
+    monkeypatch.setattr(m, 'fixed_read', lambda fd, name, tree: files[name])
+    return files, inventory, q
+
+
+@pytest.mark.parametrize('mutation', ['none', 'duplicate_case', 'skip', 'execution_twice', 'inventory_changed', 'model_used'])
+def test_existing_265_results_validated_without_running_anything(monkeypatch, mutation):
+    files, inventory, q = synthetic_proofs(monkeypatch)
+    if mutation in {'duplicate_case', 'skip'}:
+        name = 'qualification-output/observer-neutral-junit.xml'
+        if mutation == 'duplicate_case':
+            files[name] = files[name].replace(b'name="case1"', b'name="case0"')
+        else:
+            files[name] = files[name].replace(b'name="case0" />', b'name="case0"><skipped /></testcase>')
+    elif mutation == 'execution_twice':
+        name = 'qualification-output/observer-neutral-execution.json'
+        value = json.loads(files[name]); value['run_count'] = 2; files[name] = json.dumps(value).encode()
+    elif mutation == 'inventory_changed':
+        files['qualification-output/source-after.json'] = b'{}'
+    elif mutation == 'model_used':
+        q = copy.deepcopy(q); q['native_model_calls'] = 1
+        files['qualification-output/qualification.json'] = json.dumps(q).encode()
+        monkeypatch.setattr(m, 'QUALIFICATION', hashlib.sha256(files['qualification-output/qualification.json']).hexdigest())
+    if mutation == 'none':
+        result = m.validate_existing(10, inventory, m.QUALIFICATION)
+        assert result['already_completed_unique_cases'] == 265 and result['tests_executed_by_delivery'] == 0
+    else:
+        with pytest.raises(ValueError):
+            m.validate_existing(10, inventory, m.QUALIFICATION)
+
+
+def test_allocation_refusal_precedes_source_open_or_output(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sys, 'argv', ['NEUTRAL', '--source-root', m.SOURCE_ROOT, '--output-root', m.OUTPUT_ROOT,
+        '--qualification-sha256', m.QUALIFICATION])
+
+    def refused():
+        calls.append('allocation'); raise ValueError('NEUTRAL allocation refusal')
+
+    monkeypatch.setattr(m, 'allocation_guard', refused)
+    monkeypatch.setattr(m, 'root_fd', lambda *a: calls.append('SOURCE-MUST-NOT-OPEN'))
+    with pytest.raises(ValueError, match='allocation refusal'):
+        m.main()
+    assert calls == ['allocation']
+
+
+def test_helper_has_no_code_import_or_replay_mechanism():
+    tree = ast.parse((HERE / 'livrer-qualification-existante.py').read_text())
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    assert not names.intersection({'subprocess', 'runpy', 'importlib', 'eval', 'exec', 'compile', 'pytest'})
+    assert not any(isinstance(n, ast.Attribute) and n.attr in {'extractall', 'extractfile'} for n in ast.walk(tree))
+
+
+def allocated_double(monkeypatch, mutation=None):
+    environment = {'SLURM_CPUS_PER_TASK': '4', 'SLURM_NTASKS': '1', 'SLURM_JOB_NUM_NODES': '1',
+        'SLURM_MEM_PER_NODE': '16384', 'SLURM_JOB_ID': '999999'}
+    if mutation == 'cpu':
+        environment['SLURM_CPUS_PER_TASK'] = '8'
+    elif mutation == 'memory':
+        environment['SLURM_MEM_PER_NODE'] = '32768'
+    elif mutation == 'GPU':
+        environment['SLURM_GPUS'] = '1'
+    elif mutation == 'old_job':
+        environment['SLURM_JOB_ID'] = '753709'
+    no_effect = lambda *a, **kw: (_ for _ in ()).throw(AssertionError('No I/O in allocation fixture'))
+    fake = SimpleNamespace(name='nt' if mutation == 'Windows' else 'posix', environ=environment,
+        O_NOFOLLOW=1, O_DIRECTORY=2, O_NONBLOCK=4, O_CLOEXEC=8,
+        open=no_effect, stat=no_effect, readlink=no_effect, scandir=no_effect,
+        supports_dir_fd={no_effect}, supports_fd={no_effect}, sched_getaffinity=lambda _: {0, 1, 2, 3})
+    monkeypatch.setattr(m, 'os', fake)
+    monkeypatch.setattr(m, 'platform', SimpleNamespace(machine=lambda: 'aarch64'))
+
+
+def test_exact_allocation_and_exclusive_delivery_deadline(monkeypatch):
+    allocated_double(monkeypatch)
+    assert m.allocation_guard(now=m.DEADLINE - 11401)['delivery_only'] is True
+    with pytest.raises(ValueError, match='exclusive deadline'):
+        m.allocation_guard(now=m.DEADLINE - 11400)
+
+
+@pytest.mark.parametrize('mutation', ['cpu', 'memory', 'GPU', 'old_job', 'Windows'])
+def test_wrong_delivery_allocation_refuses(monkeypatch, mutation):
+    allocated_double(monkeypatch, mutation)
+    with pytest.raises(ValueError):
+        m.allocation_guard(now=1)
+
+
+def test_wrong_source_root_refuses_before_lstat(monkeypatch):
+    monkeypatch.setattr(m, 'os', SimpleNamespace(lstat=lambda *a: (_ for _ in ()).throw(AssertionError('Must not lstat'))))
+    with pytest.raises(ValueError, match='Exact immutable'):
+        m.root_fd(m.SOURCE_ROOT + '-foreign')

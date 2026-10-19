@@ -1,0 +1,302 @@
+#include "knn.h"
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+enum { KNN_LABEL_COUNT = UCHAR_MAX + 1 };
+
+typedef struct {
+    size_t order;
+    float distance;
+    char label;
+} KnnNeighbor;
+
+static int knn_before(KnnNeighbor a, KnnNeighbor b, int farthest) {
+    if (a.distance < b.distance) return !farthest;
+    if (a.distance > b.distance) return farthest;
+    return farthest ? a.order > b.order : a.order < b.order;
+}
+
+static int knn_compare_near(const void *pa, const void *pb) {
+    const KnnNeighbor *a = (const KnnNeighbor *) pa;
+    const KnnNeighbor *b = (const KnnNeighbor *) pb;
+    if (a->distance < b->distance) return -1;
+    if (a->distance > b->distance) return 1;
+    return (a->order > b->order) - (a->order < b->order);
+}
+
+static int knn_compare_far(const void *pa, const void *pb) {
+    return -knn_compare_near(pa, pb);
+}
+
+static KnnNeighbor knn_median(KnnNeighbor a, KnnNeighbor b,
+                              KnnNeighbor c, int farthest) {
+    if (knn_before(a, b, farthest)) {
+        if (knn_before(b, c, farthest)) return b;
+        return knn_before(a, c, farthest) ? c : a;
+    }
+    if (knn_before(a, c, farthest)) return a;
+    return knn_before(b, c, farthest) ? c : b;
+}
+
+static void knn_select_prefix(KnnNeighbor *items, size_t length,
+                              size_t keep, int farthest) {
+    if (keep == 0 || keep >= length) return;
+
+    size_t left = 0;
+    size_t right = length;
+    unsigned int depth = 0;
+    for (size_t m = length; m > 1; m >>= 1) ++depth;
+    depth *= 2;
+
+    while (right - left > 24) {
+        if (depth == 0) {
+            qsort(items + left, right - left, sizeof(*items),
+                  farthest ? knn_compare_far : knn_compare_near);
+            return;
+        }
+        --depth;
+
+        KnnNeighbor pivot = knn_median(items[left],
+                                      items[left + (right - left) / 2],
+                                      items[right - 1], farthest);
+        size_t i = left;
+        size_t j = right;
+        for (;;) {
+            while (i < j && knn_before(items[i], pivot, farthest)) ++i;
+            while (i < j && knn_before(pivot, items[j - 1], farthest)) --j;
+            if (i >= j) break;
+            KnnNeighbor temporary = items[i];
+            items[i] = items[j - 1];
+            items[j - 1] = temporary;
+            ++i;
+            --j;
+        }
+
+        if (keep == i) return;
+        if (keep < i) right = i;
+        else left = i;
+    }
+
+    for (size_t i = left + 1; i < right; ++i) {
+        KnnNeighbor value = items[i];
+        size_t j = i;
+        while (j > left && knn_before(value, items[j - 1], farthest)) {
+            items[j] = items[j - 1];
+            --j;
+        }
+        items[j] = value;
+    }
+}
+
+static size_t knn_block_begin(size_t total, int id, int team) {
+    size_t quotient = total / (size_t) team;
+    size_t remainder = total % (size_t) team;
+    return quotient * (size_t) id
+         + ((size_t) id < remainder ? (size_t) id : remainder);
+}
+
+static char knn_vote(const size_t counts[KNN_LABEL_COUNT]) {
+    char best = (char) -1;
+    size_t best_count = 0;
+    for (int b = 0; b < KNN_LABEL_COUNT; ++b) {
+        char label = (char) b;
+        if (counts[b] > best_count ||
+            (counts[b] != 0 && counts[b] == best_count && label < best)) {
+            best = label;
+            best_count = counts[b];
+        }
+    }
+    return best;
+}
+
+static char knn_sequential(int n_groups, Group *groups, int k,
+                           Point to_evaluate) {
+    char *labels = (char *) malloc(sizeof(char) * k);
+    float *distances = (float *) malloc(sizeof(float) * k);
+    int i, j, x, y;
+
+    for (i = 0; i < k; ++i) {
+        labels[i] = -1;
+        distances[i] = -1;
+    }
+
+    for (i = 0; i < n_groups; ++i) {
+        Group g = groups[i];
+        for (j = 0; j < g.length; ++j) {
+            float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+            for (x = 0; x < k; ++x) {
+                if (d < distances[x] || distances[x] == -1) {
+                    for (y = k - 1; y > x; --y) {
+                        distances[y] = distances[y - 1];
+                        labels[y] = labels[y - 1];
+                    }
+                    distances[x] = d;
+                    labels[x] = g.label;
+                    break;
+                }
+            }
+        }
+    }
+
+    qsort(labels, k, sizeof(char), compare_for_sort);
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+    for (i = 1; i < k; ++i) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            ++current_frequency;
+        }
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+    free(distances);
+    free(labels);
+    return most_frequent;
+}
+
+char knn(int n_groups, Group *groups, int k, Point to_evaluate) {
+    if (k <= 0) return knn_sequential(n_groups, groups, k, to_evaluate);
+
+    size_t total_counts[KNN_LABEL_COUNT] = {0};
+    size_t total = 0;
+    for (int g = 0; g < n_groups; ++g) {
+        if (groups[g].length < 0)
+            return knn_sequential(n_groups, groups, k, to_evaluate);
+        size_t length = (size_t) groups[g].length;
+        if (length > SIZE_MAX - total)
+            return knn_sequential(n_groups, groups, k, to_evaluate);
+        total += length;
+        total_counts[(unsigned char) groups[g].label] += length;
+    }
+
+    size_t wanted = (size_t) k;
+    if (wanted >= total) {
+        total_counts[(unsigned char) -1] += wanted - total;
+        return knn_vote(total_counts);
+    }
+
+    int farthest = wanted > total - wanted;
+    size_t keep = farthest ? total - wanted : wanted;
+    if (total > SIZE_MAX / sizeof(KnnNeighbor))
+        return knn_sequential(n_groups, groups, k, to_evaluate);
+
+    int workers = 1;
+#ifdef _OPENMP
+    workers = omp_get_max_threads();
+#endif
+    size_t useful_threads = total / 16384;
+    if (useful_threads == 0) useful_threads = 1;
+    if ((size_t) workers > useful_threads) workers = (int) useful_threads;
+
+    KnnNeighbor *items = (KnnNeighbor *) malloc(total * sizeof(*items));
+    size_t *counts = (size_t *) malloc((size_t) workers * sizeof(*counts));
+    if (items == NULL || counts == NULL) {
+        free(counts);
+        free(items);
+        return knn_sequential(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t chosen_counts[KNN_LABEL_COUNT] = {0};
+    int saw_nan = 0;
+#pragma omp parallel num_threads(workers) if(workers > 1) reduction(|:saw_nan)
+    {
+        int tid = 0;
+        int team = 1;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+        team = omp_get_num_threads();
+#endif
+        size_t begin = knn_block_begin(total, tid, team);
+        size_t end = knn_block_begin(total, tid + 1, team);
+        size_t group_begin = 0;
+
+        for (int g = 0; g < n_groups && group_begin < end; ++g) {
+            size_t length = (size_t) groups[g].length;
+            size_t group_end = group_begin + length;
+            if (group_end > begin) {
+                size_t first = begin > group_begin ? begin - group_begin : 0;
+                size_t last = end < group_end ? end - group_begin : length;
+                for (size_t p = first; p < last; ++p) {
+                    size_t order = group_begin + p;
+                    float d = euclidean_distance_no_sqrt(to_evaluate,
+                                                         groups[g].points[p]);
+                    if (d != d) {
+                        saw_nan = 1;
+                        d = 0;
+                    }
+                    items[order].order = order;
+                    items[order].distance = d;
+                    items[order].label = groups[g].label;
+                }
+            }
+            group_begin = group_end;
+        }
+
+        size_t local_count = end - begin;
+        if (local_count > keep) local_count = keep;
+        knn_select_prefix(items + begin, end - begin, local_count, farthest);
+        counts[tid] = local_count;
+#pragma omp barrier
+
+        for (size_t stride = 1; stride < (size_t) team; stride *= 2) {
+            if ((size_t) tid % (2 * stride) == 0 &&
+                (size_t) tid + stride < (size_t) team) {
+                int partner = (int) ((size_t) tid + stride);
+                size_t partner_begin = knn_block_begin(total, partner, team);
+                size_t left_count = counts[tid];
+                size_t right_count = counts[partner];
+                /* Compaction stays within this pair's original point range. */
+                memmove(items + begin + left_count, items + partner_begin,
+                        right_count * sizeof(*items));
+                size_t combined = left_count + right_count;
+                size_t retained = combined < keep ? combined : keep;
+                knn_select_prefix(items + begin, combined, retained, farthest);
+                counts[tid] = retained;
+            }
+#pragma omp barrier
+        }
+
+#pragma omp for schedule(static) reduction(+:chosen_counts[:KNN_LABEL_COUNT])
+        for (size_t p = 0; p < keep; ++p) {
+            ++chosen_counts[(unsigned char) items[p].label];
+        }
+    }
+
+    free(counts);
+    free(items);
+    if (saw_nan) return knn_sequential(n_groups, groups, k, to_evaluate);
+
+    if (farthest) {
+        for (int b = 0; b < KNN_LABEL_COUNT; ++b)
+            chosen_counts[b] = total_counts[b] - chosen_counts[b];
+    }
+    return knn_vote(chosen_counts);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

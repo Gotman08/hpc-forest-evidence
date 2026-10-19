@@ -1,0 +1,99 @@
+"""Verify the exact rendered Terra edition before the parent's visual review."""
+import csv
+import hashlib
+import json
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+EDITORIAL = STUDY / "edition-professionnelle"
+WORKSPACE = STUDY.parents[1]
+VERSION = STUDY / "versions/20261017-avant-terra-double-professionnelle"
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def descriptor(path):
+    return {"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size}
+
+
+def main():
+    assert not (HERE / "construction-verifiee.json").exists()
+    admission = read(EDITORIAL / "admission-terra-double-verifiee.json")
+    assert admission["verified"] and sha(EDITORIAL / "admissions.json") == admission["admissions_sha256"]
+    for item in admission["bound_receipts"]:
+        assert sha(Path(item["receipt_path"])) == item["receipt_sha256"]
+        assert sha(Path(item["normalized_path"])) == item["normalized_sha256"]
+    preservation = read(VERSION / "PRESERVATION.json")
+    assert preservation["all_copied_bytes_verified"] and preservation["copied_files"] == 4450
+    assert len(preservation["previous_manifest"]["files"]) == 1063
+    for name, expected in {**preservation["files"], **preservation["extra_snapshots"]}.items():
+        assert sha(VERSION / name) == expected
+    audit = read(EDITORIAL / "audit-calculs.json")
+    assert audit["verified"] and audit["registry_count"] == 194 and audit["research_confirmation_rows"] == 178
+    assert audit["checks"]["cohort_exact_token_sums"] == audit["checks"]["cohort_native_call_sums"] == 13
+    assert audit["cpu_totals"]["samples"] == 11575
+    for name, expected in audit["frozen_data_files"].items():
+        assert sha(EDITORIAL / "donnees" / name) == expected
+    rows = read(EDITORIAL / "donnees/confirmations-recalculees.json")
+    native = [row for row in rows if row["cohort"] != "deepseek"]
+    assert len(rows) == 178 and len(native) == 172
+    assert sum(row["native_calls"] for row in native) == 1580
+    assert sum(row["known_exact_tokens"] for row in native) == 33796289
+    assert sum(row["unmetered_calls"] for row in native) == 144
+    with (EDITORIAL / "donnees/confirmations.csv").open(encoding="utf-8-sig", newline="") as stream:
+        csv_rows = list(csv.DictReader(stream))
+    assert len(csv_rows) == len(rows)
+    summaries = {name: read(EDITORIAL / "donnees" / name)["request_summary"]
+                 for name in ("couts-terra-xhigh.json", "couts-source-only-terra.json")}
+    assert sum(s["requests_with_unknown_consumption"] for s in summaries.values()) == 44
+    assert sum(s["unmeasured_native_invocations"] for s in summaries.values()) == 38
+    assert sum(s["interrupted_claims_unknown"] for s in summaries.values()) == 2
+    assert sum(s["published_requests"] - s["verified_deliveries"] for s in summaries.values()) == 8
+    quality = read(EDITORIAL / "controle-qualite.json")
+    assert quality["all_pdf_pages_rendered"] and not quality["visual_review_completed"]
+    assert quality["arithmetic_audit_verified"] and quality["frozen_inputs_still_match"]
+    for document in quality["documents"]:
+        assert sha(STUDY / (document["name"] + ".pdf")) == document["pdf_sha256"]
+        assert all(not document[name] for name in ("glyph_errors", "outside_page", "blank_pages"))
+    assert [doc["figures"] for doc in quality["documents"]] == [7, 253]
+    for name in ("ARTICLE", "ANNEXES-TECHNIQUES"):
+        assert not re.search(r"\{\{.+?\}\}", (STUDY / (name + ".md")).read_text(encoding="utf8"))
+    identifiers = re.findall(r"^\| (ID-\d{3}) \|", (WORKSPACE / "ID.md").read_text(encoding="utf8"), re.MULTILINE)
+    assert identifiers == [f"ID-{i:03d}" for i in range(1, 41)]
+    result = {
+        "verified": True, "verified_utc": datetime.now(UTC).isoformat(),
+        "preserved_files_reverified": 4450, "previous_manifest_files_reverified": 1063,
+        "registry_count": 194, "principal_results": 178, "CPU_samples_unchanged": 11575,
+        "native_closed_cohorts": 13, "native_closed_invocations": 1580,
+        "native_closed_known_exact_tokens": 33796289, "native_closed_unmetered_invocations": 144,
+        "new_terra_unknown_consumption_requests": 44, "new_terra_unmetered_invocations": 38,
+        "new_terra_undelivered_requests": 8, "interrupted_claims_already_counted_as_unmetered": 2,
+        "total_native_consumption_exact": False, "all_forty_IDs_preserved": True,
+        "neutral_tests": 10, "ruff_passed": True,
+        "documents": [{key: item[key] for key in ("name", "pages", "figures", "pdf_sha256")} for item in quality["documents"]],
+        "contact_sheets": quality["contact_sheets"],
+        "quality_control": descriptor(EDITORIAL / "controle-qualite.json"),
+        "arithmetic_audit": descriptor(EDITORIAL / "audit-calculs.json"),
+        "admissions": descriptor(EDITORIAL / "admissions.json"),
+        "outputs": {name + suffix: descriptor(STUDY / (name + suffix))
+                    for name in ("ARTICLE", "ANNEXES-TECHNIQUES") for suffix in (".md", ".html", ".pdf")},
+        "visual_review_completed": False, "visual_review_and_final_seal_pending": True,
+        "new_model_calls": 0, "new_candidate_execution_or_compilation": False,
+        "process_interventions": 0, "public_repository_or_private_kit_updated": False,
+    }
+    (HERE / "construction-verifiee.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    print(json.dumps({key: result[key] for key in ("verified", "registry_count", "principal_results", "documents", "visual_review_completed")}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,208 @@
+"""Bounded local cache capture after nine delivered claims; no audit or stop."""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RECEPTION = HERE.parent
+STUDY = RECEPTION.parents[1]
+WORKSPACE = STUDY.parents[1]
+RUN = STUDY / "runs/coverage-gpt-6.1-sol-xhigh"
+SOURCE = RUN / "worker"
+SESSION = "445f72b190204fc08e02a578205b4ef4"
+CLI_SHA = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def load(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def write(name, value):
+    path = HERE / name
+    require(not path.exists(), "Preserve prior receipt: " + name)
+    path.write_text(json.dumps(value, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def bound(path):
+    return {"path": str(Path(path).resolve()), "sha256": sha(path)}
+
+
+def lock_exception():
+    lock = SOURCE / "worker.lock"
+    require(lock.is_file(), "Owned worker lock missing")
+    info = lock.stat()
+    try:
+        lock.read_bytes()
+    except PermissionError:
+        return {"relative_path": "worker.lock", "reason": "locked_by_live_owned_worker",
+                "preserved_in_place": True, "locked_read_observed": True,
+                "bytes_observed_by_stat": info.st_size, "mtime_ns": info.st_mtime_ns,
+                "kernel_handle_owner_independently_queried": False}
+    raise ValueError("Lock became readable; reconcile ownership before another capture")
+
+
+def inventory(root, exclude_lock=False):
+    files, directories = {}, []
+    for path in sorted(root.rglob("*")):
+        require(not path.is_symlink() and not path.is_junction(), "Unexpected link; no silent exclusion")
+        relative = path.relative_to(root).as_posix()
+        if path.is_dir():
+            directories.append(relative)
+        elif path.is_file():
+            if relative == "worker.lock" and exclude_lock:
+                continue
+            files[relative] = {"bytes": path.stat().st_size, "sha256": sha(path)}
+        else:
+            raise ValueError("Unexpected nonregular cache entry: " + relative)
+    return {"files": files, "directories": directories}
+
+
+def delivered_claims(root):
+    rows = []
+    folders = [p for p in root.iterdir() if p.is_dir()]
+    require(len(folders) == 9 and all(re.fullmatch(r"[0-9a-f]{32}", p.name) for p in folders), "Expected exactly nine nonce caches")
+    for folder in sorted(folders):
+        request = load(folder / "request.json")
+        response = load(folder / "response.json")
+        claim = load(folder / "generation-claimed.json")
+        ready = load(folder / "response-ready.json")
+        delivery = load(folder / "delivered.json")
+        require(all(request.get(k) == v for k, v in {"protocol": "hpc-forest-codex-mailbox-v1", "nonce": folder.name,
+                "session_id": SESSION, "model": "gpt-6.1-sol", "reasoning_effort": "xhigh"}.items()), "Wrong request identity")
+        checksum = sha(folder / "request.json")
+        response_sha = sha(folder / "response.json")
+        require(claim.get("request_sha256") == delivery.get("request_sha256") == response.get("request_sha256") == checksum,
+                "Claim/request/delivery binding differs")
+        require(all(response.get(k) == request[k] for k in ("protocol", "nonce", "session_id", "model", "reasoning_effort")), "Wrong response identity")
+        require(ready == {"sha256": response_sha, "bytes": (folder / "response.json").stat().st_size}
+                and delivery.get("response_sha256") == response_sha, "Unready or undelivered claim")
+        rows.append({"nonce": folder.name, "request_sha256": checksum, "response_sha256": response_sha,
+                     "delivered_at": delivery["delivered_at"]})
+    return rows
+
+
+def main():
+    destination = HERE / "worker"
+    require(not destination.exists(), "Never reuse a worker snapshot")
+    owner, ready = load(SOURCE / "OWNER.json"), load(SOURCE / "worker-ready.json")
+    require(owner == {"protocol": "hpc-forest-codex-mailbox-v1", "session_id": SESSION, "owner": "751571",
+                      "model": "gpt-6.1-sol", "reasoning_effort": "xhigh"}, "Wrong OWNER")
+    require(ready.get("session_id") == SESSION and ready.get("model") == "gpt-6.1-sol"
+            and ready.get("reasoning_effort") == "xhigh" and ready.get("pid") == 14612, "Wrong readiness identity")
+    require(sha(ready["codex_executable"]) == CLI_SHA, "CLI pin changed")
+    cim = load(HERE / "cim-avant.json")
+    require(isinstance(cim, list), "CIM must contain both identities")
+    indexed = {p["ProcessId"]: p for p in cim}
+    require({12988, 14612} <= indexed.keys(), "Owned live identities absent")
+    for pid in (12988, 14612):
+        process = indexed[pid]
+        require(SESSION in process["CommandLine"] and str(SOURCE.resolve()) in process["CommandLine"]
+                and "-m hpc_forest.matrix_worker" in process["CommandLine"], "Wrong live worker command")
+        require(bool(process["ExecutablePath"]) and bool(process["CreationDate"]), "Incomplete process identity")
+    require(indexed[14612]["ParentProcessId"] == 12988, "Wrong launcher/Python relation")
+    rows_before = delivered_claims(SOURCE)
+    exception_before = lock_exception()
+    before = inventory(SOURCE, exclude_lock=True)
+    write("inventaire-avant.json", before)
+    destination.mkdir()
+    for name in before["directories"]:
+        (destination / name).mkdir(parents=True, exist_ok=True)
+    for name in before["files"]:
+        target = destination / name
+        require(target.resolve().is_relative_to(destination.resolve()), "Copy escaped destination")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SOURCE / name, target)
+    after = inventory(SOURCE, exclude_lock=True)
+    copied = inventory(destination)
+    rows_after = delivered_claims(SOURCE)
+    exception_after = lock_exception()
+    write("inventaire-apres.json", after)
+    write("inventaire-copie.json", copied)
+    require(before == after == copied and rows_before == rows_after and exception_before == exception_after,
+            "Cache changed during copy; preserve and reconcile")
+    require(delivered_claims(destination) == rows_before, "Copied claims differ")
+    worker_manifest = write("MANIFESTE-CACHE-FICHIERS.json", {"files": copied["files"]})
+    links = HERE / "provenance-inputs"
+    links.mkdir()
+    cancel = load(RECEPTION / "cancel-intent.json")
+    require(cancel.get("job_id") == "751571" and cancel.get("human_answer") == "Arrêter ce supplément proprement", "Missing preserved human decision")
+    authorization = write("human_authorization.json", {"human_approved": True, "job_id": "751571", "session_id": SESSION,
+                         "human_decision": cancel["human_answer"], "based_on_preserved_cancel_intent": bound(RECEPTION / "cancel-intent.json")})
+    status_record = load(RECEPTION / "statut-apres-cancel.json")
+    terminal = status_record.get("structuredContent")
+    require(terminal and terminal.get("job_id") == "751571" and terminal.get("finished") is True
+            and terminal.get("state", "").startswith("CANCELLED"), "No actual terminal observation")
+    terminal_path = write("terminal_status.json", terminal)
+    state_path = STUDY / "coordinator-state.json"
+    state_raw = state_path.read_bytes()
+    state = json.loads(state_raw)
+    groups = [g for g in state["queue"] if g.get("key") == "coverage-gpt-6.1-sol-xhigh"]
+    require(len(groups) == 1 and groups[0].get("job_id") == "751571" and groups[0].get("session_id") == SESSION, "Wrong planned group")
+    group_path = write("planned_group.json", groups[0])
+    write("provenance-transformations.json", {"human_authorization_source": bound(RECEPTION / "cancel-intent.json"),
+          "terminal_status_source": bound(RECEPTION / "statut-apres-cancel.json"), "terminal_transformation": "structuredContent extracted without alteration",
+          "planned_group_source_path": str(state_path.resolve()), "planned_group_source_sha256_at_extraction": hashlib.sha256(state_raw).hexdigest(),
+          "planned_group_transformation": "exact queue object selected by key/job/session", "audit_executed": False})
+    source_zip = STUDY / "HPC-Forest-Archives-Modele-Mere-r1.zip"
+    migration = STUDY / "receptions/coverage-terra-xhigh-750909/continuation-cli-r1/migration-cli-continuation-r1.json"
+    historical = WORKSPACE / "outputs/HPC-Forest-Harnais-Comparaison-r1/cli-figee.json"
+    require(sha(source_zip) == "cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18", "Source ZIP changed")
+    require(sha(historical) == "9808e32b0fc05802b181c1552708be64f79e8f3e9110ace1ed3d29b603bcfa11", "Historical pin changed")
+    for source in (RECEPTION / "cancel-intent.json", RECEPTION / "statut-apres-cancel.json", RUN / "worker-lancement.json", migration, historical):
+        shutil.copy2(source, links / source.name)
+    remote_manifest = RECEPTION / "transfert-archive-allouee-r1/MANIFESTE-DISTANT-FICHIERS.json"
+    remote_proof = RECEPTION / "transfert-archive-allouee-r1/restauration-verifiee.json"
+    require(sha(remote_manifest) == "015f87dd955013c4ac24fffc0993bfa1aea5e8830cb69a1871a6d07af0dec419", "Parent remote manifest changed")
+    remote = load(remote_proof)
+    require(remote.get("verified") is True and remote.get("three_archive_sha256_identical") is True
+            and remote.get("source_entries_unchanged_before_after") is True and remote.get("source_complete") is False, "Parent restoration proof incomplete")
+    provenance = {"schema": "hpc-forest-voluntary-partial-reception-v1", "job_id": "751571", "session_id": SESSION,
+                  "model": "gpt-6.1-sol", "effort": "xhigh", "human_stop_approved": True,
+                  "new_remote_requests_stopped": True, "remote_snapshot_stable_before_after": True,
+                  "worker_snapshot_stable_before_after": True, "human_authorization": bound(authorization),
+                  "terminal_status": bound(terminal_path), "planned_group": bound(group_path), "source_zip": bound(source_zip),
+                  "remote_manifest": bound(remote_manifest), "worker_manifest": bound(worker_manifest),
+                  "cli_migration": bound(migration), "historical_cli_pin": bound(historical),
+                  "worker_copy_exceptions": [exception_before], "parent_restoration_proof": bound(remote_proof),
+                  "source_job_complete": False, "audit_executed": False}
+    proof_path = write("provenance-pour-audit-non-execute.json", provenance)
+    receipt = {"status": "stable_post_drain_cache_copied_not_audited", "captured_utc": datetime.now(timezone.utc).isoformat(),
+               "source": str(SOURCE.resolve()), "worker_snapshot": str(destination.resolve()), "worker_manifest": bound(worker_manifest),
+               "provenance": bound(proof_path), "files_copied": len(copied["files"]), "file_bytes_copied": sum(x["bytes"] for x in copied["files"].values()),
+               "claims": len(rows_before), "delivered": len(rows_before), "undelivered_claims": [], "deliveries": rows_before,
+               "inventory_before": bound(HERE / "inventaire-avant.json"), "inventory_after": bound(HERE / "inventaire-apres.json"),
+               "inventory_copy": bound(HERE / "inventaire-copie.json"), "all_inventory_files_equal": True,
+               "worker_copy_exceptions": [exception_before], "owner": bound(destination / "OWNER.json"),
+               "worker_ready": bound(destination / "worker-ready.json"), "fresh_cim": bound(HERE / "cim-avant.json"),
+               "source_written": False, "worker_stopped": False, "audit_executed": False, "native_calls": 0,
+               "source_research_complete": False, "scientific_result_admitted": False}
+    write("capture-verifiee.json", receipt)
+    print(json.dumps({"status": receipt["status"], "files": receipt["files_copied"], "claims_delivered": len(rows_before),
+                      "worker_manifest": receipt["worker_manifest"], "provenance": receipt["provenance"],
+                      "capture_sha256": sha(HERE / "capture-verifiee.json")}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        path = HERE / "refus.json"
+        if not path.exists():
+            path.write_text(json.dumps({"status": "refused_preserve_partial_no_retry", "error_type": type(error).__name__,
+                            "error": str(error), "audit_executed": False, "source_written": False}, indent=2) + "\n", encoding="utf-8")
+        raise

@@ -1,0 +1,78 @@
+set -euo pipefail
+py=/scratch_p/nimarano/hpc-forest-localmodels-20261015-r1/venv-r3/bin/python
+packet=/scratch_p/nimarano/hpc-forest-r4b-target-profile-source110-20261018-r1.tar.gz
+root=/scratch_p/nimarano/hpc-forest-r4b-target-profile-source110-20261018-r1
+test -x "$py"
+test ! -e "$root"
+test -d /scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-qualification-20261018-eaff9217499f
+printf '%s  %s\n' 7474210c2ae206ae2fb1cb6bb961b77850f0f0b7eec2d374916988a7957c0023 "$packet" | sha256sum -c -
+romeo_load_armgpu_env
+spack load /zrtbeqke25s2vbqo4yrhsowjz7mg3pjf
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1 CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=TRUE OPENBLAS_NUM_THREADS=1
+exec srun --ntasks=1 --cpus-per-task=4 --cpu-bind=cores "$py" -I -S -B - "$packet" "$root" 7474210c2ae206ae2fb1cb6bb961b77850f0f0b7eec2d374916988a7957c0023 <<'SOURCE110_TARGET_BOOTSTRAP'
+"""Inline bootstrap for one allocated srun; no scientific work before guard."""
+import hashlib
+import io
+import json
+import os
+import platform
+import re
+import runpy
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+
+def need(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def main():
+    need(time.time() + 600 + 10800 < 1793487600, "Deadline plus audit reserve exceeded")
+    need(platform.machine().lower() == "aarch64", "ARM64 allocation required")
+    need(all(os.environ.get(k) == v for k, v in {
+        "SLURM_CPUS_PER_TASK": "4", "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
+        "SLURM_MEM_PER_NODE": "16384"}.items()), "Exact 4CPU/1task/1node/16GiB allocation required")
+    need(re.fullmatch(r"[0-9]+", os.environ.get("SLURM_JOB_ID", "")) is not None, "Actual Slurm job required")
+    need(not os.environ.get("SLURM_JOB_GPUS", "") and not os.environ.get("SLURM_STEP_GPUS", "")
+         and os.environ.get("SLURM_GPUS", "0") == "0"
+         and os.environ.get("SLURM_GPUS_ON_NODE", "0") == "0", "Zero GPU required")
+    affinity = sorted(os.sched_getaffinity(0))
+    need(len(affinity) == 4, "Unique srun must bind exactly four CPUs")
+    packet, root = map(Path, sys.argv[1:3])
+    expected_packet_sha = sys.argv[3]
+    need(root.is_absolute() and not root.exists() and not root.is_symlink(), "Fresh absolute dedicated root required")
+    packet_bytes = packet.read_bytes()
+    need(len(packet_bytes) <= 64 * 1024 * 1024
+         and hashlib.sha256(packet_bytes).hexdigest() == expected_packet_sha,
+         "Exact bounded packet bytes required")
+    expected = {'target-qualification-bindings.json', 'q753709-qualification.json', 'packet-manifest.json', 'qualifier-cible-source110.py', 'q753709-bindings.json', 'q753709-bootstrap-allocation.json'}
+    with tarfile.open(fileobj=io.BytesIO(packet_bytes), mode="r:gz") as archive:
+        members = archive.getmembers()
+        need(len(members) == len(expected) and {m.name for m in members} == expected
+             and all(m.isfile() and not m.issym() and not m.islnk() for m in members)
+             and sum(m.size for m in members) <= 128 * 1024 * 1024,
+             "Exact six regular target packet files required")
+        root.mkdir(parents=False, exist_ok=False)
+        for member in members:
+            with (root / member.name).open("xb") as stream:
+                stream.write(archive.extractfile(member).read())
+    actual = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+              for name in expected - {"packet-manifest.json"}}
+    need(actual == json.loads((root / "packet-manifest.json").read_text(encoding="utf-8")),
+         "Exact packet manifest required before wrapper execution")
+    with (root / "bootstrap-allocation.json").open("x", encoding="utf-8") as stream:
+        json.dump({"observed_at": time.time(), "architecture": "ARM64", "cpu_cores": 4,
+                   "tasks": 1, "nodes": 1, "allocated_memory_mib": 16384, "allocated_gpus": 0,
+                   "slurm_job_id": os.environ["SLURM_JOB_ID"], "affinity_cpu_ids": affinity,
+                   "guard_before_any_extraction": True, "native_model_calls": 0}, stream)
+    sys.argv = [str(root / "qualifier-cible-source110.py"), "--driver", str(root), "--shared", '/scratch_p/nimarano/hpc-forest-dynamic-r4b-lane-r3-qualification-20261018-eaff9217499f']
+    runpy.run_path(str(root / "qualifier-cible-source110.py"), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
+
+SOURCE110_TARGET_BOOTSTRAP

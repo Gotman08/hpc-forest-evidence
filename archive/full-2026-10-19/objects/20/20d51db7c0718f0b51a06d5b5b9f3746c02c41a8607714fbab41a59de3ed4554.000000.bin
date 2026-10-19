@@ -1,0 +1,169 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+#include <arm_neon.h>
+
+#pragma STDC FP_CONTRACT OFF
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static void *aligned_malloc(size_t size) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
+    return ptr;
+}
+
+void body_force(float * restrict px, float * restrict py, float * restrict pz,
+                float * restrict vx, float * restrict vy, float * restrict vz,
+                int n) {
+    const float dt = DT;
+    #pragma omp parallel for schedule(static)
+    for (int i0 = 0; i0 < n; i0 += 4) {
+        if (i0 + 3 < n) {
+            // Vectorized group of 4
+            float32x4_t x_i = vld1q_f32(px + i0);
+            float32x4_t y_i = vld1q_f32(py + i0);
+            float32x4_t z_i = vld1q_f32(pz + i0);
+            float32x4_t fx = vdupq_n_f32(0.0f);
+            float32x4_t fy = vdupq_n_f32(0.0f);
+            float32x4_t fz = vdupq_n_f32(0.0f);
+
+            for (int j = 0; j < n; ++j) {
+                float pxj = px[j];
+                float pyj = py[j];
+                float pzj = pz[j];
+
+                float32x4_t dx = vsubq_f32(vdupq_n_f32(pxj), x_i);
+                float32x4_t dy = vsubq_f32(vdupq_n_f32(pyj), y_i);
+                float32x4_t dz = vsubq_f32(vdupq_n_f32(pzj), z_i);
+
+                float32x4_t dx2 = vmulq_f32(dx, dx);
+                float32x4_t dy2 = vmulq_f32(dy, dy);
+                float32x4_t dz2 = vmulq_f32(dz, dz);
+                float32x4_t sqrd = vaddq_f32(vaddq_f32(vaddq_f32(dx2, dy2), dz2),
+                                             vdupq_n_f32(SOFTENING));
+
+                float32x4_t inv_dist = vdivq_f32(vdupq_n_f32(1.0f), vsqrtq_f32(sqrd));
+                float32x4_t inv_dist3 = vmulq_f32(vmulq_f32(inv_dist, inv_dist), inv_dist);
+
+                fx = vaddq_f32(fx, vmulq_f32(dx, inv_dist3));
+                fy = vaddq_f32(fy, vmulq_f32(dy, inv_dist3));
+                fz = vaddq_f32(fz, vmulq_f32(dz, inv_dist3));
+            }
+
+            float32x4_t dvx = vmulq_n_f32(fx, dt);
+            float32x4_t dvy = vmulq_n_f32(fy, dt);
+            float32x4_t dvz = vmulq_n_f32(fz, dt);
+
+            vst1q_f32(vx + i0, vaddq_f32(vld1q_f32(vx + i0), dvx));
+            vst1q_f32(vy + i0, vaddq_f32(vld1q_f32(vy + i0), dvy));
+            vst1q_f32(vz + i0, vaddq_f32(vld1q_f32(vz + i0), dvz));
+        } else {
+            // Scalar tail
+            for (int i = i0; i < n; ++i) {
+                float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+                for (int j = 0; j < n; ++j) {
+                    float dx = px[j] - px[i];
+                    float dy = py[j] - py[i];
+                    float dz = pz[j] - pz[i];
+                    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+                    float inv_dist = 1.0f / sqrt(sqrd_dist);
+                    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+                    fx += dx * inv_dist3;
+                    fy += dy * inv_dist3;
+                    fz += dz * inv_dist3;
+                }
+                vx[i] += dt*fx;
+                vy[i] += dt*fy;
+                vz[i] += dt*fz;
+            }
+        }
+    }
+}
+
+Body* read_dataset(int *nbodies) {
+    int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+    if (b != 1) {
+        fprintf(stderr,"\nError reading nbodie value\n");
+        exit(EXIT_FAILURE);
+    }
+    Body *tmp = (Body *)malloc(*nbodies * sizeof(Body));
+    b = fread(tmp, *nbodies * sizeof(Body), 1, stdin);
+    if (b != 1) {
+        fprintf(stderr,"\nError reading input values\n");
+        exit(EXIT_FAILURE);
+    }
+    return tmp;
+}
+
+void write_dataset(const int nbodies, Body *bodies) {
+    int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+    if (b != 1) {
+        fprintf(stderr,"\nError writing to output\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+int main(int argc,char **argv) {
+    int nbodies;
+    Body *tmp = read_dataset(&nbodies);
+
+    // Allocate aligned SoA arrays
+    float *px = (float*)aligned_malloc(nbodies * sizeof(float));
+    float *py = (float*)aligned_malloc(nbodies * sizeof(float));
+    float *pz = (float*)aligned_malloc(nbodies * sizeof(float));
+    float *vx = (float*)aligned_malloc(nbodies * sizeof(float));
+    float *vy = (float*)aligned_malloc(nbodies * sizeof(float));
+    float *vz = (float*)aligned_malloc(nbodies * sizeof(float));
+
+    if (!px || !py || !pz || !vx || !vy || !vz) {
+        fprintf(stderr, "Memory allocation failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < nbodies; ++i) {
+        px[i] = tmp[i].x;
+        py[i] = tmp[i].y;
+        pz[i] = tmp[i].z;
+        vx[i] = tmp[i].vx;
+        vy[i] = tmp[i].vy;
+        vz[i] = tmp[i].vz;
+    }
+    free(tmp);
+
+    for (int iter = 0; iter < N_ITER; iter++) {
+        body_force(px, py, pz, vx, vy, vz, nbodies);
+
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < nbodies; i++) {
+            px[i] += vx[i] * DT;
+            py[i] += vy[i] * DT;
+            pz[i] += vz[i] * DT;
+        }
+    }
+
+    // Convert back to AoS for output
+    Body *out = (Body*)malloc(nbodies * sizeof(Body));
+    if (!out) { fprintf(stderr, "Memory allocation failed\n"); exit(EXIT_FAILURE); }
+    for (int i = 0; i < nbodies; ++i) {
+        out[i].x = px[i];
+        out[i].y = py[i];
+        out[i].z = pz[i];
+        out[i].vx = vx[i];
+        out[i].vy = vy[i];
+        out[i].vz = vz[i];
+    }
+
+    write_dataset(nbodies, out);
+
+    free(out);
+    free(px); free(py); free(pz); free(vx); free(vy); free(vz);
+
+    exit(EXIT_SUCCESS);
+}

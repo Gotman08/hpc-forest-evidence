@@ -1,0 +1,220 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdint.h>
+
+enum { RADIX = 256, INSERTION_CUTOFF = 32 };
+
+typedef struct {
+    unsigned char *data;
+    size_t used;
+    size_t capacity;
+} token_buffer;
+
+static void allocation_error(void) {
+    fputs("ERROR memory\n", stderr);
+    exit(EXIT_FAILURE);
+}
+
+static void append_byte(token_buffer *buffer, unsigned char value) {
+    if (buffer->used == buffer->capacity) {
+        size_t capacity;
+        unsigned char *data;
+
+        if (buffer->capacity == 0)
+            capacity = 4096;
+        else if (buffer->capacity <= SIZE_MAX / 2)
+            capacity = buffer->capacity * 2;
+        else
+            capacity = SIZE_MAX;
+
+        if (capacity <= buffer->capacity)
+            allocation_error();
+        data = (unsigned char *)realloc(buffer->data, capacity);
+        if (data == NULL)
+            allocation_error();
+        buffer->data = data;
+        buffer->capacity = capacity;
+    }
+    buffer->data[buffer->used++] = value;
+}
+
+static void load(token_buffer *strings, size_t **index_out, size_t *count_out) {
+    int len, offset, nbucket;
+    long int n;
+    size_t count;
+    size_t *index = NULL;
+
+    if (fscanf(stdin, "%d", &len) != 1) {
+        printf("ERROR len\n");
+        exit(EXIT_FAILURE);
+    }
+    if (fscanf(stdin, "%ld", &n) != 1) {
+        printf("ERROR n\n");
+        exit(EXIT_FAILURE);
+    }
+    if (fscanf(stdin, "%d", &offset) != 1) {
+        printf("ERROR offset\n");
+        exit(EXIT_FAILURE);
+    }
+    if (fscanf(stdin, "%d", &nbucket) != 1) {
+        printf("ERROR nbucket\n");
+        exit(EXIT_FAILURE);
+    }
+    if (n < 0 || (uintmax_t)n > (uintmax_t)(SIZE_MAX / sizeof(*index)))
+        allocation_error();
+
+    /* Preserve the header format, but use actual token lengths and bytes. */
+    (void)len;
+    (void)offset;
+    (void)nbucket;
+    count = (size_t)n;
+    if (count != 0) {
+        index = (size_t *)malloc(count * sizeof(*index));
+        if (index == NULL)
+            allocation_error();
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        int c;
+        do {
+            c = fgetc(stdin);
+        } while (c != EOF && isspace((unsigned char)c));
+        if (c == EOF) {
+            printf("ERROR %zu\n", i);
+            exit(EXIT_FAILURE);
+        }
+
+        index[i] = strings->used;
+        do {
+            append_byte(strings, (unsigned char)c);
+            c = fgetc(stdin);
+        } while (c != EOF && !isspace((unsigned char)c));
+        append_byte(strings, 0);
+    }
+
+    *index_out = index;
+    *count_out = count;
+}
+
+static void insertion_sort(const unsigned char *strings, size_t *index,
+                           size_t count, size_t depth) {
+    for (size_t i = 1; i < count; ++i) {
+        size_t key = index[i];
+        size_t j = i;
+        const char *suffix = (const char *)(strings + key + depth);
+        while (j != 0 &&
+               strcmp((const char *)(strings + index[j - 1] + depth),
+                      suffix) > 0) {
+            index[j] = index[j - 1];
+            --j;
+        }
+        index[j] = key;
+    }
+}
+
+static void radix_sort(const unsigned char *strings, size_t *index,
+                       size_t *scratch, size_t count, size_t depth) {
+    size_t frequency[RADIX];
+    size_t end[RADIX];
+
+    for (;;) {
+        size_t total = 0;
+        size_t largest_count = 0;
+        unsigned int largest = 0;
+        unsigned int first;
+
+        if (count <= INSERTION_CUTOFF) {
+            insertion_sort(strings, index, count, depth);
+            return;
+        }
+
+        memset(frequency, 0, sizeof(frequency));
+        for (size_t i = 0; i < count; ++i)
+            ++frequency[strings[index[i] + depth]];
+
+        first = strings[index[0] + depth];
+        if (frequency[first] == count) {
+            if (first == 0)
+                return;
+            /* Advance through a shared prefix without recursion or scatter. */
+            ++depth;
+            continue;
+        }
+
+        for (unsigned int b = 0; b < RADIX; ++b) {
+            end[b] = total;
+            total += frequency[b];
+            if (b != 0 && frequency[b] > largest_count) {
+                largest = b;
+                largest_count = frequency[b];
+            }
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            size_t key = index[i];
+            unsigned int b = strings[key + depth];
+            scratch[end[b]++] = key;
+        }
+        memcpy(index, scratch, count * sizeof(*index));
+
+        /* Bucket zero contains complete strings and must not be inspected again. */
+        for (unsigned int b = 1; b < RADIX; ++b) {
+            if (b != largest && frequency[b] > 1) {
+                size_t begin = end[b] - frequency[b];
+                radix_sort(strings, index + begin, scratch + begin,
+                           frequency[b], depth + 1);
+            }
+        }
+
+        if (largest_count <= 1)
+            return;
+
+        /* Recurse only on smaller children, bounding stack depth logarithmically. */
+        {
+            size_t begin = end[largest] - largest_count;
+            index += begin;
+            scratch += begin;
+            count = largest_count;
+            ++depth;
+        }
+    }
+}
+
+static void bucket_sort(const unsigned char *strings, size_t *index,
+                        size_t count) {
+    size_t *scratch;
+
+    if (count <= INSERTION_CUTOFF) {
+        insertion_sort(strings, index, count, 0);
+        return;
+    }
+    if (count > SIZE_MAX / sizeof(*scratch))
+        allocation_error();
+    scratch = (size_t *)malloc(count * sizeof(*scratch));
+    if (scratch == NULL)
+        allocation_error();
+    radix_sort(strings, index, scratch, count, 0);
+    free(scratch);
+}
+
+static void save(const unsigned char *strings, const size_t *index, size_t count) {
+    for (size_t i = 0; i < count; ++i)
+        printf("%s\n", (const char *)(strings + index[i]));
+}
+
+int main(int ac, char **av) {
+    token_buffer strings = { NULL, 0, 0 };
+    size_t *index = NULL;
+    size_t count = 0;
+
+    (void)ac;
+    (void)av;
+    load(&strings, &index, &count);
+    bucket_sort(strings.data, index, count);
+    save(strings.data, index, count);
+    free(index);
+    free(strings.data);
+    return EXIT_SUCCESS;
+}

@@ -1,0 +1,238 @@
+"""Pure cold SO/OBS3 transition preparation. No census, subprocess, RPC or lock.
+
+Root alone supplies an actual full CIM file and may later start OBS4. This tool
+never invents completeness flags or accepts a partial envelope as a full census.
+"""
+from __future__ import annotations
+import argparse
+import ast
+from datetime import UTC, datetime
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import stat
+import time
+
+HERE = Path(__file__).resolve().parent
+OPS = HERE.parent
+PREP = OPS.parent
+BASE = PREP.parents[1]
+CHAIN = PREP / "adaptateurs-source110-r1/revision-r7-racines-techniques-neuves"
+COMPARE = BASE / "outputs/HPC-Forest-Harnais-Comparaison-r1"
+HISTORY = COMPARE / "reprises/r3-corrige-r4-parallele-20261018/reprise-surveillance-apres-negatif-752306"
+LEGACY_POLICY = HISTORY / "politique-reelle.json"
+LEGACY_RESUME = HISTORY / "reprise-surveillance-verifiee.json"
+HISTORICAL_ABSENCE = BASE / "outputs/HPC-Forest-Mere-Dynamique-R4-MAX-Preparation-r2/operations-parent-lane-close-20261018T0542/reception-sortie-naturelle"
+SCIENCE = COMPARE / "receptions/source-only-sol-max-751592/reception-verifiee.json"
+SCIENCE_SHA = "6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7"
+RECON = SCIENCE.parent / "reconciliation-livraisons-r1/RECONCILIATION-LIVRAISONS.json"
+RECON_SHA = "0ed5c437d3737ec9a970a4183b3e80ce996e87a7f655e5fba9965a979682def8"
+OBSERVER_SHA = "5e5d3023ac538ed7197c6cd5da3e68a87e2b95228797af5b7ecbf6250579de95"
+COMPONENTS_SHA = "dc64e1360ea8c7b061cbda5eb2dc638f7cb76d9f4264c2f062a495c62ba12f30"
+SO_SESSION = "665743a02b824021a697b6a4884a667c"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+SOURCE = "eaff9217499fe268e4d151165a368a83bad1550d921955a9f9256026cfac2d48"
+PLAN = "5c3cc0082589257897caf79caf90c678f931eefcecb823f315ef614f72b9de70"
+SCOPE = "hpc-forest-dynamic-independent-roots-r4b-max"
+
+# Only our reviewed held-read definitions are loaded, with a workspace boundary.
+# No operational reader main or received source module is imported.
+RAW_SOURCE = PREP / "qualification-allouee-source110-G-recu-r1/revue-resultats-Q753709-r1/lecteur-r4b/auditer-restauration-existante-r4b.py"
+RAW_SHA = "5c1e1784574566a585e2d9cc50f85b52337d10d3109e449a4112581eae68f8d5"
+RAW_NAMES = {"need", "ordinary", "metadata", "open_nofollow_read", "cross_identity", "validate_windows_mode_views", "native_basic_info", "raw", "decode"}
+
+def need(value, message):
+    if not value:
+        raise ValueError(message)
+
+def held_namespace():
+    value = RAW_SOURCE.read_bytes()
+    need(hashlib.sha256(value).hexdigest() == RAW_SHA, "Reviewed held-read code changed")
+    tree = ast.parse(value)
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in RAW_NAMES]
+    need({node.name for node in nodes} == RAW_NAMES, "Exact held-read definitions missing")
+    result = {"Path":Path, "os":os, "stat":stat, "Q":BASE, "json":json}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(RAW_SOURCE), "exec"), result)
+    return result
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+def timestamp(value):
+    need(isinstance(value, str), "A real timezone-aware capture date is required")
+    parsed = datetime.fromisoformat(value)
+    need(parsed.tzinfo is not None and parsed.utcoffset().total_seconds() == 0, "UTC capture required")
+    return parsed.timestamp()
+
+def full_census(value, *, now, fresh):
+    need(value.get("schema") == "hpc-forest-dynamic-r4b-full-cim-v1"
+         and value.get("complete_census") is True and value.get("strict_utf8_decoding") is True,
+         "UNKNOWN full-census provenance: completeness/strict UTF8 flags missing or false")
+    captured = timestamp(value.get("captured_at_utc"))
+    need(math.isfinite(captured) and captured <= now and (not fresh or 0 <= now - captured <= 120),
+         "Full census is future or older than the initial120s gate")
+    rows = value.get("rows")
+    need(isinstance(rows, list) and rows and type(value.get("rows_count")) is int
+         and value["rows_count"] == len(rows), "Complete row count required")
+    seen = set()
+    for row in rows:
+        need(isinstance(row, dict) and all(k in row for k in FIELDS)
+             and all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+             and row["ProcessId"] not in seen, "Malformed/duplicate census identity")
+        seen.add(row["ProcessId"])
+        need(all(row[k] is None or isinstance(row[k], str) for k in FIELDS[2:]), "Invalid opaque census metadata")
+        if row["CreationDate"] is not None:
+            need(timestamp(row["CreationDate"]) <= captured, "Census contains identity created after its capture")
+    return rows, captured
+
+def identity(row):
+    need(isinstance(row, dict) and all(k in row and row[k] is not None for k in FIELDS)
+         and all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+         and all(isinstance(row[k], str) and row[k] for k in FIELDS[2:]), "All five owned identity fields are required")
+    match = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,7}))?(Z|[+-]\d\d:\d\d)", row["CreationDate"])
+    need(match is not None, "Exact <=7-digit timezone creation required")
+    normalized = datetime.fromisoformat(match[1] + match[3]).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S") + "." + (match[2] or "").ljust(7, "0") + "Z"
+    return tuple(row[k] for k in FIELDS[:-1]) + (normalized,)
+
+def pair_absent(expected, rows, *, equivalent_script=None):
+    need(len(expected) == 2 and len({identity(row) for row in expected}) == 2, "Original full pair required")
+    for old in expected:
+        for row in rows:
+            if row["ProcessId"] == old["ProcessId"]:
+                need(identity(row) != identity(old), "Original full identity still present")
+            need(row.get("CommandLine") != old["CommandLine"], "Equivalent original command still present")
+    if equivalent_script:
+        script = equivalent_script.replace("/", "\\").casefold()
+        need(not any(script in (row.get("CommandLine") or "").replace("/", "\\").casefold()
+                     and (row.get("ExecutablePath") is None or Path(row["ExecutablePath"]).name.casefold() in {"python.exe", "pythonw.exe"})
+                     for row in rows), "Equivalent OBS3 reader or opaque executable still present")
+    need(not any(SO_SESSION in (row.get("CommandLine") or "")
+                 and re.search(r"hpc_forest\..*worker|bootstrap_worker\.py", row.get("CommandLine") or "", re.I)
+                 for row in rows), "Equivalent source-only worker session remains")
+
+GUARD = HERE / "verifier-absence-ancien-OBS4-R7.py"
+GUARD_SHA = "70da272e4ede4d4ea4caf78242212dc2f55d984ba866ad3bd39c7c9de798f16b"
+
+def external_old_guard(current_ref, closure_review_ref):
+    """Only this pinned local pure metadata helper; no observer module/main."""
+    source = GUARD.read_bytes()
+    need(hashlib.sha256(source).hexdigest() == GUARD_SHA, "External old OBS4 guard changed")
+    namespace = {"__file__": str(GUARD), "__name__": "external_OBS4_metadata_only"}
+    exec(compile(source, str(GUARD), "exec"), namespace)
+    return namespace["verify_paths"](current_ref, closure_review_ref)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--full-cim", type=Path, required=True)
+    parser.add_argument("--full-cim-sha256", required=True)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--require-fresh", action="store_true")
+    parser.add_argument("--old-observer-review", type=Path, required=True)
+    parser.add_argument("--old-observer-review-sha256", required=True)
+    args = parser.parse_args()
+    need(args.require_fresh, "R7 actual preparation requires the full fresh initial gate; no old template promotion")
+    io = held_namespace()
+    pins = {}
+    def read_ref(path, expected=None):
+        path = Path(path)
+        value = io["raw"](path)
+        checksum = digest(value)
+        need(expected is None or checksum == expected, "Pinned metadata changed")
+        pins[str(path)] = checksum
+        return io["decode"](value)
+    def reference(path):
+        path = Path(path)
+        value = io["raw"](path)
+        pins[str(path)] = digest(value)
+        return {"path":str(path), "sha256":digest(value)}
+    target = io["ordinary"](args.output_directory)
+    need(target.is_relative_to(HERE) and target.parent == HERE and not target.exists(), "New direct preparation output only")
+    cim_path = io["ordinary"](args.full_cim)
+    need(cim_path.is_relative_to(OPS) and re.fullmatch(r"[0-9a-f]{64}", args.full_cim_sha256), "Explicit root-supplied CIM path/SHA required")
+    census = read_ref(cim_path, args.full_cim_sha256)
+    old_guard = external_old_guard({"path": str(cim_path), "sha256": args.full_cim_sha256},
+        {"path": str(args.old_observer_review), "sha256": args.old_observer_review_sha256})
+    now = time.time()
+    legacy_policy = read_ref(LEGACY_POLICY, "fd6359d30d39f8313b1645f4e52ad0779271ab2f2e9e38430d33dbc5f1a4c488")
+    legacy_resume = read_ref(LEGACY_RESUME, "c1eef13a2963be346ad14a52245545e08724b0a9b18e08ac8e3fb10746acb048")
+    science = read_ref(SCIENCE, SCIENCE_SHA)
+    read_ref(RECON, RECON_SHA)
+    need(science.get("verified") is True and science.get("job_id") == "751592"
+         and science.get("session_id") == SO_SESSION
+         and all(science.get(k) is True for k in ("deliveries_reconciled", "all_started_calls_reconciled", "scientific_reception_verified", "independent_audit_verified")),
+         "Actual received scientific source-only closure required")
+    components = read_ref(CHAIN / "COMPONENTS.json", COMPONENTS_SHA)
+    read_ref(CHAIN / "observer/ABI.json", "b7e5d776cc3cca4bc93a53b75dd458c95a790b1199907206a72f3fd57aed2562")
+    need(digest(io["raw"](CHAIN / "observer/observer-mixte.py")) == OBSERVER_SHA and len(components["code_pins"]) == 62,
+         "Exact allocated62 component observer required")
+    # The intentionally incomplete preparation census can prove only row-level
+    # absence, never a complete/fresh initial admission. Preserve that limitation.
+    failure = None
+    try:
+        rows, captured = full_census(census, now=now, fresh=args.require_fresh)
+    except ValueError as error:
+        if args.require_fresh:
+            raise
+        failure = str(error)
+        rows = census.get("rows")
+        need(isinstance(rows, list) and len(rows) > 0 and all(isinstance(row, dict) and all(k in row for k in FIELDS) for row in rows), "Even preparation rows must be explicit")
+        captured = census.get("observed_at")
+        need(type(captured) in (int, float) and math.isfinite(captured) and captured <= now, "Actual incomplete preparation capture time required")
+    pairs = {"source-only":legacy_policy["source_only_full_identities"], "observer3":legacy_resume["observer_full_identities"]}
+    absence = {}
+    for subject, expected in pairs.items():
+        old = read_ref(HISTORICAL_ABSENCE / f"INPUT-{subject}-ABSENCE-FROIDE-0629.json")
+        need({identity(row) for row in old["owned_full_identities"]} == {identity(row) for row in expected}, "Historical absence pair differs")
+        prior_ref = old["prior_full_cim"]
+        prior = read_ref(prior_ref["path"], prior_ref["sha256"])
+        prior_rows, prior_capture = full_census(prior, now=now, fresh=False)
+        need(prior_capture <= captured and all(any(identity(row) == identity(owned) for row in prior_rows if row["ProcessId"] == owned["ProcessId"]) for owned in expected),
+             "Historical prior full pair presence required")
+        pair_absent(expected, rows, equivalent_script=legacy_resume["code"]["path"] if subject == "observer3" else None)
+        # Preserve the original cold absence census and all ownership evidence,
+        # including the intermediate absence that breaks recycled-PID ancestry.
+        refs = old["evidence_refs"] + [reference(cim_path), reference(LEGACY_POLICY), reference(LEGACY_RESUME)]
+        for item in refs:
+            read_bytes = io["raw"](item["path"])
+            need(digest(read_bytes) == item["sha256"], "Historical evidence changed")
+        current = dict(old)
+        current.update(verified=failure is None, verification_scope="Cold complete census absence only; fresh initial gate remains separately enforced",
+            fresh_full_cim=reference(cim_path), observed_at=captured, evidence_refs=refs,
+            current_freshness_verified=bool(args.require_fresh and failure is None),
+            native_generation_admitted=False, complete_census_verified=failure is None,
+            row_level_absence_only_if_census_provenance_unknown=failure is not None)
+        absence[subject] = current
+    external_old_guard({"path": str(cim_path), "sha256": args.full_cim_sha256},
+        {"path": str(args.old_observer_review), "sha256": args.old_observer_review_sha256})
+    target.mkdir()
+    def save(name, value):
+        with (target / name).open("x", encoding="utf8", newline="\n") as output:
+            json.dump(value, output, indent=2); output.write("\n")
+    save("ABSENCE-OBS4-R5-ACTUELLE.json", old_guard)
+    for subject, value in absence.items():
+        save(f"ABSENCE-{subject}.json", value)
+    obs_ref = reference(target / "ABSENCE-observer3.json")
+    transition = {"schema":"hpc-forest-r4b-obs4-transition-v1", "verified":failure is None,
+        "model_workers_untouched":True, "previous_reader_identities":pairs["observer3"],
+        "previous_reader_absence":obs_ref, "initial_fresh_gate_verified":bool(args.require_fresh and failure is None),
+        "native_generation_admitted":False, "observer_started":False}
+    save("TRANSITION-OBS3-OBS4.json", transition)
+    for path, checksum in pins.items():
+        need(digest(io["raw"](path)) == checksum, "Cold input changed while preparing transition")
+    save("BILAN-PREPARATION-OBSERVATION.json", {"schema":"hpc-forest-source110-cold-observation-preparation-v1",
+        "verified_preparation_only":True, "complete_census_proof_accepted":failure is None,
+        "exact_two_historical_pairs_absent_in_supplied_rows":True, "observed_rows":len(rows),
+        "observed_at":captured, "fresh_initial_admission_verified":bool(args.require_fresh and failure is None),
+        "blocking_unknown":failure, "source_only_science":reference(SCIENCE), "source_only_reconciliation":reference(RECON),
+        "full_cim":reference(cim_path), "prior_OBS4_current_absence":reference(target / "ABSENCE-OBS4-R5-ACTUELLE.json"), "observer_components_sha256":COMPONENTS_SHA,
+        "historical_PID_reuse_intermediate_absence_preserved":True,
+        "CIM_RPC_process_cache_lock_or_model_effects":0, "native_generation_admitted":False,
+        "next":"Root must supply an actual complete fresh standard CIM and --require-fresh; never promote this old preparation file."})
+    print(json.dumps({"output":str(target), "rows":len(rows), "complete_census_accepted":failure is None,
+                      "fresh_initial_admission_verified":bool(args.require_fresh and failure is None), "unknown":failure}))
+
+if __name__ == "__main__":
+    main()

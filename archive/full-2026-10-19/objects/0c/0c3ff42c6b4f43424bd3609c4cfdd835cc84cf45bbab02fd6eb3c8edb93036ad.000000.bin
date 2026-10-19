@@ -1,0 +1,137 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define PARALLEL_THRESHOLD 64
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/* Use contiguous state arrays while preserving each target's ascending j sum. */
+static void body_force(const float * restrict x,
+                       const float * restrict y,
+                       const float * restrict z,
+                       float * restrict vx,
+                       float * restrict vy,
+                       float * restrict vz,
+                       float dt, int n) {
+  #pragma omp for schedule(static)
+  for (int i = 0; i < n; ++i) {
+    float xi = x[i];
+    float yi = y[i];
+    float zi = z[i];
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; ++j) {
+      float dx = x[j] - xi;
+      float dy = y[j] - yi;
+      float dz = z[j] - zi;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    vx[i] += dt*fx;
+    vy[i] += dt*fy;
+    vz[i] += dt*fz;
+  }
+}
+
+/* Read a binary dataset with initialized bodies. */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr, "\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr, "\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/* Write simulation results into a binary dataset. */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr, "\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc, char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+
+  size_t count = (size_t)nbodies;
+  size_t allocation_count = count ? count : 1;
+  if (allocation_count > (size_t)-1 / (6 * sizeof(float))) {
+    fprintf(stderr, "\nError allocating coordinate arrays\n");
+    free(bodies);
+    exit(EXIT_FAILURE);
+  }
+  float *state = (float *)malloc(6 * allocation_count * sizeof(*state));
+  if (state == NULL) {
+    fprintf(stderr, "\nError allocating coordinate arrays\n");
+    free(bodies);
+    exit(EXIT_FAILURE);
+  }
+
+  float *x = state;
+  float *y = x + allocation_count;
+  float *z = y + allocation_count;
+  float *vx = z + allocation_count;
+  float *vy = vx + allocation_count;
+  float *vz = vy + allocation_count;
+  for (int i = 0; i < nbodies; ++i) {
+    x[i] = bodies[i].x;
+    y[i] = bodies[i].y;
+    z[i] = bodies[i].z;
+    vx[i] = bodies[i].vx;
+    vy[i] = bodies[i].vy;
+    vz[i] = bodies[i].vz;
+  }
+
+  /* Reuse one team across iterations and synchronize force/update phases. */
+  #pragma omp parallel if (nbodies >= PARALLEL_THRESHOLD) shared(x, y, z, vx, vy, vz, nbodies)
+  {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      body_force(x, y, z, vx, vy, vz, DT, nbodies);
+
+      #pragma omp for schedule(static)
+      for (int i = 0; i < nbodies; ++i) {
+        x[i] += vx[i] * DT;
+        y[i] += vy[i] * DT;
+        z[i] += vz[i] * DT;
+      }
+    }
+  }
+
+  for (int i = 0; i < nbodies; ++i) {
+    bodies[i].x = x[i];
+    bodies[i].y = y[i];
+    bodies[i].z = z[i];
+    bodies[i].vx = vx[i];
+    bodies[i].vy = vy[i];
+    bodies[i].vz = vz[i];
+  }
+
+  write_dataset(nbodies, bodies);
+
+  free(state);
+  free(bodies);
+  return EXIT_SUCCESS;
+}

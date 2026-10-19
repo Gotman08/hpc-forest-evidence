@@ -1,0 +1,301 @@
+"""R2 extension: exactly one admitted fresh MAX cell; no automatic matrix."""
+from __future__ import annotations
+
+import argparse
+import importlib.metadata
+import re
+import socket
+import sys
+import tarfile
+import time
+import traceback
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hpc_forest.core import InfrastructureError, atomic_json, file_digest  # noqa: E402
+from hpc_forest.native_r2max import (  # noqa: E402
+    EFFORT,
+    SCOPE,
+    allocation_guard,
+    artifact,
+    cell_binding,
+    install_identity,
+    read_json,
+    selected_identity,
+)
+from hpc_forest.primes_contract import (  # noqa: E402
+    prepare_runtime_reference,
+    verify_preparation,
+    verify_resolved_expected,
+)
+from hpc_forest.r2max_first_start import first_start_receipt  # noqa: E402
+
+FINITE_CONTRACT = (
+    "This experiment uses a reviewed finite certified input/output contract only. "
+    "There are six private research cases and six distinct private confirmation cases. "
+    "P is in {1,2,4,8,16,30}; the input lists two separately permuted groups of P decimal fragments. "
+    "Left fragments have no leading zero and end in an even digit; right fragments have seven "
+    "characters including a leading zero. Each original pair comes from a true prime and the "
+    "multiset of every admissible prime concatenation equals the P source occurrences. "
+    "Concatenations are at most 600971707; output is compared as exact bytes. "
+    "The official example has an unresolved P/output-count contradiction. No claim is made "
+    "for the whole contest domain or arbitrary fragment orders. The fixed benchmark is one "
+    "member of the same certified finite set; no hidden values or expected outputs are supplied. "
+    "Target: Linux ARM64, four CPU cores, 16 GiB RAM, zero GPUs. "
+    "Compilation: GCC -O2 -std=c11 -Werror=uninitialized -Werror=maybe-uninitialized -lm."
+)
+
+
+def reconcile_after_batch(controller, channel, authorization, allocation, output, first_verified):
+    path = output / ("reconciliation-en-cours.json" if first_verified else "premier-demarrage-verifie.json")
+    receipt = first_start_receipt(controller, channel, authorization, allocation, path)
+    if receipt.get("technical_errors_found") is True:
+        raise InfrastructureError("Technical/unknown invocation after this batch; stop immediately and never replay")
+    return first_verified or receipt["verified"], receipt
+
+
+def bound_ref(path):
+    return {"path": str(path.resolve()), "sha256": file_digest(path)}
+
+
+def private_call_bindings(first):
+    result = {}
+    for call in first["all_started_calls_reconciled"]:
+        request = read_json(artifact(call["request"]))
+        nonce = request.get("nonce", "")
+        private = call.get("private_cli_records", {})
+        if (not re.fullmatch(r"[0-9a-f]{32}", nonce) or nonce in result
+                or set(private) != {"invocation_sha256", "process_sha256", "argv_sha256",
+                                    "skill_override_sha256", "task_cli_policy_sha256"}
+                or any(not re.fullmatch(r"[0-9a-f]{64}", str(value)) for value in private.values())
+                or call.get("private_cli_review_required") is not True or call.get("private_cli_argv_verified") is not False):
+            raise InfrastructureError("Every first-batch call needs exact pending private CLI bindings")
+        result[nonce] = {**private, "invocation_projection_sha256": call["invocation"]["sha256"],
+                         "process_projection_sha256": call["process"]["sha256"]}
+    if not result:
+        raise InfrastructureError("No real first-batch calls to review")
+    return result
+
+
+def validate_first_batch_release(release, snapshot, first, authorization):
+    """Only a root-produced actual audit may open the next unchanged batch."""
+    identity = cell_binding(authorization)
+    fields = {"schema", "verified", *identity, "paused_snapshot", "first_start_receipt",
+              "evaluation_snapshot", "private_cli_audit", "no_replay", "new_model_or_budget_authorized"}
+    if (set(release) != fields or release.get("schema") != "hpc-forest-r2e-first-batch-release-v1"
+            or release.get("verified") is not True or any(release.get(key) != value for key, value in identity.items())
+            or release.get("no_replay") is not True or release.get("new_model_or_budget_authorized") is not False
+            or release.get("paused_snapshot") != snapshot["self_ref"]
+            or release.get("first_start_receipt") != snapshot["first_start_receipt"]
+            or release.get("evaluation_snapshot") != snapshot["evaluation_snapshot"]):
+        raise InfrastructureError("Release does not bind this exact unchanged first-batch checkpoint")
+    artifact(release["paused_snapshot"])
+    artifact(release["first_start_receipt"])
+    if (first.get("verified") is not True or first.get("technical_errors_found") is not False
+            or first.get("invocation_unknown") is not False or not first.get("first_normal_delivered_call")
+            or first.get("first_real_evaluation", {}).get("status") not in {"valid", "incorrect", "build_failed", "runtime_failed"}
+            or first.get("private_cli_review_required") is not True or first.get("private_cli_argv_verified") is not False):
+        raise InfrastructureError("Actual normal delivery and recorded evaluation required before release")
+    evaluation = read_json(artifact(release["evaluation_snapshot"]))
+    if (evaluation.get("never_model_input") is not True
+            or evaluation.get("experiment_id") != first["first_real_evaluation"]["experiment_id"]
+            or evaluation.get("outcome", {}).get("status") != first["first_real_evaluation"]["status"]):
+        raise InfrastructureError("Release evaluation differs; algorithmic negatives must stay negative")
+    audit = read_json(artifact(release["private_cli_audit"]))
+    audit_fields = {"schema", "verified", *identity, "first_start_receipt_sha256", "paused_snapshot_sha256",
+                    "call_bindings", "all_private_raws_received_and_hashed", "argv_matches_projections_and_local_policy",
+                    "cli_diagnostics_clean", "raw_skill_paths_exported", "private_review_receipt_sha256"}
+    if (set(audit) != audit_fields or audit.get("schema") != "hpc-forest-r2e-private-cli-audit-digest-projection-v1"
+            or audit.get("verified") is not True or any(audit.get(key) != value for key, value in identity.items())
+            or audit.get("first_start_receipt_sha256") != snapshot["first_start_receipt"]["sha256"]
+            or audit.get("paused_snapshot_sha256") != snapshot["self_ref"]["sha256"]
+            or audit.get("call_bindings") != private_call_bindings(first)
+            or any(audit.get(key) is not True for key in ("all_private_raws_received_and_hashed",
+                   "argv_matches_projections_and_local_policy", "cli_diagnostics_clean"))
+            or audit.get("raw_skill_paths_exported") is not False
+            or not re.fullmatch(r"[0-9a-f]{64}", audit.get("private_review_receipt_sha256", ""))):
+        raise InfrastructureError("Actual hash-linked private CLI audit is required; ARM cannot certify private argv")
+    return audit
+
+
+def wait_first_batch_release(controller, authorization, output, first, *, now=time.time,
+                             monotonic=time.monotonic, sleep=time.sleep):
+    """Passive wait on the existing search deadline; never rerun or fabricate a response."""
+    deadline = controller.db.get("deadline") - controller.config["budget"]["confirmation_seconds"]
+    deadline = min(deadline, authorization["expires_at"])
+    first_ref = bound_ref(output / "premier-demarrage-verifie.json")
+    snapshot_path = output / "premier-batch-en-attente.json"
+    snapshot = {"schema": "hpc-forest-r2e-first-batch-paused-v1", **cell_binding(authorization),
+                "first_batch_completed": True, "first_start_receipt": first_ref,
+                "evaluation_snapshot": first.get("evaluation_snapshot"), "first_start_public_verified": first.get("verified") is True,
+                "existing_campaign_deadline": controller.db.get("deadline"), "existing_search_deadline": deadline,
+                "budget_or_chronology_reset": False, "new_requests_created": 0,
+                "private_cli_argv_verified_on_ARM": False, "waiting_for_external_root_audit": True}
+    if snapshot_path.exists():
+        raise InfrastructureError("First-batch checkpoint already exists; no overwrite or replay")
+    atomic_json(snapshot_path, snapshot)
+    snapshot["self_ref"] = bound_ref(snapshot_path)
+    remaining = max(0.0, deadline - now())
+    end = monotonic() + remaining
+    release_path = output / "autorisation-apres-premier-batch.json"
+    refused_hashes = set()
+    while now() < deadline and monotonic() < end:
+        if release_path.is_file():
+            checksum = file_digest(release_path)
+            if checksum not in refused_hashes:
+                try:
+                    release = read_json(release_path)
+                    audit = validate_first_batch_release(release, snapshot, first, authorization)
+                except (InfrastructureError, ValueError, OSError, KeyError, TypeError, IndexError) as exc:
+                    refused_hashes.add(checksum)
+                    atomic_json(output / ("refus-release-" + checksum + ".json"),
+                                {"verified": False, "release_sha256": checksum,
+                                 "reason": type(exc).__name__ + ": " + str(exc), "next_batch_started": False})
+                else:
+                    if now() >= deadline or monotonic() >= end:
+                        break
+                    atomic_json(output / "premier-batch-release-verifiee.json",
+                                {"verified": True, "release": bound_ref(release_path), "private_cli_audit": release["private_cli_audit"],
+                                 "private_review_receipt_sha256": audit["private_review_receipt_sha256"],
+                                 "budget_or_chronology_reset": False, "replayed_claims": 0})
+                    return True
+        sleep(min(2.0, max(0.0, deadline - now()), max(0.0, end - monotonic())))
+    atomic_json(output / "premier-batch-attente-expiree.json",
+                {"verified": False, "reason": "existing_search_budget_expired_while_waiting_for_actual_audit",
+                 "snapshot": snapshot["self_ref"], "existing_search_deadline": deadline,
+                 "next_batch_started": False, "budget_or_chronology_reset": False,
+                 "model_error_or_response_fabricated": False, "replayed_claims": 0})
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--authorization", type=Path, required=True)
+    args = parser.parse_args()
+    allocation = allocation_guard()
+    authorization = install_identity(args.authorization)
+    model, session = selected_identity(authorization)
+    if allocation["job_id"] != authorization["job_id"] or str(args.root) != authorization["remote_root"]:
+        raise InfrastructureError("Runner allocation/root differs from its explicit admission")
+    if importlib.metadata.version("treequest") != "0.3.2":
+        raise InfrastructureError("The actual pinned TreeQuest 0.3.2 runtime is required")
+    package = artifact(authorization["artifacts"]["preparation_manifest"]).parent
+    data = verify_preparation(package)
+    # Import after installing the only permitted process identity.
+    import romeo_codex as runner
+    from romeo_harness_comparison import ObservedController, verify_worker
+
+    from hpc_forest.codex_mailbox import initialize_channel
+    from hpc_forest.controller import create_workspace
+    from hpc_forest.mother import MotherContext
+    from hpc_forest.reporting import package as package_result
+    from hpc_forest.reporting import report
+
+    class MotherController(MotherContext, ObservedController):
+        pass
+
+    root = args.root.resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    output = root / f"results-{allocation['job_id']}"
+    output.mkdir()
+    result = {"schema": "hpc-forest-primes-r2max-native-single-cell-v1", "scope_id": SCOPE,
+              "model": model, "effort": EFFORT, "mother_model": model, "mother_effort": EFFORT,
+              "session_id": session, "allocation": allocation, "native_research_admitted_by_this_code": False,
+              "automatic_extension": False, "other_cells_started": 0, "pipeline_complete": False,
+              "source_zip_sha256": authorization["artifacts"]["source_zip"]["sha256"],
+              "plan_sha256": authorization["artifacts"]["plan"]["sha256"],
+              "first_start_control": "pending_real_call_and_evaluation", "negative_outcomes_preserved": True,
+              "hardware_or_process_isolation_proved": False}
+    started = time.monotonic()
+    try:
+        prepared = prepare_runtime_reference(package, root, allocation,
+                                             result["source_zip_sha256"], result["plan_sha256"],
+                                             authorization["artifacts"]["allocated_contract_qualification"])
+        # The native baseline will also be measured by Controller on this same allocation.
+        result["runtime_reference_origin"] = {"path": str(root / "runtime-reference-origin.json"),
+                                               "sha256": file_digest(root / "runtime-reference-origin.json")}
+        atomic_json(output / "runtime-reference-origin.json", read_json(root / "runtime-reference-origin.json"))
+        verify_resolved_expected(Path(prepared["validation"]), data)
+        channel = output / "mailbox"
+        owner = initialize_channel(channel, session, allocation["job_id"])
+        atomic_json(channel / "OWNER.json", {**owner, **cell_binding(authorization)})
+        atomic_json(output / "channel.json", {"channel": str(channel), "session_id": session,
+                    "job_id": allocation["job_id"], "model": model, "effort": EFFORT})
+        worker = verify_worker(channel, session, 600)
+        expected_worker = {"scope_id": SCOPE, "source_zip_sha256": result["source_zip_sha256"],
+                           "plan_sha256": result["plan_sha256"]}
+        if any(worker.get(k) != value for k, value in expected_worker.items()):
+            raise InfrastructureError("Native R2 worker did not prove the admitted source/plan identity")
+        atomic_json(output / "worker-identity.json", worker)
+        runner.CHANNEL, runner.SESSION_ID = channel, session
+        runner.reference.SCHEDULE.update(cycles=1, trials_per_role_per_cycle=2, integrations_per_cycle=2)
+        runner.reference.LIMITS.update(wall_seconds=1800, tokens=1500000, generation_seconds=600)
+        runner.HARNESS = {"enabled": True, "max_attempts": 3, "call_token_ceiling": 196608,
+                          "research": {"enabled": False}}
+        target = f"romeo:{socket.gethostname()}:slurm-{allocation['job_id']}:primes-r2max-cpu4"
+        settings = runner.config_for("codex-mailbox", "2020-primes-finite-certified", target, prepared)
+        settings["protocol"]["private_execution_audit"] = True
+        settings["budget"]["search_slots"] += 2  # Two model-authored mother calls, separately charged.
+        statement = (data / "model-view/statement-primes.txt").read_text(encoding="utf8") + "\n\n" + FINITE_CONTRACT
+        campaign = output / ("primes-max-" + model)
+        create_workspace(campaign, settings, source=Path(prepared["source"]), validation=Path(prepared["validation"]))
+        with MotherController(campaign, statement) as controller:
+            with controller.db.connection:
+                controller.db.connection.execute("DELETE FROM documents")
+            controller.db.event("r2max_finite_protocol_identity", {
+                "model": model, "effort": EFFORT, "mother_model": model, "mother_effort": EFFORT,
+                "certified_manifest": authorization["artifacts"]["preparation_manifest"]["sha256"],
+                "operator_algorithm_advice": False, "old_candidates_imported": False})
+            first_checked = False
+            first_batch_released = False
+            while True:
+                result["search"] = controller.run(max_batches=1)
+                atomic_json(output / "results.json", result)
+                first_checked, first_receipt = reconcile_after_batch(controller, channel, authorization, allocation,
+                                                                      output, first_checked)
+                result["first_start_control"] = "verified" if first_checked else "pending_first_real_evaluation"
+                if result["search"]["status"] != "checkpointed":
+                    break
+                if not first_batch_released:
+                    if not wait_first_batch_release(controller, authorization, output, first_receipt):
+                        result.update(first_batch_release="closed_at_existing_search_deadline", extension_blocked=True,
+                                      model_negative_preserved=True, no_candidate_replay=True)
+                        return 1
+                    first_batch_released = True
+            final = first_start_receipt(controller, channel, authorization, allocation,
+                                        output / "reconciliation-finale-verifiee.json")
+            if final.get("technical_errors_found") is True:
+                raise InfrastructureError("Unknown or failed interface invocation blocks completion and extension")
+            if not final["verified"]:
+                result.update(first_start_control="closed_known_negative_without_real_evaluation",
+                              extension_blocked=True, no_candidate_replay=True)
+            else:
+                result["first_start_control"] = "verified"
+            result["best_confirmed"] = controller.confirm()
+            result["costs"] = controller.db.costs()
+            result["mother"] = {phase: controller.db.get("mother_plan:" + phase)
+                                for phase in ("preparation", "synthesis")}
+        report(campaign)
+        package_result(campaign, campaign / "submission.zip")
+        result["pipeline_complete"] = True
+    except Exception as exc:
+        result.update(error_type=type(exc).__name__, error=str(exc), traceback=traceback.format_exc(),
+                      extension_blocked=True)
+    finally:
+        result["elapsed_seconds"] = time.monotonic() - started
+        atomic_json(output / "results.json", result)
+        archive = root / f"results-{allocation['job_id']}.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(output, arcname=output.name)
+            if (root / "prepared").is_dir():
+                tar.add(root / "prepared", arcname="runtime-preparation-private-audit")
+        atomic_json(root / "archive.json", {"path": str(archive), "sha256": file_digest(archive),
+                                           "private_audit_only_never_model_context": True})
+    return 0 if result["pipeline_complete"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

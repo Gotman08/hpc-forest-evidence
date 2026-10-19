@@ -1,0 +1,130 @@
+"""Synthetic allocation and neutral compiler-interface evidence; no model call."""
+import copy
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from hpc_forest import target_profile as tp
+from hpc_forest.controller import Controller
+from hpc_forest.core import InfrastructureError, Mission, digest, file_digest
+from hpc_forest.dynamic_controller import DynamicController
+
+
+@pytest.fixture
+def allocation(monkeypatch):
+    monkeypatch.setattr(tp.platform, "machine", lambda: "aarch64")
+    for name in ["SLURM_JOB_GPUS", "SLURM_STEP_GPUS", "SLURM_GPUS", "SLURM_GPUS_ON_NODE", "SLURM_MEM_PER_CPU"]:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in {"SLURM_JOB_ID": "12345", "SLURM_CPUS_PER_TASK": "4",
+                        "SLURM_MEM_PER_NODE": "16384", "SLURM_NTASKS": "1",
+                        "SLURM_JOB_NUM_NODES": "1"}.items():
+        monkeypatch.setenv(name, value)
+    return monkeypatch
+
+
+@pytest.fixture
+def profile(allocation, tmp_path):
+    value = {"schema": "hpc-forest-target-profile-v1", **tp.allocation_facts(),
+             "verified_capabilities": ["cpu", "c", "cxx", "openmp"], "compilers": {}}
+    for name in ["gcc", "g++"]:
+        path = tmp_path / name
+        path.write_bytes(("synthetic compiler fixture " + name).encode())
+        value["compilers"][name] = {"path": str(path), "sha256": file_digest(path),
+                                    "probe_returncode": 0, "probe_stdout": "4\n"}
+    value["profile_digest"] = digest(value)
+    config = {"target_profile": value, "target_id": "synthetic-target",
+              "dynamic_mother": {"verified_capabilities": value["verified_capabilities"][:]},
+              "protocol": {"environment": {"OMP_NUM_THREADS": "4", "CUDA_VISIBLE_DEVICES": ""}},
+              "budget": {"tokens": 100, "generation_seconds": 60},
+              "compiler": {k: value["compilers"]["gcc"][k] for k in ["path", "sha256"]}}
+    return config
+
+
+def test_allocated_cores_are_never_node_cpu_count(allocation):
+    allocation.setattr(tp.os, "cpu_count", lambda: 192)
+    assert tp.allocation_facts()["cpu_cores"] == 4
+
+
+@pytest.mark.parametrize("field,value", [("SLURM_CPUS_PER_TASK", "192"),
+    ("SLURM_NTASKS", "2"), ("SLURM_JOB_NUM_NODES", "2"), ("SLURM_MEM_PER_NODE", "8192"),
+    ("SLURM_GPUS", "1"), ("SLURM_JOB_GPUS", "0,1"), ("SLURM_GPUS_ON_NODE", "2"),
+    ("SLURM_JOB_GPUS", "0"), ("SLURM_STEP_GPUS", "0")])
+def test_unprepared_target_is_rejected(allocation, field, value):
+    allocation.setenv(field, value)
+    with pytest.raises(InfrastructureError):
+        tp.allocation_facts()
+
+
+def test_no_probe_compilation_outside_an_allocation(allocation):
+    allocation.delenv("SLURM_JOB_ID")
+    allocation.setattr(tp.subprocess, "run", lambda *args, **kwargs: pytest.fail("No compiler on login"))
+    with pytest.raises(InfrastructureError, match="allocation"):
+        tp.prepare_target_profile()
+
+
+def test_missing_memory_is_not_inferred_from_host_ram(allocation):
+    allocation.delenv("SLURM_MEM_PER_NODE")
+    with pytest.raises(InfrastructureError, match="absent or ambiguous"):
+        tp.allocation_facts()
+
+
+def test_explicit_per_cpu_memory_is_supported(allocation):
+    allocation.delenv("SLURM_MEM_PER_NODE")
+    allocation.setenv("SLURM_MEM_PER_CPU", "4096")
+    assert tp.allocation_facts()["allocated_memory_mib"] == 16384
+
+
+def test_conflicting_memory_sources_fail_closed(allocation):
+    allocation.setenv("SLURM_MEM_PER_CPU", "1024")
+    with pytest.raises(InfrastructureError, match="ambiguous"):
+        tp.allocation_facts()
+
+
+def test_stale_or_modified_profile_cannot_enter_generation(profile, allocation):
+    assert tp.target_context(profile)["allocated_gpus"] == 0
+    profile["target_profile"]["cpu_cores"] = 128
+    with pytest.raises(InfrastructureError, match="digest"):
+        tp.target_context(profile)
+
+
+def test_other_allocation_is_rejected_even_with_intact_profile(profile, allocation):
+    allocation.setenv("SLURM_JOB_ID", "99999")
+    with pytest.raises(InfrastructureError, match="different allocation"):
+        tp.target_context(profile)
+
+
+def test_compiler_bytes_and_capabilities_are_checked(profile):
+    from pathlib import Path
+
+    Path(profile["target_profile"]["compilers"]["g++"]["path"]).write_bytes(b"changed")
+    with pytest.raises(InfrastructureError, match="compiler"):
+        tp.target_context(profile)
+
+
+def test_unsupported_capability_not_admitted_by_caller(profile):
+    profile["dynamic_mother"]["verified_capabilities"].append("mpi")
+    with pytest.raises(InfrastructureError, match="capabilities"):
+        tp.target_context(profile)
+
+
+def test_identical_verified_target_facts_reach_mother_and_children(profile, monkeypatch):
+    profile["dynamic_mother"]["advice_enabled"] = False
+    instance = object.__new__(DynamicController)
+    instance.config = profile
+    instance.statement = "Synthetic official statement fixture"
+    instance.directions = {"T001": {"id": "T001", "objective": "Synthetic fixture only"}}
+    instance.db = SimpleNamespace(get=lambda key: "protocol-fixture", costs=lambda: {"tokens_used": 0})
+    original = {"sources": [], "automatic_observations": {}, "generation_deadline": time.time()+50}
+    monkeypatch.setattr(Controller, "_context", lambda *args: copy.deepcopy(original))
+    mission = Mission("a", "e1:T001", "t", 1, "T001", "base", None, "R/T001", 1, 1, "unused")
+    mother = instance._facts()
+    context = instance._context(mission, [])
+    assert context["official_statement_as_data"] == instance.statement
+    child = context["runtime_as_data"]
+    assert all(mother[k] == v for k, v in child.items())
+    assert child["architecture"] == "ARM64" and child["cpu_cores"] == 4
+    assert child["allocated_memory_mib"] == 16384 and child["allocated_gpus"] == 0
+    assert child["compilers"]["gcc"]["sha256"] == profile["compiler"]["sha256"]
+    child["compilers"]["gcc"]["sha256"] = "untrusted child modification"
+    assert tp.target_context(profile)["compilers"]["gcc"]["sha256"] == profile["compiler"]["sha256"]

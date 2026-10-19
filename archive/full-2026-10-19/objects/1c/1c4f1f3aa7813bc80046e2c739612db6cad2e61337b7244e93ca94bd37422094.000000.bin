@@ -1,0 +1,210 @@
+"""Neutral auth/ready metadata checks only; no live cache, CLI or authentication read."""
+import ast
+import copy
+import importlib.util
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('neutral_initial_oauth', HERE / 'recevoir-installation-oauth.py')
+r = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r)
+
+
+def auth():
+    return {'schema': 'hpc-forest-r2e-parent-auth-metadata-observation-v1', 'verified': True,
+        'observed_at': datetime.now(UTC).isoformat(), 'auth_mode': 'chatgpt',
+        'api_key_in_auth_present': False, 'OPENAI_API_KEY_environment_present': False,
+        'CODEX_API_KEY_environment_present': False, 'secrets_exported': False,
+        'authentication_changed': False, 'cli_executable_sha256': 'a' * 64}
+
+
+def test_closed_secret_free_parent_auth_metadata_allowed():
+    r.check_auth_metadata(auth(), 'a' * 64)
+
+
+@pytest.mark.parametrize('field,value', [('schema', 'OTHER'), ('verified', False), ('auth_mode', 'api'),
+    ('api_key_in_auth_present', True), ('OPENAI_API_KEY_environment_present', True),
+    ('CODEX_API_KEY_environment_present', True), ('secrets_exported', True),
+    ('authentication_changed', True), ('cli_executable_sha256', 'b' * 64)])
+def test_auth_flags_must_be_observed_and_closed(field, value):
+    record = auth()
+    record[field] = value
+    with pytest.raises(ValueError):
+        r.check_auth_metadata(record, 'a' * 64)
+
+
+@pytest.mark.parametrize('change', ['extra_secret', 'missing', 'stale', 'future'])
+def test_auth_missing_or_nonmetadata_input_refused(change):
+    record = auth()
+    if change == 'extra_secret':
+        record['token'] = 'NEUTRAL-NEVER-EXPORT'
+    elif change == 'missing':
+        record.pop('api_key_in_auth_present')
+    else:
+        record['observed_at'] = (datetime.now(UTC) + timedelta(seconds=-121 if change == 'stale' else 20)).isoformat()
+    with pytest.raises(ValueError):
+        r.check_auth_metadata(record, 'a' * 64)
+
+
+def ready_fixture(tmp_path):
+    cli = tmp_path / 'not-executed.exe'
+    cli.write_bytes(b'NEUTRAL-FILE-NOT-EXECUTABLE')
+    binding = {'scope_id': 'NEUTRAL', 'model': 'NEUTRAL', 'effort': 'max', 'session_id': '0' * 32,
+        'job_id': '123456', 'remote_root': '/scratch_p/NEUTRAL', 'source_zip_sha256': 'c' * 64, 'plan_sha256': 'd' * 64}
+    owner = {'protocol': 'hpc-forest-codex-mailbox-v1', 'owner': '123456', 'reasoning_effort': 'max', **binding}
+    ready = {**owner, 'mode': 'codex', 'authentication': 'existing-local-ChatGPT',
+        'codex_executable': str(cli), 'codex_executable_sha256': r.c.sha(cli),
+        'codex_cli_version': 'codex-cli 0.163.0-alpha.10.2', 'task_cli_policy_sha256': 'e' * 64,
+        'task_cli_policy_candidate_count': 236, 'local_skill_paths_exported': False,
+        'weight_digest_available': False, 'model_weights_on_romeo': False, 'pid': 123,
+        'started_at': datetime.now(UTC).timestamp() - 1}
+    now = datetime.now(UTC)
+    born = (now - timedelta(seconds=2)).isoformat()
+    pair = [{'ProcessId': 124, 'ParentProcessId': 1, 'ExecutablePath': 'NEUTRAL',
+        'CommandLine': 'NEUTRAL', 'CreationDate': born},
+        {'ProcessId': 123, 'ParentProcessId': 124, 'ExecutablePath': 'NEUTRAL',
+         'CommandLine': 'NEUTRAL', 'CreationDate': born}]
+    def census(rows, age):
+        return {'schema': 'hpc-forest-dynamic-r4b-full-cim-v1', 'complete_census': True,
+                'strict_utf8_decoding': True, 'rows': copy.deepcopy(rows), 'rows_count': len(rows),
+                'captured_at_utc': (now - timedelta(seconds=age)).isoformat()}
+    context = {'before_census': census([], 3), 'after_census': census(pair, 1.5),
+               'lane_observed_at': (now - timedelta(seconds=5)).timestamp()}
+    return binding, owner, ready, cli, pair, context
+
+
+def test_actual_ready_contract_with_neutral_files_only(tmp_path):
+    binding, owner, ready, cli, pair, context = ready_fixture(tmp_path)
+    r.validate_ready(binding, owner, ready, 'e' * 64, cli, pair, **context)
+
+
+@pytest.mark.parametrize('field,value', [('job_id', '999999'), ('effort', 'high'),
+    ('authentication', 'api'), ('task_cli_policy_sha256', 'f' * 64), ('task_cli_policy_candidate_count', 235),
+    ('local_skill_paths_exported', True), ('model_weights_on_romeo', True), ('pid', 999),
+    ('codex_executable_sha256', 'f' * 64)])
+def test_wrong_ready_never_creates_initial_oauth_receipt(tmp_path, field, value):
+    binding, owner, ready, cli, pair, context = ready_fixture(tmp_path)
+    ready[field] = value
+    with pytest.raises(ValueError):
+        r.validate_ready(binding, owner, ready, 'e' * 64, cli, pair, **context)
+
+
+def test_exact_three_startup_names_and_no_authentication_or_process_access():
+    assert r.NAMES == ('CELL-BINDING.json', 'OWNER.json', 'worker-ready.json')
+    source = (HERE / 'recevoir-installation-oauth.py').read_text(encoding='utf8')
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            assert not {name.name.split('.')[0] for name in node.names} & {'subprocess', 'socket', 'requests', 'asyncio'}
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            assert node.func.attr not in {'Popen', 'run', 'system', 'execvpe', 'glob', 'rglob', 'iterdir', 'home'}
+    assert 'os.environ' not in source and "'auth.json'" not in source and '"auth.json"' not in source
+    assert 'worker.lock' not in source and 'sqlite' not in source.casefold()
+
+
+def test_wrong_pair_cannot_claim_an_owned_ready(tmp_path):
+    binding, owner, ready, cli, pair, context = ready_fixture(tmp_path)
+    wrong = copy.deepcopy(pair)
+    wrong[0]['CommandLine'] = None
+    with pytest.raises(ValueError):
+        r.validate_ready(binding, owner, ready, 'e' * 64, cli, wrong, **context)
+
+
+@pytest.mark.parametrize('change', ['missing_main', 'different_command', 'opaque_executable',
+    'wrong_row_count', 'duplicate_pid', 'pair_preexists', 'creation_after_census', 'ready_is_launcher',
+    'ready_before_main_birth'])
+def test_received_before_after_census_closes_exact_full_pair(tmp_path, change):
+    binding, owner, ready, cli, pair, context = ready_fixture(tmp_path)
+    after = context['after_census']
+    if change == 'missing_main':
+        after['rows'].pop()
+        after['rows_count'] = 1
+    elif change == 'different_command':
+        after['rows'][1]['CommandLine'] += ' CHANGED'
+    elif change == 'opaque_executable':
+        after['rows'][1]['ExecutablePath'] = None
+    elif change == 'wrong_row_count':
+        after['rows_count'] = 3
+    elif change == 'duplicate_pid':
+        after['rows'].append(copy.deepcopy(after['rows'][1]))
+        after['rows_count'] = 3
+    elif change == 'pair_preexists':
+        context['before_census']['rows'] = copy.deepcopy(pair)
+        context['before_census']['rows_count'] = 2
+    elif change == 'creation_after_census':
+        pair[1]['CreationDate'] = datetime.now(UTC).isoformat()
+        after['rows'][1] = copy.deepcopy(pair[1])
+    elif change == 'ready_is_launcher':
+        ready['pid'] = pair[0]['ProcessId']
+    else:
+        ready['started_at'] = r.utc_timestamp(pair[1]['CreationDate']) - 0.001
+    with pytest.raises(ValueError):
+        r.validate_ready(binding, owner, ready, 'e' * 64, cli, pair, **context)
+
+
+@pytest.mark.parametrize('offset', [-0.001, 600.001])
+def test_ready_is_bounded_by_frozen_lane_observation(tmp_path, offset):
+    binding, owner, ready, cli, pair, context = ready_fixture(tmp_path)
+    context['lane_observed_at'] = ready['started_at'] - offset
+    with pytest.raises(ValueError, match='within600seconds'):
+        r.validate_ready(binding, owner, ready, 'e' * 64, cli, pair, **context)
+
+
+def test_historical_initial_ready_does_not_require_current_lane_freshness(tmp_path):
+    binding, owner, ready, cli, pair, context = ready_fixture(tmp_path)
+    age = 7200
+    ready['started_at'] -= age
+    for row in pair:
+        row['CreationDate'] = datetime.fromtimestamp(r.utc_timestamp(row['CreationDate']) - age, UTC).isoformat()
+    for key in ('before_census', 'after_census'):
+        context[key]['captured_at_utc'] = datetime.fromtimestamp(r.utc_timestamp(context[key]['captured_at_utc']) - age, UTC).isoformat()
+    context['after_census']['rows'] = copy.deepcopy(pair)
+    context['lane_observed_at'] -= age
+    r.validate_ready(binding, owner, ready, 'e' * 64, cli, pair, **context)
+
+
+@pytest.mark.parametrize('outside', [True, False])
+def test_auth_metadata_namespace_refused_before_any_hash_or_read(tmp_path, monkeypatch, outside):
+    ops = tmp_path / 'OPS'
+    factory = tmp_path / 'FACTORY'
+    monkeypatch.setattr(r.c, 'OPS', ops)
+    monkeypatch.setattr(r.c, 'FACTORY', factory)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('No path may be read or hashed before namespace validation')
+    monkeypatch.setattr(r.c, 'pinned', forbidden)
+    monkeypatch.setattr(r.c, 'read', forbidden)
+    launch = factory / 'helper-lancement-possedes' / 'NEUTRAL' / 'LANCEMENTS-POSSEDES-RECUS.json'
+    auth_path = (tmp_path / 'FOREIGN' / 'AUTH-METADATA-PARENT.json' if outside else ops / 'OTHER.json')
+    with pytest.raises(ValueError, match='named parent OPS'):
+        r.receive(launch, 'a' * 64, auth_path, 'b' * 64, 'NEUTRAL')
+
+
+def test_pinned_frozen_function_uses_new_scope_without_importing_old_controller():
+    from types import SimpleNamespace
+    factory = SimpleNamespace(m=SimpleNamespace(SCOPE='NEUTRAL-FRESH-R2F', need=r.c.need))
+    function = r.frozen_validator(factory)
+    calls = []
+    def original(ref):
+        return ref
+    artifact = original
+    receipt = {'scope_id': 'NEUTRAL-FRESH-R2F', 'artifacts': {key: {'sha256': str(n) * 64}
+               for n, key in enumerate(('source_zip', 'plan', 'preparation_manifest', 'preparation_review'), 1)}}
+    module = SimpleNamespace(artifact=artifact)
+    def validate(path, jobs, **kwargs):
+        calls.append((path, jobs, kwargs))
+        return copy.deepcopy(receipt)
+    module.validate_receipt = validate
+    assert function(module, 'LOCAL-NEUTRAL', 'REMOTE-NEUTRAL', lambda ref: ref) == (receipt, receipt)
+    assert module.artifact is original
+    assert len(calls) == 2 and all(row[1] == {'NEUTRAL-FRESH-R2F'} for row in calls)
+    assert all(row[2] == {'runtime': False, 'prepared': False, 'initial_lane': False} for row in calls)
+
+
+@pytest.mark.parametrize('wrong', [True, None, float('nan'), float('inf'), '2026-10-18T00:00:00Z'])
+def test_lane_observation_rejects_non_numeric_or_nonfinite_values(tmp_path, wrong):
+    binding, owner, ready, cli, pair, context = ready_fixture(tmp_path)
+    context['lane_observed_at'] = wrong
+    with pytest.raises(ValueError, match='finite numeric'):
+        r.validate_ready(binding, owner, ready, 'e' * 64, cli, pair, **context)

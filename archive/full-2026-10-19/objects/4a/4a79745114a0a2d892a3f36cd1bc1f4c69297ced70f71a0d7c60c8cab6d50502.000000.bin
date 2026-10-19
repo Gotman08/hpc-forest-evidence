@@ -1,0 +1,594 @@
+#include "knn.h"
+#include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+enum {
+    KNN_FILTER_TILE = 64,
+    KNN_RANK_MAX_THREADS = 4,
+    KNN_RANK_GRAIN = 4096,
+    KNN_PARTITION_ROUNDS = 32
+};
+
+static char knn_vote(char * labels, int k) {
+    qsort(labels, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (labels[i] != labels[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+    return most_frequent;
+}
+
+static inline void knn_insert_neighbor(float d, char label, int k,
+                                       char * labels, float * distances,
+                                       int * used, int * ordered) {
+    if (*ordered && *used == k && *used > 0 &&
+        d >= distances[*used - 1]) {
+        return;
+    }
+
+    int x;
+    if (*ordered) {
+        int left = 0;
+        int right = *used;
+        while (left < right) {
+            int middle = left + (right - left) / 2;
+            if (d < distances[middle]) {
+                right = middle;
+            } else {
+                left = middle + 1;
+            }
+        }
+        x = left;
+    } else {
+        for (x = 0; x < *used; x++) {
+            if (d < distances[x]) {
+                break;
+            }
+        }
+    }
+
+    if (x == k) {
+        return;
+    }
+
+    int end = *used < k ? *used : k - 1;
+    if (end > x) {
+        size_t count = (size_t) (end - x);
+        memmove(distances + x + 1, distances + x,
+                count * sizeof(*distances));
+        memmove(labels + x + 1, labels + x,
+                count * sizeof(*labels));
+    }
+    distances[x] = d;
+    labels[x] = label;
+    if (*used < k) {
+        (*used)++;
+    }
+    if (d != d) {
+        *ordered = 0;
+    }
+}
+
+static char knn_serial(int n_groups, Group * groups, int k, Point to_evaluate) {
+    char * labels = (char *) malloc((size_t) k * sizeof(*labels));
+    float * distances = (float *) malloc((size_t) k * sizeof(*distances));
+    int candidates[KNN_FILTER_TILE];
+    int used = 0;
+    int ordered = 1;
+
+    for (int i = 0; i < k; i++) {
+        labels[i] = -1;
+    }
+
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        for (int j = 0; j < g.length; ) {
+            int count = g.length - j;
+            if (count > KNN_FILTER_TILE) {
+                count = KNN_FILTER_TILE;
+            }
+
+            int filter = ordered && used == k && used > 0;
+            float bound = 0.0f;
+            if (filter) {
+                bound = distances[used - 1];
+                filter = bound >= 0.0f;
+            }
+            if (filter) {
+#if defined(_OPENMP)
+#pragma omp simd
+#elif defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+                for (int t = 0; t < count; t++) {
+                    float dx = g.points[j + t].x - to_evaluate.x;
+                    float dy = g.points[j + t].y - to_evaluate.y;
+                    candidates[t] = (dx * dx < bound) & (dy * dy < bound);
+                }
+            }
+
+            for (int t = 0; t < count; t++) {
+                if (filter && !candidates[t]) {
+                    continue;
+                }
+                float d = euclidean_distance_no_sqrt(to_evaluate,
+                                                      g.points[j + t]);
+                knn_insert_neighbor(d, g.label, k, labels, distances,
+                                    &used, &ordered);
+            }
+            j += count;
+        }
+    }
+
+    char result = knn_vote(labels, k);
+    free(distances);
+    free(labels);
+    return result;
+}
+
+typedef struct {
+    size_t begin;
+    size_t end;
+    size_t lo;
+    size_t hi;
+    size_t lower;
+    size_t upper;
+    size_t below;
+    size_t equal;
+    size_t take_equal;
+    size_t histogram[256];
+    size_t equal_histogram[256];
+} KnnRankPart;
+
+static char knn_histogram_vote(const size_t * histogram) {
+    char best = 0;
+    size_t best_count = 0;
+    for (unsigned int i = 0; i < 256; i++) {
+        char label = (char) (unsigned char) i;
+        size_t count = histogram[i];
+        if (count > best_count ||
+            (count != 0 && count == best_count && label < best)) {
+            best = label;
+            best_count = count;
+        }
+    }
+    return best;
+}
+
+static int knn_float_compare(const void * a, const void * b) {
+    float x = *(const float *) a;
+    float y = *(const float *) b;
+    return (x > y) - (x < y);
+}
+
+static float knn_rank_pivot(const float * values, const KnnRankPart * parts,
+                            int part_count, int sorted) {
+    int chosen = 0;
+    size_t largest = 0;
+    for (int p = 0; p < part_count; p++) {
+        size_t length = parts[p].hi - parts[p].lo;
+        if (length > largest) {
+            largest = length;
+            chosen = p;
+        }
+    }
+
+    size_t lo = parts[chosen].lo;
+    size_t hi = parts[chosen].hi;
+    float b = values[lo + (hi - lo) / 2];
+    if (sorted) {
+        return b;
+    }
+
+    float a = values[lo];
+    float c = values[hi - 1];
+    if (a > b) {
+        float temporary = a;
+        a = b;
+        b = temporary;
+    }
+    if (b > c) {
+        b = c;
+    }
+    if (a > b) {
+        b = a;
+    }
+    return b;
+}
+
+static void knn_rank_partition(float * values, KnnRankPart * part,
+                               float pivot, int sorted) {
+    if (sorted) {
+        size_t left = part->lo;
+        size_t right = part->hi;
+        while (left < right) {
+            size_t middle = left + (right - left) / 2;
+            if (values[middle] < pivot) {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        part->lower = left;
+        right = part->hi;
+        while (left < right) {
+            size_t middle = left + (right - left) / 2;
+            if (pivot < values[middle]) {
+                right = middle;
+            } else {
+                left = middle + 1;
+            }
+        }
+        part->upper = left;
+        return;
+    }
+
+    size_t lower = part->lo;
+    size_t upper = part->hi;
+    size_t scan = part->lo;
+    while (scan < upper) {
+        float value = values[scan];
+        if (value < pivot) {
+            values[scan] = values[lower];
+            values[lower] = value;
+            lower++;
+            scan++;
+        } else if (value > pivot) {
+            upper--;
+            values[scan] = values[upper];
+            values[upper] = value;
+        } else {
+            scan++;
+        }
+    }
+    part->lower = lower;
+    part->upper = upper;
+}
+
+static int knn_fill_part(int n_groups, Group * groups, Point to_evaluate,
+                         const KnnRankPart * part, float * distances,
+                         float * values) {
+    int bad = 0;
+    size_t offset = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        size_t length = g.length > 0 ? (size_t) g.length : 0;
+        size_t group_end = offset + length;
+        if (group_end > part->begin && offset < part->end) {
+            size_t first = part->begin > offset ? part->begin - offset : 0;
+            size_t last = part->end < group_end ? part->end - offset : length;
+#ifdef _OPENMP
+#pragma omp simd reduction(|:bad)
+#endif
+            for (size_t j = first; j < last; j++) {
+                float d = euclidean_distance_no_sqrt(to_evaluate, g.points[j]);
+                distances[offset + j] = d;
+                values[offset + j] = d;
+                bad |= (d != d);
+            }
+        }
+        offset = group_end;
+        if (offset >= part->end) {
+            break;
+        }
+    }
+    return bad;
+}
+
+static void knn_count_part(int n_groups, Group * groups,
+                           const float * distances, float cutoff,
+                           KnnRankPart * part) {
+    memset(part->histogram, 0, sizeof(part->histogram));
+    memset(part->equal_histogram, 0, sizeof(part->equal_histogram));
+    part->below = 0;
+    part->equal = 0;
+    size_t offset = 0;
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        size_t length = g.length > 0 ? (size_t) g.length : 0;
+        size_t group_end = offset + length;
+        if (group_end > part->begin && offset < part->end) {
+            size_t first = part->begin > offset ? part->begin - offset : 0;
+            size_t last = part->end < group_end ? part->end - offset : length;
+            size_t below = 0;
+            size_t equal = 0;
+#ifdef _OPENMP
+#pragma omp simd reduction(+:below,equal)
+#endif
+            for (size_t j = first; j < last; j++) {
+                float d = distances[offset + j];
+                below += d < cutoff;
+                equal += d == cutoff;
+            }
+            part->histogram[(unsigned char) g.label] += below;
+            part->equal_histogram[(unsigned char) g.label] += equal;
+            part->below += below;
+            part->equal += equal;
+        }
+        offset = group_end;
+        if (offset >= part->end) {
+            break;
+        }
+    }
+}
+
+static void knn_add_equal(int n_groups, Group * groups,
+                          const float * distances, float cutoff,
+                          KnnRankPart * part) {
+    size_t remaining = part->take_equal;
+    if (remaining == 0) {
+        return;
+    }
+    if (remaining == part->equal) {
+        for (unsigned int i = 0; i < 256; i++) {
+            part->histogram[i] += part->equal_histogram[i];
+        }
+        return;
+    }
+
+    size_t offset = 0;
+    for (int i = 0; i < n_groups && remaining != 0; i++) {
+        Group g = groups[i];
+        size_t length = g.length > 0 ? (size_t) g.length : 0;
+        size_t group_end = offset + length;
+        if (group_end > part->begin && offset < part->end) {
+            size_t first = part->begin > offset ? part->begin - offset : 0;
+            size_t last = part->end < group_end ? part->end - offset : length;
+            size_t equal = 0;
+#ifdef _OPENMP
+#pragma omp simd reduction(+:equal)
+#endif
+            for (size_t j = first; j < last; j++) {
+                equal += distances[offset + j] == cutoff;
+            }
+            size_t take = equal < remaining ? equal : remaining;
+            part->histogram[(unsigned char) g.label] += take;
+            remaining -= take;
+        }
+        offset = group_end;
+        if (offset >= part->end) {
+            break;
+        }
+    }
+}
+
+static int knn_rank(int n_groups, Group * groups, int k, Point to_evaluate,
+                     size_t total, int threads, char * result) {
+    if (total > ((size_t) -1) / sizeof(float)) {
+        return 0;
+    }
+    float * distances = (float *) malloc(total * sizeof(*distances));
+    float * values = (float *) malloc(total * sizeof(*values));
+    KnnRankPart * parts = (KnnRankPart *) calloc((size_t) threads,
+                                                sizeof(*parts));
+    if (distances == NULL || values == NULL || parts == NULL) {
+        free(parts);
+        free(values);
+        free(distances);
+        return 0;
+    }
+
+    size_t wanted = (size_t) k < total ? (size_t) k : total;
+    size_t rank = wanted - 1;
+    size_t below_count = 0;
+    size_t equal_count = 0;
+    float pivot = 0.0f;
+    float cutoff = 0.0f;
+    int part_count = 1;
+    int has_nan = 0;
+    int finished = 0;
+    int rounds = 0;
+    int sorted = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads) if(threads > 1)
+#endif
+    {
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+#ifdef _OPENMP
+            part_count = omp_get_num_threads();
+#endif
+            size_t width = total / (size_t) part_count;
+            size_t extra = total % (size_t) part_count;
+            size_t offset = 0;
+            for (int p = 0; p < part_count; p++) {
+                size_t length = width + ((size_t) p < extra ? 1 : 0);
+                parts[p].begin = offset;
+                parts[p].lo = offset;
+                offset += length;
+                parts[p].end = offset;
+                parts[p].hi = offset;
+            }
+        }
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:has_nan)
+#endif
+        for (int p = 0; p < part_count; p++) {
+            has_nan |= knn_fill_part(n_groups, groups, to_evaluate, &parts[p],
+                                      distances, values);
+        }
+
+        if (!has_nan) {
+            while (!finished) {
+                if (rounds == KNN_PARTITION_ROUNDS) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+                    for (int p = 0; p < part_count; p++) {
+                        qsort(values + parts[p].lo,
+                              parts[p].hi - parts[p].lo,
+                              sizeof(*values), knn_float_compare);
+                    }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+                    {
+                        sorted = 1;
+                    }
+                }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+                {
+                    pivot = knn_rank_pivot(values, parts, part_count, sorted);
+                    below_count = 0;
+                    equal_count = 0;
+                }
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(+:below_count,equal_count)
+#endif
+                for (int p = 0; p < part_count; p++) {
+                    knn_rank_partition(values, &parts[p], pivot, sorted);
+                    below_count += parts[p].lower - parts[p].lo;
+                    equal_count += parts[p].upper - parts[p].lower;
+                }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+                {
+                    if (rank < below_count) {
+                        for (int p = 0; p < part_count; p++) {
+                            parts[p].hi = parts[p].lower;
+                        }
+                    } else if (rank - below_count < equal_count) {
+                        cutoff = pivot;
+                        finished = 1;
+                    } else {
+                        rank -= below_count + equal_count;
+                        for (int p = 0; p < part_count; p++) {
+                            parts[p].lo = parts[p].upper;
+                        }
+                    }
+                    rounds++;
+                }
+            }
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (int p = 0; p < part_count; p++) {
+                knn_count_part(n_groups, groups, distances, cutoff, &parts[p]);
+            }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+            {
+                size_t below = 0;
+                for (int p = 0; p < part_count; p++) {
+                    below += parts[p].below;
+                }
+                size_t remaining = wanted - below;
+                for (int p = 0; p < part_count; p++) {
+                    size_t take = parts[p].equal < remaining
+                                ? parts[p].equal : remaining;
+                    parts[p].take_equal = take;
+                    remaining -= take;
+                }
+            }
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (int p = 0; p < part_count; p++) {
+                knn_add_equal(n_groups, groups, distances, cutoff, &parts[p]);
+            }
+        }
+    }
+
+    int success = !has_nan;
+    if (success) {
+        size_t histogram[256] = {0};
+        for (int p = 0; p < part_count; p++) {
+            for (unsigned int i = 0; i < 256; i++) {
+                histogram[i] += parts[p].histogram[i];
+            }
+        }
+        if ((size_t) k > total) {
+            char missing = -1;
+            histogram[(unsigned char) missing] += (size_t) k - total;
+        }
+        *result = knn_histogram_vote(histogram);
+    }
+    free(parts);
+    free(values);
+    free(distances);
+    return success;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    if (k <= 64) {
+        return knn_serial(n_groups, groups, k, to_evaluate);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < n_groups; i++) {
+        if (groups[i].length > 0) {
+            total += (size_t) groups[i].length;
+        }
+    }
+    if (total == 0) {
+        return knn_serial(n_groups, groups, k, to_evaluate);
+    }
+
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+    if (threads < 1) {
+        threads = 1;
+    }
+    if (threads > KNN_RANK_MAX_THREADS) {
+        threads = KNN_RANK_MAX_THREADS;
+    }
+    size_t slots = total / KNN_RANK_GRAIN;
+    if (slots == 0) {
+        slots = 1;
+    }
+    if ((size_t) threads > slots) {
+        threads = (int) slots;
+    }
+#endif
+
+    char result;
+    if (knn_rank(n_groups, groups, k, to_evaluate, total, threads, &result)) {
+        return result;
+    }
+    return knn_serial(n_groups, groups, k, to_evaluate);
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

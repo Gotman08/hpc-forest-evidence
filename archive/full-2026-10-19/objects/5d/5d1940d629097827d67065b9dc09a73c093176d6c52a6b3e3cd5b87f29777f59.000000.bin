@@ -1,0 +1,410 @@
+"""Inert Python data only; no received native cohort or production-positive fixture."""
+from __future__ import annotations
+
+import base64
+import copy
+import json
+import sys
+from pathlib import Path
+
+import audit_cache_preservation_r2 as preservation
+import audit_context as ctx
+import audit_private_r2c as private
+import pytest
+from audit_common import sha
+from audit_formats_r2 import KNOWN_WARNING, parse_native_jsonl
+from audit_transport import invocation_command_evidence
+
+
+def put(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(value if isinstance(value, bytes) else json.dumps(value, sort_keys=True).encode())
+    return path
+
+
+def ref(path):
+    return {"path": str(path.resolve()), "sha256": sha(path.read_bytes())}
+
+
+def identity(model="gpt-6-astra"):
+    session = ctx.CELLS[model]
+    return {"schema": "hpc-forest-primes-r2c-native-cell-audit-expectation-v1", "scope_id": ctx.SCOPE_VALUE,
+            "model": model, "effort": "max", "session_id": session,
+            "source_zip_sha256": ctx.SOURCE_VALUE, "plan_sha256": ctx.PLAN_VALUE,
+            "job_id": "999999999", "remote_root": "/scratch_p/nimarano/" + ctx.SCOPE_VALUE + "-" + session,
+            "cache_source_root": ctx.CACHE_PARENT + "/worker-" + session}
+
+
+@pytest.mark.parametrize("model", ctx.CELLS)
+def test_static_identity_is_not_admission(model):
+    selected = ctx.validate_identity(identity(model))
+    assert selected[0] == "999999999"
+    assert selected[3:] == (model, ctx.CELLS[model])
+    assert ctx.Binding.__dataclass_params__.frozen
+
+
+@pytest.mark.parametrize(("field", "value"), [("job_id", None), ("job_id", "751992"), ("job_id", "752087"),
+    ("job_id", "752128"), ("job_id", "751926"), ("job_id", "751975"),
+    ("job_id", "../123"), ("model", "gpt-6-luna"), ("effort", "medium"), ("session_id", "0" * 32),
+    ("source_zip_sha256", "0" * 64), ("plan_sha256", "1" * 64), ("remote_root", "/scratch_p/nimarano/foreign"),
+    ("cache_source_root", "C:/foreign"), ("synthetic_fixture", True), ("stub", True)])
+def test_binding_rejects_absent_job_old_identity_and_other_roots(field, value):
+    data = identity()
+    data[field] = value
+    with pytest.raises(ValueError):
+        ctx.validate_identity(data)
+
+
+def test_actual_artifacts_required_before_binding(tmp_path, monkeypatch):
+    monkeypatch.setattr(ctx, "_binding", None)
+    path = put(tmp_path / "NEUTRAL-no-observation.json", identity())
+    with pytest.raises(ValueError, match="exact path/SHA"):
+        ctx.configure(path)
+    assert ctx._binding is None
+
+
+def test_immutable_context_cannot_be_replaced(monkeypatch):
+    monkeypatch.setattr(ctx, "_binding", object())
+    with pytest.raises(ValueError, match="cannot be replaced"):
+        ctx.configure(Path("NEUTRAL-never-read"))
+
+
+@pytest.fixture(params=tuple(ctx.CELLS))
+def operation(tmp_path, monkeypatch, request):
+    data = identity(request.param)
+    binding = ctx.Binding(data["model"], data["session_id"], data["job_id"], data["remote_root"], data["cache_source_root"], "0" * 64, (), "{}")
+    monkeypatch.setattr(ctx, "_binding", binding)
+    root = tmp_path / "NEUTRAL-restoration"
+    campaign_name = "results-" + data["job_id"] + "/primes-max-" + data["model"]
+    campaign = root / campaign_name
+    remote = data["remote_root"] + "/" + campaign_name
+    relative = "e1/NEUTRAL/search/attempt-001"
+    logs, build = campaign / "logs" / relative, campaign / "builds" / relative
+    raw = put(logs / "build.log", b"NEUTRAL combined bytes; not executable")
+    binary = put(build / "solution", b"NEUTRAL inert bytes; never executable")
+    checker = put(campaign / "trusted/contract_tool.py", b"NEUTRAL checker bytes; not imported")
+    put(campaign / "trusted/contract.json", {"search": [], "confirmation": [], "benchmark": {}})
+    put(campaign / "trusted/config.json", {"protocol": {"private_execution_audit": True}})
+    argv = ["/NEUTRAL/python", remote + "/trusted/contract_tool.py", "build",
+            remote + "/repo", remote + "/builds/" + relative]
+    context = {"schema": "hpc-forest-private-evaluation-context-v1", "never_model_input": True,
+               "execution_purpose": "native-search", "experiment_id": "NEUTRAL", "epoch": 1,
+               "commit": "1" * 40, "tree_hash": "2" * 40, "phase": "search", "protocol_id": "3" * 64,
+               "operation": "build", "argv": argv, "worktree": remote + "/repo",
+               "binary_path": remote + "/builds/" + relative + "/solution", "binary_sha256_before": None,
+               "command_file_sha256": {argv[1]: sha(checker.read_bytes()), "/NEUTRAL/python": "4" * 64},
+               "private_cases": []}
+    context_path = put(logs / "build.log.private-context.json", context)
+    process = {"argv": argv, "returncode": 0, "timed_out": False, "seconds": 0.125}
+    process_path = put(logs / "build.log.json", process)
+    proof = {**context, "schema": "hpc-forest-private-evaluation-execution-v2", "verified": True,
+             "context": {"path": remote + "/logs/" + relative + "/build.log.private-context.json",
+                         "sha256": sha(context_path.read_bytes())},
+             "binary_sha256_after": sha(binary.read_bytes()), "returncode": 0, "timed_out": False,
+             "measured_seconds": 0.125, "hashing_outside_measured_interval": True,
+             "streams": {"combined_stdout_stderr": {"path": remote + "/logs/" + relative + "/build.log",
+                         "sha256": sha(raw.read_bytes()), "bytes": raw.stat().st_size},
+                         "separate_stdout": None, "separate_stderr": None,
+                         "layout": "original_run_process_combined_unchanged"},
+             "case_execution_records": [], "execution_semantics_changed": False}
+    path = put(logs / "build.log.private-execution.json", proof)
+    # This unit tests only the sidecar graph. Git/worktree validity is never invented by this double.
+    monkeypatch.setattr(private, "_worktree", lambda *_: {"commit": "1" * 40, "tree_hash": "2" * 40})
+    return {"identity": data, "root": root, "path": path, "proof": proof, "context": context, "context_path": context_path,
+            "raw": raw, "binary": binary, "process": process_path, "campaign": campaign}
+
+
+def test_native_sidecar_reads_inert_data_preserves_raw_false(operation):
+    row = private.operation_evidence(operation["path"], operation["root"])
+    assert row["experiment_id"] == "NEUTRAL"
+    report = private.raw_evidence(operation["root"])
+    assert report["native_private_operations_verified"] == 1
+    assert report["qualification_only_trace_used_for_candidate"] is False
+    assert report["independent_raw_stdout_per_candidate_verified"] is False
+
+
+@pytest.mark.parametrize("mutation", ["raw", "binary", "purpose", "context", "phase", "outcome", "escape", "missing", "layout"])
+def test_private_graph_falsifications_refused(operation, mutation):
+    proof = copy.deepcopy(operation["proof"])
+    if mutation == "raw":
+        operation["raw"].write_bytes(b"NEUTRAL tampered")
+    elif mutation == "binary":
+        operation["binary"].write_bytes(b"NEUTRAL foreign binary")
+    elif mutation == "purpose":
+        proof["execution_purpose"] = "qualification-only-not-model-official"
+    elif mutation == "context":
+        proof["context"]["sha256"] = "0" * 64
+    elif mutation == "phase":
+        value = copy.deepcopy(operation["context"])
+        value["phase"] = proof["phase"] = "confirmation"
+        put(operation["context_path"], value)
+        proof["context"]["sha256"] = sha(operation["context_path"].read_bytes())
+    elif mutation == "outcome":
+        proof["measured_seconds"] = 0.25
+    elif mutation == "escape":
+        proof["context"]["path"] = "/scratch_p/nimarano/foreign/context.json"
+    elif mutation == "missing":
+        proof["context"]["path"] = proof["context"]["path"].replace("build.log", "absent.log")
+    elif mutation == "layout":
+        proof["streams"]["separate_stderr"] = {"sha256": "0" * 64}
+    put(operation["path"], proof)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        private.operation_evidence(operation["path"], operation["root"])
+
+
+@pytest.mark.parametrize("kind", ["context", "case"])
+def test_unlinked_private_refs_refused(operation, kind):
+    if kind == "context":
+        put(operation["campaign"] / "logs/unlinked.private-context.json", {"NEUTRAL": True})
+    else:
+        put(operation["campaign"] / "private-audit/executions" / ("a" * 32) / "execution-provenance.json", {"NEUTRAL": True})
+    with pytest.raises(ValueError, match="unlinked"):
+        private.raw_evidence(operation["root"])
+
+
+def test_warning_grammar_remains_only_actual_known_format():
+    raw = ("2026-10-18T00:00:00.000001Z  WARN " + KNOWN_WARNING + '\n\n{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}\n').encode()
+    assert len(parse_native_jsonl(raw)["recognized_warnings"]) == 1
+    with pytest.raises(ValueError):
+        parse_native_jsonl(b"NEUTRAL unknown CLI text\n")
+
+
+def test_changed_immutable_ref_rejected(tmp_path, monkeypatch):
+    path = put(tmp_path / "NEUTRAL-authorization.json", b"NEUTRAL original")
+    binding = ctx.Binding("gpt-6-astra", ctx.CELLS["gpt-6-astra"], "999999999", identity()["remote_root"], identity()["cache_source_root"], "0" * 64,
+                          ((str(path), sha(path.read_bytes())),), "{}")
+    monkeypatch.setattr(ctx, "_binding", binding)
+    assert ctx.recheck() == binding
+    path.write_bytes(b"NEUTRAL changed")
+    with pytest.raises(ValueError, match="changed"):
+        ctx.recheck()
+
+
+@pytest.fixture
+def case_data(operation):
+    root, campaign = operation['root'], operation['campaign']
+    trusted = campaign / 'trusted'
+    data = b'NEUTRAL expected bytes'
+    stdin = put(trusted / 'NEUTRAL-input.txt', b'NEUTRAL input bytes')
+    case = {'name': 'search-case-1', 'argv': [], 'stdin': 'NEUTRAL-input.txt', 'files': [], 'capture_files': [],
+            'input_fingerprint': '5' * 64,
+            'expected': {'stdout': {'base64': base64.b64encode(data).decode(), 'sha256': sha(data), 'bytes': len(data)}}}
+    benchmark = {**case, 'name': 'benchmark-case-1'}
+    contract = {'search': [case], 'confirmation': [], 'benchmark': benchmark}
+    context = copy.deepcopy(operation['context'])
+    context.update(operation='check', binary_sha256_before=sha(operation['binary'].read_bytes()))
+    context['private_cases'] = [{'name': row['name'], 'case_sha256': private.digest(row),
+        'stdin_sha256': sha(stdin.read_bytes()), 'stdin_bytes': stdin.stat().st_size} for row in [case, benchmark]]
+    context_path = put(operation['context_path'], context)
+    proof = {**operation['proof'], **context, 'schema': 'hpc-forest-private-evaluation-execution-v2',
+             'context': {**operation['proof']['context'], 'sha256': sha(context_path.read_bytes())}}
+    case_path = campaign / 'private-audit/executions' / ('a' * 32) / 'execution-provenance.json'
+    historical = put(case_path.with_name('execution.json'),
+                     {'case': case['name'], 'returncode': 0, 'timed_out': False, 'never_model_input': True})
+    put(case_path.with_name('stdout.bin'), data)
+    put(case_path.with_name('stderr.bin'), b'')
+    record = {'schema': 'hpc-forest-private-case-execution-v2', 'role': 'candidate', 'case': case['name'],
+              'experiment_id': 'NEUTRAL', 'phase': 'search', 'never_model_input': True,
+              'hashing_outside_execution_timer': True, 'capture_layout': 'separate_actual_stdout_and_stderr',
+              'context': {**proof['context'], 'value': context}, 'binary_path': proof['binary_path'],
+              'binary_sha256_before': proof['binary_sha256_before'], 'binary_sha256_after': proof['binary_sha256_after'],
+              'argv': [proof['binary_path']], 'stdin_sha256': sha(stdin.read_bytes()), 'stdin_bytes': stdin.stat().st_size,
+              'case_sha256': private.digest(case), 'input_fingerprint_declared': case['input_fingerprint'],
+              'asset_sha256': {}, 'historical_record': {'file': 'execution.json', 'sha256': sha(historical.read_bytes())},
+              'returncode': 0, 'timed_out': False, 'execution_seconds': 0.01,
+              'stdout': {'file': 'stdout.bin', 'sha256': sha(data), 'bytes': len(data)},
+              'stderr': {'file': 'stderr.bin', 'sha256': sha(b''), 'bytes': 0}}
+    put(case_path, record)
+    relative = case_path.relative_to(root).as_posix()
+    proof['case_execution_records'] = [{'path': operation['identity']['remote_root'] + '/' + relative,
+                                        'sha256': sha(case_path.read_bytes())}]
+    return {'root': root, 'proof': proof, 'context': context, 'trusted': trusted,
+            'contract': contract, 'path': case_path, 'record': record}
+
+
+def test_private_case_exact_bytes_and_inputs_without_execution(case_data):
+    d = case_data
+    assert private._case_records(d['proof'], d['context'], d['root'], d['trusted'], d['contract']) == [d['path']]
+
+
+@pytest.mark.parametrize('mutation', ['stdout', 'stderr', 'input', 'phase', 'binary', 'historical', 'role', 'case'])
+def test_candidate_case_falsifications_refused(case_data, mutation):
+    d = case_data
+    record = copy.deepcopy(d['record'])
+    if mutation in {'stdout', 'stderr'}:
+        d['path'].with_name(mutation + '.bin').write_bytes(b'NEUTRAL substituted raw stream')
+    elif mutation == 'input':
+        record['stdin_sha256'] = '0' * 64
+    elif mutation == 'phase':
+        record['phase'] = 'confirmation'
+    elif mutation == 'binary':
+        record['binary_sha256_after'] = '0' * 64
+    elif mutation == 'historical':
+        record['historical_record']['sha256'] = '0' * 64
+    elif mutation == 'role':
+        record['role'] = 'qualification-official-reference'
+    elif mutation == 'case':
+        record['case_sha256'] = '0' * 64
+    put(d['path'], record)
+    d['proof']['case_execution_records'][0]['sha256'] = sha(d['path'].read_bytes())
+    with pytest.raises(ValueError):
+        private._case_records(d['proof'], d['context'], d['root'], d['trusted'], d['contract'])
+
+
+@pytest.fixture(params=tuple(ctx.CELLS))
+def command_data(tmp_path, monkeypatch, request):
+    # Only the frozen pure argv/file preparer is exercised; no CLI process is invoked.
+    base = Path(__file__).resolve().parents[2]
+    source = base / 'work/hpc-forest-primes-native-max-r2c/project/src'
+    sys.path.insert(0, str(source))
+    try:
+        from hpc_forest import codex_process
+    finally:
+        sys.path.pop(0)
+    model = request.param
+    monkeypatch.setattr(codex_process, 'MODEL', model)
+    monkeypatch.setattr(codex_process, 'EFFORT', 'max')
+    monkeypatch.setattr(codex_process.shutil, 'which', lambda _: 'C:\\NEUTRAL\\not-executed.exe')
+    nonce = 'b' * 32
+    cache = tmp_path / 'NEUTRAL-command-cache'
+    local = cache / nonce
+    request = {'model': model, 'reasoning_effort': 'max',
+               'messages': [{'role': 'system', 'content': 'NEUTRAL system\nline2'},
+                            {'role': 'user', 'content': 'NEUTRAL user'}],
+               'schema': {'type': 'object', 'properties': {}}}
+    argv = codex_process.command_for(request, local, executable='NEUTRAL-not-executed')
+    binding = ctx.Binding(model, ctx.CELLS[model], '999999999', identity(model)['remote_root'], str(cache), '0' * 64, (),
+                          json.dumps({'executable_path': argv[0]}))
+    monkeypatch.setattr(ctx, '_binding', binding)
+    return argv, request, local, nonce
+
+
+def test_cli_reader_matches_frozen_pure_argv_preparer_without_process(command_data):
+    invocation_command_evidence(*command_data)
+
+
+@pytest.mark.parametrize('mutation', ['executable', 'model', 'effort', 'tool', 'cache', 'instructions'])
+def test_exact_cli_identity_and_configs_falsification_refused(command_data, mutation):
+    argv, request, local, nonce = command_data
+    argv = list(argv)
+    if mutation == 'executable':
+        argv[0] = 'C:\\NEUTRAL\\foreign.exe'
+    elif mutation == 'model':
+        argv[argv.index('--model') + 1] = 'gpt-6-luna'
+    elif mutation == 'effort':
+        argv[argv.index('model_reasoning_effort="max"')] = 'model_reasoning_effort="medium"'
+    elif mutation == 'tool':
+        argv[argv.index('features.shell_tool=false')] = 'features.shell_tool=true'
+    elif mutation == 'cache':
+        argv[argv.index('-C') + 1] = 'C:\\NEUTRAL\\foreign'
+    elif mutation == 'instructions':
+        (local / 'instructions.txt').write_text('NEUTRAL substituted', encoding='utf8')
+    with pytest.raises(ValueError):
+        invocation_command_evidence(argv, request, local, nonce)
+
+
+@pytest.fixture
+def cache_data(tmp_path, operation, monkeypatch):
+    cache = tmp_path / 'NEUTRAL-cache-snapshot'
+    for name in ['CELL-BINDING.json', 'OWNER.json', 'worker-ready.json']:
+        put(cache / name, {'NEUTRAL': name})
+    files = preservation.inventory(cache)
+    metadata = {**files, 'worker.lock': {'bytes': 1, 'bytes_read': False, 'sha256': None,
+                                        'path': ctx.SOURCE_LOCK}}
+    before = put(tmp_path / 'NEUTRAL-before.json', files)
+    after = put(tmp_path / 'NEUTRAL-after.json', files)
+    meta_before = put(tmp_path / 'NEUTRAL-full-before.json', metadata)
+    meta_after = put(tmp_path / 'NEUTRAL-full-after.json', metadata)
+    monkeypatch.setattr(preservation, 'verify_owned_lock_exception', lambda _: {'NEUTRAL': True})
+    receipt = {'preservation_phase': 'pre_stop_owned_lock_pending', 'verified': False,
+               'source_cache_complete': False, 'owned_operational_lock_exception': {'NEUTRAL': True},
+               'source_inventory_before': ref(before), 'source_inventory_after': ref(after),
+               'source_full_metadata_before': ref(meta_before), 'source_full_metadata_after': ref(meta_after),
+               'files': files, 'source_files_observed': 4, 'post_stop_lock_preservation': None}
+    return cache, receipt
+
+
+def test_owned_lock_pending_uses_actual_count_and_never_full_admission(cache_data):
+    cache, receipt = cache_data
+    report = preservation.cache_preservation(receipt, cache)
+    assert report['readable_files_verified_before_stop'] == 3
+    assert report['source_files_observed'] == 4
+    assert report['total_cache_bytes_preservation_complete'] is False
+    assert report['worker_lock_sha256_before'] is None
+
+
+@pytest.mark.parametrize('mutation', ['old_luna_count', 'extra_file', 'invented_lock', 'fake_post_stop'])
+def test_cache_exception_never_ignores_extra_data_or_fabricates_stop(cache_data, mutation):
+    cache, receipt = cache_data
+    if mutation == 'old_luna_count':
+        receipt['source_files_observed'] = 133
+    elif mutation == 'extra_file':
+        put(cache / 'NEUTRAL-unmanifested.json', {'NEUTRAL': True})
+    elif mutation == 'invented_lock':
+        put(cache / 'worker.lock', b'x')
+        receipt['files'] = preservation.inventory(cache)
+    else:
+        receipt['post_stop_lock_preservation'] = {'NEUTRAL': True}
+    with pytest.raises(ValueError):
+        preservation.cache_preservation(receipt, cache)
+
+
+def test_entrypoint_actual_missing_job_refuses_before_any_cache(tmp_path, monkeypatch):
+    import audit_r2_native
+    monkeypatch.setattr(ctx, '_binding', None)
+    data = identity()
+    data['job_id'] = None
+    binding = put(tmp_path / 'NEUTRAL-no-job.json', data)
+    output = tmp_path / 'NEUTRAL-refusal-report.json'
+    args = ['--binding', str(binding), '--output', str(output)]
+    for name in ['root', 'cache', 'reception', 'cache-receipt', 'source-zip', 'plan', 'certified']:
+        args.extend(['--' + name, str(tmp_path / ('NEVER-READ-' + name))])
+    assert audit_r2_native.main(args) == 1
+    report = json.loads(output.read_bytes())
+    assert report['verified'] is False
+    assert report['native_research_admitted'] is False
+    assert report['independent_raw_stdout_per_candidate_verified'] is False
+    assert 'actual native selected-cell job' in report['audit_error']
+
+
+@pytest.mark.parametrize("model", ctx.CELLS)
+def test_cross_model_session_and_root_substitutions_refused(model):
+    for other, session in ctx.CELLS.items():
+        if model == other:
+            continue
+        data = identity(model)
+        data["session_id"] = session
+        with pytest.raises(ValueError):
+            ctx.validate_identity(data)
+        data = identity(model)
+        data["remote_root"] = identity(other)["remote_root"]
+        with pytest.raises(ValueError):
+            ctx.validate_identity(data)
+        data = identity(model)
+        data["cache_source_root"] = identity(other)["cache_source_root"]
+        with pytest.raises(ValueError):
+            ctx.validate_identity(data)
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3])
+def test_lane_syntax_accepts_only_available_slots_under_cap4(count):
+    ctx.validate_lane({"active_native_workers_before_start": count, "maximum_native_workers": 4})
+
+
+@pytest.mark.parametrize("count", [4, 5, -1, True, False, 1.0, None, "1"])
+def test_lane_syntax_refuses_fifth_worker_and_non_integer_claims(count):
+    with pytest.raises(ValueError):
+        ctx.validate_lane({"active_native_workers_before_start": count, "maximum_native_workers": 4})
+
+
+def test_old_cap2_scope_source_plan_and_expectation_schema_refused():
+    for field, value in {"schema": "hpc-forest-primes-r2b-astra-audit-expectation-v1",
+        "scope_id": "hpc-forest-primes-native-max-r2b",
+        "source_zip_sha256": "1a1dde5f1de6b3e3f062e3984c57c6327f714a7570b41e5734371bcda291e33b",
+        "plan_sha256": "000323615fbb6fd602c3f69d1bcd20b46d22ab631400300f3e9068dcf151fc3f"}.items():
+        data = identity()
+        data[field] = value
+        with pytest.raises(ValueError):
+            ctx.validate_identity(data)
+    with pytest.raises(ValueError):
+        ctx.validate_lane({"active_native_workers_before_start": 1, "maximum_native_workers": 2})

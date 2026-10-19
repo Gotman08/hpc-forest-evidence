@@ -1,0 +1,45 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cassert>\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <limits>\n#include <vector>\n\n#if defined(__aarch64__)\n#include <arm_neon.h>\n#endif\n\nclass FastInput {\n    unsigned char buffer_[1 << 16];\n    std::size_t position_ = 0;\n    std::size_t length_ = 0;\n\n    int get() {\n        if (position_ == length_) {\n            length_ = std::fread(buffer_, 1, sizeof buffer_, stdin);\n            position_ = 0;\n            if (length_ == 0) return EOF;\n        }\n        return buffer_[position_++];\n    }\n\npublic:\n    bool readInt(int& value) {\n        int c = get();\n        while (c != EOF && c <= ' ') c = get();\n        if (c == EOF) return false;\n        const bool negative = c == '-';\n        if (c == '-' || c == '+') c = get();\n        std::int64_t magnitude = 0;\n        while (c >= '0' && c <= '9') {\n            magnitude = magnitude * 10 + (c - '0');\n            c = get();\n        }\n        value = static_cast<int>(negative ? -magnitude : magnitude);\n        return true;\n    }\n};\n\nstatic void advanceBands(const int* matrix, int n, int s, int first,\n                         int count, std::int64_t* bands) {\n    const int* outgoing[4] = {};\n    const int* incoming[4] = {};\n    for (int k = 0; k < count; ++k) {\n        outgoing[k] = matrix + std::size_t(first + k - 1) * n;\n        incoming[k] = outgoing[k] + std::size_t(s) * n;\n    }\n\n    int c = 0;\n#if defined(__aarch64__)\n    if (count == 4) {\n        for (; c + 2 <= n; c += 2) {\n            const int64x2_t last = vld4q_s64(bands + 4 * c).val[3];\n            const int64x2_t d0 = vsubl_s32(vld1_s32(incoming[0] + c),\n                                           vld1_s32(outgoing[0] + c));\n            const int64x2_t d1 = vsubl_s32(vld1_s32(incoming[1] + c),\n                                           vld1_s32(outgoing[1] + c));\n            const int64x2_t d2 = vsubl_s32(vld1_s32(incoming[2] + c),\n                                           vld1_s32(outgoing[2] + c));\n            const int64x2_t d3 = vsubl_s32(vld1_s32(incoming[3] + c),\n                                           vld1_s32(outgoing[3] + c));\n            int64x2x4_t next;\n            next.val[0] = vaddq_s64(last, d0);\n            next.val[1] = vaddq_s64(next.val[0], d1);\n            next.val[2] = vaddq_s64(next.val[1], d2);\n            next.val[3] = vaddq_s64(next.val[2], d3);\n            vst4q_s64(bands + 4 * c, next);\n        }\n    }\n#endif\n    for (; c < n; ++c) {\n        std::int64_t value = bands[4 * c + 3];\n        for (int k = 0; k < 4; ++k) {\n            if (k < count) {\n                value += static_cast<std::int64_t>(incoming[k][c])\n                         - outgoing[k][c];\n            }\n            bands[4 * c + k] = value;\n        }\n    }\n}\n\n#if defined(__aarch64__)\nstatic inline int64x2_t maximum64(int64x2_t a, int64x2_t b) {\n    return vbslq_s64(vcgtq_s64(a, b), a, b);\n}\n#endif\n\nstatic std::int64_t scanBands(const std::int64_t* bands, int n, int s) {\n#if defined(__aarch64__)\n    int64x2_t sum01 = vdupq_n_s64(0);\n    int64x2_t sum23 = vdupq_n_s64(0);\n    for (int c = 0; c < s; ++c) {\n        sum01 = vaddq_s64(sum01, vld1q_s64(bands + 4 * c));\n        sum23 = vaddq_s64(sum23, vld1q_s64(bands + 4 * c + 2));\n    }\n    int64x2_t best01 = sum01;\n    int64x2_t best23 = sum23;\n    for (int c = s; c < n; ++c) {\n        const std::int64_t* entering = bands + 4 * c;\n        const std::int64_t* leaving = bands + 4 * (c - s);\n        sum01 = vaddq_s64(sum01,\n            vsubq_s64(vld1q_s64(entering), vld1q_s64(leaving)));\n        sum23 = vaddq_s64(sum23,\n            vsubq_s64(vld1q_s64(entering + 2), vld1q_s64(leaving + 2)));\n        best01 = maximum64(best01, sum01);\n        best23 = maximum64(best23, sum23);\n    }\n    const int64x2_t best = maximum64(best01, best23);\n    return std::max(vgetq_lane_s64(best, 0), vgetq_lane_s64(best, 1));\n#else\n    std::int64_t sums[4] = {};\n    for (int c = 0; c < s; ++c)\n        for (int k = 0; k < 4; ++k)\n            sums[k] += bands[4 * c + k];\n    std::int64_t best = sums[0];\n    for (int k = 1; k < 4; ++k) best = std::max(best, sums[k]);\n    for (int c = s; c < n; ++c) {\n        for (int k = 0; k < 4; ++k) {\n            sums[k] += bands[4 * c + k] - bands[4 * (c - s) + k];\n            best = std::max(best, sums[k]);\n        }\n    }\n    return best;\n#endif\n}\n\nint main() {\n    FastInput input;\n    int n, s;\n    if (!input.readInt(n) || !input.readInt(s)) return 0;\n    assert(s < n);\n    assert(n < 8000);\n    assert(s > 0);\n    assert(n > 0);\n\n    std::vector<int> matrix(std::size_t(n) * n);\n    for (std::size_t k = 0; k < matrix.size(); ++k)\n        if (!input.readInt(matrix[k])) return 0;\n\n    std::vector<std::int64_t> vertical(n, 0);\n    for (int r = 0; r < s; ++r) {\n        const int* row = matrix.data() + std::size_t(r) * n;\n        int c = 0;\n#if defined(__aarch64__)\n        for (; c + 4 <= n; c += 4) {\n            const int32x4_t values = vld1q_s32(row + c);\n            vst1q_s64(vertical.data() + c,\n                vaddw_s32(vld1q_s64(vertical.data() + c),\n                          vget_low_s32(values)));\n            vst1q_s64(vertical.data() + c + 2,\n                vaddw_s32(vld1q_s64(vertical.data() + c + 2),\n                          vget_high_s32(values)));\n        }\n#endif\n        for (; c < n; ++c) vertical[c] += row[c];\n    }\n\n    const int width = n - s + 1;\n    // Each column record contains totals for four consecutive output rows.\n    std::vector<std::int64_t> bands(std::size_t(n) * 4);\n    for (int c = 0; c < n; ++c) {\n        std::int64_t value = vertical[c];\n        bands[4 * c] = value;\n        for (int k = 1; k < 4; ++k) {\n            if (k < width) {\n                value += static_cast<std::int64_t>(\n                             matrix[std::size_t(s + k - 1) * n + c])\n                         - matrix[std::size_t(k - 1) * n + c];\n            }\n            bands[4 * c + k] = value;\n        }\n    }\n\n    std::int64_t best = std::numeric_limits<std::int64_t>::lowest();\n    for (int first = 0; first < width; first += 4) {\n        if (first != 0) {\n            advanceBands(matrix.data(), n, s, first,\n                         std::min(4, width - first), bands.data());\n        }\n        best = std::max(best, scanBands(bands.data(), n, s));\n    }\n    std::printf(\"%lld\\n\", static_cast<long long>(best));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "SIMD across four independent output rows can overlap horizontal rolling-sum dependency chains without intra-vector prefix scans.",
+    "notes": "Not executed. Uses 64-bit accumulation, an ARM64 NEON kernel, and a scalar fallback. Padded final channels duplicate valid rows.",
+    "sources_kept": [],
+    "transformations": [
+      "Replace the serpentine O(SN²) traversal with O(N²) rolling-column work grouped into four output rows.",
+      "Interleave row channels and use widening NEON column updates plus independent horizontal sum/max reductions.",
+      "Batch integer input with a buffered reader while preserving the textual input/output contract."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6.1-sol",
+  "nonce": "11afe2ecd5514858aa7ff953c669800d",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "4473e8a10ca38d42cae4ca97a978d6a66c4a4f8807ae934a8423c32c80d8c9c9",
+  "session_id": "5cbdd08b886a40dcb685b3b4dffa7fe5",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "f28947844f3d00b12a98b771b5e8501ca9e325dc8b24742d31f8dc8c4d23f770",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 4224,
+        "input_tokens": 12342,
+        "output_tokens": 17245,
+        "reasoning_output_tokens": 14791
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6.1-sol",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 29587,
+    "tool_events": []
+  }
+}

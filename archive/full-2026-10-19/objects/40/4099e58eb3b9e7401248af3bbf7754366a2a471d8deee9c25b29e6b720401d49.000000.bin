@@ -1,0 +1,359 @@
+"""Local received-evidence adapter only. No CLI, CIM, network, process or factory dispatch."""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LAUNCH = HERE.parent / "lancement-technique-r4b-r1"
+FACTORY_SHA = "0fdf836ce89b6f4da9a0b3896bf5a14f36933f5c6c80f157ae24cb3436683f66"
+REVIEW_SHA = "57c20ca6bba3c64df5449bbff0d7680faf8341b96b7993fcb13e53164f02802b"
+INPUT_REFS = {"real_qualification_reception", "allocation_marker", "request_prepared", "submission_intent",
+              "submission_observed", "script_reread", "fresh_private_full_cim", "r2_main_closure",
+              "mixed_observer_admission", "oauth_source", "codex_config", "remote_checks", "factory_review"}
+FLAGS = ("full_census_locally_reviewed", "no_unclassified_research_processes", "remote_registry_absent",
+         "prior_session_claims_absent", "local_cache_absent", "local_registry_absent", "existing_transport_only",
+         "no_new_authentication", "CLI_tools_disabled", "source_only_preserved")
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def ref(path):
+    path = Path(path).resolve(strict=True)
+    return {"path": str(path), "sha256": sha(path)}
+
+
+def artifact(value):
+    need(isinstance(value, dict) and set(value) == {"path", "sha256"}, "closed_reference_required")
+    path = Path(value["path"])
+    need(path.is_absolute() and ".." not in path.parts and path.is_file() and not path.is_symlink()
+         and not (hasattr(path, "is_junction") and path.is_junction())
+         and isinstance(value["sha256"], str) and re.fullmatch("[0-9a-f]{64}", value["sha256"])
+         and sha(path) == value["sha256"], "evidence_missing_or_sha_changed")
+    return path
+
+
+def read(value):
+    def pairs(items):
+        result = {}
+        for key, item in items:
+            need(key not in result, "duplicate_json_member")
+            result[key] = item
+        return result
+    def constant(_):
+        raise ValueError("nonfinite_json")
+    value = json.loads(artifact(value).read_text(encoding="utf8"), object_pairs_hook=pairs, parse_constant=constant)
+    need(isinstance(value, dict), "evidence_object_required")
+    return value
+
+
+def factory():
+    sys.dont_write_bytecode = True  # Never create bytecode in the sealed source on import.
+    need(sha(LAUNCH / "assemble_admissions.py") == FACTORY_SHA, "sealed_factory_changed")
+    spec = importlib.util.spec_from_file_location("r4b_received_evidence_factory", LAUNCH / "assemble_admissions.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def result_object(value):
+    if isinstance(value.get("structuredContent"), dict):
+        return value["structuredContent"]
+    if "ok" in value:
+        return value
+    texts = [v["text"] for v in value.get("content", []) if v.get("type") == "text"]
+    need(len(texts) == 1, "unambiguous_mcp_result_required")
+    result = json.loads(texts[0])
+    need(isinstance(result, dict), "mcp_result_object_required")
+    return result
+
+
+def epoch(value):
+    if isinstance(value, str):
+        return datetime.fromisoformat(value).timestamp()
+    return value
+
+
+def actual_tool(item, tool, f, now):
+    value = read(item)
+    need(set(value) == {"observed_at", "tool", "result"} and value["tool"] == tool,
+         "exact_timestamped_actual_tool_result_required")
+    f.fresh(value["observed_at"], now=now)
+    result = result_object(value["result"])
+    need(result.get("ok") is True, "mcp_operation_not_successful")
+    return result
+
+
+def validate_oauth(source, config_ref, pins, cli_files, f, now):
+    value = read(source)
+    need(value.get("schema") == "hpc-forest-r4b-parent-local-cli-oauth-observation-v1" and value.get("verified") is True,
+         "actual_oauth_producer_receipt_required")
+    f.fresh(value["observed_at"], now=now)
+    need(value.get("authentication") == "existing-local-ChatGPT" and value.get("auth_mode") == "chatgpt"
+         and value.get("cli_login_status") == "Logged in using ChatGPT" and value.get("model_provider") == "openai"
+         and value.get("executable_path") == pins["copied_cli_executable"]
+         and value.get("executable_sha256") == cli_files["codex.exe"]
+         and value.get("version") == "codex-cli 0.163.0-alpha.10.2", "exact_existing_oauth_cli_required")
+    need(all(value.get(k) is False for k in ("api_key_in_auth_present", "endpoint_override_present", "credentials_exported",
+         "new_connection_or_auth", "model_inference_executed", "native_generation_admitted")), "oauth_negative_flags_missing")
+    for field, keys in (("api_key_environment_presence", {"OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"}),
+                        ("endpoint_environment_presence", {"OPENAI_BASE_URL", "OPENAI_API_BASE", "AZURE_OPENAI_ENDPOINT", "CODEX_MODEL_PROVIDER"})):
+        need(isinstance(value.get(field), dict) and set(value[field]) == keys
+             and all(v is False for v in value[field].values()), "api_key_or_endpoint_presence_unknown")
+    need(value.get("codex_config") == config_ref, "configuration_observation_differs")
+    artifact(config_ref)  # hash only; never parse or copy private configuration
+    rows = value.get("files")
+    expected = {str(Path(pins["copied_cli_executable"]).parent / name): digest for name, digest in cli_files.items()}
+    need(isinstance(rows, list) and len(rows) == 4 and len({r["path"] for r in rows}) == 4
+         and {r["path"]: r["sha256"] for r in rows} == expected, "four_exact_cli_files_required")
+    for row in rows:
+        artifact(row)  # binary hashes only; never execute
+    return value
+
+
+def required_absences(cell):
+    root = cell["remote_root"]
+    output = root + "/results-" + cell["job_id"]
+    return {base + suffix for base in (root + "/registry.sqlite3", output + "/registry.sqlite3")
+            for suffix in ("", "-wal", "-shm")} | {output + "/mailbox/worker-ready.json"}
+
+
+def proof_path_aliases(expected, cell):
+    root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + cell["session_id"]
+    need(cell["remote_root"] == root and isinstance(cell["job_id"], str) and cell["job_id"].isdigit(), "exact_owned_proof_cell_required")
+    output = root + "/results-" + cell["job_id"]
+    need(expected in {output + "/mailbox/OWNER.json", output + "/request-prepared.json"}, "only_owner_request_proof_aliases_allowed")
+    return {expected, expected.replace("/scratch_p/nimarano/", "/gpfs/scratch/nimarano/", 1)}
+
+
+def validate_remote(remote_ref, cell, marker_ref, request_ref, f, now):
+    value = read(remote_ref)
+    need(set(value) == {"schema", "verified", "path_absence", "listings", "downloads"}
+         and value.get("schema") == "hpc-forest-dynamic-r4b-actual-remote-checks-v1"
+         and value.get("verified") is True, "actual_remote_packet_required")
+    checks = actual_tool(value["path_absence"], "sbatch_check_paths", f, now)
+    need(checks.get("unchecked") == [] and checks.get("dynamic_paths") == []
+         and checks.get("scope") == "remote_literal_paths", "literal_absence_checks_incomplete")
+    paths = checks.get("paths")
+    need(isinstance(paths, list) and len(paths) == len(required_absences(cell))
+         and {p["path"] for p in paths} == required_absences(cell)
+         and all(p.get("exists") is False for p in paths), "registry_or_prior_worker_not_proven_absent")
+    root = cell["remote_root"]
+    output = root + "/results-" + cell["job_id"]
+    expected = {root: {"results-" + cell["job_id"]}, output + "/mailbox": {"OWNER.json", "requests", "responses", "logs"},
+                **{output + "/mailbox/" + name: set() for name in ("requests", "responses", "logs")}}
+    need(isinstance(value["listings"], list) and len(value["listings"]) == len(expected), "all_exact_listings_required")
+    seen = set()
+    for item in value["listings"]:
+        listing = actual_tool(item, "list_dir", f, now)
+        path = listing.get("path")
+        need(path in expected and path not in seen and listing.get("truncated") is False
+             and type(listing.get("disappeared_entries")) is int and listing["disappeared_entries"] == 0, "listing_wrong_path_or_truncated")
+        seen.add(path)
+        entries = listing.get("entries")
+        need(isinstance(entries, list) and type(listing.get("count")) is int
+             and listing["count"] == len(entries) == len(expected[path])
+             and {v.get("name") for v in entries} == expected[path]
+             and all(v.get("is_symlink") is False and type(v.get("is_dir")) is bool for v in entries), "unexpected_remote_entry")
+        for entry in entries:
+            need(entry["is_dir"] is (entry["name"] != "OWNER.json"), "unexpected_remote_entry_kind")
+    need(seen == set(expected), "missing_remote_listing")
+    need(isinstance(value["downloads"], list) and len(value["downloads"]) in (2, 3), "two_downloads_and_optional_exact_owner_required")
+    wanted = {"/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + cell["session_id"] + "/allocation-marker.json": marker_ref,
+              output + "/request-prepared.json": request_ref}
+    owner_path = output + "/mailbox/OWNER.json"
+    request_path = output + "/request-prepared.json"
+    marker = read(marker_ref)
+    marker_request = marker.get("request_prepared")
+    if marker_request is not None:
+        need(isinstance(marker_request, dict) and set(marker_request) == {"path", "sha256"}
+             and marker_request["path"] in proof_path_aliases(request_path, cell)
+             and marker_request["sha256"] == request_ref["sha256"], "marker_request_reference_mismatch")
+    if len(value["downloads"]) == 3:
+        owner_ref = marker.get("owner")
+        need(isinstance(owner_ref, dict) and set(owner_ref) == {"path", "sha256"} and owner_ref["path"] in proof_path_aliases(owner_path, cell), "marker_owner_reference_missing")
+        wanted[owner_path] = None
+    received = set()
+    for item in value["downloads"]:
+        download = actual_tool(item, "download_from_romeo", f, now)
+        original_path = download.get("downloaded")
+        path = original_path
+        for expected_path in (owner_path, request_path):
+            if original_path in proof_path_aliases(expected_path, cell):
+                path = expected_path
+                break
+        need(path in wanted and path not in received, "wrong_or_duplicate_download")
+        received.add(path)
+        target = wanted[path] if path != owner_path else {"path": download.get("to"), "sha256": owner_ref["sha256"]}
+        local = artifact(target)
+        need(download.get("to") == str(local) and download.get("verifie") is True
+             and type(download.get("bytes")) is int and download["bytes"] == local.stat().st_size
+             and download.get("transport") == "scp"
+             and all(download.get(key) == target["sha256"] for key in ("remote_sha256", "empreinte_locale", "empreinte_distante")),
+             "actual_download_hash_or_destination_mismatch")
+        if path == owner_path:
+            need(local.stat().st_size <= 4096, "owner_size_unexpected")
+            owner = read(target)
+            need(owner == {"protocol": "hpc-forest-codex-mailbox-v1", "session_id": cell["session_id"],
+                 "model": cell["model"], "reasoning_effort": cell["effort"], "job_id": cell["job_id"]}, "owner_identity_or_protocol_mismatch")
+    need(received == set(wanted), "missing_actual_download")
+    return min(epoch(read(r)["observed_at"]) for r in [value["path_absence"], *value["listings"], *value["downloads"]])
+
+
+def validate_census(census, closure, policy, cell, f, now):
+    f.check_census(census, closure, now=now)
+    # Broader unknown native-worker detection supplements the sealed factory's known-module list.
+    native = [r for r in census["rows"] if re.search(r"hpc_forest\.[a-zA-Z0-9_]*worker|bootstrap_worker\.py", str(r["CommandLine"]), re.IGNORECASE)]
+    need({r["ProcessId"] for r in native} == {37900, 37848}, "unclassified_native_worker")
+    f.bind(policy, cell)
+    need(policy.get("schema") == "hpc-forest-dynamic-r4b-mixed-observer-admission-v1" and policy.get("verified") is True
+         and type(policy.get("maximum_native_workers_total")) is int and policy["maximum_native_workers_total"] == 4
+         and all(policy.get(k) is True for k in ("source_only_preserved", "existing_observer_untouched",
+             "all_native_sessions_covered", "native_calls_started_zero")), "actual_mixed_admission_required")
+    f.fresh(policy["observed_at"], now=now)
+    f.evidence(policy)
+    current = {r["ProcessId"]: r for r in census["rows"]}
+    identities = policy.get("observer_full_identities")
+    need(isinstance(identities, list) and identities and len({r["ProcessId"] for r in identities}) == len(identities)
+         and all(r["ProcessId"] in current and f.full_identity(current[r["ProcessId"]]) == f.full_identity(r) for r in identities),
+         "observer_full_identity_mismatch")
+
+
+def static_tools_policy(project):
+    tree = ast.parse((project / "src/hpc_forest/codex_process.py").read_text(encoding="utf8"))
+    command = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "command_for")
+    constants = {n.value for n in ast.walk(command) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    need({"--ignore-user-config", "--strict-config", "--sandbox", "read-only", "forced_login_method", "chatgpt",
+          "web_search", "disabled", "shell_tool", "unified_exec", "apps", "plugins", "multi_agent", "hooks"} <= constants,
+         "frozen_no_tools_command_policy_missing")
+    # Frozen source exact103 and its independent review establish code provenance; this is no invocation claim.
+
+
+def collect(packet, output, *, now=None):
+    injected_clock = now is not None
+    now = time.time() if now is None else now
+    f = factory()
+    need(set(packet) == {"schema", "phase", "job_id", "refs"}
+         and packet["schema"] == "hpc-forest-dynamic-r4b-collection-inputs-v1"
+         and packet["phase"] in {"roots", "advice", "harvest"}
+         and isinstance(packet["job_id"], str) and packet["job_id"].isdigit()
+         and isinstance(packet["refs"], dict) and set(packet["refs"]) == INPUT_REFS, "closed_real_technical_phase_packet_required")
+    refs = packet["refs"]
+    for item in refs.values():
+        artifact(item)
+    need(len(read(refs["remote_checks"]).get("downloads", [])) == 3, "operator_packet_requires_marker_request_owner_downloads")
+    phase, job = packet["phase"], packet["job_id"]
+    session = f.SESSIONS[phase]
+    cell = {"scope_id": f.SCOPE, "source_zip_sha256": f.SOURCE, "plan_sha256": f.PLAN, "model": f.MODEL,
+            "effort": "max", "session_id": session, "job_id": job,
+            "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + session}
+    pins, admission = f.bootstrap_source()
+    f.check_qualification(refs["real_qualification_reception"], admission)
+    need(refs["r2_main_closure"] == pins["real_r2_main_closure"], "exact_pinned_r2_closure_required")
+    need(refs["factory_review"]["sha256"] == REVIEW_SHA, "exact_real_interface_review_required")
+    review = read(refs["factory_review"])
+    need(review.get("verified") is True and review.get("blocking_findings") == []
+         and review.get("schema") == "hpc-forest-dynamic-r4b-launch-independent-review-v1", "real_independent_review_required")
+    f.bind(review, {k: cell[k] for k in ("scope_id", "source_zip_sha256", "plan_sha256")})
+    for name, digest in review["reviewed_files"].items():
+        need(Path(name).name == name and sha(LAUNCH / name) == digest, "reviewed_launcher_changed")
+    marker, request = read(refs["allocation_marker"]), read(refs["request_prepared"])
+    f.bind(marker, cell)
+    f.fresh(marker["created_at"], now=now, ceiling=600)
+    need(marker.get("schema") == "hpc-forest-dynamic-r4b-allocation-marker-v1" and marker.get("verified") is True
+         and marker.get("phase") == phase and marker.get("source_files") == 103
+         and marker.get("native_root_absent_before_stage") is True and marker.get("cache_claims_registry_created") is False
+         and type(marker.get("native_model_calls")) is int and marker["native_model_calls"] == 0
+         and type(marker.get("requests_published")) is int and marker["requests_published"] == 0, "actual_zero_call_stage_required")
+    allocation = marker.get("allocation", {})
+    need(all(type(allocation.get(k)) is type(v) and allocation[k] == v for k, v in {"slurm_job_id": job, "architecture": "ARM64",
+         "cpu_cores": 4, "tasks": 1, "nodes": 1, "allocated_memory_mib": 16384, "allocated_gpus": 0}.items())
+         and isinstance(marker.get("cpu_affinity"), list) and len(marker["cpu_affinity"]) == 4
+         and all(type(v) is int and v >= 0 for v in marker["cpu_affinity"]) and len(set(marker["cpu_affinity"])) == 4
+         and marker.get("admission_root") == "/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + session, "exact_allocated_4cpu_profile_required")
+    need(refs["request_prepared"]["sha256"] == marker["request_sha256"] and admission.digest(request) == marker["request_digest"]
+         and request.get("session_id") == session and request.get("model") == f.MODEL and request.get("reasoning_effort") == "max"
+         and request.get("meta_role") == "mother-dynamic-" + phase
+         and type(request.get("expires_at")) in (int, float) and 0 < request["expires_at"] - now <= 600,
+         "exact_unexpired_600s_phase_request_required")
+    intent = read(refs["submission_intent"])
+    need(type(intent.get("native_model_calls")) is int, "strict_int_zero_call_intent_required")
+    f.check_submission(intent, read(refs["submission_observed"]), read(refs["script_reread"]), cell, phase)
+    census, closure, policy = (read(refs[k]) for k in ("fresh_private_full_cim", "r2_main_closure", "mixed_observer_admission"))
+    validate_census(census, closure, policy, cell, f, now)
+    oauth_source = validate_oauth(refs["oauth_source"], refs["codex_config"], pins, admission.CLI_FILES, f, now)
+    remote_at = validate_remote(refs["remote_checks"], cell, refs["allocation_marker"], refs["request_prepared"], f, now)
+    static_tools_policy(Path(pins["source_project"]))
+    cache = LAUNCH / ("worker-" + session)
+    need(not cache.exists() and not cache.is_symlink() and not (hasattr(cache, "is_junction") and cache.is_junction()), "local_cache_or_registry_or_claim_present")
+    # No observation becomes younger than its underlying evidence. Revalidation occurs in the factory as well.
+    observed_at = min(epoch(census["captured_at_utc"]), epoch(policy["observed_at"]), epoch(oauth_source["observed_at"]), remote_at)
+    f.fresh(observed_at, now=now if injected_clock else time.time())
+    output = Path(output).absolute()
+    need(output.parent == HERE and not output.exists(), "fresh_direct_child_output_only")
+    # Rehash all source refs immediately before output; no credentials or complete census are copied.
+    for item in refs.values():
+        artifact(item)
+    output.mkdir()
+    def save(name, value):
+        path = output / name
+        with path.open("x", encoding="utf8", newline="\n") as stream:
+            stream.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+        return ref(path)
+    evidence = list(refs.values())
+    oauth = save("oauth-observation.json", {**cell, "schema": "hpc-forest-dynamic-r4b-existing-oauth-observation-v1",
+        "verified": True, "observed_at": read(refs["oauth_source"])["observed_at"], "authentication": "existing-local-ChatGPT",
+        "executable_sha256": admission.CLI_SHA256, "OPENAI_API_KEY_present": False, "CODEX_API_KEY_present": False,
+        "OPENAI_BASE_URL_present": False, "evidence_refs": [refs["oauth_source"]], "credentials_exported": False})
+    transport = save("transport-observation.json", {**cell, "schema": "hpc-forest-dynamic-r4b-neutral-transport-observation-v1",
+        "verified": True, "observed_at": observed_at, "native_model_calls": 0, "configuration_path": str(artifact(refs["codex_config"])),
+        "configuration_sha256": refs["codex_config"]["sha256"], "transport_name": "romeo-mcp", "neutral_controls_passed": True,
+        "evidence_refs": [refs["remote_checks"], refs["oauth_source"], refs["factory_review"]]})
+    linked = {k: refs[k] for k in ("fresh_private_full_cim", "allocation_marker", "request_prepared", "r2_main_closure", "mixed_observer_admission")}
+    parent = save("parent-observations.json", {**cell, "schema": "hpc-forest-dynamic-r4b-parent-observations-v1",
+        "verified": True, "observed_at": observed_at, "evidence_refs": evidence, "proposed_cache": str(cache),
+        **linked, **dict.fromkeys(FLAGS, True), "scope_limit": "received bytes and local absence checks; no remote call or native invocation by collector"})
+    factory_refs = {k: v for k, v in refs.items() if k not in {"oauth_source", "remote_checks"}}
+    factory_refs.update(parent_observations=parent, oauth_observation=oauth, transport_probe_readback=transport)
+    need(len(factory_refs) == 14, "exact_fourteen_factory_refs_required")
+    inputs = {"schema": "hpc-forest-dynamic-r4b-launch-inputs-v1", "verified": True, **{k: v for k, v in cell.items() if k != "remote_root"},
+              "phase": phase, **factory_refs, "native_contract_phase_receipts": []}
+    result = save("factory-input.json", inputs)
+    save("packet14refs.json", {"schema": "hpc-forest-dynamic-r4b-collected-packet14refs-v1", "verified": True, **cell,
+        "phase": phase, "refs": factory_refs, "factory_input": result, "model_calls": 0, "authorization_created": False,
+        "worker_started": False, "remote_action_performed": False})
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--packet", type=Path, required=True)
+    parser.add_argument("--packet-sha256", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        result = collect(read({"path": str(args.packet.absolute()), "sha256": args.packet_sha256}), args.output)
+    except (ValueError, OSError, KeyError, TypeError, StopIteration, ImportError, RuntimeError) as exc:
+        print(json.dumps({"verified": False, "reason": str(exc) if type(exc) is ValueError else type(exc).__name__, "model_calls": 0}))
+        return 1
+    print(json.dumps({"factory_input": result, "model_calls": 0, "remote_actions": 0}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

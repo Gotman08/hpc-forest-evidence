@@ -1,0 +1,179 @@
+#include "knn.h"
+#include <arm_neon.h>
+#include <omp.h>
+
+typedef struct {
+    float d;
+    char label;
+    long idx;
+} Cand;
+
+static inline int worse(const Cand *a, const Cand *b) {
+    if (a->d != b->d) return a->d > b->d;
+    return a->idx > b->idx;
+}
+
+static void swap_c(Cand *a, Cand *b) {
+    Cand t = *a; *a = *b; *b = t;
+}
+
+static void sift_up(Cand *heap, int pos) {
+    while (pos > 0) {
+        int parent = (pos - 1) / 2;
+        if (worse(&heap[pos], &heap[parent])) {
+            swap_c(&heap[pos], &heap[parent]);
+            pos = parent;
+        } else break;
+    }
+}
+
+static void sift_down(Cand *heap, int size, int root) {
+    while (1) {
+        int left = 2 * root + 1;
+        if (left >= size) break;
+        int right = left + 1;
+        int largest = root;
+        if (worse(&heap[left], &heap[largest])) largest = left;
+        if (right < size && worse(&heap[right], &heap[largest])) largest = right;
+        if (largest != root) {
+            swap_c(&heap[root], &heap[largest]);
+            root = largest;
+        } else break;
+    }
+}
+
+static int cmp_cand(const void *pa, const void *pb) {
+    const Cand *a = (const Cand *)pa;
+    const Cand *b = (const Cand *)pb;
+    if (a->d != b->d) return (a->d > b->d) - (a->d < b->d);
+    return (a->idx > b->idx) - (a->idx < b->idx);
+}
+
+char knn(Dataset *ds, int k, Point q) {
+    long n = ds->n;
+    float qx = q.x, qy = q.y;
+
+    int nthreads = 1;
+    #pragma omp parallel
+    {
+        #pragma omp single
+        nthreads = omp_get_num_threads();
+    }
+
+    Cand **local_heaps = (Cand **)malloc(sizeof(Cand *) * nthreads);
+    int *heap_sizes = (int *)calloc(nthreads, sizeof(int));
+    if (!local_heaps || !heap_sizes) on_error();
+    for (int t = 0; t < nthreads; t++) {
+        local_heaps[t] = (Cand *)malloc(sizeof(Cand) * k);
+        if (!local_heaps[t]) on_error();
+    }
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        Cand *heap = local_heaps[tid];
+        int hsize = 0;
+
+        long chunk = (n + nthreads - 1) / nthreads;
+        long start = tid * chunk;
+        long end = start + chunk < n ? start + chunk : n;
+
+        for (long i = start; i < end; ) {
+            if (i + 3 < end) {
+                float32x4_t xv = vld1q_f32(&ds->xs[i]);
+                float32x4_t yv = vld1q_f32(&ds->ys[i]);
+                float32x4_t dx = xv - vdupq_n_f32(qx);
+                float32x4_t dy = yv - vdupq_n_f32(qy);
+                float32x4_t d2 = dx * dx + dy * dy;
+                float dists[4];
+                vst1q_f32(dists, d2);
+
+                for (int t = 0; t < 4; t++) {
+                    Cand c;
+                    c.d = dists[t];
+                    c.label = ds->labels[i + t];
+                    c.idx = i + t;
+
+                    if (hsize < k) {
+                        heap[hsize++] = c;
+                        sift_up(heap, hsize - 1);
+                    } else if (!worse(&c, &heap[0])) {
+                        heap[0] = c;
+                        sift_down(heap, k, 0);
+                    }
+                }
+                i += 4;
+            } else {
+                float dx = ds->xs[i] - qx;
+                float dy = ds->ys[i] - qy;
+                float d = dx * dx + dy * dy;
+                Cand c;
+                c.d = d; c.label = ds->labels[i]; c.idx = i;
+
+                if (hsize < k) {
+                    heap[hsize++] = c;
+                    sift_up(heap, hsize - 1);
+                } else if (!worse(&c, &heap[0])) {
+                    heap[0] = c;
+                    sift_down(heap, k, 0);
+                }
+                i++;
+            }
+        }
+
+        heap_sizes[tid] = hsize;
+    }
+
+    long total_cands = 0;
+    for (int t = 0; t < nthreads; t++) total_cands += heap_sizes[t];
+
+    Cand *all = (Cand *)malloc(sizeof(Cand) * total_cands);
+    if (!all && total_cands > 0) on_error();
+    long pos = 0;
+    for (int t = 0; t < nthreads; t++) {
+        for (int i = 0; i < heap_sizes[t]; i++) {
+            all[pos++] = local_heaps[t][i];
+        }
+    }
+
+    qsort(all, total_cands, sizeof(Cand), cmp_cand);
+
+    int counts[256] = {0};
+    long take = k < total_cands ? k : total_cands;
+    for (long i = 0; i < take; i++) {
+        counts[(unsigned char)all[i].label]++;
+    }
+    if (total_cands < k) {
+        counts[255] += (int)(k - total_cands);
+    }
+
+    int best_count = -1;
+    char best_label = 0;
+    for (int c = 0; c < 256; c++) {
+        if (counts[c] > best_count) {
+            best_count = counts[c];
+            best_label = (char)c;
+        }
+    }
+
+    free(all);
+    for (int t = 0; t < nthreads; t++) free(local_heaps[t]);
+    free(local_heaps);
+    free(heap_sizes);
+
+    return best_label;
+}
+
+int main() {
+    Dataset *ds = parse_dataset();
+    int k = parse_k();
+    Point q = parse_point();
+
+    printf("%c", knn(ds, k, q));
+
+    free(ds->xs);
+    free(ds->ys);
+    free(ds->labels);
+    free(ds);
+    return 0;
+}

@@ -1,0 +1,53 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cassert>\n#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n#include <iostream>\n#include <limits>\n#include <vector>\n\n#ifdef _OPENMP\n#include <omp.h>\n#endif\n\n#if defined(__aarch64__) && defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\nstruct SeedEvent {\n    int row;\n    int band;\n    bool finish;\n};\n\nstatic std::int64_t maximum_horizontal_sum(const std::int64_t* columns,\n                                           int n, int s) {\n    std::int64_t sum = 0;\n    #pragma omp simd reduction(+:sum)\n    for (int c = 0; c < s; ++c)\n        sum += columns[c];\n\n    std::int64_t best = sum;\n    int c = s;\n#if defined(__aarch64__) && defined(__ARM_NEON)\n    const int64x2_t zero = vdupq_n_s64(0);\n    int64x2_t carry = vdupq_n_s64(sum);\n    int64x2_t maxima = carry;\n    for (; c + 3 < n; c += 4) {\n        // Column totals are already widened before subtraction.\n        int64x2_t low = vsubq_s64(vld1q_s64(columns + c),\n                                  vld1q_s64(columns + c - s));\n        int64x2_t high = vsubq_s64(vld1q_s64(columns + c + 2),\n                                   vld1q_s64(columns + c - s + 2));\n\n        low = vaddq_s64(low, vextq_s64(zero, low, 1));\n        high = vaddq_s64(high, vextq_s64(zero, high, 1));\n        high = vaddq_s64(high, vdupq_laneq_s64(low, 1));\n        low = vaddq_s64(low, carry);\n        high = vaddq_s64(high, carry);\n\n        maxima = vbslq_s64(vcgtq_s64(low, maxima), low, maxima);\n        maxima = vbslq_s64(vcgtq_s64(high, maxima), high, maxima);\n        carry = vdupq_laneq_s64(high, 1);\n    }\n    sum = vgetq_lane_s64(carry, 0);\n    best = std::max(vgetq_lane_s64(maxima, 0),\n                    vgetq_lane_s64(maxima, 1));\n#endif\n    for (; c < n; ++c) {\n        sum += columns[c] - columns[c - s];\n        best = std::max(best, sum);\n    }\n    return best;\n}\n\nint main() {\n    int n, s;\n    if (!(std::cin >> n >> s)) return 0;\n\n    assert(s < n);\n    assert(n < 8000);\n    assert(s > 0);\n    assert(n > 0);\n\n    const std::size_t cells = static_cast<std::size_t>(n) * n;\n    std::vector<int> matrix(cells);\n    for (std::size_t k = 0; k < cells; ++k) {\n        if (std::scanf(\"%d\", &matrix[k]) != 1) return 0;\n    }\n\n    const int starts = n - s + 1;\n    int requested_threads = 1;\n#ifdef _OPENMP\n    const int available = std::min(4, omp_get_max_threads());\n    if (cells >= 1024u * 1024u && available >= 4 && starts >= 4)\n        requested_threads = 4;\n    else if (cells >= 256u * 1024u && available >= 2 && starts >= 2)\n        requested_threads = 2;\n#endif\n\n    std::vector<std::int64_t> seeds(\n        static_cast<std::size_t>(requested_threads) * n, 0);\n    std::int64_t maximum = std::numeric_limits<std::int64_t>::lowest();\n\n#ifdef _OPENMP\n    #pragma omp parallel num_threads(requested_threads) if(requested_threads > 1) reduction(max:maximum)\n#endif\n    {\n        int thread = 0;\n        int team = 1;\n#ifdef _OPENMP\n        thread = omp_get_thread_num();\n        team = omp_get_num_threads();\n#endif\n        const int first = thread * starts / team;\n        const int limit = (thread + 1) * starts / team;\n        const int last_start = (team - 1) * starts / team;\n        const bool cooperative = team > 1 &&\n            4LL * team * s > 5LL * (s + last_start);\n\n        if (cooperative) {\n            const int col_first = thread * n / team;\n            const int col_limit = (thread + 1) * n / team;\n            const int width = col_limit - col_first;\n            std::vector<std::int64_t> prefix(width, 0);\n\n            SeedEvent events[8];\n            for (int t = 0; t < team; ++t) {\n                const int start = t * starts / team;\n                events[2 * t] = SeedEvent{start, t, false};\n                events[2 * t + 1] = SeedEvent{start + s, t, true};\n            }\n            std::sort(events, events + 2 * team,\n                      [](const SeedEvent& a, const SeedEvent& b) {\n                          return a.row < b.row;\n                      });\n\n            int scanned = 0;\n            for (int e = 0; e < 2 * team; ++e) {\n                const SeedEvent event = events[e];\n                for (int r = scanned; r < event.row; ++r) {\n                    const int* row = matrix.data() +\n                        static_cast<std::size_t>(r) * n + col_first;\n                    #pragma omp simd\n                    for (int c = 0; c < width; ++c)\n                        prefix[c] += static_cast<std::int64_t>(row[c]);\n                }\n\n                std::int64_t* destination = seeds.data() +\n                    static_cast<std::size_t>(event.band) * n + col_first;\n                if (event.finish) {\n                    #pragma omp simd\n                    for (int c = 0; c < width; ++c)\n                        destination[c] += prefix[c];\n                } else {\n                    #pragma omp simd\n                    for (int c = 0; c < width; ++c)\n                        destination[c] = -prefix[c];\n                }\n                scanned = event.row;\n            }\n#ifdef _OPENMP\n            #pragma omp barrier\n#endif\n        } else {\n            std::int64_t* columns = seeds.data() +\n                static_cast<std::size_t>(thread) * n;\n            for (int r = first; r < first + s; ++r) {\n                const int* row = matrix.data() +\n                    static_cast<std::size_t>(r) * n;\n                #pragma omp simd\n                for (int c = 0; c < n; ++c)\n                    columns[c] += static_cast<std::int64_t>(row[c]);\n            }\n        }\n\n        std::int64_t* columns = seeds.data() +\n            static_cast<std::size_t>(thread) * n;\n        std::int64_t local_maximum =\n            std::numeric_limits<std::int64_t>::lowest();\n        for (int r = first; r < limit; ++r) {\n            if (r != first) {\n                const int* leaving = matrix.data() +\n                    static_cast<std::size_t>(r - 1) * n;\n                const int* entering = matrix.data() +\n                    static_cast<std::size_t>(r + s - 1) * n;\n                #pragma omp simd\n                for (int c = 0; c < n; ++c)\n                    columns[c] += static_cast<std::int64_t>(entering[c])\n                                - static_cast<std::int64_t>(leaving[c]);\n            }\n            local_maximum = std::max(local_maximum,\n                maximum_horizontal_sum(columns, n, s));\n        }\n        maximum = std::max(maximum, local_maximum);\n    }\n\n    std::printf(\"%lld\\n\", static_cast<long long>(maximum));\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "Combining cooperative row-band initialization with ARM64 four-delta horizontal scans and independent-loop SIMD should reduce computation while preserving the existing input/output contract.",
+    "notes": "Retains compatible scan and SIMD ideas, not B's incompatible horizontal-history storage. Input parsing remains unchanged. No commands executed; correctness and speed await controller evaluation.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [
+      "69e8a257994d4eba",
+      "c8994f068c464610",
+      "fbe724f9da164861"
+    ],
+    "transformations": [
+      "Retain contiguous storage, 64-bit rolling columns, dimension-based worker selection, cooperative prefix seeding, actual-team row bands, and one maximum reduction from 69e8a257994d4eba.",
+      "Adapt c8994f068c464610's four-delta NEON inclusive scan to already-widened column totals, retaining scalar tails and a portable fallback; reduce window maxima directly in registers.",
+      "Retain fbe724f9da164861's explicit SIMD for independent updates and the initial-sum reduction, without applying SIMD directives to dependent horizontal recurrences."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "e857e849711a412cbdbae0126b741e68",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "xhigh",
+  "request_sha256": "bce2f0407464fb527ca5d48a684cc443d2bba3cb678c675312f12175745fa60a",
+  "session_id": "2bd8b683b45b41c8b48ec38708f46bab",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "8f2c47c9b30b5f61057a5fe618a1f21fe379d025641c1eadf3bafca4b064a63d",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 21916,
+        "output_tokens": 6295,
+        "reasoning_output_tokens": 4001
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "xhigh",
+    "token_accounting": "exact",
+    "tokens": 28211,
+    "tool_events": []
+  }
+}

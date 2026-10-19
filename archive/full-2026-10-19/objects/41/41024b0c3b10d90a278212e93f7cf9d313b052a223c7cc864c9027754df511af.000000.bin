@@ -1,0 +1,177 @@
+"""Read-only supervision of one existing allocation; never submits, receives or stops."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+BASE = STUDY.parent.parent
+COMPARE = BASE / "outputs/HPC-Forest-Harnais-Comparaison-r1"
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
+LANES = {
+    "r1": {"root": STUDY, "job": "750205", "key": "coverage-gpt-6-astra-xhigh", "model": "gpt-6-astra", "effort": "xhigh",
+           "session": "2bd8b683b45b41c8b48ec38708f46bab", "source": "cd769d474b6cb14c2fba11ab687f8825d35cb0b57a397d09aefab0ae743ffc18",
+           "archive": "HPC-Forest-Archives-Modele-Mere-r1.zip", "lock": "coordinator.lock"},
+    "source_only": {"root": COMPARE, "job": "750831", "key": "source-only-gpt-5.6-terra-max", "model": "gpt-5.6-terra", "effort": "max",
+                    "session": "15219a6fd62b4dcb91b395dcd4ae03d5", "source": "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb",
+                    "archive": "HPC-Forest-Harnais-Comparaison-r1.zip", "lock": "comparison-coordinator.lock"},
+}
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def save(path, value):
+    temp = path.with_name(path.name + ".strict-observer.tmp")
+    with temp.open("w", encoding="utf8") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temp, path)
+
+
+def census():
+    command = "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate) | ConvertTo-Json -Depth 4 -Compress"
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True,
+                            text=True, check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+    return json.loads(result.stdout)
+
+
+def verify_pair(expected, rows):
+    if (len(expected) != 2 or expected[1]["ParentProcessId"] != expected[0]["ProcessId"]
+            or expected[0]["CreationDate"] == expected[1]["CreationDate"]):
+        raise RuntimeError("Unbound launcher and real Python")
+    for saved in expected:
+        current = next((row for row in rows if row["ProcessId"] == saved["ProcessId"]), None)
+        if current is None or any(current.get(k) != saved.get(k) for k in FIELDS):
+            raise RuntimeError("Relay exited or complete identity changed")
+
+
+def verify_cell(state, lane):
+    if state.get("source_zip_sha256") != lane["source"] or state.get("current_key") != lane["key"]:
+        raise RuntimeError("Wrong source or existing queue group")
+    cells = [cell for cell in state["queue"] if cell["key"] == lane["key"]]
+    if len(cells) != 1:
+        raise RuntimeError("Existing group is not unique")
+    cell = cells[0]
+    checks = {"job_id": lane["job"], "session_id": lane["session"], "model": lane["model"], "effort": lane["effort"], "state": "working"}
+    if any(str(cell.get(k)) != v for k, v in checks.items()):
+        raise RuntimeError("Existing job/session/model/effort differs")
+    return cell
+
+
+def check_rpc(lane, name, arguments):
+    if name not in {"job_status", "job_efficiency"} or arguments != {"job_id": lane["job"]}:
+        raise RuntimeError("Observer permits only status/accounting reads of its bound allocation")
+
+
+def verify_status(value, lane, accounting=False):
+    if value.get("ok") is not True or str(value.get("job_id")) != lane["job"]:
+        raise RuntimeError("No current observation of the bound allocation")
+    if accounting:
+        if not value.get("found") or not value.get("state"):
+            raise RuntimeError("Accounting did not find the allocation")
+        return value["state"] in TERMINAL
+    observation = value.get("observation", {})
+    if observation.get("current_state_observed") is not True or time.time() - observation.get("observed_at", 0) > 120:
+        raise RuntimeError("Cached or stale scheduler state is not a current observation")
+    if not value.get("state"):
+        raise RuntimeError("Scheduler state missing")
+    return value.get("finished") is True and value["state"] in TERMINAL
+
+
+async def watch(name):
+    lane = LANES[name]
+    project = BASE / "work/hpc-forest-harnais-comparaison-r1/project/HPC-Forest"
+    sys.path.insert(0, str(project / "src"))
+    from hpc_forest.codex_worker import RomeoFiles
+    from hpc_forest.core import FileLock
+
+    expected = load(HERE / f"relais-attendu-{name}.json")
+    state_path = lane["root"] / "coordinator-state.json"
+    with FileLock(lane["root"] / lane["lock"]):
+        state = load(state_path)
+        cell = verify_cell(state, lane)
+        rows = census()
+        verify_pair(expected, rows)
+        command = expected[0]["CommandLine"]
+        if "--resume" not in command or lane["session"] not in command or cell["channel"] not in command:
+            raise RuntimeError("Relay command is not bound to this channel/session")
+        if hashlib.sha256((lane["root"] / lane["archive"]).read_bytes()).hexdigest() != lane["source"]:
+            raise RuntimeError("Frozen archive changed")
+        owned = next(row for row in rows if row["ProcessId"] == os.getpid())
+        previous_worker = cell["worker_identity"]
+        cell.update(worker_identity=expected[0], worker_initial_tree=expected,
+                    interface_recovery={"incident": str(HERE), "previous_worker_identity": previous_worker,
+                                        "submission_replayed": False, "same_cache": True})
+        state.update(stage=f"{name}_running_current_group_strict_observer", error=None,
+                     strict_coordinator_identity=owned, strict_observer_only=True,
+                     unsafe_legacy_source_only_coordinator_must_not_restart=True,
+                     recovery_incident={"path": str(HERE), "job_id": lane["job"], "session_id": lane["session"],
+                                        "observer_only": True, "submission_replayed": False})
+        state["updated_at"] = time.time()
+        save(HERE / f"identites-observateur-{name}.json", {"observer": owned, "relay": expected})
+        save(state_path, state)
+        async with RomeoFiles(Path("C:/Users/nicol/.codex/config.toml")) as rpc:
+            async def call(tool, **arguments):
+                check_rpc(lane, tool, arguments)
+                response = await rpc.session.call_tool(tool, arguments)
+                value = response.structuredContent
+                if value is None:
+                    value = json.loads(next(c.text for c in response.content if c.type == "text"))
+                if response.isError or not isinstance(value, dict) or value.get("ok") is not True:
+                    raise RuntimeError("ROMEO read failed: " + tool + ": " + str(value)[:2000])
+                return value
+            failures = 0
+            while True:
+                try:
+                    try:
+                        status = await call("job_status", job_id=lane["job"])
+                        terminal = verify_status(status, lane)
+                    except (ValueError, RuntimeError) as status_error:
+                        status = await call("job_efficiency", job_id=lane["job"])
+                        terminal = verify_status(status, lane, accounting=True)
+                        status = dict(status, status_reader_error=str(status_error)[:3000], observation_source="job_efficiency")
+                    state = load(state_path)
+                    cell = verify_cell(state, lane)
+                    cell["scheduler"] = status
+                    if terminal:
+                        state.update(stage=f"awaiting_audited_{name}_reception_after_strict_observation",
+                                     recovery_next_action="Efficiency/archive/three SHA/new restoration/native read-only audit/reconciliation BEFORE individually owned stop; continue same queue")
+                    else:
+                        verify_pair(expected, census())
+                    failures = 0
+                    state["updated_at"] = time.time()
+                    save(state_path, state)
+                    save(HERE / f"derniere-observation-{name}.json", status)
+                    if terminal:
+                        return
+                except Exception as exc:
+                    failures += 1
+                    with (HERE / f"erreurs-observation-{name}.jsonl").open("a", encoding="utf8") as stream:
+                        stream.write(json.dumps({"observed_at": time.time(), "consecutive_failures": failures,
+                                                 "error": str(exc)[:6000], "submission_replayed": False}) + "\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if failures >= 3 or "Relay exited" in str(exc):
+                        state.update(stage="attention_required", error=str(exc)[:6000], updated_at=time.time())
+                        save(state_path, state)
+                        raise
+                await asyncio.sleep(30)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lane", choices=LANES, required=True)
+    asyncio.run(watch(parser.parse_args().lane))

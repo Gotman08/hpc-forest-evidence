@@ -1,0 +1,251 @@
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+using i32 = std::int32_t;
+using i64 = std::int64_t;
+using u32 = std::uint32_t;
+using u64 = std::uint64_t;
+
+static constexpr i32 MOD = 1000000007;
+static constexpr i32 HALF = MOD / 2;
+static constexpr u64 MOD_BIAS = static_cast<u64>(MOD) << 33;
+
+// For N <= 1020, every value reduced here has magnitude below 8.01e18.
+// This multiple-of-MOD bias makes BIAS+value nonnegative and less than 2^64.
+static inline u32 positive_mod(i64 value) {
+    return static_cast<u32>((static_cast<u64>(value) + MOD_BIAS) %
+                            static_cast<u64>(MOD));
+}
+
+static inline i32 center_mod(i64 value) {
+    const i32 residue = static_cast<i32>(positive_mod(value));
+    return residue > HALF ? residue - MOD : residue;
+}
+
+static inline i32 subtract_mod(i32 a, i32 b) {
+    i32 value = a - b;
+    if (value > HALF) {
+        value -= MOD;
+    } else if (value < -HALF) {
+        value += MOD;
+    }
+    return value;
+}
+
+// Centered operands permit 32 exact products per signed 64-bit reduction.
+static inline i32 dot_mod(const i32* a, const i32* b, int count) {
+    i64 total = 0;
+    while (count >= 32) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        int64x2_t sum0 = vdupq_n_s64(0);
+        int64x2_t sum1 = vdupq_n_s64(0);
+        int64x2_t sum2 = vdupq_n_s64(0);
+        int64x2_t sum3 = vdupq_n_s64(0);
+        for (int i = 0; i < 32; i += 8) {
+            const int32x4_t x0 = vld1q_s32(a + i);
+            const int32x4_t y0 = vld1q_s32(b + i);
+            const int32x4_t x1 = vld1q_s32(a + i + 4);
+            const int32x4_t y1 = vld1q_s32(b + i + 4);
+            sum0 = vmlal_s32(sum0, vget_low_s32(x0), vget_low_s32(y0));
+            sum1 = vmlal_s32(sum1, vget_high_s32(x0), vget_high_s32(y0));
+            sum2 = vmlal_s32(sum2, vget_low_s32(x1), vget_low_s32(y1));
+            sum3 = vmlal_s32(sum3, vget_high_s32(x1), vget_high_s32(y1));
+        }
+        const i64 block = vaddvq_s64(vaddq_s64(vaddq_s64(sum0, sum1),
+                                               vaddq_s64(sum2, sum3)));
+#else
+        i64 block = 0;
+        for (int i = 0; i < 32; ++i) {
+            block += static_cast<i64>(a[i]) * b[i];
+        }
+#endif
+        total += positive_mod(block);
+        a += 32;
+        b += 32;
+        count -= 32;
+    }
+
+    // At most 31 products and 32 block residues remain, still within i64.
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    if (count >= 4) {
+        int64x2_t low = vdupq_n_s64(0);
+        int64x2_t high = vdupq_n_s64(0);
+        do {
+            const int32x4_t x = vld1q_s32(a);
+            const int32x4_t y = vld1q_s32(b);
+            low = vmlal_s32(low, vget_low_s32(x), vget_low_s32(y));
+            high = vmlal_s32(high, vget_high_s32(x), vget_high_s32(y));
+            a += 4;
+            b += 4;
+            count -= 4;
+        } while (count >= 4);
+        total += vaddvq_s64(vaddq_s64(low, high));
+    }
+#endif
+    for (int i = 0; i < count; ++i) {
+        total += static_cast<i64>(a[i]) * b[i];
+    }
+    return center_mod(total);
+}
+
+// Coefficient k of a*b, with b supplied in reverse coefficient order.
+static inline i32 product_coefficient(const std::vector<i32>& a,
+                                      const std::vector<i32>& b_reversed,
+                                      int k) {
+    if (k < 0 || a.empty() || b_reversed.empty()) {
+        return 0;
+    }
+    const int b_size = static_cast<int>(b_reversed.size());
+    const int first = std::max(0, k - b_size + 1);
+    const int last = std::min(k, static_cast<int>(a.size()) - 1);
+    if (first > last) {
+        return 0;
+    }
+    return dot_mod(a.data() + first,
+                   b_reversed.data() + b_size - 1 - k + first,
+                   last - first + 1);
+}
+
+// Symmetry leaves only pairs i<j and, when present, one diagonal product.
+static inline i32 square_coefficient(const std::vector<i32>& a,
+                                     const std::vector<i32>& a_reversed,
+                                     int k) {
+    if (k < 0 || a.empty()) {
+        return 0;
+    }
+    const int size = static_cast<int>(a.size());
+    const int first = std::max(0, k - size + 1);
+    const int last = std::min(k, size - 1);
+    if (first > last) {
+        return 0;
+    }
+    const int pair_last = std::min(last, (k + 1) / 2 - 1);
+    i64 value = 0;
+    if (first <= pair_last) {
+        value = 2LL * dot_mod(a.data() + first,
+                             a_reversed.data() + size - 1 - k + first,
+                             pair_last - first + 1);
+    }
+    if ((k & 1) == 0) {
+        const i64 middle = a[k / 2];
+        value += middle * middle;
+    }
+    return center_mod(value);
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n;
+    u64 h;
+    if (!(std::cin >> n >> h)) {
+        return 0;
+    }
+
+    std::vector<i32> numerator(n);
+    std::vector<i32> denominator(n + 1);
+    denominator[0] = 1;
+    for (int i = 0; i < n; ++i) {
+        u64 value;
+        std::cin >> value;
+        const i32 residue = static_cast<i32>(value % static_cast<u64>(MOD));
+        numerator[i] = residue > HALF ? residue - MOD : residue;
+    }
+    for (int i = 0; i < n; ++i) {
+        u64 value;
+        std::cin >> value;
+        const i32 coefficient = static_cast<i32>(value % static_cast<u64>(MOD));
+        denominator[i + 1] = coefficient > HALF ? MOD - coefficient
+                                                : -coefficient;
+    }
+
+    if (h <= static_cast<u64>(n)) {
+        const i32 answer = numerator[static_cast<std::size_t>(h - 1)];
+        std::cout << (answer < 0 ? answer + MOD : answer) << '\n';
+        return 0;
+    }
+
+    // The generating function is S(z)/Q(z), where S=(A*Q) mod z^n.
+    std::vector<i32> next_numerator(n);
+    {
+        const std::vector<i32> reversed_denominator(denominator.rbegin(),
+                                                    denominator.rend());
+        for (int i = 0; i < n; ++i) {
+            next_numerator[i] = product_coefficient(numerator,
+                                                     reversed_denominator, i);
+        }
+    }
+    numerator.swap(next_numerator);
+
+    const int numerator_even_size = (n + 1) / 2;
+    const int numerator_odd_size = n / 2;
+    const int denominator_even_size = n / 2 + 1;
+    const int denominator_odd_size = (n + 1) / 2;
+    std::vector<i32> numerator_even(numerator_even_size);
+    std::vector<i32> numerator_odd(numerator_odd_size);
+    std::vector<i32> denominator_even(denominator_even_size);
+    std::vector<i32> denominator_odd(denominator_odd_size);
+    std::vector<i32> even_reversed(denominator_even_size);
+    std::vector<i32> odd_reversed(denominator_odd_size);
+    std::vector<i32> next_denominator(n + 1);
+
+    u64 index = h - 1;
+    while (index != 0) {
+        for (int i = 0; i < numerator_even_size; ++i) {
+            numerator_even[i] = numerator[2 * i];
+        }
+        for (int i = 0; i < numerator_odd_size; ++i) {
+            numerator_odd[i] = numerator[2 * i + 1];
+        }
+        for (int i = 0; i < denominator_even_size; ++i) {
+            const i32 value = denominator[2 * i];
+            denominator_even[i] = value;
+            even_reversed[denominator_even_size - 1 - i] = value;
+        }
+        for (int i = 0; i < denominator_odd_size; ++i) {
+            const i32 value = denominator[2 * i + 1];
+            denominator_odd[i] = value;
+            odd_reversed[denominator_odd_size - 1 - i] = value;
+        }
+
+        // Write Q(z)=E(z^2)+z*O(z^2), S(z)=C(z^2)+z*D(z^2).
+        // Retain only the required parity of S(z)*Q(-z).
+        if (index & 1ULL) {
+            for (int i = 0; i < n; ++i) {
+                next_numerator[i] = subtract_mod(
+                    product_coefficient(numerator_odd, even_reversed, i),
+                    product_coefficient(numerator_even, odd_reversed, i));
+            }
+        } else {
+            for (int i = 0; i < n; ++i) {
+                next_numerator[i] = subtract_mod(
+                    product_coefficient(numerator_even, even_reversed, i),
+                    product_coefficient(numerator_odd, odd_reversed, i - 1));
+            }
+        }
+
+        // The next denominator is E(z)^2-z*O(z)^2.
+        next_denominator[0] = 1;
+        for (int i = 1; i <= n; ++i) {
+            next_denominator[i] = subtract_mod(
+                square_coefficient(denominator_even, even_reversed, i),
+                square_coefficient(denominator_odd, odd_reversed, i - 1));
+        }
+
+        numerator.swap(next_numerator);
+        denominator.swap(next_denominator);
+        index >>= 1;
+    }
+
+    // Q(0) remains one throughout Bostan-Mori reduction.
+    const i32 answer = numerator[0];
+    std::cout << (answer < 0 ? answer + MOD : answer) << '\n';
+    return 0;
+}

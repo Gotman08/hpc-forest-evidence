@@ -1,0 +1,222 @@
+#include <cstdint>
+#include <iostream>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+typedef std::uint64_t word_type;
+
+class BitGraph {
+public:
+    explicit BitGraph(int vertexCount)
+        : vertexCount_(vertexCount),
+          wordsPerRow_((vertexCount + 63) / 64),
+          rows_(static_cast<size_t>(vertexCount) * wordsPerRow_, 0) {}
+
+    int size() const {
+        return vertexCount_;
+    }
+
+    int wordsPerRow() const {
+        return wordsPerRow_;
+    }
+
+    void setEdge(int row, int column) {
+        rows_[index(row, column >> 6)] |= word_type(1) << (column & 63);
+    }
+
+    bool getEdge(int row, int column) const {
+        return (rowWord(row, column >> 6) & (word_type(1) << (column & 63))) != 0;
+    }
+
+    word_type rowWord(int row, int word) const {
+        return rows_[index(row, word)];
+    }
+
+    // Change from M[i][j] to M[p(i)][p(j)] for a transposition p.
+    void swapCoordinates(int first, int second) {
+        if (first == second)
+            return;
+
+        for (int word = 0; word < wordsPerRow_; ++word)
+            swap(rows_[index(first, word)], rows_[index(second, word)]);
+
+        const int firstWord = first >> 6;
+        const int secondWord = second >> 6;
+        const word_type firstMask = word_type(1) << (first & 63);
+        const word_type secondMask = word_type(1) << (second & 63);
+        for (int row = 0; row < vertexCount_; ++row) {
+            word_type &firstRowWord = rows_[index(row, firstWord)];
+            word_type &secondRowWord = rows_[index(row, secondWord)];
+            const bool firstBit = (firstRowWord & firstMask) != 0;
+            const bool secondBit = (secondRowWord & secondMask) != 0;
+            if (firstBit != secondBit) {
+                firstRowWord ^= firstMask;
+                secondRowWord ^= secondMask;
+            }
+        }
+    }
+
+private:
+    size_t index(int row, int word) const {
+        return static_cast<size_t>(row) * wordsPerRow_ + word;
+    }
+
+    int vertexCount_;
+    int wordsPerRow_;
+    vector<word_type> rows_;
+};
+
+BitGraph readGraph();
+bool testIsomorphism(BitGraph &g1, BitGraph &g2);
+bool verifyPermutation(BitGraph &g1, BitGraph &g2, vector<int> &equivalence);
+inline void printPermutation(vector<int> &equivalence);
+
+static inline int popcountWord(word_type value) {
+    return __builtin_popcountll(static_cast<unsigned long long>(value));
+}
+
+static int countMismatches(const BitGraph &g1, const BitGraph &mappedG2) {
+    int mismatches = 0;
+    for (int i = 0; i < g1.size(); ++i) {
+        const int lastWord = i >> 6;
+        const word_type lastWordMask = ~word_type(0) >> (63 - (i & 63));
+        for (int word = 0; word <= lastWord; ++word) {
+            word_type mask = (word == lastWord) ? lastWordMask : ~word_type(0);
+            mismatches += popcountWord((g1.rowWord(i, word) ^
+                                        mappedG2.rowWord(i, word)) & mask);
+        }
+    }
+    return mismatches;
+}
+
+static int countAffectedMismatches(const BitGraph &g1,
+                                   const BitGraph &mappedG2,
+                                   int first, int second) {
+    int mismatches = 0;
+    const int remainder = g1.size() & 63;
+
+    for (int word = 0; word < g1.wordsPerRow(); ++word) {
+        word_type mask = ~word_type(0);
+        if (word == g1.wordsPerRow() - 1 && remainder != 0)
+            mask = (word_type(1) << remainder) - 1;
+        if ((first >> 6) == word)
+            mask &= ~(word_type(1) << (first & 63));
+        if ((second >> 6) == word)
+            mask &= ~(word_type(1) << (second & 63));
+
+        mismatches += popcountWord((g1.rowWord(first, word) ^
+                                    mappedG2.rowWord(first, word)) & mask);
+        mismatches += popcountWord((g1.rowWord(second, word) ^
+                                    mappedG2.rowWord(second, word)) & mask);
+    }
+
+    mismatches += g1.getEdge(first, first) != mappedG2.getEdge(first, first);
+    mismatches += g1.getEdge(second, second) != mappedG2.getEdge(second, second);
+    mismatches += g1.getEdge(first, second) != mappedG2.getEdge(first, second);
+    return mismatches;
+}
+
+static void updateMismatchesAfterSwap(const BitGraph &g1,
+                                      BitGraph &mappedG2,
+                                      vector<int> &equivalence,
+                                      int first, int second,
+                                      int &mismatches) {
+    if (first == second)
+        return;
+
+    const int oldAffected = countAffectedMismatches(g1, mappedG2, first, second);
+    swap(equivalence[first], equivalence[second]);
+    mappedG2.swapCoordinates(first, second);
+    const int newAffected = countAffectedMismatches(g1, mappedG2, first, second);
+    mismatches += newAffected - oldAffected;
+}
+
+int main() {
+    BitGraph g1 = readGraph();
+    BitGraph g2 = readGraph();
+
+    if (!testIsomorphism(g1, g2))
+        cout << "The graphs are not isomorphic" << endl;
+
+    return 0;
+}
+
+bool testIsomorphism(BitGraph &g1, BitGraph &g2) {
+    vector<int> equivalence(g1.size(), 0);
+    vector<int> exchange_counter(g1.size(), 0);
+    int exchange_index = 1;
+    bool isomorphism_found = false;
+
+    if (g1.size() != g2.size())
+        return false;
+
+    for (int i = 0; i < static_cast<int>(equivalence.size()); ++i)
+        equivalence[i] = i;
+
+    BitGraph mappedG2 = g2;
+    int mismatches = countMismatches(g1, mappedG2);
+    if (mismatches == 0) {
+        printPermutation(equivalence);
+        return true;
+    }
+
+    while (exchange_index < static_cast<int>(g1.size())) {
+        if (exchange_counter[exchange_index] < exchange_index) {
+            int first, second;
+            if (exchange_index % 2 == 0) {
+                first = 0;
+                second = exchange_index;
+            } else {
+                first = exchange_counter[exchange_index];
+                second = exchange_index;
+            }
+            updateMismatchesAfterSwap(g1, mappedG2, equivalence,
+                                      first, second, mismatches);
+            if (mismatches == 0) {
+                printPermutation(equivalence);
+                isomorphism_found = true;
+            }
+
+            exchange_counter[exchange_index]++;
+            exchange_index = 1;
+        } else {
+            exchange_counter[exchange_index] = 0;
+            exchange_index++;
+        }
+    }
+    return isomorphism_found;
+}
+
+BitGraph readGraph() {
+    int vertices, edges, source, destination;
+
+    cin >> vertices;
+    BitGraph read(vertices);
+
+    cin >> edges;
+    for (int i = 0; i < edges; ++i) {
+        cin >> source >> destination;
+        read.setEdge(destination, source);
+        read.setEdge(source, destination);
+    }
+
+    return read;
+}
+
+bool verifyPermutation(BitGraph &g1, BitGraph &g2, vector<int> &equivalence) {
+    int mismatches = 0;
+    for (int i = 0; i < static_cast<int>(equivalence.size()); ++i) {
+        for (int j = 0; j <= i; ++j)
+            mismatches += g1.getEdge(i, j) !=
+                          g2.getEdge(equivalence[i], equivalence[j]);
+    }
+    return mismatches == 0;
+}
+
+inline void printPermutation(vector<int> &equivalence) {
+    for (auto i : equivalence)
+        cout << i << " ";
+    cout << endl;
+}

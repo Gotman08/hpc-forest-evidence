@@ -1,0 +1,455 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#define N_ITER 10
+#define DT 0.01f
+#define SOFTENING 1e-9f
+#define PAIR_TILE 48
+#define TARGET_PACKET 8
+
+#if defined(__GNUC__) || defined(__clang__)
+#define CACHE_ALIGNED __attribute__((aligned(64)))
+#else
+#define CACHE_ALIGNED
+#endif
+
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER)
+#define COEFFICIENT_ATTRIBUTES __attribute__((noinline, optimize("no-math-errno")))
+#else
+#define COEFFICIENT_ATTRIBUTES
+#endif
+
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+static inline void force_one(Body *p, float dt, int n, int i) {
+  const float x = p[i].x;
+  const float y = p[i].y;
+  const float z = p[i].z;
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  for (int j = 0; j < n; ++j) {
+    float dx = p[j].x - x;
+    float dy = p[j].y - y;
+    float dz = p[j].z - z;
+    float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+    float inv_dist = 1 / sqrt(sqrd_dist);
+    float inv_dist3 = inv_dist * inv_dist * inv_dist;
+    fx += dx * inv_dist3;
+    fy += dy * inv_dist3;
+    fz += dz * inv_dist3;
+  }
+
+  p[i].vx += dt*fx;
+  p[i].vy += dt*fy;
+  p[i].vz += dt*fz;
+}
+
+static void direct_advance(Body *p, float dt, int n,
+                           int iterations, int integrate) {
+#ifdef _OPENMP
+#pragma omp parallel if(n >= 2 * PAIR_TILE)
+#endif
+  {
+    for (int iter = 0; iter < iterations; ++iter) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < n; ++i) {
+        force_one(p, dt, n, i);
+      }
+      if (integrate) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < n; ++i) {
+          p[i].x += p[i].vx * dt;
+          p[i].y += p[i].vy * dt;
+          p[i].z += p[i].vz * dt;
+        }
+      }
+    }
+  }
+}
+
+static inline float coefficient_one(float sx, float sy, float sz,
+                                     float tx, float ty, float tz) {
+  float dx = sx - tx;
+  float dy = sy - ty;
+  float dz = sz - tz;
+  float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+  float inv_dist = 1 / sqrt(sqrd_dist);
+  return inv_dist * inv_dist * inv_dist;
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static inline float32x4_t distance4(float sx, float sy, float sz,
+                                   float32x4_t tx,
+                                   float32x4_t ty,
+                                   float32x4_t tz) {
+  const float32x4_t dx = vsubq_f32(vdupq_n_f32(sx), tx);
+  const float32x4_t dy = vsubq_f32(vdupq_n_f32(sy), ty);
+  const float32x4_t dz = vsubq_f32(vdupq_n_f32(sz), tz);
+  float32x4_t d = vaddq_f32(vmulq_f32(dx, dx), vmulq_f32(dy, dy));
+  d = vaddq_f32(d, vmulq_f32(dz, dz));
+  return vaddq_f32(d, vdupq_n_f32(SOFTENING));
+}
+
+/* Match the double sqrt and division in 1 / sqrt(float). */
+static inline float32x4_t inverse_cube4(float32x4_t distance) {
+  const float64x2_t one = vdupq_n_f64(1.0);
+  const float64x2_t lo = vcvt_f64_f32(vget_low_f32(distance));
+  const float64x2_t hi = vcvt_f64_f32(vget_high_f32(distance));
+  const float64x2_t root_lo = vsqrtq_f64(lo);
+  const float64x2_t root_hi = vsqrtq_f64(hi);
+  const float32x2_t inv_lo = vcvt_f32_f64(vdivq_f64(one, root_lo));
+  const float32x2_t inv_hi = vcvt_f32_f64(vdivq_f64(one, root_hi));
+  const float32x4_t inv = vcombine_f32(inv_lo, inv_hi);
+  return vmulq_f32(vmulq_f32(inv, inv), inv);
+}
+
+/* Transpose each freshly computed microtile without reloading it. */
+static inline void store_coefficient_block4(
+    float *forward, float *reverse, int row, int col,
+    float32x4_t c0, float32x4_t c1,
+    float32x4_t c2, float32x4_t c3) {
+  vst1q_f32(forward + row*PAIR_TILE + col, c0);
+  vst1q_f32(forward + (row+1)*PAIR_TILE + col, c1);
+  vst1q_f32(forward + (row+2)*PAIR_TILE + col, c2);
+  vst1q_f32(forward + (row+3)*PAIR_TILE + col, c3);
+
+  if (reverse != NULL) {
+    const float32x4x2_t t0 = vtrnq_f32(c0, c1);
+    const float32x4x2_t t1 = vtrnq_f32(c2, c3);
+    vst1q_f32(reverse + col*PAIR_TILE + row,
+               vcombine_f32(vget_low_f32(t0.val[0]),
+                            vget_low_f32(t1.val[0])));
+    vst1q_f32(reverse + (col+1)*PAIR_TILE + row,
+               vcombine_f32(vget_low_f32(t0.val[1]),
+                            vget_low_f32(t1.val[1])));
+    vst1q_f32(reverse + (col+2)*PAIR_TILE + row,
+               vcombine_f32(vget_high_f32(t0.val[0]),
+                            vget_high_f32(t1.val[0])));
+    vst1q_f32(reverse + (col+3)*PAIR_TILE + row,
+               vcombine_f32(vget_high_f32(t0.val[1]),
+                            vget_high_f32(t1.val[1])));
+  }
+}
+#endif
+
+/* Coefficient rows are sources; columns are independent targets. */
+static void COEFFICIENT_ATTRIBUTES make_coefficients(
+    const float *restrict x, const float *restrict y,
+    const float *restrict z, int a, int na, int b, int nb,
+    float *restrict forward, float *restrict reverse) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  int j = 0;
+  for (; j + 4 <= nb; j += 4) {
+    int i = 0;
+    for (; i + 4 <= na; i += 4) {
+      const float32x4_t tx = vld1q_f32(x + a + i);
+      const float32x4_t ty = vld1q_f32(y + a + i);
+      const float32x4_t tz = vld1q_f32(z + a + i);
+      const float32x4_t d0 = distance4(x[b+j], y[b+j], z[b+j],
+                                      tx, ty, tz);
+      const float32x4_t d1 = distance4(x[b+j+1], y[b+j+1], z[b+j+1],
+                                      tx, ty, tz);
+      const float32x4_t d2 = distance4(x[b+j+2], y[b+j+2], z[b+j+2],
+                                      tx, ty, tz);
+      const float32x4_t d3 = distance4(x[b+j+3], y[b+j+3], z[b+j+3],
+                                      tx, ty, tz);
+      const float32x4_t c0 = inverse_cube4(d0);
+      const float32x4_t c1 = inverse_cube4(d1);
+      const float32x4_t c2 = inverse_cube4(d2);
+      const float32x4_t c3 = inverse_cube4(d3);
+      store_coefficient_block4(forward, reverse, j, i,
+                               c0, c1, c2, c3);
+    }
+    for (; i < na; ++i) {
+      for (int r = 0; r < 4; ++r) {
+        const float c = coefficient_one(x[b+j+r], y[b+j+r], z[b+j+r],
+                                         x[a+i], y[a+i], z[a+i]);
+        forward[(j+r)*PAIR_TILE+i] = c;
+        if (reverse != NULL) {
+          reverse[i*PAIR_TILE+j+r] = c;
+        }
+      }
+    }
+  }
+  for (; j < nb; ++j) {
+    int i = 0;
+    for (; i + 4 <= na; i += 4) {
+      const float32x4_t d = distance4(
+          x[b+j], y[b+j], z[b+j],
+          vld1q_f32(x+a+i), vld1q_f32(y+a+i), vld1q_f32(z+a+i));
+      const float32x4_t c = inverse_cube4(d);
+      vst1q_f32(forward + j*PAIR_TILE + i, c);
+      if (reverse != NULL) {
+        reverse[i*PAIR_TILE+j] = vgetq_lane_f32(c, 0);
+        reverse[(i+1)*PAIR_TILE+j] = vgetq_lane_f32(c, 1);
+        reverse[(i+2)*PAIR_TILE+j] = vgetq_lane_f32(c, 2);
+        reverse[(i+3)*PAIR_TILE+j] = vgetq_lane_f32(c, 3);
+      }
+    }
+    for (; i < na; ++i) {
+      const float c = coefficient_one(x[b+j], y[b+j], z[b+j],
+                                       x[a+i], y[a+i], z[a+i]);
+      forward[j*PAIR_TILE+i] = c;
+      if (reverse != NULL) {
+        reverse[i*PAIR_TILE+j] = c;
+      }
+    }
+  }
+#else
+  for (int j = 0; j < nb; ++j) {
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+    for (int i = 0; i < na; ++i) {
+      forward[j*PAIR_TILE+i] = coefficient_one(
+          x[b+j], y[b+j], z[b+j], x[a+i], y[a+i], z[a+i]);
+    }
+  }
+  if (reverse != NULL) {
+    for (int i = 0; i < na; ++i) {
+      for (int j = 0; j < nb; ++j) {
+        reverse[i*PAIR_TILE+j] = forward[j*PAIR_TILE+i];
+      }
+    }
+  }
+#endif
+}
+
+static void accumulate_panel(
+    float *restrict fx, float *restrict fy, float *restrict fz,
+    const float *restrict x, const float *restrict y,
+    const float *restrict z,
+    int target_first, int target_count, int source_first, int source_count,
+    const float *restrict coefficients) {
+  int q = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  for (; q + TARGET_PACKET <= target_count; q += TARGET_PACKET) {
+    const int t = target_first + q;
+    const float32x4_t tx0 = vld1q_f32(x+t);
+    const float32x4_t ty0 = vld1q_f32(y+t);
+    const float32x4_t tz0 = vld1q_f32(z+t);
+    const float32x4_t tx1 = vld1q_f32(x+t+4);
+    const float32x4_t ty1 = vld1q_f32(y+t+4);
+    const float32x4_t tz1 = vld1q_f32(z+t+4);
+    float32x4_t ax0 = vld1q_f32(fx+t);
+    float32x4_t ay0 = vld1q_f32(fy+t);
+    float32x4_t az0 = vld1q_f32(fz+t);
+    float32x4_t ax1 = vld1q_f32(fx+t+4);
+    float32x4_t ay1 = vld1q_f32(fy+t+4);
+    float32x4_t az1 = vld1q_f32(fz+t+4);
+
+    for (int k = 0; k < source_count; ++k) {
+      const int s = source_first + k;
+      const float32x4_t sx = vdupq_n_f32(x[s]);
+      const float32x4_t sy = vdupq_n_f32(y[s]);
+      const float32x4_t sz = vdupq_n_f32(z[s]);
+      const float32x4_t c0 = vld1q_f32(coefficients+k*PAIR_TILE+q);
+      const float32x4_t c1 = vld1q_f32(coefficients+k*PAIR_TILE+q+4);
+      ax0 = vaddq_f32(ax0, vmulq_f32(vsubq_f32(sx, tx0), c0));
+      ay0 = vaddq_f32(ay0, vmulq_f32(vsubq_f32(sy, ty0), c0));
+      az0 = vaddq_f32(az0, vmulq_f32(vsubq_f32(sz, tz0), c0));
+      ax1 = vaddq_f32(ax1, vmulq_f32(vsubq_f32(sx, tx1), c1));
+      ay1 = vaddq_f32(ay1, vmulq_f32(vsubq_f32(sy, ty1), c1));
+      az1 = vaddq_f32(az1, vmulq_f32(vsubq_f32(sz, tz1), c1));
+    }
+
+    vst1q_f32(fx+t, ax0);
+    vst1q_f32(fy+t, ay0);
+    vst1q_f32(fz+t, az0);
+    vst1q_f32(fx+t+4, ax1);
+    vst1q_f32(fy+t+4, ay1);
+    vst1q_f32(fz+t+4, az1);
+  }
+#endif
+  for (; q < target_count; ++q) {
+    const int t = target_first + q;
+    const float tx = x[t];
+    const float ty = y[t];
+    const float tz = z[t];
+    float ax = fx[t];
+    float ay = fy[t];
+    float az = fz[t];
+    for (int k = 0; k < source_count; ++k) {
+      const int s = source_first + k;
+      const float c = coefficients[k*PAIR_TILE+q];
+      float dx = x[s] - tx;
+      float dy = y[s] - ty;
+      float dz = z[s] - tz;
+      ax += dx * c;
+      ay += dy * c;
+      az += dz * c;
+    }
+    fx[t] = ax;
+    fy[t] = ay;
+    fz[t] = az;
+  }
+}
+
+static void advance_bodies(Body *p, float dt, int n,
+                            int iterations, int integrate) {
+  if (n <= 0 || iterations <= 0) {
+    return;
+  }
+  if (n < 2 * PAIR_TILE) {
+    direct_advance(p, dt, n, iterations, integrate);
+    return;
+  }
+
+  const size_t count = (size_t)n;
+  if (count > SIZE_MAX - 15u) {
+    direct_advance(p, dt, n, iterations, integrate);
+    return;
+  }
+  const size_t stride = (count + 15u) & ~(size_t)15u;
+  if (stride > (SIZE_MAX - 63u) / (6u * sizeof(float))) {
+    direct_advance(p, dt, n, iterations, integrate);
+    return;
+  }
+  void *allocation = malloc(6u * stride * sizeof(float) + 63u);
+  if (allocation == NULL) {
+    direct_advance(p, dt, n, iterations, integrate);
+    return;
+  }
+
+  float *x = (float *)(((uintptr_t)allocation + 63u) & ~(uintptr_t)63u);
+  float *y = x + stride;
+  float *z = y + stride;
+  float *fx = z + stride;
+  float *fy = fx + stride;
+  float *fz = fy + stride;
+  const int tile_count = n / PAIR_TILE + (n % PAIR_TILE != 0);
+  int bad_positions = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+    float forward[PAIR_TILE * PAIR_TILE] CACHE_ALIGNED;
+    float reverse[PAIR_TILE * PAIR_TILE] CACHE_ALIGNED;
+
+    for (int iter = 0; iter < iterations; ++iter) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:bad_positions)
+#endif
+      for (int i = 0; i < n; ++i) {
+        const float px = p[i].x;
+        const float py = p[i].y;
+        const float pz = p[i].z;
+        x[i] = px;
+        y[i] = py;
+        z[i] = pz;
+        fx[i] = 0.0f;
+        fy[i] = 0.0f;
+        fz[i] = 0.0f;
+        bad_positions |= (!isfinite(px) || !isfinite(py) || !isfinite(pz));
+      }
+
+      if (bad_positions) {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int i = 0; i < n; ++i) {
+          force_one(p, dt, n, i);
+        }
+      } else {
+        /* Disjoint pairs within a wave; ascending sources across waves. */
+        for (int sum = 0; sum < 2 * tile_count - 1; ++sum) {
+          const int first = sum < tile_count ? 0 : sum - tile_count + 1;
+          const int last = sum / 2;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+          for (int ta = first; ta <= last; ++ta) {
+            const int tb = sum - ta;
+            const int a = ta * PAIR_TILE;
+            const int b = tb * PAIR_TILE;
+            const int na = n - a < PAIR_TILE ? n - a : PAIR_TILE;
+            const int nb = n - b < PAIR_TILE ? n - b : PAIR_TILE;
+            make_coefficients(x, y, z, a, na, b, nb,
+                               forward, ta == tb ? NULL : reverse);
+            accumulate_panel(fx, fy, fz, x, y, z,
+                              a, na, b, nb, forward);
+            if (ta != tb) {
+              accumulate_panel(fx, fy, fz, x, y, z,
+                                b, nb, a, na, reverse);
+            }
+          }
+        }
+      }
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < n; ++i) {
+        if (!bad_positions) {
+          p[i].vx += dt*fx[i];
+          p[i].vy += dt*fy[i];
+          p[i].vz += dt*fz[i];
+        }
+        if (integrate) {
+          p[i].x += p[i].vx * dt;
+          p[i].y += p[i].vy * dt;
+          p[i].z += p[i].vz * dt;
+        }
+      }
+    }
+  }
+  free(allocation);
+}
+
+/* Force-only semantics are preserved for independent and repeated calls. */
+void body_force(Body *p, float dt, int n) {
+  advance_bodies(p, dt, n, 1, 0);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+  advance_bodies(bodies, DT, nbodies, N_ITER, 1);
+  write_dataset(nbodies, bodies);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

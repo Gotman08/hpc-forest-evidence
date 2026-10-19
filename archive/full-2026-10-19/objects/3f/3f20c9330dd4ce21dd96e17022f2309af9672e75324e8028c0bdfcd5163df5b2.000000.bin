@@ -1,0 +1,198 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+
+/* Maximum size (in char) for neighbors and compute lists */
+#define MAX 100
+#define PARALLEL_THRESHOLD 256
+
+typedef struct {
+  int id;
+  float value;
+  char neighbors[MAX];
+} Node;
+
+
+/* Reads input, allocates memory, writes graph size and node list. Returns the graph. */
+Node* read_input(char* fname, int *n, char* list) {
+  Node* data = NULL;
+  FILE *fl = NULL;
+
+  if (fname == NULL)
+    fl = stdin;
+  else
+    fl = fopen(fname, "r");
+
+  if (fl == NULL) {
+    fprintf(stderr, "Error!\n");
+    exit(1);
+  }
+
+  /* header */
+  fscanf(fl, "%d %[^
+]", n, list);
+
+  if (*n > 0) {
+    data = (Node*) malloc ((*n)*sizeof(Node));
+    if(data == NULL){
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+  }
+
+  for(int i = 0; i < *n; i++)
+    fscanf(fl, "%d %f %[^
+]", &data[i].id, &data[i].value, data[i].neighbors);
+
+  fclose(fl);
+  return data;
+}
+
+/* Returns the index of the node with the given id or -1 if not found */
+int find_by_id(Node g[], int id, int size){
+  int i = 0;
+  while((i < size) && g[i].id != id)
+    i++;
+  if(i < size)
+    return i;
+  return -1;
+}
+
+/* Main program - calls read input, computes sums, prints output */
+int main() {
+  char *fileN = NULL;
+  char computelist[MAX];
+  int n = -1;
+  Node* input = NULL;
+  int *successor = NULL;
+  int *pred_count = NULL;
+  int *offset = NULL;
+  int *cursor = NULL;
+  int *predecessors = NULL;
+  int *frontier = NULL;
+  int *next_frontier = NULL;
+  float *cost = NULL;
+
+  input = read_input(fileN, &n, computelist);
+
+  if (n > 0) {
+    successor = (int*) malloc(n * sizeof(int));
+    pred_count = (int*) calloc(n, sizeof(int));
+    offset = (int*) malloc((n + 1) * sizeof(int));
+    cursor = (int*) malloc(n * sizeof(int));
+    predecessors = (int*) malloc(n * sizeof(int));
+    frontier = (int*) malloc(n * sizeof(int));
+    next_frontier = (int*) malloc(n * sizeof(int));
+    cost = (float*) malloc(n * sizeof(float));
+
+    if (successor == NULL || pred_count == NULL || offset == NULL ||
+        cursor == NULL || predecessors == NULL || frontier == NULL ||
+        next_frontier == NULL || cost == NULL) {
+      fprintf(stderr, "Error!\n");
+      exit(1);
+    }
+
+    /* Select the same single best neighbor used by get_costly for each node. */
+    #pragma omp parallel for schedule(static) if(n > PARALLEL_THRESHOLD)
+    for (int i = 0; i < n; i++) {
+      char aux[MAX];
+      char *auxptr;
+      char *t;
+      int best_id = -1;
+      int best_index = -1;
+      float max = 0;
+
+      strcpy(aux, input[i].neighbors);
+      t = strtok_r(aux, " ", &auxptr);
+      while (t != NULL) {
+        int id = atoi(t);
+        int d = find_by_id(input, id, n);
+        if (d >= 0 && max < input[d].value) {
+          max = input[d].value;
+          best_id = id;
+          best_index = d;
+        }
+        t = strtok_r(NULL, " ", &auxptr);
+      }
+
+      /* The original routine uses -1 as its no-successor sentinel. */
+      successor[i] = (best_id != -1) ? best_index : -1;
+    }
+
+    /* Build reverse edges for the selected-successor graph. */
+    for (int i = 0; i < n; i++)
+      if (successor[i] >= 0)
+        pred_count[successor[i]]++;
+
+    offset[0] = 0;
+    for (int i = 0; i < n; i++)
+      offset[i + 1] = offset[i] + pred_count[i];
+
+    memcpy(cursor, offset, n * sizeof(int));
+    for (int i = 0; i < n; i++)
+      if (successor[i] >= 0)
+        predecessors[cursor[successor[i]]++] = i;
+
+    /* Evaluate sink-to-source layers; every selected edge is in the input DAG. */
+    int frontier_count = 0;
+    for (int i = 0; i < n; i++)
+      if (successor[i] < 0)
+        frontier[frontier_count++] = i;
+
+    int next_count = 0;
+    #pragma omp parallel if(n > PARALLEL_THRESHOLD) shared(frontier, next_frontier, frontier_count, next_count, cost, successor, offset, predecessors)
+    {
+      while (frontier_count > 0) {
+        #pragma omp for schedule(static)
+        for (int j = 0; j < frontier_count; j++) {
+          int i = frontier[j];
+          float r = input[i].value;
+          if (successor[i] >= 0)
+            r += cost[successor[i]];
+          cost[i] = r;
+        }
+
+        #pragma omp single
+        next_count = 0;
+
+        #pragma omp for schedule(static)
+        for (int j = 0; j < frontier_count; j++) {
+          int i = frontier[j];
+          for (int p = offset[i]; p < offset[i + 1]; p++) {
+            int slot;
+            #pragma omp atomic capture
+            slot = next_count++;
+            next_frontier[slot] = predecessors[p];
+          }
+        }
+
+        #pragma omp single
+        {
+          int *tmp = frontier;
+          frontier = next_frontier;
+          next_frontier = tmp;
+          frontier_count = next_count;
+        }
+      }
+    }
+  }
+
+  /* Reuse the precomputed result for every requested ID, including repeats. */
+  for(char *c = strtok(computelist, " "); c != NULL; c = strtok(NULL, " ")) {
+    int nd = find_by_id(input, atoi(c), n);
+    float result = (nd >= 0) ? cost[nd] : 0.0f;
+    printf("%s: %f\n", c, result);
+  }
+
+  free(input);
+  free(successor);
+  free(pred_count);
+  free(offset);
+  free(cursor);
+  free(predecessors);
+  free(frontier);
+  free(next_frontier);
+  free(cost);
+
+  return 0;
+}

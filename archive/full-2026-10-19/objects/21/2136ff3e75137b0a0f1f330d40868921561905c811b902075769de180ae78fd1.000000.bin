@@ -1,0 +1,344 @@
+"""Pure temporary metadata/AST tests; no native or candidate process is invoked."""
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+factory = __import__("assemble_admissions")
+publication = __import__("publication")
+receive_phase = __import__("receive_phase")
+remote_stage = __import__("remote_stage")
+
+
+def ref(path, data=b"NEUTRAL METADATA ONLY"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return factory.reference(path)
+
+
+def test_templates_and_job_id_alone_do_not_create_authorization(tmp_path):
+    for value in ({}, {"schema": "hpc-forest-dynamic-r4b-launch-inputs-v1", "verified": False, "job_id": "999999"}):
+        with pytest.raises(ValueError, match="Actual parent"):
+            factory.assemble(value, tmp_path / "never-created")
+    assert not (tmp_path / "never-created").exists()
+
+
+def test_positive_flag_and_job_alone_is_still_not_evidence(tmp_path):
+    with pytest.raises(ValueError, match="Closed complete"):
+        factory.assemble({"schema": "hpc-forest-dynamic-r4b-launch-inputs-v1", "verified": True, "job_id": "999999"},
+                         tmp_path / "never-created")
+    assert not (tmp_path / "never-created").exists()
+
+
+@pytest.mark.parametrize("instant", [-1, 1001, True, "2026-10-18T02:00:00"])
+def test_future_bool_naive_stale_observations_refused(instant):
+    with pytest.raises(ValueError):
+        factory.fresh(instant, now=1000)
+
+
+def test_boundary_freshness_is_explicit():
+    factory.fresh(880, now=1000)
+    factory.fresh(1000, now=1000)
+    with pytest.raises(ValueError):
+        factory.fresh(879.99, now=1000)
+
+
+def source_only_census():
+    def row(pid, parent):
+        return {"ProcessId": pid, "ParentProcessId": parent, "ExecutablePath": "NEUTRAL-PYTHON",
+                "CommandLine": 'python "-m" "hpc_forest.ablation_worker" --session-id 665743a02b824021a697b6a4884a667c',
+                "CreationDate": "2026-10-17T21:06:42.1234560Z"}
+    rows = [row(37900, 1), row(37848, 37900)]
+    census = {"schema": "hpc-forest-dynamic-r4b-full-cim-v1", "complete_census": True,
+              "strict_utf8_decoding": True, "captured_at_utc": "1970-01-01T00:16:40Z",
+              "rows": rows, "rows_count": 2, "other_native_groups": []}
+    closure = {"schema": "hpc-forest-r2c-owned-main-only-stop-receipt-v1", "verified": True,
+               "all_three_main_identities_absent": True, "source_only_identities_preserved": True,
+               "source_only": copy.deepcopy(rows), "actions": [
+                   {"identity": {**row(100 + i, 1), "CommandLine": "NEUTRAL OLD R2"}} for i in range(3)]}
+    return census, closure
+
+
+def test_full_five_fields_preserved_and_native_count_is_research_sessions():
+    census, closure = source_only_census()
+    identities, count = factory.check_census(census, closure, now=1000)
+    assert count == 1 and len(identities) == 2
+
+
+@pytest.mark.parametrize("change", ["missing", "parent", "date", "exe", "command", "unknown", "old_R2", "duplicate", "groups"])
+def test_unknown_changed_or_closed_native_identity_refused(change):
+    census, closure = source_only_census()
+    if change == "missing":
+        census["rows"].pop()
+    elif change in {"parent", "date", "exe", "command"}:
+        key = {"parent": "ParentProcessId", "date": "CreationDate", "exe": "ExecutablePath", "command": "CommandLine"}[change]
+        census["rows"][0][key] = 2 if change == "parent" else "CHANGED"
+    elif change == "unknown":
+        census["rows"].append({**census["rows"][0], "ProcessId": 8, "CommandLine": 'python "-m" "hpc_forest.matrix_worker"'})
+    elif change == "old_R2":
+        census["rows"].append(closure["actions"][0]["identity"])
+    elif change == "duplicate":
+        census["rows"].append(census["rows"][0])
+    else:
+        census["other_native_groups"] = [{"neutral_unadmitted_group": True}]
+    census["rows_count"] = len(census["rows"])
+    with pytest.raises(ValueError):
+        factory.check_census(census, closure, now=1000)
+
+
+@pytest.mark.parametrize("phase", ["roots", "advice", "harvest"])
+def test_exact_synthetic_request_and_two_distinct_hashes(phase):
+    source = HERE.parents[2] / "work/hpc-forest-mere-dynamique-r4b-max/project"
+    sys.path[:0] = [str(source / "src"), str(source / "examples/marathon22")]
+    request = remote_stage.make_request(phase, factory.SESSIONS[phase], {"verified_capabilities": ["cpu", "c", "cxx", "openmp"]},
+                                        now=1000, nonce="a" * 32)
+    assert len(request) == 14 and request["reasoning_effort"] == "max" and request["model"] == "gpt-6-luna"
+    assert request["expires_at"] == 1600 and request["meta_role"] == "mother-dynamic-" + phase
+    from hpc_forest.core import digest
+    raw = json.dumps(request, indent=2).encode()
+    assert digest(request) != hashlib.sha256(raw).hexdigest()
+    payload = remote_stage.neutral_payload(phase, {})
+    assert "SYNTHETIC JSON INTERFACE" in payload["official_statement_as_data"]
+    assert "PRIVATE SEARCH" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("code", [False, True, 1, None])
+def test_receiving_refuses_unknown_failed_or_bool_exit_before_reading_snapshot(tmp_path, code):
+    exit_receipt = {"schema": "hpc-forest-dynamic-r4b-once-worker-natural-exit-v1", "verified": True,
+        "natural_exit_observed": True, "no_stop_or_replay": True, "worker_exit_code": code, "all_owned_full_identities_absent": True}
+    with pytest.raises(ValueError, match="natural --once"):
+        receive_phase.receive({}, {}, tmp_path / "never-opened", exit_receipt)
+
+
+def publication_fixture(tmp_path):
+    cell = {"scope_id": factory.SCOPE, "source_zip_sha256": factory.SOURCE, "plan_sha256": factory.PLAN,
+            "model": "gpt-6-luna", "effort": "max", "session_id": factory.SESSIONS["roots"], "job_id": "999999",
+            "remote_root": "/scratch_p/nimarano/hpc-forest-dynamic-r4b-max-" + factory.SESSIONS["roots"]}
+    root = "/scratch_p/nimarano/hpc-forest-dynamic-r4b-admission-" + cell["session_id"]
+    dependency = ref(tmp_path / "local-dependency", b"NEUTRAL")
+    downloaded = ref(tmp_path / "downloaded-dependency", b"NEUTRAL")
+    auth = ref(tmp_path / "local-authorization", json.dumps({**cell, "verified": True, "expires_at": 2000000000}).encode())
+    auth_download = ref(tmp_path / "downloaded-authorization", Path(auth["path"]).read_bytes())
+    evidence = ref(tmp_path / "readback-evidence")
+    manifest = {"schema": "hpc-forest-dynamic-r4b-upload-manifest-v1", "verified": False, "uploaded": False, **cell,
+                "dependencies": [{"local": dependency, "remote_path": root + "/neutral.json"}], "existing_qualified_files": [],
+                "authorization_publish_after_readback": {"local": auth, "remote_path": root + "/authorization.json"}}
+    observed = {"schema": "hpc-forest-dynamic-r4b-publication-readbacks-v1", "verified": True, **cell,
+                "actual_MCP_readbacks": True, "native_model_calls": 0, "observed_at": __import__("time").time(),
+                "evidence_refs": [evidence], "dependencies": [{"remote_path": root + "/neutral.json", "downloaded": downloaded}],
+                "existing_qualified_files": [], "authorization": {"remote_path": root + "/authorization.json", "downloaded": auth_download}}
+    return manifest, observed
+
+
+@pytest.mark.parametrize("change", ["missing", "extra", "different", "wrongauth", "false", "otherjob"])
+def test_publication_missing_changed_or_unobserved_never_creates_ready(tmp_path, change):
+    manifest, observed = publication_fixture(tmp_path)
+    if change == "missing":
+        observed["dependencies"] = []
+    elif change == "extra":
+        observed["dependencies"] *= 2
+    elif change == "different":
+        observed["dependencies"][0]["downloaded"] = ref(tmp_path / "changed", b"BAD")
+    elif change == "wrongauth":
+        observed["authorization"]["downloaded"] = ref(tmp_path / "changedauth", b"BAD")
+    elif change == "false":
+        observed["verified"] = False
+    else:
+        observed["job_id"] = "999998"
+    with pytest.raises(ValueError):
+        publication.verify_readbacks(manifest, observed)
+    assert not (tmp_path / "authorization-ready.json").exists()
+
+
+def test_publication_readback_only_is_not_admission(tmp_path):
+    manifest, observed = publication_fixture(tmp_path)
+    cell, authorization, path = publication.verify_readbacks(manifest, observed)
+    assert cell["job_id"] == "999999" and authorization["verified"] is True and path.exists()
+    assert not (tmp_path / "authorization-ready.json").exists()
+
+
+def test_no_subprocess_entry_in_data_factory_or_publication():
+    import ast
+    for name in ("assemble_admissions.py", "publication.py", "bind_qualification.py", "receive_phase.py", "render_launch.py"):
+        tree = ast.parse((HERE / name).read_text(encoding="utf8"))
+        assert not any(isinstance(n, (ast.Import, ast.ImportFrom)) and "subprocess" in ast.unparse(n) for n in ast.walk(tree))
+
+
+def test_binder_rejects_false_before_creating_output(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("neutral_q_binding", HERE / "bind_qualification.py")
+    binder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(binder)
+    class Refuser:
+        @staticmethod
+        def proof(*args):
+            raise ValueError("NEUTRAL false Q rejected")
+    monkeypatch.setattr(binder.factory, "bootstrap_source", lambda: ({}, Refuser))
+    with pytest.raises(ValueError, match="actual independently"):
+        binder.bind({"path": "NEVER-READ", "sha256": "0" * 64}, tmp_path / "not-created")
+    assert not (tmp_path / "not-created").exists()
+
+
+def neutral_complete_snapshot(tmp_path):
+    # These are explicitly fake model/CLI data. Success tests must stub only the
+    # byte verifier; the unmodified production verifier rejects their fake CLI.
+    fixture_module = __import__("test_receipt_native")
+    original = tmp_path / "neutral-source"
+    original.mkdir()
+    refs, expected = fixture_module.fixture(original)
+    snapshot = tmp_path / "neutral-frozen-cache"
+    snapshot.mkdir()
+    nonce = "a" * 32
+    call = snapshot / nonce
+    call.mkdir()
+    mappings = {"request_downloaded": "downloaded-request.json", "request_native": "request.json",
+        "claim": "generation-claimed.json", "invocation": "invocation.json", "process": "process.json",
+        "jsonl": "codex.jsonl", "response": "response.json", "ready": "response-ready.json",
+        "delivered": "delivered.json", "agent_result": "agent-result.json"}
+    for key, name in mappings.items():
+        refs[key] = ref(call / name, Path(refs[key]["path"]).read_bytes())
+    for key, name in {"cli_identity": "CLI-IDENTITY-VERIFIED.json", "worker_ready": "worker-ready.json", "cell_binding": "CELL-BINDING.json"}.items():
+        refs[key] = ref(snapshot / name, Path(refs[key]["path"]).read_bytes())
+    request = json.loads(Path(refs["request_native"]["path"]).read_bytes())
+    ref(call / "instructions.txt", request["messages"][0]["content"].encode())
+    ref(call / "output-schema.json", json.dumps(request["schema"]).encode())
+    ref(call / "download-receipt.json")
+    ref(snapshot / "OWNER.json")
+    ref(snapshot / "worker.lock", b"0")
+    identity = {"ProcessId": 999999, "ParentProcessId": 999998, "ExecutablePath": "NEUTRAL NEVER EXECUTED",
+                "CommandLine": "NEUTRAL bootstrap_worker.py --session-id " + expected["session_id"],
+                "CreationDate": "2026-10-18T02:00:00Z"}
+    census = {"schema": "hpc-forest-dynamic-r4b-full-cim-v1", "complete_census": True, "strict_utf8_decoding": True,
+              "captured_at_utc": "1970-01-01T00:16:40Z", "rows": [{"ProcessId": 1, "ParentProcessId": 0,
+                  "ExecutablePath": None, "CommandLine": None, "CreationDate": None}], "rows_count": 1}
+    census_ref = ref(tmp_path / "neutral-cim.json", json.dumps(census).encode())
+    exited = {"schema": "hpc-forest-dynamic-r4b-once-worker-natural-exit-v1", "verified": True,
+              **{("scope_id" if k == "scope" else k): v for k, v in expected.items() if k not in {"request_sha256", "request_digest"}},
+              "natural_exit_observed": True, "no_stop_or_replay": True, "worker_exit_code": 0,
+              "all_owned_full_identities_absent": True, "owned_full_identities": [identity], "observed_at": 1000,
+              "source_cache": str(HERE / ("worker-" + expected["session_id"])), "snapshot_root": str(snapshot),
+              "fresh_full_cim": census_ref, "evidence_refs": [census_ref], "neutral_fixture_only": True}
+    return refs, expected, snapshot, exited
+
+
+def test_exhaustive_phase_receipt_stays_bounded(tmp_path, monkeypatch):
+    refs, expected, snapshot, exited = neutral_complete_snapshot(tmp_path)
+    monkeypatch.setattr(receive_phase.audit, "_verify_cli_bytes", lambda *args: None)
+    result = receive_phase.receive(refs, expected, snapshot, exited)
+    assert result["all_started_calls_reconciled"] is True and result["unknown_invocations"] == 0
+    assert len(result["complete_cache_inventory"]) == 18 and result["global_admission_verified"] is False
+    assert result["first_normal_candidate_delivery_and_evaluation_verified"] is False
+
+
+def test_production_receiving_rejects_fake_cli_even_when_cache_is_complete(tmp_path):
+    refs, expected, snapshot, exited = neutral_complete_snapshot(tmp_path)
+    with pytest.raises(receive_phase.audit.ReceiptError):
+        receive_phase.receive(refs, expected, snapshot, exited)
+
+
+@pytest.mark.parametrize("extra", ["orphan.invocation.json", "orphan.process.json", "orphan.jsonl", "bad-directory", "nonce-extra"])
+def test_orphan_and_unknown_artifacts_cannot_disappear(tmp_path, extra):
+    refs, expected, snapshot, exited = neutral_complete_snapshot(tmp_path)
+    path = snapshot / extra if extra != "nonce-extra" else snapshot / ("a" * 32) / "orphan.invocation.json"
+    if extra == "bad-directory":
+        path.mkdir()
+    else:
+        path.write_bytes(b"NEUTRAL ORPHAN")
+    with pytest.raises(ValueError, match="[Uu]nexpected|[Ii]ncomplete"):
+        receive_phase.receive(refs, expected, snapshot, exited)
+
+
+def test_live_identity_prevents_snapshot_read(tmp_path):
+    refs, expected, snapshot, exited = neutral_complete_snapshot(tmp_path)
+    census = {"schema": "hpc-forest-dynamic-r4b-full-cim-v1", "complete_census": True, "strict_utf8_decoding": True,
+              "captured_at_utc": "1970-01-01T00:16:40Z", "rows": exited["owned_full_identities"], "rows_count": 1}
+    exited["fresh_full_cim"] = ref(tmp_path / "still-alive-census", json.dumps(census).encode())
+    with pytest.raises(ValueError, match="remains live"):
+        receive_phase.receive(refs, expected, snapshot, exited)
+
+
+def neutral_batch(tmp_path):
+    manifest, _ = publication_fixture(tmp_path)
+    marker = {k: manifest[k] for k in ("scope_id", "source_zip_sha256", "plan_sha256", "model", "effort", "session_id", "job_id", "remote_root")}
+    marker.update(schema="hpc-forest-dynamic-r4b-allocation-marker-v1", verified=True, native_model_calls=0)
+    marker_ref = ref(tmp_path / "neutral-marker.json", json.dumps(marker).encode())
+    manifest_ref = ref(tmp_path / "neutral-manifest.json", json.dumps(manifest).encode())
+    batch_ref = publication.stage_batch(manifest_ref, marker_ref)
+    batch = factory.read(batch_ref)
+    readback = Path(batch["directory_readback"]["arguments"]["local_path"])
+    readback.mkdir()
+    for source in Path(batch["staged_directory"]).iterdir():
+        ref(readback / source.name, source.read_bytes())
+    ref(readback / "allocation-marker.json", Path(marker_ref["path"]).read_bytes())
+    destination = batch["directory_readback"]["arguments"]["remote_path"]
+    upload = ref(tmp_path / "neutral-upload-result.json", json.dumps({"ok": True, "sent": batch["staged_directory"],
+        "to": destination, "verifie": False}).encode())
+    download = ref(tmp_path / "neutral-download-result.json", json.dumps({"ok": True, "downloaded": destination,
+        "to": str(readback), "verifie": False}).encode())
+    checks = ref(tmp_path / "neutral-qualified-checks.json", json.dumps({"existing_qualified_files": []}).encode())
+    return batch_ref, upload, download, checks, readback
+
+
+def test_grouped_transport_false_is_filewise_checked_without_ready(tmp_path):
+    args = neutral_batch(tmp_path)
+    observed = factory.read(publication.verify_batch(*args[:4]))
+    assert observed["directory_tool_hash_verified"] is False and observed["grouped_filewise_SHA_verified"] is True
+    assert observed["exact_grouped_readback_files"] == 3  # unit graph2+marker; production graph9+marker
+    assert not (args[4] / "authorization-ready.json").exists()
+
+
+@pytest.mark.parametrize("change", ["extra", "missing", "marker", "ready", "directory", "authorization"])
+def test_grouped_readback_exact_graph_plus_marker_is_closed(tmp_path, change):
+    batch_ref, upload, download, checks, readback = neutral_batch(tmp_path)
+    if change == "extra":
+        ref(readback / "unknown.json")
+    elif change == "missing":
+        (readback / "neutral.json").unlink()
+    elif change == "marker":
+        (readback / "allocation-marker.json").write_bytes(b"NEUTRAL CHANGED MARKER")
+    elif change == "ready":
+        ref(readback / "authorization-ready.json")
+    elif change == "directory":
+        (readback / "nested").mkdir()
+    else:
+        (readback / "authorization.json").write_bytes(b"NEUTRAL CHANGED AUTH")
+    with pytest.raises(ValueError):
+        publication.verify_batch(batch_ref, upload, download, checks)
+    assert not (Path(batch_ref["path"]).parent / "batch-readbacks-observed.json").exists()
+
+
+def test_real_q_pins_are_not_self_declared_sha64():
+    class NeverRead:
+        @staticmethod
+        def proof(*args):
+            raise AssertionError("An unpinned Q must fail before reading its claims")
+    with pytest.raises(ValueError, match="actual independently"):
+        factory.check_qualification({"path": "NEUTRAL", "sha256": "0" * 64}, NeverRead)
+
+
+def test_commands_are_single_cell_new_roots_and_real_newlines():
+    import ast
+    import shlex
+    import tarfile
+    commands = json.loads((HERE / "COMMANDES-PROPOSEES.json").read_text(encoding="utf8"))
+    for phase, row in commands["commands"].items():
+        raw = (HERE / phase / "commande-allouee.sh").read_bytes()
+        request = json.loads((HERE / phase / "job-prepare-propose.json").read_text(encoding="utf8"))
+        assert shlex.split(request["command"]) == ["bash", "-lc", raw.decode()]
+        assert hashlib.sha256(raw).hexdigest() == row["command_sha256"]
+        assert raw.count(b"exec srun ") == 1 and b'--ntasks=1 --cpus-per-task=4 --cpu-bind=cores' in raw
+        assert b'"$py" -I -B -u ' in raw and b'test ! -e "$native_root"' in raw
+        assert request["time_limit"] == ("03:00:00" if phase == "pilot" else "01:00:00")
+        assert "r3-ede293f185e6" in request["command"] and "--phase " + phase in request["command"]
+        extracted = raw.decode().split("<<'STAGE'\n", 1)[1].split("\nSTAGE\n", 1)[0]
+        ast.parse(extracted)
+    with tarfile.open(HERE / "native-interface-stage-r1.tar.gz") as archive:
+        assert len(archive.getmembers()) == 2 and all(i.isfile() for i in archive.getmembers())
+        assert archive.extractfile("remote_stage.py").read() == (HERE / "remote_stage.py").read_bytes()

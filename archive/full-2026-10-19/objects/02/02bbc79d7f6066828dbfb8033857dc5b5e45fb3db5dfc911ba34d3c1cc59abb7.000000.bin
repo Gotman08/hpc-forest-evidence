@@ -1,0 +1,143 @@
+#include <bits/stdc++.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+using namespace std;
+
+int A[1000][1000];
+int ps[1010][1010];
+
+typedef long long ll;
+
+static inline uint32_t prefix_hash(int value) {
+  uint32_t x = static_cast<uint32_t>(value) * 0x9e3779b1u;
+  return x ^ (x >> 16);
+}
+
+#if defined(__aarch64__)
+static inline unsigned lane_mask(uint32x4_t matches) {
+  const uint32x4_t weights = {1u, 2u, 4u, 8u};
+  return vaddvq_u32(vandq_u32(matches, weights));
+}
+#endif
+
+class PrefixCounter {
+  // Valid prefix sums and query keys cannot equal INT_MIN.
+  alignas(16) int keys_[2048];
+  uint32_t counts_[2048];
+  unsigned capacity_;
+  unsigned mask_;
+
+  unsigned locate(int value, uint32_t hash) const {
+    unsigned group = hash & mask_ & ~3u;
+#if defined(__aarch64__)
+    const int32x4_t wanted = vdupq_n_s32(value);
+    const int32x4_t empty = vdupq_n_s32(INT_MIN);
+    for (;;) {
+      const int32x4_t stored = vld1q_s32(keys_ + group);
+      unsigned matches = lane_mask(vceqq_s32(stored, wanted));
+      if (matches)
+        return group + static_cast<unsigned>(__builtin_ctz(matches));
+      unsigned vacancies = lane_mask(vceqq_s32(stored, empty));
+      if (vacancies)
+        return group + static_cast<unsigned>(__builtin_ctz(vacancies));
+      group = (group + 4u) & mask_;
+    }
+#else
+    for (;;) {
+      for (unsigned lane = 0; lane < 4; ++lane) {
+        unsigned slot = group + lane;
+        if (keys_[slot] == value || keys_[slot] == INT_MIN)
+          return slot;
+      }
+      group = (group + 4u) & mask_;
+    }
+#endif
+  }
+
+public:
+  explicit PrefixCounter(unsigned entries) : capacity_(4), mask_(3) {
+    while (capacity_ < 2u * entries)
+      capacity_ *= 2u;
+    mask_ = capacity_ - 1u;
+  }
+
+  void clear() {
+    fill_n(keys_, capacity_, INT_MIN);
+    // The initial empty prefix has hash zero.
+    keys_[0] = 0;
+    counts_[0] = 1;
+  }
+
+  uint32_t consume(int value, int target, uint32_t value_hash,
+                   uint32_t target_hash) {
+    // Both probes are read-only and may be evaluated independently.
+    unsigned update_slot = locate(value, value_hash);
+    unsigned query_slot = locate(target, target_hash);
+    uint32_t result = keys_[query_slot] == target ? counts_[query_slot] : 0u;
+
+    // Preserve query-before-increment ordering, including when k is zero.
+    if (keys_[update_slot] == INT_MIN) {
+      keys_[update_slot] = value;
+      counts_[update_slot] = 1;
+    } else {
+      ++counts_[update_slot];
+    }
+    return result;
+  }
+};
+
+ll solve(int m, int n, int k) {
+  // ps[column boundary][row boundary] is a two-dimensional prefix sum.
+  for (int i = 0; i <= m; i++)
+    ps[0][i] = 0;
+  for (int j = 1; j <= n; j++) {
+    ps[j][0] = 0;
+    int column_sum = 0;
+    for (int i = 1; i <= m; i++) {
+      column_sum += A[i - 1][j - 1];
+      ps[j][i] = ps[j - 1][i] + column_sum;
+    }
+  }
+
+  PrefixCounter h(static_cast<unsigned>(m + 1));
+  ll ans = 0;
+  int band_prefix[1000];
+  uint32_t value_hash[1000];
+  uint32_t target_hash[1000];
+  for (int j = 1; j <= n; j++)
+    for (int l = j; l <= n; l++) {
+      const int *right = ps[l] + 1;
+      const int *left = ps[j - 1] + 1;
+      // Differences and unsigned hash arithmetic have no cross-row dependency.
+#pragma GCC ivdep
+      for (int i = 0; i < m; i++) {
+        int value = right[i] - left[i];
+        band_prefix[i] = value;
+        value_hash[i] = prefix_hash(value);
+        target_hash[i] = prefix_hash(value - k);
+      }
+
+      h.clear();
+      for (int i = 0; i < m; i++) {
+        int value = band_prefix[i];
+        ans += h.consume(value, value - k, value_hash[i], target_hash[i]);
+      }
+    }
+  return ans;
+}
+
+int main() {
+  int k, m, n;
+  cin >> k >> m >> n;
+  memset(A, 0, sizeof A);
+  memset(ps, 0, sizeof ps);
+
+  for (int i = 0; i < m; i++)
+    for (int j = 0; j < n; j++)
+      cin >> A[i][j];
+
+  cout << solve(m, n, k) << endl;
+  return 0;
+}

@@ -1,0 +1,46 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\n#define N_ITER 10 // number of simulation iterations\n#define DT 0.01f // time step\n#define SOFTENING 1e-9f // to avoid zero divisors\n\n/*\n * Each body holds coordinate positions (i.e., x, y, and z) and\n * velocities (i.e., vx, vy, and vz).\n */\ntypedef struct { float x, y, z, vx, vy, vz; } Body;\n\n/* Original arithmetic for residual targets and the reference path. */\nstatic void body_force_scalar_range(Body *p, float dt, int n,\n                                    int first, int last) {\n  for (int i = first; i < last; ++i) {\n    float fx = 0.0f;\n    float fy = 0.0f;\n    float fz = 0.0f;\n\n    for (int j = 0; j < n; j++) {\n      float dx = p[j].x - p[i].x;\n      float dy = p[j].y - p[i].y;\n      float dz = p[j].z - p[i].z;\n      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n      float inv_dist = 1 / sqrt(sqrd_dist);\n      float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n      fx += dx * inv_dist3;\n      fy += dy * inv_dist3;\n      fz += dz * inv_dist3;\n    }\n\n    p[i].vx += dt*fx;\n    p[i].vy += dt*fy;\n    p[i].vz += dt*fz;\n  }\n}\n\n/*\n * Compute forces for [first, last), with 0 <= first <= last <= n.\n * Positions remain unchanged throughout the force phase. Each SIMD lane\n * owns one target and visits every source in the original ascending order.\n * Only the small target tile uses structure-of-arrays working storage.\n *\n * The program does not inspect math errno. Disabling its bookkeeping lets\n * GCC vectorize double sqrt without changing precision or contraction flags.\n */\n#if defined(__GNUC__) && !defined(__clang__)\n__attribute__((optimize(\"no-math-errno\")))\n#endif\nvoid body_force_range(Body *p, float dt, int n, int first, int last) {\n#if defined(__FAST_MATH__)\n  /* Retain the original loop shape when reductions may be reassociated. */\n  body_force_scalar_range(p, dt, n, first, last);\n#else\n  enum { TARGET_LANES = 4 };\n  int i = first;\n\n  for (; last - i >= TARGET_LANES; i += TARGET_LANES) {\n    float x[TARGET_LANES];\n    float y[TARGET_LANES];\n    float z[TARGET_LANES];\n    float fx[TARGET_LANES] = {0.0f};\n    float fy[TARGET_LANES] = {0.0f};\n    float fz[TARGET_LANES] = {0.0f};\n\n    for (int k = 0; k < TARGET_LANES; ++k) {\n      x[k] = p[i + k].x;\n      y[k] = p[i + k].y;\n      z[k] = p[i + k].z;\n    }\n\n    for (int j = 0; j < n; ++j) {\n      const float sx = p[j].x;\n      const float sy = p[j].y;\n      const float sz = p[j].z;\n\n#if defined(_OPENMP) && _OPENMP >= 201307\n#pragma omp simd simdlen(4)\n#elif defined(__GNUC__) && !defined(__clang__)\n#pragma GCC ivdep\n#endif\n      for (int k = 0; k < TARGET_LANES; ++k) {\n        float dx = sx - x[k];\n        float dy = sy - y[k];\n        float dz = sz - z[k];\n        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;\n        float inv_dist = 1 / sqrt(sqrd_dist);\n        float inv_dist3 = inv_dist * inv_dist * inv_dist;\n\n        fx[k] += dx * inv_dist3;\n        fy[k] += dy * inv_dist3;\n        fz[k] += dz * inv_dist3;\n      }\n    }\n\n    for (int k = 0; k < TARGET_LANES; ++k) {\n      p[i + k].vx += dt*fx[k];\n      p[i + k].vy += dt*fy[k];\n      p[i + k].vz += dt*fz[k];\n    }\n  }\n\n  body_force_scalar_range(p, dt, n, i, last);\n#endif\n}\n\n/*\n * Compute the gravitational impact among all pairs of bodies in\n * the system.\n */\nvoid body_force(Body *p, float dt, int n) {\n  body_force_range(p, dt, n, 0, n);\n}\n\n/*\n * Read a binary dataset with initilized bodies.\n */\nBody* read_dataset(int *nbodies) {\n  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading nbodie value\\n\");\n    exit(EXIT_FAILURE);\n  }\n  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));\n  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError reading input values\\n\");\n    exit(EXIT_FAILURE);\n  }\n\n  return bodies;\n}\n\n/*\n * Write simulation results into a binary dataset.\n */\nvoid write_dataset(const int nbodies, Body *bodies) {\n  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);\n  if (b != 1) {\n    fprintf(stderr,\"\\nError writing to output\\n\");\n    exit(EXIT_FAILURE);\n  }\n}\n\nint main(int argc,char **argv) {\n  int nbodies;\n\n  Body *bodies = read_dataset(&nbodies);\n\n  /*\n   * At each simulation iteration, interbody forces are computed,\n   * and bodies' positions are integrated.\n   */\n  for (int iter = 0; iter < N_ITER; iter++) {\n    body_force(bodies, DT, nbodies);\n\n    for (int i = 0; i < nbodies; i++) {\n      bodies[i].x += bodies[i].vx * DT;\n      bodies[i].y += bodies[i].vy * DT;\n      bodies[i].z += bodies[i].vz * DT;\n    }\n  }\n\n  write_dataset(nbodies, bodies);\n\n  free(bodies);\n  \n  exit(EXIT_SUCCESS);\n}\n",
+        "path": "src/nbody.c"
+      }
+    ],
+    "hypothesis": "Four-target tiling should expose ARM64 SIMD across independent bodies while retaining each body's ascending-source accumulation order and original mixed float/double expressions.",
+    "notes": "Not executed. The controller must verify exact bytes, generated vectorization, and speed. No threading, persistent allocation, approximate arithmetic, or I/O changes.",
+    "sources_kept": [],
+    "transformations": [
+      "Strip-mine targets into four-lane local structure-of-arrays tiles, broadcasting each source to independent target lanes.",
+      "Apply SIMD hints only to the target-lane loop; preserve the sequential source loop and original arithmetic expressions.",
+      "Disable only unused math-errno bookkeeping in the GCC range kernel, retaining inherited floating-point contraction settings.",
+      "Expose an independent target-range kernel with scalar tails and an original-loop fallback for fast-math builds."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-astra",
+  "nonce": "0144ba72e0ec43f4b86f31ee2e4fa814",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "fd33edc8d6dd10caae3dbe3084852d7e281b6a3826cfa57f0158d1360b564905",
+  "session_id": "aa970cf8bf5d4c1aaa0fdabb21d73a72",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "b05b7c7030faab8b122e3925e1b09a35f2790afe7906ca35aaab3e64d0e3b97b",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 11240,
+        "output_tokens": 17799,
+        "reasoning_output_tokens": 15924
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-astra",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 29039,
+    "tool_events": []
+  }
+}

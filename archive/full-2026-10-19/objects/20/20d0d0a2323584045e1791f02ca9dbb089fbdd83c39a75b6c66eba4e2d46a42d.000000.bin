@@ -1,0 +1,141 @@
+#include "knn.h"
+#include <arm_neon.h>
+#include <string.h>
+
+// Insert a single (dist,label) into the sorted ascending array of size k.
+// Returns new size after insertion. The array always holds the smallest distances seen so far.
+static inline int insert_sorted_asc(float d, char label,
+                                    float *dists, char *labels,
+                                    int size, int k) {
+    if (size == 0) {
+        dists[0] = d;
+        labels[0] = label;
+        return 1;
+    }
+
+    // If full and new distance is not smaller than current max, skip.
+    if (size == k && d >= dists[k-1]) {
+        return size;
+    }
+
+    int low = 0, high = size - 1;
+    while (low <= high) {
+        int mid = (low + high) / 2;
+        if (dists[mid] <= d)
+            low = mid + 1;   // go right
+        else
+            high = mid - 1;  // go left
+    }
+    int pos = low; // insertion point: first element > d, or size if all <= d
+
+    if (size == k) {
+        // Full array: drop the largest (last element). Shift elements from pos to k-2 right.
+        memmove(&dists[pos+1], &dists[pos], (k - 1 - pos) * sizeof(float));
+        memmove(&labels[pos+1], &labels[pos], (k - 1 - pos) * sizeof(char));
+    } else {
+        // Not full: shift elements from pos to size-1 right.
+        memmove(&dists[pos+1], &dists[pos], (size - pos) * sizeof(float));
+        memmove(&labels[pos+1], &labels[pos], (size - pos) * sizeof(char));
+    }
+
+    dists[pos] = d;
+    labels[pos] = label;
+
+    return size == k ? k : size + 1;
+}
+
+char knn(int n_groups, Group * groups, int k, Point to_evaluate) {
+    // Allocate sorted arrays for distances and corresponding labels.
+    float *dists = (float *) malloc(sizeof(float) * k);
+    char *labels_arr = (char *) malloc(sizeof(char) * k);
+    for (int i = 0; i < k; i++) labels_arr[i] = -1;
+
+    int size = 0;
+
+    for (int i = 0; i < n_groups; i++) {
+        Group g = groups[i];
+        float *xs = g.xs;
+        float *ys = g.ys;
+        int len = g.length;
+        char label = g.label;
+
+        // Process points in batches of 4 using NEON SIMD
+        int j = 0;
+        for (; j + 3 < len; j += 4) {
+            float32x4_t x_vec = vld1q_f32(xs + j);
+            float32x4_t y_vec = vld1q_f32(ys + j);
+
+            float tx = to_evaluate.x;
+            float ty = to_evaluate.y;
+            float32x4_t dx = vsubq_f32(x_vec, vdupq_n_f32(tx));
+            float32x4_t dy = vsubq_f32(y_vec, vdupq_n_f32(ty));
+            // dist_sq = dx*dx + dy*dy
+            float32x4_t dist_sq = vmlaq_f32(vmulq_f32(dx, dx), dy, dy);
+
+            float d[4];
+            vst1q_f32(d, dist_sq);
+
+            for (int t = 0; t < 4; t++) {
+                size = insert_sorted_asc(d[t], label, dists, labels_arr, size, k);
+            }
+        }
+
+        // Remainder scalar loop
+        for (; j < len; j++) {
+            Point p;
+            p.x = xs[j];
+            p.y = ys[j];
+            float d = euclidean_distance_no_sqrt(to_evaluate, p);
+            size = insert_sorted_asc(d, label, dists, labels_arr, size, k);
+        }
+    }
+
+    // Copy labels from sorted array into a separate buffer for frequency counting.
+    char *labels_for_sort = (char *) malloc(sizeof(char) * k);
+    memcpy(labels_for_sort, labels_arr, sizeof(char) * k);
+
+    free(dists);
+    free(labels_arr);
+
+    qsort(labels_for_sort, k, sizeof(char), compare_for_sort);
+
+    char most_frequent = labels_for_sort[0];
+    int most_frequent_count = 1;
+    int current_frequency = 1;
+
+    for (int i = 1; i < k; i++) {
+        if (labels_for_sort[i] != labels_for_sort[i - 1]) {
+            if (current_frequency > most_frequent_count) {
+                most_frequent = labels_for_sort[i - 1];
+                most_frequent_count = current_frequency;
+            }
+            current_frequency = 1;
+        } else {
+            current_frequency++;
+        }
+
+        if (i == k - 1 && current_frequency > most_frequent_count) {
+            most_frequent = labels_for_sort[i - 1];
+            most_frequent_count = current_frequency;
+        }
+    }
+
+    free(labels_for_sort);
+    return most_frequent;
+}
+
+int main() {
+    int n_groups = parse_number_of_groups();
+    
+    Group * groups = (Group *) malloc(sizeof(Group) * n_groups);
+
+    for (int i = 0; i < n_groups; i++) {
+        groups[i] = parse_next_group();
+    }
+
+    int k = parse_k();
+
+    Point to_evaluate = parse_point();
+
+    printf("%c", knn(n_groups, groups, k, to_evaluate));
+}

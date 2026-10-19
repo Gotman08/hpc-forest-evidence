@@ -1,0 +1,38 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+spec = importlib.util.spec_from_file_location("overhead", Path(__file__).with_name("mesurer-controleur.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def test_measurements_keep_fixed_traces_and_exclude_warmups(tmp_path):
+    result = module.run(tmp_path / "measurement", trials=[3], seeds=[23], repetitions=2, warmups=1)
+    rows = [json.loads(line) for line in (tmp_path / "measurement/raw.jsonl").read_text().splitlines()]
+    assert len(rows) == 12
+    assert sum(row["phase"] == "measurement" for row in rows) == 8
+    assert len({row["trace_sha256"] for row in rows}) == 1
+    assert all(sum(row["cycles_wall_ns"]) == row["wall_ns"] and row["wall_ns"] > 0 for row in rows)
+    assert all(summary["series"] == 2 and summary["independent_model_searches"] == 0
+               for summary in result["summary"])
+    assert result["search_quality_gain_demonstrated"] is False
+    assert len(result["comparisons"]) == 2
+
+
+def test_cannot_overwrite_old_observations(tmp_path):
+    with pytest.raises(RuntimeError, match="fresh"):
+        module.run(tmp_path)
+
+
+@pytest.mark.parametrize("kwargs", [{"trials": [-1]}, {"seeds": [-1]}, {"repetitions": 0},
+                                    {"warmups": 3}, {"payload_bytes": 100000}])
+def test_bad_measurements_create_no_folder(tmp_path, kwargs):
+    root = tmp_path / "bad"
+    with pytest.raises(ValueError):
+        module.run(root, **kwargs)
+    assert not root.exists()

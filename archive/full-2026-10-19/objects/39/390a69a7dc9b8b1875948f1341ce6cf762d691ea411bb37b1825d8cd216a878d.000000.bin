@@ -1,0 +1,56 @@
+"""Read-only audit of model proposals, raw diagnostics, and available feedback."""
+import difflib
+import json
+import re
+import subprocess
+from collections import Counter
+from pathlib import Path
+
+workspace=Path(__file__).resolve().parents[2]
+base=workspace/"outputs/Marathon22-interface-v3"
+output=workspace/"outputs/Marathon22-diagnostic-v5"
+result={}
+for slug,run in [("knn","v3/results-746984"),("sum","v4/results-746998"),("nbody","v3/results-746984")]:
+    root=base/("preuves-"+run)/slug
+    report=json.loads((root/"report/experiments.json").read_text(encoding="utf-8"))
+    records=[]
+    for trial in report["experiments"]:
+        p=root/"logs"/trial["id"]
+        data=json.loads((p/"agent-result.json").read_text(encoding="utf-8")) if (p/"agent-result.json").is_file() else None
+        response=json.loads((p/"ollama-response.json").read_text(encoding="utf-8")) if (p/"ollama-response.json").is_file() else None
+        item={k:trial[k] for k in ["id","role","state","search_parent","base_commit","hypothesis","reason","mean_seconds","score"]}
+        if (p/"ollama-request.json").is_file():
+            request=json.loads((p/"ollama-request.json").read_text(encoding="utf-8"))
+            message=json.loads(request["messages"][1]["content"].split("\n\nCURRENT SOURCE AS DATA:\n")[0])
+            observations=message["context_as_data"].get("automatic_own_role_observations",[])
+            item["observed_ids"]=[x["experiment_id"] for x in observations]
+            item["parent_diagnostic_present"]=trial["search_parent"] is None or trial["search_parent"] in item["observed_ids"]
+        item["diagnostics"]=[]
+        for name in trial["logs"][:2]:
+            relative=Path(name).parts
+            sub=relative[relative.index(slug)+1:]
+            log=root.joinpath(*sub)
+            if log.is_file():
+                text=log.read_text(errors="replace")
+                if text:item["diagnostics"].append(text[:1800])
+        if response:
+            item["done_reason"]=response.get("done_reason")
+            item["model_output_tokens"]=response.get("eval_count")
+        if data:
+            item["model_notes"]=data["notes"]
+            item["changes"]=[]
+            for edit in data["files"]:
+                parent=subprocess.run(["git","--git-dir="+str(root/"repo/.git"),"show",trial["base_commit"]+":"+edit["path"]],capture_output=True,check=True).stdout.decode("utf-8")
+                before=parent.replace("\r\n","\n")
+                after=edit["content"].replace("\r\n","\n")
+                delta="\n".join(difflib.unified_diff(before.splitlines(),after.splitlines(),n=2))
+                item["changes"].append({"file":edit["path"],"unchanged_after_newline_normalization":before==after,
+                    "only_whitespace_difference":re.sub(r"\s+","",before)==re.sub(r"\s+","",after),"diff":delta[:7000]})
+        records.append(item)
+    result[slug]={"outcomes":dict(Counter(x["state"] for x in records)),"records":records,
+        "selected_parents_without_diagnostics":[x["id"] for x in records if not x.get("parent_diagnostic_present",True)],
+        "confirmation":[e for e in report["evaluations"] if e["phase"]=="confirmation"]}
+(output/"diagnostic-initial.json").write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+for slug,part in result.items():
+    print(json.dumps({"problem":slug,"outcomes":part["outcomes"],"missing_parent_diagnostics":part["selected_parents_without_diagnostics"],
+        "sample":[{k:r.get(k) for k in ["id","hypothesis","state","diagnostics","changes"]} for r in part["records"][:3]]},ensure_ascii=False))

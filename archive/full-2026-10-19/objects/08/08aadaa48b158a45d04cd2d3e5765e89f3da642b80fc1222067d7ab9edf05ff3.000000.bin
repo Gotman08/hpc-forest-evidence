@@ -1,0 +1,115 @@
+"""Frozen data only; no source imports, test/Q/main execution, live cache or process API."""
+import hashlib
+import io
+import json
+from pathlib import Path, PurePosixPath
+import tarfile
+import xml.etree.ElementTree as ET
+
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parent
+BASE=ROOT.parents[2]
+OLD=ROOT/'revision-r4-facades-cloture-observer'
+NEW=ROOT/'revision-r5-G-recu-avant-Q'
+OLDQ=ROOT/'qualification-complete110-r3-facades'
+Q=ROOT/'qualification-complete110-r4-G-bound'
+def need(ok,why):
+    if not ok:raise ValueError(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def read(path):return json.loads(path.read_text(encoding='utf8'))
+def reference(path):
+    need(path.name.casefold()!='worker.lock','No lock bytes read')
+    return {'path':str(path),'sha256':sha(path.read_bytes())}
+def tar_data(raw):
+    output={}
+    with tarfile.open(fileobj=io.BytesIO(raw),mode='r:gz') as archive:
+        for member in archive:
+            path=PurePosixPath(member.name)
+            need(member.isfile() and str(path)==member.name and not path.is_absolute() and '..' not in path.parts
+                 and '\\' not in member.name and member.name not in output and 0<=member.size<=64*1024*1024,'Unsafe frozen archive member')
+            data=archive.extractfile(member).read(64*1024*1024+1)
+            need(len(data)==member.size,'Short frozen archive member')
+            output[member.name]=data
+    return output
+
+delivery_path=ROOT/'LIVRAISON-FINALE-G-LIE-AVANT-Q-R5.json'
+need(reference(delivery_path)['sha256']=='d1661eacc963867059442489dc159bd34d5575c7d7de4604f8f7d0a8dcf2ba6f','Delivery pin changed')
+delivery=read(delivery_path);manifest_path=Path(delivery['manifest']['path'])
+need(reference(manifest_path)['sha256']=='45cb429362e4a3b43e18046e343ee4eeffb5b6e175a0f8941ed781a9cc380404','Manifest changed')
+for name,checksum in read(manifest_path)['files'].items():need(reference(ROOT/name)['sha256']==checksum,'Manifest member changed')
+old_components=read(OLD/'COMPONENTS.json');raw_components=(NEW/'COMPONENTS.json').read_bytes();new_components=json.loads(raw_components)
+need(sha(raw_components)=='1e60da6d5b51afaf3c857b1ba215927e7e1201c297241afd6390212a89d5e449','Components changed')
+old_pins=old_components['code_pins'];pins=new_components['code_pins']
+need(set(pins)==set(old_pins) and len(pins)==62,'Exact62registry names required')
+paths=list(NEW.rglob('*'))
+need(all(not p.is_symlink() and not getattr(p,'is_junction',lambda:False)() for p in paths),'Candidate filesystem alias')
+need({p.relative_to(NEW).as_posix() for p in paths if p.is_file()}==set(pins)|{'COMPONENTS.json'},'Exact63candidate files required')
+for name,checksum in pins.items():need(reference(NEW/name)['sha256']==checksum,'New component changed')
+for name,checksum in old_pins.items():need(reference(OLD/name)['sha256']==checksum,'Prior R4 component changed')
+changed={name for name in pins if pins[name]!=old_pins[name]}
+need(changed=={'launcher/pins-source-plan.json','reader/pins-source-plan.json'},'Only two data components may differ')
+canonical_path=BASE/'outputs/HPC-Forest-Primes-Natif-Relance-r2g/RECEPTION-FINALE-ET-CLOTURE-VERIFIEE.json'
+gref=reference(canonical_path)
+need(gref['sha256']=='d4c74352d28555ba3a476273af51b1d7791c328fa37addcee580318aedbc6df4','Actual G canonical changed')
+for name in changed:
+    prior=read(OLD/name);current=read(NEW/name)
+    need(prior['latest_native_generation_closure'] is None and current['latest_native_generation_closure']==gref,'Exact real G binding required')
+    current['latest_native_generation_closure']=None
+    need(current==prior,'Other semantic data changed in the two bindings')
+for flag in ('verified','native_generation_admitted','allocated_qualification_received','independent_integration_review_received','negative_source110_terminal_admitted'):
+    need(new_components[flag] is False,'Future native/qualification/admission flag opened')
+local=read(ROOT/'ADMISSION-LOCALE-G-POST-CLOTURE-R5.json')
+post_ref=local['independent_post_closure_review'];post_path=Path(post_ref['path'])
+need(local['canonical_receipt']==gref and reference(post_path)==post_ref
+    and post_ref['sha256']=='12d72682ca473cae60ec8133185c634420d2ea01c8ed6e13f35d4578be488ccb','External real independent post review changed')
+post=read(post_path)
+need(post['verified'] is True and post['blocking_findings']==[] and post['canonical_receipt']==gref
+    and local['new_fresh_current_CIM_still_required'] is True and local['R3_native_generation_or_scientific_admission'] is False,'Local historical binding not native permission')
+packet_raw=(Q/'complete-source110-neutral-packet.tar.gz').read_bytes()
+need(sha(packet_raw)=='0aa02f8fb0661e1689df51563ebfa1faa5c7b3f1b5b31af6794089080f2290b1','New Q packet changed')
+packet=tar_data(packet_raw)
+need(set(packet)=={'qualification-wrapper.py','bindings.json','source-bundle.tar.gz','adapter-bundle.tar.gz','packet-manifest.json'},'Exact5packet members')
+need(json.loads(packet['packet-manifest.json'])=={n:sha(v) for n,v in packet.items() if n!='packet-manifest.json'},'Packet manifest differs')
+need(all((Q/n).read_bytes()==v for n,v in packet.items()),'Qdisk/packet differs')
+for name in ('qualification-wrapper.py','source-bundle.tar.gz'):
+    need(packet[name]==(OLDQ/name).read_bytes(),'Source or Qwrapper code changed')
+need((Q/'bootstrap-alloue.py').read_bytes()==(OLDQ/'bootstrap-alloue.py').read_bytes(),'Allocated bootstrap code changed')
+adapters=tar_data(packet['adapter-bundle.tar.gz']);source=tar_data(packet['source-bundle.tar.gz'])
+need(len(adapters)==63 and set(adapters)==set(pins)|{'COMPONENTS.json'} and adapters['COMPONENTS.json']==raw_components,'Exact63adapter members')
+need(all(sha(adapters[n])==h for n,h in pins.items()),'Adapter packet pins changed')
+need(len(source)==116 and len(json.loads(source['runtime-manifest.json']))==110,'Source110/116member graph changed')
+bindings=json.loads(packet['bindings.json']);old_bindings=read(OLDQ/'bindings.json')
+need(bindings['adapter_components_manifest_sha256']==sha(raw_components)
+    and bindings['adapter_bundle_sha256']==sha(packet['adapter-bundle.tar.gz'])
+    and bindings['remote_root']=='/scratch_p/nimarano/hpc-forest-r4b-source110-completeQ-20261018-1e60da6d5b51','New Qdata bindings differ')
+for name in ('adapter_components_manifest_sha256','adapter_bundle_sha256','remote_root'):old_bindings[name]=bindings[name]
+need(old_bindings==bindings,'Unrelated Qbindings changed')
+old_command=(OLDQ/'commande-allouee-zero-modele.sh').read_text()
+new_command=(Q/'commande-allouee-zero-modele.sh').read_text()
+need(new_command==old_command.replace('03251fe482275b7ac4179be5a826ae6c556015574724780c269b64d15a94d075',sha(packet_raw)).replace('17fa505a5f8b','1e60da6d5b51'),'Only packet hash/root argument substitutions permitted')
+proposal=read(Q/'PROPOSITION-Q-COMPLETE-NON-ADMISE.json')
+need(proposal['packet_sha256']==sha(packet_raw) and proposal['adapter_components_manifest_sha256']==sha(raw_components)
+    and proposal['allocation']=={'nodes':1,'tasks':1,'cpu_cores':4,'memory_mib':16384,'gpus':0,'architecture':'ARM64','max_seconds':600}
+    and proposal['audit_reserve_seconds']==10800 and proposal['native_generation_admitted'] is False,'Exact mechanical Qscope/resources required')
+for names in (packet,source,adapters,tar_data(adapters['launcher/native-interface-models-max-r3.tar.gz'])):
+    need(not any(PurePosixPath(n).name.startswith('cli-policy-') or PurePosixPath(n).name in {'auth.json','config.toml','invocation.json','codex.jsonl.json','RECEPTION-FINALE-ET-CLOTURE-VERIFIEE.json','REVUE-POST-CLOTURE-REELLE-G.json','ADMISSION-LOCALE-G-POST-CLOTURE-R5.json'} for n in names),'Private/raw/local receipt exported to ARM')
+need(all(canonical_path.read_bytes()!=raw for raw in adapters.values()),'Raw Gcanonical included in adapter packet')
+derivation=read(ROOT/'DERIVATION-LIAISON-G-R5.json');test_ref=derivation['seven_new_binding_cases_received']
+need(reference(Path(test_ref['path']))==test_ref,'Delta JUnit changed')
+cases=list(ET.parse(test_ref['path']).iter('testcase'))
+need(len(cases)==7 and len({(c.get('classname'),c.get('name')) for c in cases})==7
+    and all(all(c.find(k) is None for k in ('failure','error','skipped')) for c in cases),'Exact7new received cases without failure/skip required')
+ruff=derivation['new_binding_scripts_Ruff_actual_file'];need(reference(Path(ruff['path']))==ruff and read(Path(ruff['path']))==[],'Actual final Ruff report differs')
+value={'schema':'hpc-forest-r3-final-historical-G-binding-frozen-delta-inspection-v1','delivery':reference(delivery_path),
+    'manifest':reference(manifest_path),'component_sha256':sha(raw_components),'component_pins':62,'candidate_and_adapter_members':63,
+    'exact_changed_components':sorted(changed),'other60_components_byte_identical':True,'two_only_semantic_changes_null_to_actual_G_ref':True,
+    'actual_G_canonical':gref,'actual_external_independent_post_review':post_ref,'local_admission_not_ARM':True,
+    'Q_packet_sha256':sha(packet_raw),'Q_wrapper_sha256':sha(packet['qualification-wrapper.py']),
+    'source_bundle_byte_identical_R4':True,'bootstrap_wrapper_source_code_unchanged':True,'source_files':110,'source_bundle_members':116,
+    'Q_args_only_hash_and_dedicated_root_changed':True,'Q_allocation':proposal['allocation'],'new_delta_received_cases':7,
+    'delta_junit':test_ref,'new_scripts_Ruff_actual_empty_report':ruff,
+    'prior73_5_10_187_not_reexecuted':True,'any_tests_or_Q_or_operational_mains_executed_by_reviewer':False,
+    'source_modules_or_live_CIM_cache_locks_auth_models_or_network_accessed':False,
+    'R3_native_or_method_R5_or_scientific_admission':False}
+with (HERE/'INTEGRITE-DELTA-G-LIE-AVANT-Q.json').open('x',encoding='utf8') as stream:stream.write(json.dumps(value,indent=2)+'\n')
+print(json.dumps({'frozen_delta_only':True,'changed_components':sorted(changed),'other_identical':60,'Q_adapter_members':63,'new_received_cases':7,'no_execution':True}))

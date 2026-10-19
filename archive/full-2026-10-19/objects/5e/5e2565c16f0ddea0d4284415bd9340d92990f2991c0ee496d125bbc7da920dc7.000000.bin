@@ -1,0 +1,101 @@
+"""Copy only the exact external factory modules; bind actual local source review, never Q or jobs."""
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parents[1]
+OLD = BASE / 'outputs/HPC-Forest-Primes-Natif-Lancement-r2f/revision-r1'
+OUT = HERE / 'revision-r1'
+REL = BASE / 'outputs/HPC-Forest-Primes-Natif-Relance-r2g'
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def checked(path, checksum):
+    raw = path.read_bytes()
+    if sha(raw) != checksum:
+        raise ValueError('Changed exact local reviewed data')
+    return json.loads(raw)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ('delivery', 'source-review'):
+        parser.add_argument('--' + name, type=Path, required=True)
+        parser.add_argument('--' + name + '-sha256', required=True)
+    args = parser.parse_args()
+    delivery = checked(args.delivery, args.delivery_sha256)
+    review = checked(args.source_review, args.source_review_sha256)
+    assert not OUT.exists() and delivery['native_research_admitted'] is False and delivery['source_files'] == 110
+    assert review['verified'] is True and review['blocking_findings'] == [] and review['native_research_admitted'] is False
+    assert review['source_zip_sha256'] == delivery['source_zip']['sha256'] and review['plan_sha256'] == delivery['plan']['sha256']
+    manifest = checked(OLD / 'MANIFESTE-FACTORY-LOCALE.json', '19231396cc470934ec8385c37f7975aa6865c9bbd3222583b65a62b39e76375c')
+    mapping = {
+        'hpc-forest-primes-native-max-r2f': 'hpc-forest-primes-native-max-r2g',
+        'HPC-Forest-Primes-Natif-Relance-r2f': 'HPC-Forest-Primes-Natif-Relance-r2g',
+        'HPC-Forest-Primes-Natif-Lancement-r2f': 'HPC-Forest-Primes-Natif-Lancement-r2g',
+        'hpc-forest-primes-natif-relance-r2f': 'hpc-forest-primes-natif-relance-r2g',
+        'HPC-Forest-Primes-Natif-MAX-r2f.zip': 'HPC-Forest-Primes-Natif-MAX-r2g.zip',
+        '5aeceff56b26452290325ed4274d71bd': '110cefccf16b439eb226e475c875c8df',
+        'e7c86715f4d34e9f9efcdcc4ce2a81c8': '5d8811082a1842f5836a2bdda982500f',
+        '1294453607b34c68ba05872072640120': '13eaca4e39cf4147a3f677a32fb5a52d',
+        '47f97afabcd6d10c5e95a1dc3aae0a34b0841183919785a6bd62d58aa1e90d75': delivery['source_zip']['sha256'],
+        '8d91ebe83ab550ad50acc330f830e1bc86bcc67f66b88054538df6b394558450': delivery['plan']['sha256'],
+        'e515b741bb27911b5270a8379b75b533ab3391aca6db2ec4c70cd470f98f29ef': delivery['runtime_manifest']['sha256'],
+        'd0735f9903a185f3678e6584146497a456e3b6f130a629015f0e1dbd4d8a797b': args.source_review_sha256,
+        '20261018-r2f-232c714734ae': '20261018-r2g-' + delivery['bundle']['sha256'][:12],
+    }
+    names = {**manifest['components'], **manifest['owned_launch_helpers'], **manifest['neutral_tests']}
+    originals, texts = {}, {}
+    for name, checksum in names.items():
+        raw = (OLD / name).read_bytes()
+        assert sha(raw) == checksum
+        originals[name] = checksum
+        text = raw.decode('utf8')
+        for before, after in mapping.items():
+            text = text.replace(before, after)
+        text = re.sub(r'\b109\b', '110', text).replace('source109', 'source110').replace('Actual109', 'Actual110')
+        texts[name] = text
+    policy_test = texts['test_policy_launch_r2e.py']
+    policy_test = policy_test.replace("    payload = {'schema': 'hpc-forest-r2e-local-cli-policy-v1', **binding,",
+        "    from hpc_forest import codex_process as client\n"
+        "    payload = {'schema': 'hpc-forest-r2g-local-cli-policy-v1', **binding,\n"
+        "        'cli_feature_overrides': dict(client.TASK_CLI_FEATURES),\n"
+        "        'code_mode_host_executable_sha256': client.CODE_MODE_HOST_SHA256,")
+    assert "'cli_feature_overrides': dict(client.TASK_CLI_FEATURES)" in policy_test
+    texts['test_policy_launch_r2e.py'] = policy_test
+    old_review_path = 'outputs/HPC-Forest-Primes-Natif-Relance-r2g/revue-independante-source-parser/REVUE-SOURCE-PLAN-PAQUET-R2F-COMPAT-SCELLEE.json'
+    review_relative = args.source_review.resolve().relative_to(BASE).as_posix()
+    assert old_review_path in texts['rendre-trois-dossiers.py']
+    texts['rendre-trois-dossiers.py'] = texts['rendre-trois-dossiers.py'].replace(old_review_path, review_relative)
+    # Keep the established import graph but re-pin every modified component before use.
+    for name in ('preparer-cellule-max.py', 'publication-locale.py', 'assembler-admissions-cellule.py', 'lane_support.py',
+                 'helper-lancement-possedes/valider-lancement.py', 'helper-lancement-possedes/preparer-entree.py'):
+        new_pin = sha(texts[name].encode())
+        old_pin = names[name]
+        for target, content in texts.items():
+            texts[target] = content.replace(old_pin, new_pin)
+    OUT.mkdir(parents=True)
+    for name, text in texts.items():
+        path = OUT / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('x', encoding='utf8', newline='\n') as stream:
+            stream.write(text)
+    delta = {'schema': 'hpc-forest-r2g-closed-external-factory-derivative-v1',
+        'source_ancestor_files': originals, 'replacements': mapping, 'review_path_actual': review_relative,
+        'components': {name: sha((OUT / name).read_bytes()) for name in names},
+        'native_research_admitted': False, 'Q_received_or_bound_by_this_derivation': False,
+        'jobs_CLI_models_processes_auth_or_network_executed': False,
+        'mechanical_r2e_worker_projection_first_batch_schemas_preserved': True}
+    with (OUT / 'DIFF-FERME-FACTORY.json').open('x', encoding='utf8', newline='\n') as stream:
+        stream.write(json.dumps(delta, ensure_ascii=False, indent=2) + '\n')
+    print(json.dumps({'output': str(OUT.resolve()), 'components': len(names)}))
+
+
+if __name__ == '__main__':
+    main()

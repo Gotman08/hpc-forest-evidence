@@ -1,0 +1,284 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+#define FORCE_TILE 32
+#define PARALLEL_MIN 256
+#define WORKSPACE_LIMIT ((size_t)64 * 1024 * 1024)
+
+/* Each body holds positions and velocities. */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+typedef struct { int first, second; } ForceTile;
+
+typedef struct {
+  float *coeff;
+  float *x, *y, *z;
+  ForceTile *pairs;
+  int blocks, pair_count;
+} ForceWorkspace;
+
+static ForceWorkspace make_workspace(int n) {
+  ForceWorkspace w = {0};
+  if (n < PARALLEL_MIN) return w;
+
+  const size_t area = (size_t)FORCE_TILE * FORCE_TILE;
+  const size_t max_pairs = WORKSPACE_LIMIT /
+      (area * sizeof(float) + sizeof(ForceTile));
+  const size_t blocks = ((size_t)n + FORCE_TILE - 1) / FORCE_TILE;
+  if (blocks > max_pairs) return w;
+  const size_t pairs = blocks * (blocks + 1) / 2;
+  if (pairs > max_pairs) return w;
+
+  const size_t coefficients = pairs * area;
+  const size_t storage_bytes =
+      (coefficients + (size_t)3 * n) * sizeof(float);
+  const size_t pair_bytes = pairs * sizeof(ForceTile);
+  if (storage_bytes > WORKSPACE_LIMIT - pair_bytes) return w;
+
+  float *storage = (float *)malloc(storage_bytes);
+  ForceTile *list = (ForceTile *)malloc(pair_bytes);
+  if (!storage || !list) {
+    free(storage);
+    free(list);
+    return w;
+  }
+
+  w.coeff = storage;
+  w.x = storage + coefficients;
+  w.y = w.x + n;
+  w.z = w.y + n;
+  w.pairs = list;
+  w.blocks = (int)blocks;
+  w.pair_count = (int)pairs;
+  int t = 0;
+  for (int a = 0; a < w.blocks; ++a) {
+    for (int b = a; b < w.blocks; ++b) {
+      list[t].first = a;
+      list[t].second = b;
+      ++t;
+    }
+  }
+  return w;
+}
+
+static size_t tile_index(int a, int b, int blocks) {
+  return (size_t)a * (2 * (size_t)blocks - (size_t)a + 1) / 2
+      + (size_t)(b - a);
+}
+
+/* All team members encounter these worksharing helpers together. */
+static void force_rows_team(Body *p, float dt, int n) {
+  #pragma omp for schedule(static)
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+    for (int j = 0; j < n; ++j) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+/* Only errno handling is relaxed; sqrt and division remain double precision. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-math-errno")))
+#endif
+static void build_coefficients_team(const ForceWorkspace *w, int n) {
+  const float *restrict x = w->x;
+  const float *restrict y = w->y;
+  const float *restrict z = w->z;
+
+  #pragma omp for schedule(static)
+  for (int t = 0; t < w->pair_count; ++t) {
+    int low = w->pairs[t].first * FORCE_TILE;
+    int high = w->pairs[t].second * FORCE_TILE;
+    int nl = n - low;
+    int nh = n - high;
+    if (nl > FORCE_TILE) nl = FORCE_TILE;
+    if (nh > FORCE_TILE) nh = FORCE_TILE;
+    float *restrict tile = w->coeff
+        + (size_t)t * FORCE_TILE * FORCE_TILE;
+
+    for (int j = 0; j < nh; ++j) {
+      float sx = x[high + j];
+      float sy = y[high + j];
+      float sz = z[high + j];
+      #pragma omp simd
+      for (int i = 0; i < nl; ++i) {
+        float dx = sx - x[low + i];
+        float dy = sy - y[low + i];
+        float dz = sz - z[low + i];
+        float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist = 1 / sqrt(sqrd_dist);
+        float inv_dist3 = inv_dist * inv_dist * inv_dist;
+        tile[j * FORCE_TILE + i] = inv_dist3;
+      }
+    }
+  }
+}
+
+static void apply_coefficients_team(Body *restrict p, float dt, int n,
+                                    const ForceWorkspace *w) {
+  const float *restrict x = w->x;
+  const float *restrict y = w->y;
+  const float *restrict z = w->z;
+
+  #pragma omp for schedule(static)
+  for (int a = 0; a < w->blocks; ++a) {
+    int base = a * FORCE_TILE;
+    int ni = n - base;
+    if (ni > FORCE_TILE) ni = FORCE_TILE;
+    float fx[FORCE_TILE] = {0.0f};
+    float fy[FORCE_TILE] = {0.0f};
+    float fz[FORCE_TILE] = {0.0f};
+    float transposed[FORCE_TILE * FORCE_TILE];
+
+    /* Source blocks and source bodies remain in reference order. */
+    for (int b = 0; b < w->blocks; ++b) {
+      int source = b * FORCE_TILE;
+      int nj = n - source;
+      if (nj > FORCE_TILE) nj = FORCE_TILE;
+      int low = a < b ? a : b;
+      int high = a < b ? b : a;
+      const float *tile = w->coeff
+          + tile_index(low, high, w->blocks) * FORCE_TILE * FORCE_TILE;
+
+      if (b < a) {
+        for (int j = 0; j < nj; ++j) {
+          #pragma omp simd
+          for (int i = 0; i < ni; ++i) {
+            transposed[j * FORCE_TILE + i] = tile[i * FORCE_TILE + j];
+          }
+        }
+        tile = transposed;
+      }
+
+      for (int j = 0; j < nj; ++j) {
+        float sx = x[source + j];
+        float sy = y[source + j];
+        float sz = z[source + j];
+        #pragma omp simd
+        for (int i = 0; i < ni; ++i) {
+          float dx = sx - x[base + i];
+          float dy = sy - y[base + i];
+          float dz = sz - z[base + i];
+          float inv_dist3 = tile[j * FORCE_TILE + i];
+          fx[i] += dx * inv_dist3;
+          fy[i] += dy * inv_dist3;
+          fz[i] += dz * inv_dist3;
+        }
+      }
+    }
+
+    #pragma omp simd
+    for (int i = 0; i < ni; ++i) {
+      p[base + i].vx += dt*fx[i];
+      p[base + i].vy += dt*fy[i];
+      p[base + i].vz += dt*fz[i];
+    }
+  }
+}
+
+static void advance_bodies(Body *p, float dt, int n, int steps, int move) {
+  if (n <= 0 || steps <= 0) return;
+  ForceWorkspace workspace = make_workspace(n);
+  int nonfinite = 0;
+
+  #pragma omp parallel if(n >= PARALLEL_MIN) shared(workspace, nonfinite)
+  {
+    for (int iter = 0; iter < steps; ++iter) {
+      if (workspace.coeff) {
+        #pragma omp single
+        {
+          nonfinite = 0;
+        }
+        #pragma omp for schedule(static) reduction(|:nonfinite)
+        for (int i = 0; i < n; ++i) {
+          workspace.x[i] = p[i].x;
+          workspace.y[i] = p[i].y;
+          workspace.z[i] = p[i].z;
+          nonfinite |= !isfinite(p[i].x) || !isfinite(p[i].y)
+              || !isfinite(p[i].z);
+        }
+        if (!nonfinite) {
+          build_coefficients_team(&workspace, n);
+          apply_coefficients_team(p, dt, n, &workspace);
+        } else {
+          force_rows_team(p, dt, n);
+        }
+      } else {
+        force_rows_team(p, dt, n);
+      }
+
+      if (move) {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+          p[i].x += p[i].vx * dt;
+          p[i].y += p[i].vy * dt;
+          p[i].z += p[i].vz * dt;
+        }
+      }
+    }
+  }
+
+  free(workspace.pairs);
+  free(workspace.coeff);
+}
+
+/* Compute gravitational impact without integrating positions. */
+void body_force(Body *p, float dt, int n) {
+  advance_bodies(p, dt, n, 1, 0);
+}
+
+/* Read a binary dataset with initialized bodies. */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+  return bodies;
+}
+
+/* Write simulation results into a binary dataset. */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+  Body *bodies = read_dataset(&nbodies);
+
+  /* Compute forces, then integrate positions, at every iteration. */
+  advance_bodies(bodies, DT, nbodies, N_ITER, 1);
+
+  write_dataset(nbodies, bodies);
+  free(bodies);
+  exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,52 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <algorithm>\n#include <cstdint>\n#include <iostream>\n#include <omp.h>\n#include <vector>\n\n#if defined(__aarch64__) || defined(__ARM_NEON)\n#include <arm_neon.h>\n#endif\n\nusing namespace std;\n\nconstexpr uint32_t MOD = 1000000007U;\n\nstatic inline uint32_t add_mod(uint32_t a, uint32_t b) {\n    const uint32_t sum = a + b;\n    return sum >= MOD ? sum - MOD : sum;\n}\n\n#if defined(__aarch64__) || defined(__ARM_NEON)\nstatic inline uint32x4_t add_mod(uint32x4_t a, uint32x4_t b) {\n    const uint32x4_t sum = vaddq_u32(a, b);\n    const uint32x4_t ge = vcgeq_u32(sum, vdupq_n_u32(MOD));\n    return vsubq_u32(sum, vandq_u32(ge, vdupq_n_u32(MOD)));\n}\n#endif\n\nstatic int solve_sparse(int n, vector<uint64_t>& blocked) {\n    sort(blocked.begin(), blocked.end());\n    blocked.erase(unique(blocked.begin(), blocked.end()), blocked.end());\n\n    vector<uint32_t> dp(n, 0);\n    dp[0] = 1;\n    size_t blocked_index = 0;\n\n    for (int y = 0; y < n; ++y) {\n        const uint64_t row_begin = static_cast<uint64_t>(y) * static_cast<uint64_t>(n);\n        const uint64_t row_end = row_begin + static_cast<uint64_t>(n);\n        int segment_begin = 0;\n\n        while (blocked_index < blocked.size() && blocked[blocked_index] < row_end) {\n            const int blocked_x = static_cast<int>(blocked[blocked_index] - row_begin);\n            uint32_t carry = segment_begin == 0 ? 0 : dp[segment_begin - 1];\n            int x = segment_begin;\n#if defined(__aarch64__) || defined(__ARM_NEON)\n            const uint32x4_t zero = vdupq_n_u32(0);\n            for (; x + 4 <= blocked_x; x += 4) {\n                uint32x4_t values = vld1q_u32(dp.data() + x);\n                values = add_mod(values, vextq_u32(zero, values, 3));\n                values = add_mod(values, vextq_u32(zero, values, 2));\n                values = add_mod(values, vdupq_n_u32(carry));\n                vst1q_u32(dp.data() + x, values);\n                carry = vgetq_lane_u32(values, 3);\n            }\n#endif\n            for (; x < blocked_x; ++x) {\n                dp[x] = add_mod(dp[x], carry);\n                carry = dp[x];\n            }\n            dp[blocked_x] = 0;\n            segment_begin = blocked_x + 1;\n            ++blocked_index;\n        }\n\n        uint32_t carry = segment_begin == 0 ? 0 : dp[segment_begin - 1];\n        int x = segment_begin;\n#if defined(__aarch64__) || defined(__ARM_NEON)\n        const uint32x4_t zero = vdupq_n_u32(0);\n        for (; x + 4 <= n; x += 4) {\n            uint32x4_t values = vld1q_u32(dp.data() + x);\n            values = add_mod(values, vextq_u32(zero, values, 3));\n            values = add_mod(values, vextq_u32(zero, values, 2));\n            values = add_mod(values, vdupq_n_u32(carry));\n            vst1q_u32(dp.data() + x, values);\n            carry = vgetq_lane_u32(values, 3);\n        }\n#endif\n        for (; x < n; ++x) {\n            dp[x] = add_mod(dp[x], carry);\n            carry = dp[x];\n        }\n    }\n    return static_cast<int>(dp[n - 1]);\n}\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n\n    int n;\n    size_t m;\n    if (!(cin >> n >> m)) return 0;\n\n    vector<uint64_t> coordinates;\n    coordinates.reserve(m);\n    for (size_t i = 0; i < m; ++i) {\n        int y, x;\n        cin >> y >> x;\n        coordinates.push_back(static_cast<uint64_t>(static_cast<uint32_t>(y)) *\n                              static_cast<uint64_t>(n) + static_cast<uint32_t>(x));\n    }\n\n    const uint64_t cells = static_cast<uint64_t>(n) * static_cast<uint64_t>(n);\n    if (cells > (uint64_t{1} << 30)) {\n        cout << solve_sparse(n, coordinates) << '\\n';\n        return 0;\n    }\n\n    vector<vector<bool>> blocked(n, vector<bool>(n, false));\n    for (uint64_t p : coordinates) {\n        blocked[static_cast<size_t>(p / static_cast<uint64_t>(n))]\n               [static_cast<size_t>(p % static_cast<uint64_t>(n))] = true;\n    }\n\n    vector<int> dp(n, 0);\n    if (!blocked[0][0]) dp[0] = 1;\n    for (int x = 1; x < n; ++x)\n        dp[x] = blocked[0][x] ? 0 : dp[x - 1];\n\n    if (n > 1) {\n        vector<int> tails;\n        vector<int> first_blocked;\n        vector<int> offsets;\n#pragma omp parallel\n        {\n            const int threads = omp_get_num_threads();\n            const int tid = omp_get_thread_num();\n            const int begin = static_cast<int>(static_cast<long long>(n) * tid / threads);\n            const int end = static_cast<int>(static_cast<long long>(n) * (tid + 1) / threads);\n#pragma omp single\n            {\n                tails.resize(threads);\n                first_blocked.resize(threads);\n                offsets.resize(threads);\n            }\n            for (int y = 1; y < n; ++y) {\n                int value = 0;\n                int first = end;\n                for (int x = begin; x < end; ++x) {\n                    if (blocked[y][x]) {\n                        value = 0;\n                        if (first == end) first = x;\n                    } else {\n                        value += dp[x];\n                        if (value >= static_cast<int>(MOD)) value -= MOD;\n                    }\n                    dp[x] = value;\n                }\n                tails[tid] = value;\n                first_blocked[tid] = first;\n#pragma omp barrier\n#pragma omp single\n                {\n                    int carry = 0;\n                    for (int t = 0; t < threads; ++t) {\n                        offsets[t] = carry;\n                        const int segment_end = static_cast<int>(static_cast<long long>(n) * (t + 1) / threads);\n                        if (first_blocked[t] == segment_end) {\n                            carry += tails[t];\n                            if (carry >= static_cast<int>(MOD)) carry -= MOD;\n                        } else {\n                            carry = tails[t];\n                        }\n                    }\n                }\n                const int offset = offsets[tid];\n                if (offset != 0) {\n                    for (int x = begin; x < first_blocked[tid]; ++x) {\n                        const int with_offset = dp[x] + offset;\n                        dp[x] = with_offset >= static_cast<int>(MOD) ? with_offset - MOD : with_offset;\n                    }\n                }\n#pragma omp barrier\n            }\n        }\n    }\n\n    cout << dp[n - 1] << '\\n';\n    return 0;\n}\n",
+        "path": "src/solution.cpp"
+      }
+    ],
+    "hypothesis": "A bounded hybrid retains the fastest measured dense persistent OpenMP segmented scan where its bit matrix is safely bounded, while using the measured sparse segmented/NEON row formulation for large valid grids where dense storage is infeasible.",
+    "notes": "Dense mode caps its bit matrix at 128 MiB; sparse mode preserves correctness for all larger valid dimensions and deduplicates repeated blockers.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [
+      "8e05a4e147e34181",
+      "857a562080f74491"
+    ],
+    "transformations": [
+      "Integrate the persistent OpenMP segmented in-place DP from the fastest dense candidate for bounded dense grids.",
+      "Integrate sorted deduplicated packed sparse blockers and ARM NEON segment prefix scans as the large-grid fallback.",
+      "Use a representation-selection bound so valid large dimensions do not require quadratic blocked-cell storage."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-5.6-terra",
+  "nonce": "7669be669c784ddf88563246e51afc84",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "medium",
+  "request_sha256": "a16e2d1afef3ce9c950070e5ed7941c4e0d7f1959daf899763956d3e712374cd",
+  "session_id": "6c21751f3d074f408f5a1ddbc2a924a7",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "c5e9b5ed8e44c2cdd29fb68c1038f47dc2a0224b65198b3eb82f10fffd18ebae",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 20993,
+        "output_tokens": 3162,
+        "reasoning_output_tokens": 1101
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-5.6-terra",
+    "reasoning_effort_requested": "medium",
+    "token_accounting": "exact",
+    "tokens": 24155,
+    "tool_events": []
+  }
+}

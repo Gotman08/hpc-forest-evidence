@@ -1,0 +1,192 @@
+"""Project reviewed native first-batch numbers; never execute received bytes."""
+import hashlib
+import json
+import statistics
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "outputs/HPC-Forest-Matrice15-Execution-root-01"
+
+
+def read(path):
+    raw = path.read_bytes()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+
+
+def main():
+    first, first_sha = read(BASE / "first-batch-received-wave1/first.json")
+    evaluation, evaluation_sha = read(BASE / "first-batch-received-wave1/evaluation.json")
+    origin, origin_sha = read(BASE / "first-batch-received-wave1/origin.json")
+    paused, paused_sha = read(BASE / "first-batch-received-wave1/paused.json")
+    audit, audit_sha = read(BASE / "first-batch-audit-r2/AUDIT-PRIVE.json")
+    receipt, receipt_sha = read(BASE / "first-batch-audit-r2/RECU-PROPOSITION.json")
+    digest, digest_sha = read(BASE / "first-batch-audit-r2/audit-cli-prive-digest.json")
+    incident, incident_sha = read(BASE / "ECHEC-AVANT-ADMISSION-ET-DIAGNOSTIC.json")
+    accepted, accepted_sha = read(BASE / "first-batch-release-accepted-scp.json")
+    acceptance_readback, acceptance_readback_sha = read(BASE / "FIRST-BATCH-RELEASE-ACCEPTED-READBACK-REEL.json")
+    reader_sha = hashlib.sha256((ROOT / "work/matrix15-first-batch-audit-r2/first_batch_audit.py").read_bytes()).hexdigest()
+    assert receipt_sha == "47c230711a7c6c3757c1495996a2c1be36b7b5afa21530541df37d4de422eb54"
+    assert audit_sha == receipt["private_audit"]["sha256"] == digest["private_review_receipt_sha256"]
+    assert digest_sha == receipt["projection"]["sha256"]
+    assert audit["verified"] is receipt["verified"] is digest["verified"] is True
+    assert receipt["source127_validate_first_batch_release_passed"] is True
+    assert receipt["release_installed"] is audit["release_installed"] is False
+    assert accepted_sha == "60f1bb327a0caa9fbf3d873cf7a4ab967db234728832de9a2f03206798e10c87"
+    assert accepted["verified"] is True and accepted["budget_or_chronology_reset"] is False
+    assert accepted["replayed_claims"] == 0
+    assert accepted["release"]["sha256"] == receipt["proposed_release"]["sha256"]
+    assert accepted["private_cli_audit"]["sha256"] == digest_sha
+    assert accepted["private_review_receipt_sha256"] == audit_sha
+    assert acceptance_readback["response"]["structuredContent"]["ok"] is True
+    assert json.loads(acceptance_readback["response"]["structuredContent"]["content"]) == accepted
+    assert acceptance_readback["observed_at"] < paused["existing_search_deadline"]
+    assert first["runtime_reference_origin"]["sha256"] == origin_sha
+    assert first["evaluation_snapshot"]["sha256"] == evaluation_sha
+    assert paused["first_start_receipt"]["sha256"] == first_sha
+    assert digest["first_start_receipt_sha256"] == first_sha
+    assert digest["paused_snapshot_sha256"] == paused_sha
+    common = ("subject_id", "model", "effort", "job_id", "source_zip_sha256",
+              "plan_sha256", "preparation_manifest_sha256", "r1_contract_sha256", "protocol_id")
+    for item in (evaluation, origin, paused, audit, receipt, digest, accepted):
+        assert all(item[key] == first[key] for key in common)
+    assert audit["original_evaluation_outcome"] == evaluation["outcome"]
+
+    reference_times, reference_stream_hashes = [], []
+    for index in range(3):
+        suffix = f"/baseline-e1/search/attempt-001/sample-{index}.log.command-stream.json"
+        refs = [entry for entry in audit["received_inventory"]
+                if entry.get("remote_ref", {}).get("path", "").endswith(suffix)]
+        assert len(refs) == 1
+        ref = refs[0]
+        local = Path(ref["local_ref"]["path"])
+        assert local.resolve().is_relative_to(BASE.resolve())
+        stream, stream_sha = read(local)
+        assert stream_sha == ref["remote_ref"]["sha256"] == ref["local_ref"]["sha256"]
+        assert stream["verified"] is True and stream["returncode"] == 0 and stream["timed_out"] is False
+        reference_times.append(stream["measured_seconds"])
+        reference_stream_hashes.append(stream_sha)
+
+    outcome = evaluation["outcome"]
+    times = outcome["times"]
+    assert outcome["status"] == "valid" and outcome["correct"] is True and len(times) == 3
+    assert outcome["mean_seconds"] == statistics.mean(times)
+    calls = []
+    for call in first["all_started_calls_reconciled"]:
+        assert call["usage_exact"] is call["normal_delivered"] is True
+        calls.append({
+            "role": "mother_preparation" if call["mother_call"] else "first_optimization",
+            "exact_tokens": call["exact_tokens"], "usage_exact": call["usage_exact"],
+            "normal_delivered": call["normal_delivered"],
+            "request_sha256": call["request"]["sha256"],
+            "response_sha256": call["response"]["sha256"],
+        })
+    registry = first["usage_and_mother_reconciliation"]["registry_costs"]
+    assert sum(call["exact_tokens"] for call in calls) == audit["exact_tokens_all_calls"] == registry["exact_tokens_used"]
+    external = audit["external_program_copies"]
+    assert len(external) == 1
+    shell = external[0]
+    manifest = shell["manifest"]
+    assert hashlib.sha256(Path(shell["local_copy"]["path"]).read_bytes()).hexdigest() == shell["copy_ref"]["sha256"]
+    assert manifest["source_ref"]["sha256"] == shell["copy_ref"]["sha256"]
+    assert manifest["exporter"]["model_calls"] == 0
+    assert origin["reference_origin_is_current_allocation"] is True and origin["qualification_timings_imported"] is False
+
+    value = {
+        "schema": "hpc-forest-public-native-first-batch-v1",
+        "scope": "initial_search_batch_only",
+        "source_cutoff_utc": datetime.fromtimestamp(acceptance_readback["observed_at"], timezone.utc).isoformat(),
+        "audit_cutoff_utc": datetime.fromtimestamp(audit["observed_at"], timezone.utc).isoformat(),
+        "cell": {"subject_id": first["subject_id"], "model": first["model"], "effort": first["effort"],
+                 "seed": 23, "job_id": first["job_id"]},
+        "allocation": {key: first["allocation"][key] for key in
+                       ("architecture", "nodes", "tasks", "cpus_per_task", "memory_mib", "gpus", "affinity_cpu_count")},
+        "provenance": {
+            "source_archive_sha256": first["source_zip_sha256"], "plan_sha256": first["plan_sha256"],
+            "preparation_manifest_sha256": first["preparation_manifest_sha256"],
+            "r1_contract_sha256": first["r1_contract_sha256"], "protocol_id": first["protocol_id"],
+            "first_start_receipt_sha256": first_sha, "evaluation_snapshot_sha256": evaluation_sha,
+            "reference_origin_sha256": origin_sha, "paused_snapshot_sha256": paused_sha,
+            "private_audit_sha256": audit_sha, "private_audit_digest_sha256": digest_sha,
+            "proposal_receipt_sha256": receipt_sha, "cold_reader_sha256": reader_sha,
+        },
+        "initial_search": {
+            "status": outcome["status"], "correct": outcome["correct"],
+            "samples_seconds": times, "mean_seconds": outcome["mean_seconds"],
+            "sample_stdev_seconds": statistics.stdev(times),
+            "binary_sha256": outcome["binary_sha256"],
+            "outcome_sha256": first["first_real_evaluation"]["outcome_sha256"],
+            "recorded_search_score": outcome["score"],
+        },
+        "contemporary_reference": {
+            "current_allocation": origin["reference_origin_is_current_allocation"],
+            "qualification_timings_imported": origin["qualification_timings_imported"],
+            "samples_seconds": reference_times, "mean_seconds": statistics.mean(reference_times),
+            "sample_stdev_seconds": statistics.stdev(reference_times),
+            "outcome_sha256": origin["outcome_sha256"], "sample_stream_sha256": reference_stream_hashes,
+        },
+        "comparison": {
+            "initial_mean_ratio": statistics.mean(reference_times) / statistics.mean(times),
+            "initial_runtime_reduction_fraction": 1 - statistics.mean(times) / statistics.mean(reference_times),
+            "final_confirmation_received": False, "scientifically_admitted_gain": False,
+        },
+        "model_accounting": {"calls": calls, "delivered_calls": len(calls), "registry_slots": registry["slots"],
+                             **{key: registry[key] for key in ("tokens_used", "tokens_reserved", "unknown_usage_calls",
+                                                             "bounded_usage_calls", "exact_tokens_used")}},
+        "audit": {
+            "private_cli_verified": audit["verified"],
+            **{key: audit[key] for key in ("all_private_raws_received_and_hashed", "argv_matches_projections_and_local_policy",
+                "cli_diagnostics_clean", "raw_skill_paths_exported", "independent_SQLite_snapshot_reaudited",
+                "independent_performance_audit_verified", "no_replay", "new_model_or_budget_authorized")},
+            "source127_release_validator_passed": receipt["source127_validate_first_batch_release_passed"],
+            "observation_mode": evaluation["observation_mode"], "private_case_v2_claimed": evaluation["private_case_v2_claimed"],
+            "independent_raw_stdout_per_candidate_verified": first["independent_raw_stdout_per_candidate_verified"],
+            "candidate_command_streams": audit["command_stream_review"]["records"],
+            "reference_command_streams": audit["current_reference_command_stream_review"]["records"],
+            "individual_case_provenance_verified": audit["command_stream_review"]["individual_case_provenance_verified"],
+            "external_shell": {"program": "/bin/sh", "sha256": manifest["source_ref"]["sha256"],
+                               "manifest_sha256": shell["manifest_ref"]["sha256"],
+                               "bytes": manifest["source_ref"]["bytes"],
+                               "copy_job_id": manifest["exporter"]["job_id"],
+                               "copy_node": manifest["exporter"]["node"],
+                               "model_calls": manifest["exporter"]["model_calls"],
+                               "copy_received_and_hashed": True},
+        },
+        "paused_snapshot": {
+            "first_batch_completed": paused["first_batch_completed"],
+            "waiting_for_external_root_audit": paused["waiting_for_external_root_audit"],
+            "existing_search_deadline": paused["existing_search_deadline"],
+            "existing_campaign_deadline": paused["existing_campaign_deadline"],
+            "budget_or_chronology_reset": paused["budget_or_chronology_reset"],
+            "new_requests_created": paused["new_requests_created"],
+            "release_installed_at_audit": audit["release_installed"],
+            "arm_release_acceptance_claimed": False, "campaign_completion_claimed": False,
+            "other_cell_launches_claimed": 0,
+        },
+        "release_acceptance": {
+            "verified": accepted["verified"],
+            "observed_utc": datetime.fromtimestamp(acceptance_readback["observed_at"], timezone.utc).isoformat(),
+            "receipt_sha256": accepted_sha, "primary_readback_sha256": acceptance_readback_sha,
+            "release_sha256": accepted["release"]["sha256"],
+            "private_cli_audit_sha256": accepted["private_cli_audit"]["sha256"],
+            "private_review_receipt_sha256": accepted["private_review_receipt_sha256"],
+            "budget_or_chronology_reset": accepted["budget_or_chronology_reset"],
+            "replayed_claims": accepted["replayed_claims"], "accepted_before_search_deadline": True,
+        },
+        "pre_admission_incident": {"receipt_sha256": incident_sha,
+            **{key: incident[key] for key in ("failed_job", "failed_job_terminal_state", "scientific_clock_started",
+                "native_model_calls", "diagnostic_job", "diagnostic_state", "diagnostic_exit_code", "native_source_modified")},
+            "empty_cuda_visibility_missing_before_inline_env": incident["observed_before_inline_env"]["CUDA_VISIBLE_DEVICES"] is None,
+            "empty_cuda_visibility_restored_for_diagnostic": incident["observed_after_inline_env"]["CUDA_VISIBLE_DEVICES"] == "",
+        },
+    }
+    target = ROOT / "work/hpc-forest-evidence/evidence/native-first-batch-2026-10-19/first-batch.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    print(json.dumps({"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                      "source_cutoff_utc": value["source_cutoff_utc"], "delivered_calls": len(calls),
+                      "exact_tokens": registry["exact_tokens_used"]}))
+
+
+if __name__ == "__main__":
+    main()

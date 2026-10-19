@@ -1,0 +1,370 @@
+"""Seal the SHA-bound Terra document snapshot without scientific or live actions."""
+import argparse
+import hashlib
+import json
+import re
+import shutil
+from datetime import UTC, datetime
+from pathlib import Path
+
+import fitz
+
+HERE = Path(__file__).resolve().parent
+STUDY = HERE.parents[1]
+EDITORIAL = STUDY / "edition-professionnelle"
+WORKSPACE = STUDY.parents[1]
+VERSION = STUDY / "versions/20261017-avant-terra-double-professionnelle"
+COMPARE = STUDY.parent / "HPC-Forest-Harnais-Comparaison-r1"
+R1 = STUDY / "receptions/coverage-terra-xhigh-750909"
+SO = COMPARE / "receptions/source-only-terra-max-750831"
+EXPECTED = {
+    "ARTICLE": (19, 7, "158b765773fd8b7997b34a1d84c4a249cecd0b81e98353419224517dc90eb6cd"),
+    "ANNEXES-TECHNIQUES": (291, 253, "49c12fa1ae0977b85ea19023a400afb504f815bf36bd1138214e84f7f50a38a6"),
+}
+RISK = {
+    "ARTICLE": {1, 10, 11, 16, 17, 19},
+    "ANNEXES-TECHNIQUES": {1, 14, 15, 22, 210, 212, 214, 216, 291},
+}
+REVIEWS = (
+    "revue-visuelle-agent-1.json",
+    "revue-visuelle-agent-2.json",
+    "revue-visuelle-pleine-resolution.json",
+)
+LIMITS = [
+    "All 310 pages were inspected within 53 contact sheets; this establishes structural coverage, not character-by-character verification.",
+    "Fifteen individual risk-page PNGs were inspected at original size.",
+    "Annex forest pages 210, 212, 214 and 216 are dense overview figures: identifiers are small at 100 percent and require digital PDF zoom.",
+    "Four PDF crops rendered at matrix 4 were actually inspected; identifiers are sharp and distinguishable at zoom. No permanent raster-blur defect was observed.",
+    "The document snapshot was built at 2026-10-17 20:56 UTC with a scientific data cutoff at 20:53 UTC. It precedes the subsequent human MAX instruction.",
+    "PDF prose and its ID ledger describe that construction snapshot. The living experimental guides and current human instructions govern current MAX priorities; the PDFs do not establish current operating policy.",
+]
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def descriptor(path):
+    return {"path": str(path), "sha256": sha(path), "bytes": path.stat().st_size}
+
+
+def check_descriptor(value):
+    path = Path(value["path"])
+    assert path.is_file() and sha(path) == value["sha256"], str(path)
+
+
+def verify_inputs():
+    quality = read(EDITORIAL / "controle-qualite.json")
+    construction = read(HERE / "construction-verifiee.json")
+    assert construction["verified"] and quality["all_pdf_pages_rendered"]
+    assert quality["arithmetic_audit_verified"] and quality["frozen_inputs_still_match"]
+    assert len(quality["contact_sheets"]) == 53
+    for doc in quality["documents"]:
+        name = doc["name"]
+        pages, figures, expected = EXPECTED[name]
+        assert (doc["pages"], doc["figures"], doc["pdf_sha256"]) == (pages, figures, expected)
+        assert sha(STUDY / (name + ".pdf")) == expected
+        with fitz.open(STUDY / (name + ".pdf")) as pdf:
+            assert len(pdf) == pages
+        assert not any(doc[key] for key in ("glyph_errors", "outside_page", "blank_pages"))
+        assert len(doc["page_proofs"]) == pages
+    for value in construction["outputs"].values():
+        check_descriptor(value)
+    check_descriptor(construction["arithmetic_audit"])
+    check_descriptor(construction["admissions"])
+    audit = read(EDITORIAL / "audit-calculs.json")
+    assert audit["verified"] and audit["registry_count"] == 194
+    assert audit["research_confirmation_rows"] == 178
+    assert audit["checks"]["cohort_exact_token_sums"] == 13
+    assert audit["checks"]["cohort_native_call_sums"] == 13
+    assert audit["cpu_totals"] == {
+        "campaigns": 58, "models": 10, "subjects": 7, "inputs": 47,
+        "points": 2315, "samples": 11575, "unique_combinations": 1865,
+        "repeated_controls": 450,
+    }
+    assert audit["program_executions"] == audit["candidate_edits"] == audit["model_calls"] == 0
+    for name, expected in audit["frozen_data_files"].items():
+        assert sha(EDITORIAL / "donnees" / name) == expected, name
+    rows = read(EDITORIAL / "donnees/confirmations-recalculees.json")
+    native = [row for row in rows if row["cohort"] != "deepseek"]
+    assert len(rows) == 178 and len(native) == 172
+    assert len({row["cohort"] for row in native}) == 13
+    assert sum(row["native_calls"] for row in native) == 1580
+    assert sum(row["known_exact_tokens"] for row in native) == 33796289
+    assert sum(row["unmetered_calls"] for row in native) == 144
+    costs = [read(EDITORIAL / "donnees" / name)["request_summary"]
+             for name in ("couts-terra-xhigh.json", "couts-source-only-terra.json")]
+    assert sum(row["requests_with_unknown_consumption"] for row in costs) == 44
+    assert sum(row["unmeasured_native_invocations"] for row in costs) == 38
+    assert sum(row["interrupted_claims_unknown"] for row in costs) == 2
+    assert sum(row["published_requests"] - row["verified_deliveries"] for row in costs) == 8
+    admission = read(EDITORIAL / "admission-terra-double-verifiee.json")
+    assert admission["verified"] and sha(EDITORIAL / "admissions.json") == admission["admissions_sha256"]
+    for row in admission["bound_receipts"]:
+        assert sha(Path(row["receipt_path"])) == row["receipt_sha256"]
+        assert sha(Path(row["normalized_path"])) == row["normalized_sha256"]
+    assert construction["total_native_consumption_exact"] is False
+    assert read(EDITORIAL / "donnees/couts-terra.json")["total_exact_consumption_available"] is False
+    preservation = read(VERSION / "PRESERVATION.json")
+    assert preservation["all_copied_bytes_verified"] and preservation["copied_files"] == 4450
+    for name, expected in {**preservation["files"], **preservation["extra_snapshots"]}.items():
+        assert sha(VERSION / name) == expected, name
+    old = read(VERSION / "edition-professionnelle/manifeste-edition.json")
+    assert len(old["files"]) == 1063
+    for name, expected in old["files"].items():
+        assert sha(VERSION / name) == expected, name
+    first, second, risk = [read(HERE / name) for name in REVIEWS]
+    assert first["scope_complete"] and first["actual_pixel_review"] and first["contact_layout_passed"]
+    assert not first["blocking_findings"] and first["contact_sheets_inspected"] == 28
+    assert second["visual_result"] == "pass_for_contact_sheet_structural_review"
+    assert not second["defects"] and second["partition"]["contact_sheets_viewed"] == 25
+    contacts = first["inspected_contact_sheets"] + second["reviewed_contact_sheets"]
+    assert len(contacts) == 53 and len({row["path"] for row in contacts}) == 53
+    assert {row["path"] for row in contacts} == set(quality["contact_sheets"])
+    for row in contacts:
+        check_descriptor(row)
+    represented = {
+        (row["document"], page["page"])
+        for row in first["inspected_contact_sheets"]
+        for page in row["represented_pages"]
+    }
+    represented |= {
+        ("ANNEXES-TECHNIQUES", row["page"])
+        for row in second["pages_seen_via_contact_sheets"]
+    }
+    assert represented == {(name, page) for name, (pages, _, _) in EXPECTED.items()
+                           for page in range(1, pages + 1)}
+    assert risk["individual_page_count"] == 15 and not risk["material_defects"]
+    assert risk["result"] == "pass_with_explicit_dense_overview_zoom_limitation"
+    assert {(row["document"], row["page"]) for row in risk["individual_pages"]} == {
+        (name, page) for name, pages in RISK.items() for page in pages
+    }
+    assert len(risk["pdf_zooms"]) == 4
+    assert {row["page"] for row in risk["pdf_zooms"]} == {210, 212, 214, 216}
+    for row in risk["individual_pages"] + risk["pdf_zooms"]:
+        check_descriptor(row)
+        assert row["individually_viewed"]
+    identifiers = re.findall(r"^\| (ID-\d{3}) \|", (WORKSPACE / "ID.md").read_text(encoding="utf-8"), re.MULTILINE)
+    assert identifiers == [f"ID-{n:03d}" for n in range(1, 41)]
+    return quality, old, contacts, risk
+
+
+def final_check():
+    manifest = read(EDITORIAL / "manifeste-edition.json")
+    quality = read(EDITORIAL / "controle-qualite.json")
+    assert (manifest["main_pages"], manifest["supplement_pages"]) == (19, 291)
+    assert manifest["registry_count"] == 194 and manifest["principal_received_results"] == 178
+    assert manifest["raw_cpu_timings"] == 11575
+    assert manifest["all_pages_visually_reviewed"] and quality["visual_review_completed"]
+    assert manifest["visually_reviewed_pages"] == quality["visually_reviewed_pages"] == 310
+    assert manifest["contact_sheets_reviewed"] == quality["contact_sheets_reviewed"] == 53
+    assert len(manifest["full_resolution_risk_pages"]) == 15
+    assert manifest["total_native_consumption_exact"] is False
+    for name, expected in manifest["files"].items():
+        assert sha(STUDY / name) == expected, name
+    for folder in (R1, SO):
+        receipt = read(folder / "admission-article-recue.json")
+        assert receipt["verified"] and receipt["article_admission_pending"] is False
+        check_descriptor(receipt["delivery_manifest"])
+        check_descriptor(receipt["quality_control"])
+        assert receipt["main_pages"] == 19 and receipt["supplement_pages"] == 291
+    for name, (_, _, expected) in EXPECTED.items():
+        assert sha(STUDY / (name + ".pdf")) == expected
+    return {"verified": True, "manifest": descriptor(EDITORIAL / "manifeste-edition.json"),
+            "quality": descriptor(EDITORIAL / "controle-qualite.json"),
+            "manifest_files_verified": len(manifest["files"]),
+            "pages": 310, "contact_sheets": 53, "full_resolution_risk_pages": 15,
+            "native_job_calls": 0, "model_calls_for_editorial_work": 0}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--check-final", action="store_true")
+    args = parser.parse_args()
+    if args.check_final:
+        print(json.dumps(final_check()))
+        return
+    quality, old, contacts, risk = verify_inputs()
+    if args.verify_only:
+        print(json.dumps({"verified": True, "ready_to_seal": True, "pages": 310,
+                          "sheets": 53, "risk_pages": 15, "preserved_files_reverified": 4450}))
+        return
+    assert not quality["visual_review_completed"]
+    assert not (HERE / "integrite-apres-edition.json").exists()
+    assert all(not (folder / "admission-article-recue.json").exists() for folder in (R1, SO))
+    backup = HERE / "avant-scellement"
+    assert not backup.exists()
+    before = {name: sha(EDITORIAL / name) for name in
+              ("controle-qualite.json", "manifeste-edition.json", "REPRISE.md")}
+    backup.mkdir()
+    for name, expected in before.items():
+        shutil.copy2(EDITORIAL / name, backup / name)
+        assert sha(backup / name) == sha(EDITORIAL / name) == expected
+    save(HERE / "preservation-avant-scellement.json", {
+        "verified": True, "preserved_utc": datetime.now(UTC).isoformat(),
+        "files": {name: descriptor(backup / name) for name in before},
+        "source_files_unchanged_during_preservation": True,
+    })
+    now = datetime.now(UTC).isoformat()
+    review_refs = [descriptor(HERE / name) for name in REVIEWS]
+    observed = {
+        "schema": "hpc-forest-observed-pdf-visual-review-v1",
+        "reviewed_utc": now, "inspection_method": "Independent complete contact review plus fifteen individually viewed risk pages and four PDF zoom crops.",
+        "documents": [{key: doc[key] for key in ("name", "pages", "figures", "pdf_sha256")} for doc in quality["documents"]],
+        "pages_reviewed": {name: list(range(1, pages + 1)) for name, (pages, _, _) in EXPECTED.items()},
+        "contact_sheets": contacts, "full_resolution_risk_pages": risk["individual_pages"],
+        "pdf_zoom_proofs": risk["pdf_zooms"], "independent_reviews": review_refs,
+        "known_visual_defects": [], "visual_review_limitations": LIMITS,
+        "all_current_page_content_visually_reviewed": True,
+        "full_resolution_review_is_not_claimed_for_all_pages": True,
+        "native_job_calls": 0,
+    }
+    save(HERE / "revue-visuelle-observation.json", observed)
+    risk_names = [f"{name}-{page:03d}.png" for name, nums in RISK.items() for page in sorted(nums)]
+    quality.update({
+        "visual_review_completed": True, "visual_review_completed_utc": now,
+        "visually_reviewed_pages": 310, "contact_sheets_reviewed": 53,
+        "full_resolution_risk_pages": risk_names, "known_visual_defects": [],
+        "all_current_page_content_visually_reviewed": True,
+        "visual_review_limitations": LIMITS, "dense_forest_digital_zoom_required": [210, 212, 214, 216],
+        "independent_visual_reviews": review_refs,
+        "visual_review_observation": descriptor(HERE / "revue-visuelle-observation.json"),
+        "document_snapshot_precedes_current_MAX_instruction": True,
+    })
+    save(EDITORIAL / "controle-qualite.json", quality)
+    prior_resume = (backup / "REPRISE.md").read_text(encoding="utf-8")
+    header = """# Édition Terra double du 17 octobre : reçue, inspectée et scellée
+
+Les cohortes closes R1 Terra xhigh / 750909 et source-only Terra MAX / 750831 sont admises dans cet instantané scientifique après réception, audit et réconciliation. L'édition Astra précédente est préservée sous versions/20261017-avant-terra-double-professionnelle/ : 4 450 fichiers et les 1 063 entrées de son manifeste sont revérifiés. L'ancien manifeste, le contrôle de rendu avant revue et cette reprise sont aussi copiés et vérifiés sous receptions/admission-terra-double-20261017/avant-scellement/. Les admissions préalables restent des instantanés ; les deux nouveaux admission-article-recue.json lient la livraison finale.
+
+L'édition comporte 19 pages / sept figures principales et 291 pages / 253 figures d'annexes. Les 310 pages ont été inspectées sur 53 planches par deux relecteurs indépendants ; quinze pages à risque ont été vues individuellement. Les forêts denses des pages 210, 212, 214 et 216 sont des vues d'ensemble : leurs identifiants demandent un zoom numérique. Quatre recadrages réels du PDF à matrice 4 ont été vus et leurs identifiants restent nets et distinguables. Aucun défaut matériel connu ; ne pas convertir cette inspection en affirmation de lecture fine de tous les identifiants à 100 %.
+
+Les 194 registres et 178 résultats reçus sont recalculés ; les 58 racines CPU, 2 315 points et 11 575 chronométrages restent inchangés. Treize cohortes natives closes totalisent 1 580 invocations observées, 33 796 289 jetons exacts connus et 144 invocations non mesurées, plus l'ancienne requête Terra sans réponse de consommation inconnue. Les deux nouvelles cohortes ont 44 requêtes de consommation inconnue et 38 invocations non mesurées ; ces catégories ne s'additionnent pas. Cache et raisonnement sont inclus ; aucun total exact global n'est annoncé.
+
+Les PDF ont été construits le 17 octobre à 20:56 UTC (données arrêtées à 20:53 UTC), avant la nouvelle consigne humaine MAX. Leurs descriptions de pilotage et leur registre ID sont l'instantané de construction. Les guides expérimentaux vivants et les consignes humaines actuelles font autorité pour les priorités MAX présentes ; le PDF ne vaut pas politique opérationnelle actuelle. ID.md a été actualisé séparément par le parent ; il n'est pas modifié par ce scellement.
+
+Lire controle-qualite.json et manifeste-edition.json, puis receptions/admission-terra-double-20261017/revue-visuelle-observation.json, revue-visuelle-agent-1.json, revue-visuelle-agent-2.json, revue-visuelle-pleine-resolution.json et integrite-apres-edition.json. Aucun nouveau candidat, compilation, appel de modèle, job natif, rebuild, publication ou modification du guide, de l'automation ou d'ID.md n'est réalisé par le scellement. Les anciens paragraphes ci-dessous sont historiques lorsque leurs chiffres ou leurs priorités diffèrent.
+
+---
+
+"""
+    (EDITORIAL / "REPRISE.md").write_text(header + prior_resume, encoding="utf-8")
+    files = {STUDY / name for name in old["files"]
+             if not name.startswith("edition-professionnelle/controle-rendu/")
+             and name != "REPRISE-ACTUALISEE.md"}
+    files |= {p for p in EDITORIAL.iterdir()
+              if p.is_file() and p.suffix in {".py", ".md", ".json"}
+              and p.name != "manifeste-edition.json"}
+    render_root = Path(quality["contact_sheets"][0]).parent
+    for folder in (EDITORIAL / "donnees", EDITORIAL / "figures", render_root):
+        files |= {p for p in folder.rglob("*") if p.is_file()}
+    for name in (
+        "sceller-edition-terra.py", "construction-verifiee.json",
+        "revue-visuelle-observation.json", *REVIEWS,
+        "preservation-avant-scellement.json", "verification-construction.log",
+        "tests-neutres.log", "ruff-code-only.log",
+    ):
+        path = HERE / name
+        if path.is_file():
+            files.add(path)
+    files |= {p for p in (HERE / "revue-pleine-resolution-zooms").glob("*.png")}
+    for suffix in ("couverture-terra-xhigh", "source-only-terra-max"):
+        for prefix in ("resultats-", "details-missions-", "arbres-"):
+            files.add(STUDY / (prefix + suffix + ".json"))
+        files.add(STUDY / ("jetons-par-appel-" + suffix + ".csv"))
+    files |= {STUDY / name for name in (
+        "BILAN-COUVERTURE-TERRA-XHIGH.md", "BILAN-SOURCE-ONLY-TERRA-MAX.md",
+        "comparabilite-couverture-terra-xhigh-max.json",
+        "comparabilite-source-only-terra-max-r1.json",
+    )}
+    assert all(p.is_file() and not p.is_symlink() for p in files)
+    manifest = {
+        "schema": "hpc-forest-professional-edition-delivery-v1", "verified_utc": now,
+        "authors": ["Nicolas Marano", "Romain Despoullain"],
+        "main_pages": 19, "main_figures": 7, "supplement_pages": 291, "supplement_figures": 253,
+        "registry_count": 194, "principal_received_results": 178, "raw_cpu_timings": 11575,
+        "all_pages_visually_reviewed": True, "visually_reviewed_pages": 310,
+        "contact_sheets_reviewed": 53, "full_resolution_risk_pages": risk_names,
+        "known_visual_defects": [], "visual_review_limitations": LIMITS,
+        "independent_visual_reviews": review_refs,
+        "visual_review_observation": descriptor(HERE / "revue-visuelle-observation.json"),
+        "previous_version_preserved_under": "versions/20261017-avant-terra-double-professionnelle",
+        "previous_version_files_reverified": 4450, "previous_manifest_files_reverified": 1063,
+        "metadata_before_seal_preservation": descriptor(HERE / "preservation-avant-scellement.json"),
+        "admitted_new_cohorts": ["R1 Terra xhigh 750909: fourteen closed finite-contract searches",
+                                "source-only Terra MAX 750831: fifteen fresh closed finite-contract searches"],
+        "native_closed_cohorts": 13, "native_closed_observed_invocations": 1580,
+        "native_closed_known_exact_tokens": 33796289, "native_closed_unmetered_invocations": 144,
+        "terra_expired_unanswered_request_unknown_consumption": 1,
+        "new_terra_unknown_consumption_requests": 44, "new_terra_unmetered_invocations": 38,
+        "new_terra_undelivered_requests": 8, "interrupted_claims_already_counted_as_unmetered": 2,
+        "total_native_consumption_exact": False,
+        "document_snapshot_built_utc": "2026-10-17T20:56:48.546273+00:00",
+        "scientific_data_cutoff_utc": "2026-10-17T20:53:00+00:00",
+        "document_snapshot_precedes_current_MAX_instruction": True,
+        "live_experimental_guides_are_authority_for_current_policy": True,
+        "pdf_is_not_current_operating_policy": True,
+        "live_ID_observed_at_seal": descriptor(WORKSPACE / "ID.md"),
+        "live_ID_updated_after_document_snapshot": True,
+        "new_candidate_executions": 0, "new_candidate_compilations": 0,
+        "native_job_calls": 0, "model_calls_for_editorial_work": 0,
+        "scientific_documents_rebuilt_by_seal": False,
+        "guide_automation_or_live_ID_modified_by_seal": False,
+        "public_repository_or_private_kit_updated": False,
+        "files_scope": "SHA-bound edition inputs, outputs and reviewed proofs. Living governance and current process state are not frozen as operating policy.",
+        "files": {p.relative_to(STUDY).as_posix(): sha(p) for p in sorted(files)},
+    }
+    save(EDITORIAL / "manifeste-edition.json", manifest)
+    quality_ref = descriptor(EDITORIAL / "controle-qualite.json")
+    manifest_ref = descriptor(EDITORIAL / "manifeste-edition.json")
+    common = {
+        "verified": True, "verified_utc": now, "article_admission_pending": False,
+        "admissions": descriptor(EDITORIAL / "admissions.json"),
+        "arithmetic_audit": descriptor(EDITORIAL / "audit-calculs.json"),
+        "quality_control": quality_ref, "delivery_manifest": manifest_ref,
+        "main_pages": 19, "supplement_pages": 291, "visually_reviewed_pages": 310,
+        "contact_sheets_reviewed": 53, "individual_risk_pages_reviewed": 15,
+        "registry_count": 194, "principal_results": 178, "raw_cpu_timings": 11575,
+        "native_closed_cohorts": 13, "native_closed_observed_invocations": 1580,
+        "native_closed_known_exact_tokens": 33796289, "native_closed_unmetered_invocations": 144,
+        "total_native_consumption_exact": False, "visual_review_limitations": LIMITS,
+        "document_snapshot_precedes_current_MAX_instruction": True,
+        "public_publication": False,
+    }
+    for folder in (R1, SO):
+        save(folder / "admission-article-recue.json", {
+            **common, "prior_reception_receipt": descriptor(folder / "reception-verifiee.json"),
+            "independent_visual_reviews": review_refs,
+        })
+    integrity = {
+        **common, "schema": "hpc-forest-terra-double-final-editorial-integrity-v1",
+        "full_resolution_risk_pages": risk["individual_pages"], "pdf_zoom_proofs": risk["pdf_zooms"],
+        "preserved_version_files_reverified": 4450, "previous_manifest_files_reverified": 1063,
+        "metadata_preservation": descriptor(HERE / "preservation-avant-scellement.json"),
+        "independent_visual_reviews": review_refs,
+        "documents": observed["documents"],
+        "document_MD_HTML_PDF_unchanged_since_construction": True,
+        "native_job_calls": 0, "new_candidate_executions_or_compilations": False,
+        "model_calls_for_editorial_work": 0, "process_interventions": 0,
+        "scientific_or_live_governance_source_changes": 0,
+        "article_receipts": [descriptor(folder / "admission-article-recue.json") for folder in (R1, SO)],
+    }
+    save(HERE / "integrite-apres-edition.json", integrity)
+    checked = final_check()
+    save(HERE / "validation-scellement.json", {**checked, "verified_utc": datetime.now(UTC).isoformat(),
+                                              "integrity_receipt": descriptor(HERE / "integrite-apres-edition.json")})
+    print(json.dumps(checked))
+
+
+if __name__ == "__main__":
+    main()

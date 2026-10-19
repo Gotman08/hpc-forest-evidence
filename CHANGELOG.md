@@ -2,6 +2,15 @@
 
 _Public versions preserve the evidence and its interpretation._
 
+## Complete sources and received corpus — 2026-10-19
+
+- Publish separate exact R1 historical, R1 comparison-derived and R2 native source trees, their archives and restoration guide on the owner's explicit request
+- Preserve the available historical workspaces, source variants, scripts, tests, received raw archives, operational receipts and negative outcomes in a content-addressed inventory
+- Deduplicate identical file bytes and split large objects into bounded parts with per-part and complete-file SHA-256 checks; provide offline verification and fresh-directory restoration
+- Keep authentication material, installed third-party runtimes and regenerable caches outside the capture, with explicit exclusions
+- Retain frozen article editions and scientific figures without changing their bytes, sample counts or admission status; keep all experiments paused
+- Supersede the earlier source-distribution boundary for the newly published snapshot, without rewriting historical provenance records or assigning MIT to third-party materials
+
 ## Received evidence update — 2026-10-19
 
 - Add a separate later technical-status supplement for Sol/count and Astra/count; preserve the article r5 cutoff, all frozen performance data, source-announced token accounting and zero admitted new gains or pairs
@@ -21,7 +30,7 @@ _Public versions preserve the evidence and its interpretation._
 - Preserve negative observations, unknown costs and historical non-MAX observations without adding them to the new MAX-only plan
 - Define the next campaign as fifteen subjects × four models at MAX after one completed primes pilot and technical qualification
 
-The current PDFs carry the received article r5 comparison; the exact r4 bytes and their dated technical snapshot remain in the self-contained history directory. The historical received-data projection, r4 supplement, qualification and first-batch snapshot are retained. Private source, prompts, credentials, account paths, evaluated binaries and protected inputs remain excluded.
+The current PDFs carry the received article r5 comparison; the exact r4 bytes and their dated technical snapshot remain in the self-contained history directory. The historical received-data projection, r4 supplement, qualification and first-batch snapshot are retained. The earlier curated projections retain their original redaction scope. The later complete-source snapshot separately publishes owner-authorized historical materials; authentication material remains excluded.
 
 ## 0.1.0 — 2026-10-16
 

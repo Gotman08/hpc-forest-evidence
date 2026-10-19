@@ -1,0 +1,269 @@
+"""Pure SO state proof reader. No process, cache, lock, transport or authority writer."""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+FIELDS = ("ProcessId", "ParentProcessId", "ExecutablePath", "CommandLine", "CreationDate")
+SO_SESSION = "665743a02b824021a697b6a4884a667c"
+SO_SOURCE = "9a68a83fde4acb6bd247d79e00490e7d36f0c4c59c6c881152101e4c499387eb"
+SCIENCE_SHA = "6cd1f532e43bf4fae443bc58e38527847df6cb03511fa84a8d233199db1b41e7"
+COLD_RECEPTION_SHA = "6a0b0c2e9e2562daeb6837f517d75fc360fa5f3696bab6bf0274dc0c02d67838"
+RECON_SHA = "0ed5c437d3737ec9a970a4183b3e80ce996e87a7f655e5fba9965a979682def8"
+
+
+def need(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def artifact(ref):
+    need(isinstance(ref, dict) and set(ref) == {"path", "sha256"}, "Closed SHA reference required")
+    p = Path(ref["path"])
+    need(p.is_absolute() and ".." not in p.parts and p.is_file()
+         and not any(q.is_symlink() or (hasattr(q, "is_junction") and q.is_junction()) for q in (p, *p.parents))
+         and isinstance(ref["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"])
+         and digest(p) == ref["sha256"], "Changed or aliased evidence")
+    return p
+
+
+def read(ref):
+    return json.loads(artifact(ref).read_text(encoding="utf-8-sig"))
+
+
+def epoch(text):
+    need(isinstance(text, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,7})?Z", text), "Exact UTC timestamp required")
+    return datetime.fromisoformat(text).timestamp()
+
+
+def identity(row):
+    need(isinstance(row, dict) and all(k in row for k in FIELDS), "Five identity fields required")
+    need(all(type(row[k]) is int and row[k] >= 0 for k in FIELDS[:2])
+         and all(isinstance(row[k], str) and row[k] for k in FIELDS[2:]), "Opaque or invalid owned identity")
+    epoch(row["CreationDate"])
+    return tuple(row[k] for k in FIELDS)
+
+
+def complete_census(value, *, now=None, fresh=False):
+    need(isinstance(value, dict) and value.get("schema") == "hpc-forest-dynamic-r4b-full-cim-v1"
+         and value.get("complete_census") is True and value.get("strict_utf8_decoding") is True, "Actual complete UTF8 census required")
+    rows = value.get("rows")
+    need(isinstance(rows, list) and rows and type(value.get("rows_count")) is int and len(rows) == value["rows_count"], "Complete row count required")
+    pids = set()
+    for r in rows:
+        need(isinstance(r, dict) and all(k in r for k in FIELDS)
+             and all(type(r[k]) is int and r[k] >= 0 for k in FIELDS[:2]), "Malformed census identity inventory")
+        need(r["ProcessId"] not in pids, "Duplicate census PID")
+        pids.add(r["ProcessId"])
+        need(all(r[k] is None or isinstance(r[k], str) for k in FIELDS[2:]), "Malformed census text")
+        if r["CreationDate"] is not None:
+            need(epoch(r["CreationDate"]) <= (time.time() if now is None else now), "Future process creation")
+    captured = epoch(value["captured_at_utc"])
+    now = time.time() if now is None else now
+    need(captured <= now and (not fresh or now - captured <= 120), "Fresh <=120s nonfuture census required")
+    return rows, captured
+
+
+def pair(owned):
+    need(isinstance(owned, list) and len(owned) == 2, "Original two-member SO pair required")
+    values = [identity(r) for r in owned]
+    a, b = owned
+    need(len(set(values)) == 2 and a["ProcessId"] != b["ProcessId"]
+         and a["CommandLine"] == b["CommandLine"] and SO_SESSION in a["CommandLine"]
+         and (a["ParentProcessId"] == b["ProcessId"] or b["ParentProcessId"] == a["ProcessId"]), "Wrong SO pair/session")
+    return values
+
+
+def scientific_closure(science_ref, recon_ref):
+    need(isinstance(science_ref, dict) and isinstance(recon_ref, dict)
+         and science_ref.get("sha256") == SCIENCE_SHA and recon_ref.get("sha256") == RECON_SHA, "Exact Sol science/reconciliation pins required")
+    science, reconciliation = read(science_ref), read(recon_ref)
+    expected = {"job_id": "751592", "session_id": SO_SESSION, "model": "gpt-6.1-sol", "effort": "max"}
+    need(science.get("schema") == "hpc-forest-source-only-sol-max-final-reception-v1"
+         and science.get("verified") is True and science.get("source_zip_sha256") == SO_SOURCE
+         and all(science.get(k) == v for k, v in expected.items())
+         and science.get("reconciliation") == recon_ref
+         and all(science.get(k) is True for k in ("deliveries_reconciled", "all_started_calls_reconciled", "scientific_reception_verified", "independent_audit_verified")), "Scientific closure does not prove process absence")
+    need(reconciliation.get("verified") is True, "Reconciliation is not verified")
+    for name in ("baseline", "independent_audit", "late_remote_readback", "normalization"):
+        artifact(science[name])
+    return science
+
+
+def _absent_owned(owned, rows):
+    by_pid = {r["ProcessId"]: r for r in rows}
+    for old in owned:
+        identity(old)
+        if old["ProcessId"] in by_pid:
+            actual = by_pid[old["ProcessId"]]
+            # A reused PID proves nothing when any actual identity field is opaque.
+            need(identity(actual) != identity(old), "An exact owned SO identity is still present")
+            need(_creation_key(actual["CreationDate"]) > _creation_key(old["CreationDate"]), "PID reuse chronology is ambiguous")
+        # Shared conhost/MCP/SSH commands do not identify a foreign process.
+        # Exact identities, strict PID reuse and the three-census possibility
+        # graph remain mandatory; the session check below catches duplicate relays.
+    need(not any(SO_SESSION in (r.get("CommandLine") or "") for r in rows), "SO session remains in the current census")
+
+
+def _creation_key(text):
+    """Compare all seven recorded fractional digits without float truncation."""
+    epoch(text)  # Retain the strict UTC/calendar validator.
+    seconds, _, fraction = text[:-1].partition(".")
+    return seconds + "." + fraction.ljust(7, "0")
+
+
+def _unresolved_descendants(owned, snapshots, *, captured_at=None):
+    """Explore possible links across all snapshots; never adopt unknown children."""
+    if captured_at is not None:
+        need(len(captured_at) == len(snapshots), "Every complete snapshot needs its exact capture timestamp")
+        capture_keys = [_creation_key(text) for text in captured_at]
+        need(capture_keys == sorted(capture_keys), "Complete snapshot chronology differs")
+    else:
+        capture_keys = []  # No bound supplied: preserve the stricter historical graph.
+    declared = {identity(r) for r in owned}
+    candidates = {}
+    for rows in snapshots:
+        for row in rows:
+            candidates[tuple(row[k] for k in FIELDS)] = row
+    frontier = list(owned)
+    visited, unresolved = set(), {}
+    while frontier:
+        parent = frontier.pop()
+        parent_key = identity(parent)
+        if parent_key in visited:
+            continue
+        visited.add(parent_key)
+        for key, child in candidates.items():
+            if child["ParentProcessId"] != parent["ProcessId"] or key == parent_key:
+                continue
+            # A birth strictly before this owner's birth proves a reused-PPID
+            # foreign process. No ownership is inferred and its branch is excluded.
+            if child["CreationDate"] is not None and _creation_key(child["CreationDate"]) < _creation_key(parent["CreationDate"]):
+                continue
+            child_key = identity(child)  # Opaque possible children always block, even after a bound.
+            if child["CreationDate"] is not None and capture_keys:
+                child_birth = _creation_key(child["CreationDate"])
+                parent_birth = _creation_key(parent["CreationDate"])
+                absent_before_birth = False
+                for rows, captured in zip(snapshots, capture_keys, strict=True):
+                    if captured < parent_birth or not child_birth > captured:
+                        continue
+                    same_pid = next((r for r in rows if r["ProcessId"] == parent["ProcessId"]), None)
+                    if same_pid is None:
+                        absent_before_birth = True
+                        break
+                    # A same-PID opaque/ambiguous row cannot prove this identity absent.
+                    if all(isinstance(same_pid.get(k), str) and same_pid[k] for k in FIELDS[2:]) and (
+                        identity(same_pid) != parent_key and parent_birth < _creation_key(same_pid["CreationDate"]) <= captured):
+                        absent_before_birth = True
+                        break
+                if absent_before_birth:
+                    continue  # Exclude an impossible edge, never adopt or stop this foreign branch.
+            if child_key not in declared:
+                unresolved[child_key] = child
+            # The frontier is only a possibility graph, never an owned inventory.
+            # A bridge may occur in cold only and its child in current only.
+            if child_key not in visited:
+                frontier.append(child)
+    return list(unresolved.values())
+
+
+def verify_absence(proof, expected_pair, current, *, now=None):
+    """Cold pair proof plus explicit owned descendants; never infer foreign ownership."""
+    now = time.time() if now is None else now
+    need(isinstance(proof, dict) and proof.get("schema") == "hpc-forest-passive-owned-pair-absence-v1"
+         and proof.get("subject") == "source-only"
+         and proof.get("verified") is True and proof.get("no_stop_or_replay") is True
+         and proof.get("job_id") == "751592" and proof.get("session_id") == SO_SESSION
+         and proof.get("source_zip_sha256") == SO_SOURCE, "Actual closed-SO absence proof required")
+    pair(expected_pair)
+    need(set(pair(proof.get("owned_full_identities"))) == set(pair(expected_pair)), "Absence concerns another original pair")
+    refs = proof.get("evidence_refs")
+    need(isinstance(refs, list) and refs and proof.get("prior_full_cim") in refs
+         and proof.get("fresh_full_cim") in refs, "Actual prior/absence evidence required")
+    for ref in refs:
+        artifact(ref)
+    cold_ref = proof.get("historical_cold_cim")
+    reception_ref = proof.get("cold_metadata_reception")
+    need(isinstance(reception_ref, dict) and reception_ref.get("sha256") == COLD_RECEPTION_SHA
+         and reception_ref in refs and cold_ref in refs, "Exact historical cold census/reception links required")
+    reception = read(reception_ref)
+    need(reception.get("schema") == "hpc-forest-natural-exit-cold-metadata-reception-v1"
+         and reception.get("verified") is True and reception.get("cold_full_cim") == cold_ref
+         and reception.get("prior_full_cim") == proof["prior_full_cim"], "Cold metadata graph differs")
+    prior_value = read(proof["prior_full_cim"])
+    cold_value = read(cold_ref)
+    cold_rows, tc = complete_census(cold_value, now=now)
+    before, t0 = complete_census(prior_value, now=now)
+    after, t1 = complete_census(read(proof["fresh_full_cim"]), now=now, fresh=True)
+    rows, t2 = complete_census(current, now=now, fresh=True)
+    need(t0 <= tc <= t1 <= t2 and type(proof.get("observed_at")) in (int, float)
+         and t1 <= proof["observed_at"] <= now and proof["observed_at"] - t1 <= 120, "Cold/current absence chronology differs")
+    descendants = proof.get("owned_descendants")
+    need(isinstance(descendants, list), "Explicit owned-descendant inventory required")
+    owned = list(expected_pair)
+    by_pid = {r["ProcessId"]: r for r in before}
+    for old in owned:
+        need(old["ProcessId"] in by_pid and identity(by_pid[old["ProcessId"]]) == identity(old)
+             and epoch(old["CreationDate"]) <= t0, "Actual prior original pair presence required")
+    # Descendants are supplied by actual prior ownership evidence, not adopted from PPID alone.
+    remaining = list(descendants)
+    while remaining:
+        progressed = False
+        for item in list(remaining):
+            need(isinstance(item, dict) and set(item) == {"identity", "ownership_evidence"}, "Closed descendant entry required")
+            child = item["identity"]
+            identity(child)
+            need(child["ProcessId"] not in {r["ProcessId"] for r in owned}, "Duplicate or reused owned descendant PID")
+            parents = [r for r in owned if r["ProcessId"] == child["ParentProcessId"]]
+            if not parents:
+                continue
+            need(item["ownership_evidence"] in refs, "Descendant ownership proof unlinked")
+            fact = read(item["ownership_evidence"])
+            need(fact.get("schema") == "hpc-forest-owned-native-descendant-v1" and fact.get("verified") is True
+                 and fact.get("owner_session_id") == SO_SESSION and fact.get("identity") == child
+                 and fact.get("parent_identity") == parents[0], "Actual full descendant ownership evidence required")
+            need(child["ProcessId"] in by_pid and identity(by_pid[child["ProcessId"]]) == identity(child)
+                 and epoch(parents[0]["CreationDate"]) <= epoch(child["CreationDate"]) <= t0, "Descendant absent from actual prior census")
+            owned.append(child)
+            remaining.remove(item)
+            progressed = True
+        need(progressed, "Unlinked owned descendant or ownership cycle")
+    need(not _unresolved_descendants(owned, (before, cold_rows, after, rows),
+        captured_at=[prior_value["captured_at_utc"], cold_value["captured_at_utc"],
+                     read(proof["fresh_full_cim"])["captured_at_utc"], current["captured_at_utc"]]),
+         "Possible owned descendant unresolved across prior/cold/current snapshots")
+    _absent_owned(owned, cold_rows)
+    _absent_owned(owned, after)
+    _absent_owned(owned, rows)
+    return owned
+
+
+def validate_state(mode, census, expected_pair, *, absence_ref=None, science_ref=None, recon_ref=None, now=None):
+    rows, _captured = complete_census(census, now=now, fresh=True)
+    pair(expected_pair)
+    if mode == "live":
+        need(absence_ref is None, "A live SO state cannot claim absence")
+        for old in expected_pair:
+            need(any(r["ProcessId"] == old["ProcessId"] and identity(r) == identity(old) for r in rows), "Live SO full pair changed/absent")
+        return {"source_only_state": "live", "source_only_preserved": True,
+                "source_only_scientifically_closed_and_absent": False, "owned_absent_identities": []}
+    need(mode == "received_absent", "Explicit live/received_absent state required")
+    scientific_closure(science_ref, recon_ref)
+    proof = read(absence_ref)
+    need(proof.get("scientific_reception") == science_ref and proof.get("reconciliation") == recon_ref, "Absence must bind exact scientific closure")
+    owned = verify_absence(proof, expected_pair, census, now=now)
+    return {"source_only_state": "received_absent", "source_only_preserved": False,
+            "source_only_scientifically_closed_and_absent": True, "owned_absent_identities": owned}
+
+
+def utc_now():
+    return datetime.now(UTC).isoformat()

@@ -1,0 +1,253 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define N_ITER 10 // number of simulation iterations
+#define DT 0.01f // time step
+#define SOFTENING 1e-9f // to avoid zero divisors
+
+#define PAIR_TILE 32
+#define PAIR_CACHE_BYTES (64u * 1024u * 1024u)
+
+/*
+ * Each body holds coordinate positions (i.e., x, y, and z) and
+ * velocities (i.e., vx, vy, and vz).
+ */
+typedef struct { float x, y, z, vx, vy, vz; } Body;
+
+/*
+ * Compute the gravitational impact among all pairs of bodies in
+ * the system.
+ */
+void body_force(Body *p, float dt, int n) {
+  for (int i = 0; i < n; ++i) {
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+
+    for (int j = 0; j < n; j++) {
+      float dx = p[j].x - p[i].x;
+      float dy = p[j].y - p[i].y;
+      float dz = p[j].z - p[i].z;
+      float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+      float inv_dist = 1 / sqrt(sqrd_dist);
+      float inv_dist3 = inv_dist * inv_dist * inv_dist;
+
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+
+    p[i].vx += dt*fx;
+    p[i].vy += dt*fy;
+    p[i].vz += dt*fz;
+  }
+}
+
+static inline float inverse_cube(float dx, float dy, float dz) {
+  float sqrd_dist = dx*dx + dy*dy + dz*dz + SOFTENING;
+  float inv_dist = 1 / sqrt(sqrd_dist);
+  float inv_dist3 = inv_dist * inv_dist * inv_dist;
+  return inv_dist3;
+}
+
+/* Each work item owns one upper-triangular tile and its transpose. */
+static inline void fill_coefficient_tile(const Body *src, float *coefficients,
+                                         int n, int nblocks, size_t tile) {
+  int lo = 0;
+  int hi = nblocks;
+  while (lo + 1 < hi) {
+    int mid = lo + (hi - lo) / 2;
+    size_t base = (size_t)mid *
+                  (2u * (size_t)nblocks - (size_t)mid + 1u) / 2u;
+    if (base <= tile)
+      lo = mid;
+    else
+      hi = mid;
+  }
+
+  size_t base = (size_t)lo *
+                (2u * (size_t)nblocks - (size_t)lo + 1u) / 2u;
+  int block_i = lo;
+  int block_j = lo + (int)(tile - base);
+  int i_begin = block_i * PAIR_TILE;
+  int j_begin = block_j * PAIR_TILE;
+  int i_end = i_begin + PAIR_TILE;
+  int j_end = j_begin + PAIR_TILE;
+  if (i_end > n) i_end = n;
+  if (j_end > n) j_end = n;
+
+  for (int i = i_begin; i < i_end; ++i) {
+    float xi = src[i].x;
+    float yi = src[i].y;
+    float zi = src[i].z;
+    int first_j = block_i == block_j ? i : j_begin;
+    for (int j = first_j; j < j_end; ++j) {
+      float dx = src[j].x - xi;
+      float dy = src[j].y - yi;
+      float dz = src[j].z - zi;
+      float scale = inverse_cube(dx, dy, dz);
+      coefficients[(size_t)i * (size_t)n + (size_t)j] = scale;
+      if (i != j) {
+        /* Preserve directional NaN propagation instead of mirroring it. */
+        float reverse = scale;
+        if (isnan(scale)) {
+          reverse = inverse_cube(src[i].x - src[j].x,
+                                 src[i].y - src[j].y,
+                                 src[i].z - src[j].z);
+        }
+        coefficients[(size_t)j * (size_t)n + (size_t)i] = reverse;
+      }
+    }
+  }
+}
+
+static inline void advance_body(const Body *src, Body *dst,
+                                const float *coefficients,
+                                float dt, int n, int i) {
+  float xi = src[i].x;
+  float yi = src[i].y;
+  float zi = src[i].z;
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+
+  if (coefficients != NULL) {
+    const float *row = coefficients + (size_t)i * (size_t)n;
+    for (int j = 0; j < n; ++j) {
+      float dx = src[j].x - xi;
+      float dy = src[j].y - yi;
+      float dz = src[j].z - zi;
+      float inv_dist3 = row[j];
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+  } else {
+    for (int j = 0; j < n; ++j) {
+      float dx = src[j].x - xi;
+      float dy = src[j].y - yi;
+      float dz = src[j].z - zi;
+      float inv_dist3 = inverse_cube(dx, dy, dz);
+      fx += dx * inv_dist3;
+      fy += dy * inv_dist3;
+      fz += dz * inv_dist3;
+    }
+  }
+
+  float vx = src[i].vx + dt*fx;
+  float vy = src[i].vy + dt*fy;
+  float vz = src[i].vz + dt*fz;
+  dst[i].vx = vx;
+  dst[i].vy = vy;
+  dst[i].vz = vz;
+  dst[i].x = xi + vx*dt;
+  dst[i].y = yi + vy*dt;
+  dst[i].z = zi + vz*dt;
+}
+
+static void simulate(Body *p, float dt, int n) {
+  if (n <= 0) return;
+
+  size_t count = (size_t)n;
+  Body *next = (Body *)malloc(count * sizeof(Body));
+  if (next == NULL) {
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      body_force(p, dt, n);
+      for (int i = 0; i < n; ++i) {
+        p[i].x += p[i].vx * dt;
+        p[i].y += p[i].vy * dt;
+        p[i].z += p[i].vz * dt;
+      }
+    }
+    return;
+  }
+
+  float *coefficients = NULL;
+  if (count <= ((size_t)PAIR_CACHE_BYTES / sizeof(float)) / count) {
+    coefficients = (float *)malloc(count * count * sizeof(float));
+  }
+
+  int nblocks = 0;
+  size_t tile_count = 0;
+  if (coefficients != NULL) {
+    nblocks = (n - 1) / PAIR_TILE + 1;
+    tile_count = (size_t)nblocks * ((size_t)nblocks + 1u) / 2u;
+  }
+
+  #pragma omp parallel if(n >= 128)
+  {
+    Body *src = p;
+    Body *dst = next;
+    for (int iter = 0; iter < N_ITER; ++iter) {
+      if (coefficients != NULL) {
+        #pragma omp for schedule(static, 1)
+        for (size_t tile = 0; tile < tile_count; ++tile) {
+          fill_coefficient_tile(src, coefficients, n, nblocks, tile);
+        }
+      }
+
+      /* The j traversal remains sequential within every force sum. */
+      #pragma omp for schedule(static)
+      for (int i = 0; i < n; ++i) {
+        advance_body(src, dst, coefficients, dt, n, i);
+      }
+
+      Body *tmp = src;
+      src = dst;
+      dst = tmp;
+    }
+  }
+
+  if (N_ITER % 2 != 0) {
+    memcpy(p, next, count * sizeof(Body));
+  }
+  free(coefficients);
+  free(next);
+}
+
+/*
+ * Read a binary dataset with initilized bodies.
+ */
+Body* read_dataset(int *nbodies) {
+  int b = fread(nbodies, sizeof(*nbodies), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading nbodie value\n");
+    exit(EXIT_FAILURE);
+  }
+  Body *bodies = (Body *)malloc(*nbodies * sizeof(Body));
+  b = fread(bodies, *nbodies * sizeof(Body), 1, stdin);
+  if (b != 1) {
+    fprintf(stderr,"\nError reading input values\n");
+    exit(EXIT_FAILURE);
+  }
+
+  return bodies;
+}
+
+/*
+ * Write simulation results into a binary dataset.
+ */
+void write_dataset(const int nbodies, Body *bodies) {
+  int b = fwrite(bodies, nbodies * sizeof(Body), 1, stdout);
+  if (b != 1) {
+    fprintf(stderr,"\nError writing to output\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc,char **argv) {
+  int nbodies;
+
+  Body *bodies = read_dataset(&nbodies);
+
+  /* Compute interbody forces and integrate positions each iteration. */
+  simulate(bodies, DT, nbodies);
+
+  write_dataset(nbodies, bodies);
+
+  free(bodies);
+
+  exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,216 @@
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <utility>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using namespace std;
+
+typedef vector<vector<bool>> adjacency_matrix;
+
+adjacency_matrix readGraph();
+
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2);
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2,
+                       const vector<int> &equivalence);
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2,
+                       const int *equivalence, int vertices);
+inline void printPermutation(const vector<int> &equivalence);
+inline void printPermutation(const int *equivalence, int vertices);
+
+static bool nextHeapPermutation(vector<int> &equivalence,
+                                vector<int> &exchange_counter,
+                                int &exchange_index);
+static bool enumerateSerial(const adjacency_matrix &g1,
+                            const adjacency_matrix &g2,
+                            vector<int> &equivalence,
+                            vector<int> &exchange_counter,
+                            int &exchange_index);
+#ifdef _OPENMP
+static bool enumerateParallel(const adjacency_matrix &g1,
+                              const adjacency_matrix &g2,
+                              vector<int> &equivalence,
+                              vector<int> &exchange_counter,
+                              int &exchange_index);
+#endif
+
+int main(){
+    adjacency_matrix g1 = readGraph();
+    adjacency_matrix g2 = readGraph();
+
+    if(!testIsomorphism(g1, g2))
+        cout << "The graphs are not isomorphic" << endl;
+
+    return 0;
+}
+
+bool testIsomorphism(const adjacency_matrix &g1, const adjacency_matrix &g2){
+    if(g1.size() != g2.size()) return false;
+
+    vector<int> equivalence(g1.size(), 0);
+    vector<int> exchange_counter(g1.size(), 0);
+    int exchange_index = 1;
+
+    for(int i = 0; i < static_cast<int>(equivalence.size()); ++i)
+        equivalence[i] = i;
+
+    if(verifyPermutation(g1, g2, equivalence)){
+        printPermutation(equivalence);
+        return true;
+    }
+
+#ifdef _OPENMP
+    if(equivalence.size() >= 8 && omp_get_max_threads() > 1)
+        return enumerateParallel(g1, g2, equivalence, exchange_counter,
+                                 exchange_index);
+#endif
+
+    return enumerateSerial(g1, g2, equivalence, exchange_counter,
+                           exchange_index);
+}
+
+adjacency_matrix readGraph(){
+    int vertices, edges, source, destination;
+
+    cin >> vertices;
+    adjacency_matrix read(vertices);
+    for (int i = 0; i < vertices; ++i)
+        read[i].resize(vertices);
+
+    cin >> edges;
+    for (int i = 0; i < edges; i++) {
+       cin >> source >> destination;
+       read[destination][source] = read[source][destination] = true;
+    }
+
+    return read;
+}
+
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2,
+                       const vector<int> &equivalence){
+    return verifyPermutation(g1, g2, equivalence.data(),
+                             static_cast<int>(equivalence.size()));
+}
+
+bool verifyPermutation(const adjacency_matrix &g1, const adjacency_matrix &g2,
+                       const int *equivalence, int vertices){
+    for (int i = 0; i < vertices; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            if(g1[i][j] != g2[equivalence[i]][equivalence[j]]) return false;
+        }
+    }
+    return true;
+}
+
+inline void printPermutation(const vector<int> &equivalence){
+    printPermutation(equivalence.data(), static_cast<int>(equivalence.size()));
+}
+
+inline void printPermutation(const int *equivalence, int vertices){
+    for (int i = 0; i < vertices; ++i)
+        cout << equivalence[i] << " ";
+    cout << endl;
+}
+
+static bool nextHeapPermutation(vector<int> &equivalence,
+                                vector<int> &exchange_counter,
+                                int &exchange_index){
+    const int vertices = static_cast<int>(equivalence.size());
+
+    while(exchange_index < vertices){
+        if(exchange_counter[exchange_index] < exchange_index){
+            if(exchange_index % 2 == 0)
+                swap(equivalence[0], equivalence[exchange_index]);
+            else
+                swap(equivalence[exchange_counter[exchange_index]],
+                     equivalence[exchange_index]);
+
+            ++exchange_counter[exchange_index];
+            exchange_index = 1;
+            return true;
+        }
+
+        exchange_counter[exchange_index] = 0;
+        ++exchange_index;
+    }
+
+    return false;
+}
+
+static bool enumerateSerial(const adjacency_matrix &g1,
+                            const adjacency_matrix &g2,
+                            vector<int> &equivalence,
+                            vector<int> &exchange_counter,
+                            int &exchange_index){
+    bool isomorphism_found = false;
+
+    while(nextHeapPermutation(equivalence, exchange_counter, exchange_index)){
+        if(verifyPermutation(g1, g2, equivalence)){
+            printPermutation(equivalence);
+            isomorphism_found = true;
+        }
+    }
+
+    return isomorphism_found;
+}
+
+#ifdef _OPENMP
+static bool enumerateParallel(const adjacency_matrix &g1,
+                              const adjacency_matrix &g2,
+                              vector<int> &equivalence,
+                              vector<int> &exchange_counter,
+                              int &exchange_index){
+    constexpr int batch_size = 2048;
+    const int vertices = static_cast<int>(equivalence.size());
+    vector<int> candidates(static_cast<size_t>(batch_size) * vertices);
+    vector<unsigned char> matches(batch_size);
+    bool isomorphism_found = false;
+    int count = 0;
+    bool more = true;
+
+#pragma omp parallel
+    {
+        while(more){
+#pragma omp single
+            {
+                count = 0;
+                while(count < batch_size &&
+                      nextHeapPermutation(equivalence, exchange_counter,
+                                          exchange_index)){
+                    int *candidate = candidates.data() +
+                                     static_cast<size_t>(count) * vertices;
+                    copy(equivalence.begin(), equivalence.end(), candidate);
+                    ++count;
+                }
+                more = count != 0;
+            }
+
+#pragma omp for schedule(static, 64)
+            for(int candidate = 0; candidate < count; ++candidate){
+                const int *mapping = candidates.data() +
+                                     static_cast<size_t>(candidate) * vertices;
+                matches[candidate] = verifyPermutation(g1, g2, mapping,
+                                                       vertices);
+            }
+
+#pragma omp single
+            {
+                for(int candidate = 0; candidate < count; ++candidate){
+                    if(matches[candidate]){
+                        printPermutation(candidates.data() +
+                                         static_cast<size_t>(candidate) * vertices,
+                                         vertices);
+                        isomorphism_found = true;
+                    }
+                }
+            }
+        }
+    }
+
+    return isomorphism_found;
+}
+#endif

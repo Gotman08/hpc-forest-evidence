@@ -1,0 +1,226 @@
+#include <vector>
+#include <cstdio>
+#include <cassert>
+#include <algorithm>
+#include <limits>
+#include <cstdint>
+#include <cstddef>
+#include <memory>
+
+class FastInput {
+    unsigned char buffer_[1u << 16];
+    std::size_t position_ = 0;
+    std::size_t available_ = 0;
+
+    inline int get() {
+        if (position_ == available_) {
+            available_ = std::fread(buffer_, 1, sizeof(buffer_), stdin);
+            position_ = 0;
+            if (available_ == 0)
+                return EOF;
+        }
+        return buffer_[position_++];
+    }
+
+public:
+    inline bool readInt(int& value) {
+        int ch;
+        do {
+            ch = get();
+            if (ch == EOF)
+                return false;
+        } while (ch <= ' ');
+
+        const bool negative = ch == '-';
+        if (ch == '-' || ch == '+')
+            ch = get();
+        std::uint32_t magnitude = 0;
+        while (ch >= '0' && ch <= '9') {
+            magnitude = magnitude * 10u + static_cast<unsigned>(ch - '0');
+            ch = get();
+        }
+        value = negative
+            ? static_cast<int>(-static_cast<std::int64_t>(magnitude))
+            : static_cast<int>(magnitude);
+        return true;
+    }
+};
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+
+static inline int64x2_t maximumPair(int64x2_t a, int64x2_t b) {
+    return vbslq_s64(vcgtq_s64(a, b), a, b);
+}
+
+static inline int64x2_t broadcastLast(int64x2_t value) {
+    return vdupq_n_s64(vgetq_lane_s64(value, 1));
+}
+
+static inline int64x2_t prefixPair(int64x2_t value) {
+    return vaddq_s64(value, vextq_s64(vdupq_n_s64(0), value, 1));
+}
+
+static inline void scanEight(const int* entering, const int* leaving,
+                             int64x2_t& p0, int64x2_t& p1,
+                             int64x2_t& p2, int64x2_t& p3) {
+    const int32x4_t e0 = vld1q_s32(entering);
+    const int32x4_t e1 = vld1q_s32(entering + 4);
+    const int32x4_t l0 = vld1q_s32(leaving);
+    const int32x4_t l1 = vld1q_s32(leaving + 4);
+    p0 = prefixPair(vsubl_s32(vget_low_s32(e0), vget_low_s32(l0)));
+    p1 = prefixPair(vsubl_s32(vget_high_s32(e0), vget_high_s32(l0)));
+    p2 = prefixPair(vsubl_s32(vget_low_s32(e1), vget_low_s32(l1)));
+    p3 = prefixPair(vsubl_s32(vget_high_s32(e1), vget_high_s32(l1)));
+    p1 = vaddq_s64(p1, broadcastLast(p0));
+    p3 = vaddq_s64(p3, broadcastLast(p2));
+    const int64x2_t firstHalf = broadcastLast(p1);
+    p2 = vaddq_s64(p2, firstHalf);
+    p3 = vaddq_s64(p3, firstHalf);
+}
+
+template<bool Remove, bool Track>
+static inline int64x2_t updatePair(std::int64_t* __restrict totals,
+                                  std::int64_t* __restrict history,
+                                  int64x2_t horizontal, int64x2_t best) {
+    int64x2_t next = vaddq_s64(vld1q_s64(totals), horizontal);
+    if (Remove)
+        next = vsubq_s64(next, vld1q_s64(history));
+    vst1q_s64(history, horizontal);
+    vst1q_s64(totals, next);
+    if (Track)
+        best = maximumPair(best, next);
+    return best;
+}
+#endif
+
+template<bool Remove, bool Track>
+static inline std::int64_t processRow(const int* __restrict row,
+                                      std::int64_t* __restrict totals,
+                                      std::int64_t* __restrict history,
+                                      int n, int s) {
+    const int width = n - s + 1;
+    std::int64_t horizontal = 0;
+    #pragma omp simd reduction(+:horizontal)
+    for (int c = 0; c < s; ++c)
+        horizontal += static_cast<std::int64_t>(row[c]);
+
+    std::int64_t first = totals[0] + horizontal;
+    if (Remove)
+        first -= history[0];
+    history[0] = horizontal;
+    totals[0] = first;
+    std::int64_t rowMaximum = Track
+        ? first : std::numeric_limits<std::int64_t>::lowest();
+    int x = 1;
+
+#if defined(__aarch64__)
+    int64x2_t carry = vdupq_n_s64(horizontal);
+    int64x2_t best0 = vdupq_n_s64(std::numeric_limits<std::int64_t>::lowest());
+    int64x2_t best1 = best0;
+    int64x2_t best2 = best0;
+    int64x2_t best3 = best0;
+    int64x2_t best4 = best0;
+    int64x2_t best5 = best0;
+    int64x2_t best6 = best0;
+    int64x2_t best7 = best0;
+
+    for (; x + 15 < width; x += 16) {
+        int64x2_t p0, p1, p2, p3, p4, p5, p6, p7;
+        scanEight(row + x + s - 1, row + x - 1, p0, p1, p2, p3);
+        scanEight(row + x + s + 7, row + x + 7, p4, p5, p6, p7);
+        const int64x2_t firstEight = broadcastLast(p3);
+        p4 = vaddq_s64(p4, firstEight);
+        p5 = vaddq_s64(p5, firstEight);
+        p6 = vaddq_s64(p6, firstEight);
+        p7 = vaddq_s64(p7, firstEight);
+
+        p0 = vaddq_s64(p0, carry);
+        p1 = vaddq_s64(p1, carry);
+        p2 = vaddq_s64(p2, carry);
+        p3 = vaddq_s64(p3, carry);
+        p4 = vaddq_s64(p4, carry);
+        p5 = vaddq_s64(p5, carry);
+        p6 = vaddq_s64(p6, carry);
+        p7 = vaddq_s64(p7, carry);
+        carry = broadcastLast(p7);
+
+        best0 = updatePair<Remove, Track>(totals + x, history + x, p0, best0);
+        best1 = updatePair<Remove, Track>(totals + x + 2, history + x + 2, p1, best1);
+        best2 = updatePair<Remove, Track>(totals + x + 4, history + x + 4, p2, best2);
+        best3 = updatePair<Remove, Track>(totals + x + 6, history + x + 6, p3, best3);
+        best4 = updatePair<Remove, Track>(totals + x + 8, history + x + 8, p4, best4);
+        best5 = updatePair<Remove, Track>(totals + x + 10, history + x + 10, p5, best5);
+        best6 = updatePair<Remove, Track>(totals + x + 12, history + x + 12, p6, best6);
+        best7 = updatePair<Remove, Track>(totals + x + 14, history + x + 14, p7, best7);
+    }
+    horizontal = vgetq_lane_s64(carry, 0);
+    if (Track) {
+        best0 = maximumPair(best0, best1);
+        best2 = maximumPair(best2, best3);
+        best4 = maximumPair(best4, best5);
+        best6 = maximumPair(best6, best7);
+        best0 = maximumPair(best0, best2);
+        best4 = maximumPair(best4, best6);
+        best0 = maximumPair(best0, best4);
+        rowMaximum = std::max(rowMaximum,
+            std::max(vgetq_lane_s64(best0, 0), vgetq_lane_s64(best0, 1)));
+    }
+#endif
+
+    for (; x < width; ++x) {
+        horizontal += static_cast<std::int64_t>(row[x + s - 1])
+                    - static_cast<std::int64_t>(row[x - 1]);
+        std::int64_t next = totals[x] + horizontal;
+        if (Remove)
+            next -= history[x];
+        history[x] = horizontal;
+        totals[x] = next;
+        if (Track)
+            rowMaximum = std::max(rowMaximum, next);
+    }
+    return rowMaximum;
+}
+
+int main() {
+    FastInput input;
+    int n, s;
+    if (!input.readInt(n) || !input.readInt(s))
+        return 0;
+
+    assert(s < n);
+    assert(n < 8000);
+    assert(s > 0);
+    assert(n > 0);
+
+    const int width = n - s + 1;
+    std::vector<int> row(n);
+    std::vector<std::int64_t> totals(width, 0);
+    std::unique_ptr<std::int64_t[]> history(
+        new std::int64_t[static_cast<std::size_t>(s) * width]);
+    std::int64_t answer = std::numeric_limits<std::int64_t>::lowest();
+    int slot = 0;
+
+    for (int r = 0; r < n; ++r) {
+        for (int c = 0; c < n; ++c)
+            if (!input.readInt(row[c]))
+                return 0;
+
+        std::int64_t* previous = history.get()
+            + static_cast<std::size_t>(slot) * width;
+        if (r < s - 1) {
+            processRow<false, false>(row.data(), totals.data(), previous, n, s);
+        } else if (r == s - 1) {
+            answer = std::max(answer,
+                processRow<false, true>(row.data(), totals.data(), previous, n, s));
+        } else {
+            answer = std::max(answer,
+                processRow<true, true>(row.data(), totals.data(), previous, n, s));
+        }
+        if (++slot == s)
+            slot = 0;
+    }
+
+    std::printf("%lld\n", static_cast<long long>(answer));
+    return 0;
+}

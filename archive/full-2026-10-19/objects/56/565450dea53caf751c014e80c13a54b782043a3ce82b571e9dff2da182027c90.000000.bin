@@ -1,0 +1,50 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "/*\n    This program solves Laplace's equation on a regular 2D grid using simple Jacobi iteration.\n\n    The stencil calculation stops when  ( err >= CONV_THRESHOLD OR  iter > ITER_MAX )\n*/\n#include <stdio.h>\n#include <stdlib.h>\n#include <time.h>\n#include <sys/time.h>\n\n#define CONV_THRESHOLD 1.0e-5f // threshold of convergence\n\n// matrix to be solved\ndouble **grid;\n\n// auxiliary matrix\ndouble **new_grid;\n\n// size of each side of the grid\nint size;\nint iter_max_num;\n\n// return the absolute value of a number\ndouble absolute(double num){\n    if(num < 0)\n        return -1.0 * num;\n    return num;\n}\n\n\n// allocate memory for the grid\nvoid allocate_memory(){\n    grid = (double **) malloc(size * sizeof(double *));\n    new_grid = (double **) malloc(size * sizeof(double *));\n\n    for(int i = 0; i < size; i++){\n        grid[i] = (double *) malloc(size * sizeof(double));\n        new_grid[i] = (double *) malloc(size * sizeof(double));\n    }\n}\n\n// initialize the grid\nvoid initialize_grid(){\n    int center = size / 2;\n    int linf = center - (size / 10);\n    int lsup = center + (size / 10);\n    for (int i = 0; i < size; i++){\n        for (int j = 0; j < size; j++){\n            // inicializa região de calor no centro do grid\n            if ( i >= linf && i <= lsup && j >= linf && j <= lsup)\n                grid[i][j] = 100;\n            else\n                grid[i][j] = 0;\n            // Both buffers retain the fixed boundary values when their roles change.\n            new_grid[i][j] = grid[i][j];\n        }\n    }\n}\n\n// save the grid in a file\nvoid save_grid(){\n\n    for(int i = 0; i < size; i++){\n        for(int j = 0; j < size; j++){\n            fprintf(stdout, \"%lf \", grid[i][j]);\n        }\n        fprintf(stdout, \"\\n\");\n    }\n}\n\nint main(int argc, char *argv[]){\n\n    fscanf(stdin, \"%d\", &size);\n    fscanf(stdin, \"%d\", &iter_max_num);\n    \n    int hasError = 1;\n    int iter = 0;\n\n    struct timeval time_start;\n    struct timeval time_end;\n\n    // Track cells that could be nonzero, beginning with the initialized heat patch.\n    int center = size / 2;\n    int active_min_i = center - (size / 10);\n    int active_max_i = center + (size / 10);\n    int active_min_j = center - (size / 10);\n    int active_max_j = center + (size / 10);\n    int work_min_i, work_max_i, work_min_j, work_max_j;\n    int full_sweep = 0;\n\n    // allocate memory to the grid (matrix)\n    allocate_memory();\n\n    // set grid initial conditions\n    initialize_grid();\n\n    //printf(\"Jacobi relaxation calculation: %d x %d grid\\n\", size, size);\n\n    // get the start time\n    //gettimeofday(&time_start, NULL);\n\n    // A conservative active box grows by one cell per iteration. Once it covers\n    // most of the grid, use full sweeps to avoid maintaining a small-region path.\n    // A single persistent team avoids creating a new team for each iteration.\n    #pragma omp parallel if(size >= 128)\n    {\n        while ( hasError && iter < iter_max_num ) {\n\n            #pragma omp single\n            {\n                hasError = 0;\n\n                if (!full_sweep) {\n                    if (active_min_i > 0) active_min_i--;\n                    if (active_min_j > 0) active_min_j--;\n                    if (active_max_i < size - 1) active_max_i++;\n                    if (active_max_j < size - 1) active_max_j++;\n\n                    long long active_height = (long long)(active_max_i - active_min_i + 1);\n                    long long active_width = (long long)(active_max_j - active_min_j + 1);\n                    long long active_cells = active_height * active_width;\n                    long long total_cells = (long long)size * (long long)size;\n                    long long full_threshold = total_cells - total_cells / 4;\n\n                    if (active_cells >= full_threshold) {\n                        full_sweep = 1;\n                        active_min_i = 0;\n                        active_min_j = 0;\n                        active_max_i = size - 1;\n                        active_max_j = size - 1;\n                    }\n                }\n\n                work_min_i = active_min_i > 1 ? active_min_i : 1;\n                work_min_j = active_min_j > 1 ? active_min_j : 1;\n                work_max_i = active_max_i < size - 2 ? active_max_i : size - 2;\n                work_max_j = active_max_j < size - 2 ? active_max_j : size - 2;\n            }\n\n            // Cells outside the expanded box have only zero-valued neighbors,\n            // so their update and convergence contribution are both zero.\n            #pragma omp for collapse(2) schedule(static) reduction(|:hasError)\n            for (int i = work_min_i; i <= work_max_i; i++) {\n                for (int j = work_min_j; j <= work_max_j; j++) {\n                    new_grid[i][j] = 0.25 * (grid[i][j+1] + grid[i][j-1] +\n                                             grid[i-1][j] + grid[i+1][j]);\n\n                    double errorCurrent = absolute(new_grid[i][j] - grid[i][j]);\n                    if (errorCurrent > CONV_THRESHOLD) {\n                        hasError = 1;\n                    }\n                }\n            }\n\n            // Every active interior cell was just overwritten; swapping buffers\n            // avoids a separate full-grid copy while leaving boundaries fixed.\n            #pragma omp single\n            {\n                double **temp_grid = grid;\n                grid = new_grid;\n                new_grid = temp_grid;\n                iter++;\n            }\n        }\n    }\n\n    // get the end time\n    //gettimeofday(&time_end, NULL);\n\n    //double exec_time = (double) (time_end.tv_sec - time_start.tv_sec) +\n    //                   (double) (time_end.tv_usec - time_start.tv_usec) / 1000000.0;\n\n    //save the final grid in file\n    save_grid();\n\n    //printf(\"\\nKernel executed in %lf seconds with %d iterations.\\n\", exec_time, iter);\n\n    return 0;\n}\n",
+        "path": "src/laplace_seq.c"
+      }
+    ],
+    "hypothesis": "A persistent OpenMP team can accelerate large Jacobi grids while a conservative active box skips cells that remain exactly zero; bitwise-OR reduction preserves the convergence decision. Swapping fully initialized buffers removes the per-iteration copy, and full sweeps resume once the active box covers at least three quarters of the grid.",
+    "notes": "This is an unmeasured candidate. The active box includes the initialized heat region, expands before each stencil step, and is clipped to the grid interior for updates; fixed boundaries remain unchanged. The OpenMP `if` clause serializes smaller grids to limit thread overhead. No correctness or speed result is claimed.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [],
+    "transformations": [
+      "Initialize both buffers identically so fixed boundary values survive buffer swaps.",
+      "Track and expand a conservative bounding box of potentially nonzero cells; switch to a full sweep at 75% of grid area.",
+      "Use a persistent OpenMP team with static collapsed work-sharing, an integer bitwise-OR convergence reduction, and a size cutoff.",
+      "Swap grid buffers after each iteration instead of copying interior values."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-luna",
+  "nonce": "8fbe2d8885214e7b81d7c82d8d0d107d",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "max",
+  "request_sha256": "37f522f4c3e0bf69382386e19c8fd8fb44d6de5fe9f5a0f519cedd10635e09ac",
+  "session_id": "c08531b8446a447bacb06c4500c0c033",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "cd50ef88a8a4ac5fdbe3092362e07d0344c8777b8ec8e473663cc42147ba39cd",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 4224,
+        "input_tokens": 13522,
+        "output_tokens": 18458,
+        "reasoning_output_tokens": 16574
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-luna",
+    "reasoning_effort_requested": "max",
+    "token_accounting": "exact",
+    "tokens": 31980,
+    "tool_events": []
+  }
+}

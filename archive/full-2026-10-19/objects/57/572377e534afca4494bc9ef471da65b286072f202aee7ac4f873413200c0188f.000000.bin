@@ -1,0 +1,127 @@
+"""Cold G private-policy/argv/projection bridge; no client or received-source import."""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import PureWindowsPath
+from subprocess import list2cmdline
+
+import audit_context as context
+from audit_common import need, read_json, sha
+from audit_formats_g import diagnostics_from_events, usage_from_events
+
+FEATURES = {"skip_host_skill_discovery": False, **{name: name == "code_mode_host" for name in (
+    "shell_tool", "unified_exec", "apps", "plugins", "memories", "multi_agent", "multi_agent_v2",
+    "hooks", "skill_search", "browser_use", "computer_use", "image_generation", "view_image",
+    "workspace_dependencies", "code_mode_host", "code_mode", "code_mode_only", "sleep_tool",
+    "unbounded_connection_retries", "shell_snapshot", "goals")}}
+HOST = "3b6a9179a4da17fa5fc6948219cd61486dc3b534c683838076d8c61bd311c68e"
+CLI = "f6dbf48cb70f62649c645f26c87dc9bf84cc36986202dfad8e12fb5b8ca70312"
+PROJECTION_FIELDS = {"schema", "kind", "record_without_private_argv", "argv_public", "private_record_sha256",
+    "private_argv_sha256", "private_skill_override_sha256", "task_cli_policy_sha256", "private_skill_path_count",
+    "private_review_required", "private_argv_verified", "projection_is_executable", "raw_record_exported"}
+
+
+def validate_policy(value, binding, cli, checksum):
+    fields = {"schema", *binding, "cli_executable_sha256", "skill_candidate_directories",
+        "filesystem_metadata_sha256", "is_actual_CLI_discovery_receipt", "instruction_or_SKILL_body_read",
+        "cli_feature_overrides", "code_mode_host_executable_sha256"}
+    need(isinstance(value, dict) and set(value) == fields
+         and value.get("schema") == "hpc-forest-r2g-local-cli-policy-v1"
+         and all(value.get(k) == v for k, v in binding.items())
+         and cli.get("executable_sha256") == value.get("cli_executable_sha256") == CLI
+         and cli.get("task_cli_policy_sha256") == checksum
+         and value.get("code_mode_host_executable_sha256") == HOST,
+         "Exact G frozen private policy/CLI/binding differs")
+    features, paths = value.get("cli_feature_overrides"), value.get("skill_candidate_directories")
+    need(isinstance(features, dict) and set(features) == set(FEATURES)
+         and all(features[k] is v for k, v in FEATURES.items())
+         and value.get("is_actual_CLI_discovery_receipt") is False
+         and value.get("instruction_or_SKILL_body_read") is False
+         and re.fullmatch("[0-9a-f]{64}", value.get("filesystem_metadata_sha256", "")) is not None
+         and isinstance(paths, list) and 0 < len(paths) <= 512,
+         "G policy must retain the exact closed22 bool map and metadata-only selectors")
+    need(all(isinstance(p, str) and re.match(r"^[A-Za-z]:[/\\]", p)
+             and ".." not in p.replace("\\", "/").split("/")
+             and not any(c in p for c in ("\0", "\n", "\r")) for p in paths)
+         and len(paths) == len(set(paths)), "Private policy path selectors differ")
+    return value
+
+
+def toml_value(value):
+    if type(value) in (str, int, bool):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict) and set(value) == {"path", "enabled"} and value["enabled"] is False:
+        return "{path=" + toml_value(value["path"]) + ",enabled=false}"
+    raise ValueError("Unsupported closed private task override type")
+
+
+def expected_argv(cli, model, directory, policy):
+    directory = PureWindowsPath(directory)
+    argv = [cli["executable_path"], "exec", "--ignore-user-config", "--strict-config", "--ephemeral",
+        "--skip-git-repo-check", "--sandbox", "read-only", "--json", "--color", "never", "--model", model,
+        "--output-schema", str(directory / "output-schema.json"), "--output-last-message", str(directory / "agent-result.json"),
+        "-C", str(directory)]
+    overrides = {"model_reasoning_effort": "max", "model_instructions_file": str(directory / "instructions.txt"),
+        "model_context_window": 65536, "project_doc_max_bytes": 0, "skills.max_context_tokens": 1,
+        "skills.config": [{"path": p, "enabled": False} for p in policy["skill_candidate_directories"]],
+        "skills.include_instructions": False, "skills.bundled.enabled": False, "approval_policy": "never",
+        "forced_login_method": "chatgpt", "web_search": "disabled", **{"features." + k: v for k, v in FEATURES.items()}}
+    for key, value in overrides.items():
+        argv.extend(["--config", key + "=" + toml_value(value)])
+    argv.append("-")
+    need(len(list2cmdline(argv).encode("utf-16-le")) // 2 + 1 <= 32767, "Exact private argv exceeds Windows limit")
+    return argv
+
+
+def check_projection(projection, raw, raw_path, kind, cli, policy, checksum):
+    need(isinstance(projection, dict) and set(projection) == PROJECTION_FIELDS
+         and projection.get("schema") == "hpc-forest-r2e-private-cli-metadata-projection-v1"
+         and projection.get("kind") == kind and projection.get("private_review_required") is True
+         and all(projection.get(k) is False for k in ("private_argv_verified", "projection_is_executable", "raw_record_exported")),
+         "G remote CLI metadata must remain a pending non-executable private projection")
+    binding = context.recheck()
+    argv = raw.get("argv")
+    nonce = raw_path.parent.name
+    need(argv == expected_argv(cli, binding.model, PureWindowsPath(binding.cache_source_root) / nonce, policy),
+         "Actual private argv differs from exact ordered G constructor/policy")
+    indices = [i for i, value in enumerate(argv) if value.startswith("skills.config=")]
+    need(len(indices) == 1 and indices[0] > 0 and argv[indices[0] - 1] == "--config", "Only one private selector allowed")
+    index = indices[0]
+    expected = {"schema": "hpc-forest-r2e-private-cli-metadata-projection-v1", "kind": kind,
+        "record_without_private_argv": {k: v for k, v in raw.items() if k != "argv"},
+        "argv_public": argv[:index - 1] + argv[index + 1:], "private_record_sha256": sha(raw_path.read_bytes()),
+        "private_argv_sha256": sha(json.dumps(argv, ensure_ascii=False, sort_keys=True).encode()),
+        "private_skill_override_sha256": sha(argv[index].encode()), "task_cli_policy_sha256": checksum,
+        "private_skill_path_count": len(policy["skill_candidate_directories"]), "private_review_required": True,
+        "private_argv_verified": False, "projection_is_executable": False, "raw_record_exported": False}
+    need(projection == expected, "G remote projection does not equal the actual frozen private bytes")
+
+
+def check_private_pair(invocation_projection, process_projection, local, nonce):
+    binding = context.recheck()
+    need(local.name == nonce and re.fullmatch("[0-9a-f]{32}", nonce), "Exact named cold nonce required")
+    cli = json.loads(binding.cli_json)
+    policy = json.loads(binding.private_cli_policy_json)
+    raw_invocation, raw_process = (read_json(local / name) for name in ("invocation.json", "codex.jsonl.json"))
+    for kind, projection, raw, name in (("invocation", invocation_projection, raw_invocation, "invocation.json"),
+                                      ("process", process_projection, raw_process, "codex.jsonl.json")):
+        check_projection(projection, raw, local / name, kind, cli, policy, cli["task_cli_policy_sha256"])
+    need(raw_invocation["argv"] == raw_process["argv"], "Invocation/process private argv differ")
+    return raw_invocation, raw_process
+
+
+def inspect_completed_cli(events, diagnostics_path, response):
+    """Dirty diagnostics block admission; exact unambiguous usage is still retained."""
+    diagnostics = diagnostics_from_events(events)
+    need(read_json(diagnostics_path) == diagnostics, "Original JSONL/received private diagnostics sidecar differ")
+    usage, tools = usage_from_events(events, context.MODEL)
+    usage["cli_diagnostics_sha256"] = sha(diagnostics_path.read_bytes())
+    usage["cli_diagnostic_count"] = len(diagnostics["findings"])
+    need(response.get("usage") == usage, "Received exact/unknown usage differs from preserved raw events")
+    known = usage["token_accounting"] == "exact"
+    return {"known": known, "exact_tokens": usage["tokens"] if known else None,
+        "raw_sha256": diagnostics["codex_jsonl_sha256"], "diagnostics": diagnostics["findings"],
+        "clean": diagnostics["clean"] is True and not tools}

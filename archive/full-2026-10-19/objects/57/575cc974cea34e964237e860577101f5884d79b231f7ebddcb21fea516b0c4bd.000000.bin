@@ -1,0 +1,50 @@
+"""Read measured diagnostics after a run; never supply this analysis to a model."""
+import json
+import sys
+from pathlib import Path
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def audit(root):
+    result=[]
+    for summary in read(root/"results.json")["problems"]:
+        slug=summary["problem"]
+        campaign=root/slug
+        report=read(campaign/"report/experiments.json")
+        records=[]
+        for trial in report["experiments"]:
+            item={k:trial[k] for k in ["id","role","state","search_parent","hypothesis","reason","score","mean_seconds"]}
+            item["diagnostics"]=[]
+            for name in trial["logs"][:2]:
+                parts=Path(name).parts
+                path=campaign.joinpath(*parts[parts.index(slug)+1:])
+                if path.is_file():
+                    item["diagnostics"].append(path.read_text(encoding="utf-8",errors="replace")[:6000])
+            response=campaign/"logs"/trial["id"]/"ollama-response.json"
+            if response.is_file():
+                generated=read(response)
+                item["model_done_reason"]=generated.get("done_reason")
+                item["model_output_tokens"]=generated.get("eval_count")
+            request=campaign/"logs"/trial["id"]/"ollama-request.json"
+            if request.is_file():
+                item["inference_options"]=read(request)["options"]
+            records.append(item)
+        reference=None
+        # Outcomes omit their trial id; the envelope retains it.
+        for evaluation in report["evaluations"]:
+            if evaluation["phase"]=="confirmation" and evaluation["experiment_id"].startswith("baseline-"):
+                reference=evaluation["outcome"]
+        result.append({"problem":slug,"records":records,"confirmed_candidate_binary_equals_baseline":{
+            e["experiment_id"]:e["outcome"]["binary_sha256"]==reference["binary_sha256"]
+            for e in report["evaluations"] if e["phase"]=="confirmation" and not e["experiment_id"].startswith("baseline-")
+        }})
+    return {"job_id":root.name.removeprefix("results-"),"problems":result}
+
+
+if __name__=="__main__":
+    result=audit(Path(sys.argv[1]))
+    Path(sys.argv[2]).write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+    print(json.dumps({"job_id":result["job_id"],"trials":[[p["problem"],len(p["records"])] for p in result["problems"]]}))

@@ -1,0 +1,51 @@
+{
+  "data": {
+    "files": [
+      {
+        "content": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n#define SHARD_COUNT 4\n#define PARALLEL_THRESHOLD 4096\n\ntypedef struct {\n    long int start;\n    long int count;\n} bucket;\n\nstatic void sort_bucket(char *strings, long int *indices, long int *scratch,\n                        long int count, int length) {\n    long int *source = indices;\n    long int *destination = scratch;\n    long int width;\n\n    for (width = 1; width < count; ) {\n        long int left = 0;\n\n        while (left < count) {\n            long int remaining = count - left;\n            long int middle = left + (width < remaining ? width : remaining);\n            long int right_remaining = count - middle;\n            long int right = middle + (width < right_remaining ? width : right_remaining);\n            long int i = left;\n            long int j = middle;\n            long int out = left;\n\n            while (i < middle && j < right) {\n                if (strcmp(strings + source[i] * length,\n                           strings + source[j] * length) <= 0) {\n                    destination[out++] = source[i++];\n                } else {\n                    destination[out++] = source[j++];\n                }\n            }\n            while (i < middle)\n                destination[out++] = source[i++];\n            while (j < right)\n                destination[out++] = source[j++];\n\n            left = right;\n        }\n\n        {\n            long int *tmp = source;\n            source = destination;\n            destination = tmp;\n        }\n\n        if (width > count / 2)\n            width = count;\n        else\n            width *= 2;\n    }\n\n    if (source != indices)\n        memcpy(indices, source, (size_t)count * sizeof(*indices));\n}\n\nlong int *bucket_sort(char *a, int length, long int size, int offset, int nbuckets) {\n    long int *returns;\n    long int *counts;\n    long int *next;\n    long int *scratch;\n    bucket *buckets;\n    size_t histogram_entries = (size_t)SHARD_COUNT * (size_t)nbuckets;\n    int active_shards;\n\n    if (size <= 0)\n        return NULL;\n\n    returns = (long int *)malloc(sizeof(*returns) * (size_t)size);\n    scratch = (long int *)malloc(sizeof(*scratch) * (size_t)size);\n    counts = (long int *)calloc(histogram_entries, sizeof(*counts));\n    next = (long int *)malloc(histogram_entries * sizeof(*next));\n    buckets = (bucket *)malloc(sizeof(*buckets) * (size_t)nbuckets);\n    if (returns == NULL || scratch == NULL || counts == NULL ||\n        next == NULL || buckets == NULL) {\n        free(returns);\n        free(scratch);\n        free(counts);\n        free(next);\n        free(buckets);\n        fprintf(stderr, \"Unable to allocate bucket-sort storage\\n\");\n        exit(EXIT_FAILURE);\n    }\n\n    active_shards = size >= PARALLEL_THRESHOLD ? SHARD_COUNT : 1;\n\n    /* Count each active input shard independently. */\n    #pragma omp parallel for schedule(static) num_threads(SHARD_COUNT) if(active_shards > 1)\n    for (int t = 0; t < active_shards; t++) {\n        long int chunk = size / active_shards;\n        long int remainder = size % active_shards;\n        long int begin = chunk * t + (remainder * t) / active_shards;\n        long int end = chunk * (t + 1) + (remainder * (t + 1)) / active_shards;\n\n        for (long int i = begin; i < end; i++) {\n            int key = a[i * length] - offset;\n            counts[(size_t)t * (size_t)nbuckets + (size_t)key]++;\n        }\n    }\n\n    /* Assign exact, disjoint ranges within each bucket to the shards. */\n    {\n        long int base = 0;\n        for (int b = 0; b < nbuckets; b++) {\n            long int bucket_total = 0;\n            for (int t = 0; t < SHARD_COUNT; t++) {\n                size_t slot = (size_t)t * (size_t)nbuckets + (size_t)b;\n                next[slot] = base + bucket_total;\n                bucket_total += counts[slot];\n            }\n            buckets[b].start = base;\n            buckets[b].count = bucket_total;\n            base += bucket_total;\n        }\n    }\n\n    /* Scatter each shard into its private ranges without synchronization. */\n    #pragma omp parallel for schedule(static) num_threads(SHARD_COUNT) if(active_shards > 1)\n    for (int t = 0; t < active_shards; t++) {\n        long int chunk = size / active_shards;\n        long int remainder = size % active_shards;\n        long int begin = chunk * t + (remainder * t) / active_shards;\n        long int end = chunk * (t + 1) + (remainder * (t + 1)) / active_shards;\n\n        for (long int i = begin; i < end; i++) {\n            int key = a[i * length] - offset;\n            size_t slot = (size_t)t * (size_t)nbuckets + (size_t)key;\n            returns[next[slot]++] = i;\n        }\n    }\n\n    /* Sort independent ranges stably, reusing one scratch array. */\n    #pragma omp parallel for schedule(dynamic, 1) num_threads(SHARD_COUNT) if(active_shards > 1)\n    for (int b = 0; b < nbuckets; b++) {\n        if (buckets[b].count > 1) {\n            long int start = buckets[b].start;\n            sort_bucket(a, returns + start, scratch + start,\n                        buckets[b].count, length);\n        }\n    }\n\n    free(scratch);\n    free(counts);\n    free(next);\n    free(buckets);\n    return returns;\n}\n\nvoid load(char **vString, long int *N, int *l, int *os, int *nb){\n   char *strings = NULL;\n   int      len,\n            offset,\n            nbucket;\n   long int n;\n\n   if (!fscanf(stdin, \"%d\", &len)) {\n      printf (\"ERROR len\\n\");\n      exit (1);\n   }\n\n   if (!fscanf(stdin, \"%ld\", &n)) {\n      printf (\"ERROR n\\n\");\n      exit (1);\n   }\n\n   if (!fscanf(stdin, \"%d\", &offset)) {\n      printf (\"ERROR offset\\n\");\n      exit (1);\n   }\n\n   if (!fscanf(stdin, \"%d\", &nbucket)) {\n      printf (\"ERROR nbucket\\n\");\n      exit (1);\n   }\n\n   nbucket = nbucket + 1;\n   len = len + 1;\n\n   strings = (char*) malloc(n * len);\n\n   for (int i = 0; i < n; i++){\n      if (!fscanf(stdin, \"%s\", strings + (i * len))) {\n      printf (\"ERROR %d\\n\",i);\n      exit (1);\n      }\n   }\n\n   *vString = strings;\n   *N = n;\n   *l = len;\n   *os = offset;\n   *nb = nbucket;\n}\n\nvoid print(char *strings, long int *index, long int n, int len){\n\n   for (int i = 0; i < n; i++){\n      printf(\"%d -> %s\\n\", i, strings + (index[i] * len));\n   }\n}\n\nvoid save(char *strings, long int *index, long int n, int len){\n   for (int i = 0; i < n; i++){\n      printf(\"%s\\n\", strings + (index[i] * len));\n   }\n}\n\nint main(int ac, char **av) {\n\n   char     *strings = NULL;\n   long int N        = 0;\n   long int *index   = NULL;\n   int      len      = 0,\n            save2File = 0,\n            offset,\n            nbuckets;\n\n   load(&strings, &N, &len, &offset, &nbuckets);\n\n   index = bucket_sort(strings, len, N, offset, nbuckets);\n\n   save(strings, index, N, len);\n\n   if (strings != NULL)\n      free(strings);\n\n   if (index != NULL)\n      free(index);\n\n   return EXIT_SUCCESS;\n}\n",
+        "path": "src/bucketsort.c"
+      }
+    ],
+    "hypothesis": "Combining per-shard bucket histograms and disjoint prefix-range scattering with a reusable stable mergesort should reduce serial scatter work while preserving each bucket’s strcmp order; dynamically scheduled bucket sorts can use up to four threads for large inputs.",
+    "notes": "This integrates the declared sharded histogram/scatter and stable mergesort ideas. No commands were executed and no measurements are claimed.",
+    "research": {
+      "queries": [],
+      "urls": []
+    },
+    "sources_kept": [
+      "a864d3a3c8484177",
+      "621efae6434b4141"
+    ],
+    "transformations": [
+      "Count keys per active input shard, compute exact per-bucket shard offsets, and scatter indices into disjoint ranges; use one active shard below the parallel threshold.",
+      "Replace insertion sorting with stable iterative mergesort using one reusable scratch array, and dynamically schedule independent bucket ranges across up to four OpenMP threads for large inputs."
+    ]
+  },
+  "error": null,
+  "infrastructure_error": false,
+  "model": "gpt-6-luna",
+  "nonce": "fad545b8be7f4b57acfe3170341caef6",
+  "protocol": "hpc-forest-codex-mailbox-v1",
+  "reasoning_effort": "xhigh",
+  "request_sha256": "b58dc5c0b2479aefc319b78bb50ed1d027f7732e707d190e911c421ebfe1dfad",
+  "session_id": "fb704484f3a5459ca3a4a358d2208a0b",
+  "usage": {
+    "cached_tokens_included_in_input": true,
+    "codex_jsonl_sha256": "bd762e8d9787694cf30ab50d2cc147f0c445cf4024ef1de754c9a33537d97611",
+    "events": [
+      {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_tokens": 27732,
+        "output_tokens": 8456,
+        "reasoning_output_tokens": 6167
+      }
+    ],
+    "llm_calls": 1,
+    "model_requested": "gpt-6-luna",
+    "reasoning_effort_requested": "xhigh",
+    "token_accounting": "exact",
+    "tokens": 36188,
+    "tool_events": []
+  }
+}

@@ -1,0 +1,143 @@
+"""Neutral cap4 tests: no source execution, process, shell, model, network or positive admission."""
+import ast
+import importlib.util
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('cap4_factory_tests', ROOT / 'assembler-admissions-cellule.py')
+f = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(f)
+m = f.m
+NOW = 1800000000
+STAMP = datetime.fromtimestamp(NOW - 10, UTC).isoformat()
+
+
+@pytest.mark.parametrize('model', ['gpt-6-astra', 'gpt-5.6-terra', 'gpt-6.1-sol'])
+def test_one_explicit_closed_cell(model):
+    assert m.selected_cell(model) == (model, m.CELLS[model])
+
+
+@pytest.mark.parametrize('model', ['gpt-6-luna', '', None, 'gpt-6-astra-high', 'unknown'])
+def test_luna_unknown_or_other_effort_never_selected(model):
+    with pytest.raises(m.Refusal):
+        m.selected_cell(model)
+
+
+def test_unadmitted_bindings_never_render_or_load_source(tmp_path):
+    p = tmp_path / 'NEUTRAL-bindings.json'; p.write_text(json.dumps({'verified': False}), encoding='utf8')
+    with pytest.raises(m.Refusal):
+        m.configure(m.ref(p), 'gpt-6-astra')
+    with pytest.raises(m.Refusal):
+        m.render_preflight()
+
+
+def test_real_r2b_plan_cap2_cannot_be_readmitted_as_cap4(tmp_path):
+    b = m.BASE
+    old = b / 'outputs/HPC-Forest-Primes-Natif-MAX-r2/revision-r2b'
+    q = b / 'outputs/HPC-Forest-Primes-Natif-Qualification-r2b/reception-752087'
+    value = {'schema': 'hpc-forest-max-cap4-source-bindings-v1', 'verified': True,
+        'scope_id': 'hpc-forest-primes-native-max-r2b', 'source_zip': m.ref(old / 'HPC-Forest-Primes-Natif-MAX-r2b.zip'),
+        'plan': m.ref(old / 'native-max-plan.json'), 'runtime_manifest': m.ref(old / 'runtime-manifest-r2max.json'),
+        'project_path': str(b / 'work/hpc-forest-primes-native-max-r2b/project'), 'source_member_count': 103,
+        'remote_extraction': '/scratch_p/nimarano/NEUTRAL/extraction', 'remote_qualification_root': '/scratch_p/nimarano/NEUTRAL',
+        'qualification': m.ref(q / 'qualification.json'), 'qualification_reception': m.ref(q / 'reception-contrat.json'),
+        'source_review': m.ref(old / 'REVUE-INDEPENDANTE-P1.json'), 'maximum_native_workers': 4, 'cells': m.CELLS}
+    p = tmp_path / 'NEUTRAL-old-plan-attempt.json'; p.write_text(json.dumps(value), encoding='utf8')
+    with pytest.raises(m.Refusal, match='sealed plan must authorize cap4'):
+        m.configure(m.ref(p), 'gpt-6-astra')
+
+
+@pytest.mark.parametrize('model', ['gpt-6-astra', 'gpt-5.6-terra', 'gpt-6.1-sol'])
+def test_rendered_neutral_ast_has_one_selected_cell_and_one_srun(monkeypatch, model):
+    values = {'BINDING': {'NEUTRAL': True}, 'MODEL': model, 'SESSION': m.CELLS[model],
+        'SCOPE': 'NEUTRAL_CAP4', 'SOURCE': 'NEUTRAL_SOURCE', 'PLAN': 'NEUTRAL_PLAN', 'RUNTIME': 'NEUTRAL_RUNTIME',
+        'SOURCE_MEMBERS': 103, 'EXTRACTION': '/scratch_p/nimarano/NEUTRAL/extraction',
+        'REMOTE_ROOT': '/scratch_p/nimarano/NEUTRAL-' + m.CELLS[model],
+        'ADMISSION_ROOT': '/scratch_p/nimarano/NEUTRAL-admission-' + m.CELLS[model],
+        'SOURCE_ZIP': Path('NEUTRAL-source.zip'), 'QUALIFICATION_JOB': 'NEUTRAL'}
+    for key, value in values.items():
+        monkeypatch.setattr(m, key, value, raising=False)
+    code = m.render_preflight(); tree = ast.parse(code)
+    assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == 'CELL')
+    cell = ast.literal_eval(assignment.value)
+    assert cell['model'] == model and cell['session_id'] == m.CELLS[model] and cell['maximum_native_workers'] == 4
+    assert m.proposal_command().count('\nsrun ') == 1
+    assert '--wait-seconds\', \'600' in code
+    mkdir = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'mkdir']
+    assert len(mkdir) == 1 and mkdir[0].func.value.id == 'admission'
+    assert code.index('verify_runtime(source_zip)') < code.index('admission.mkdir(') < code.index('spack load ')
+    assert 'root.mkdir(' not in code
+
+
+def neutral_rows():
+    return [{'ProcessId': pid, 'ParentProcessId': parent, 'ExecutablePath': 'NEUTRAL.exe',
+        'CommandLine': 'NEUTRAL -m hpc_forest.ablation_worker --session-id ' + f.SO_SESSION,
+        'CreationDate': '2026-10-17T21:00:00.1234560Z'} for pid, parent in ((37900, 2000), (37848, 37900))]
+
+
+def census(rows):
+    return {'schema': 'hpc-forest-primes-r2max-fresh-full-cim-v1', 'complete_census': True,
+            'rows_count': len(rows), 'rows': rows, 'captured_at_utc': STAMP}
+
+
+def test_neutral_source_only_baseline_leaves_three_reserved_slots():
+    rows = neutral_rows(); result = f.check_census(census(rows), rows, now=NOW)
+    assert result['active_native_workers'] == 1 and result['source_only'] == rows
+
+
+@pytest.mark.parametrize('change', ['missing', 'parent', 'exe', 'command', 'date', 'count', 'duplicate', 'unknown', 'stale'])
+def test_census_violations_fail_closed(change):
+    expected = neutral_rows(); rows = [dict(r) for r in expected]; data = census(rows)
+    if change == 'missing':
+        rows.pop(); data['rows_count'] = len(rows)
+    elif change in {'parent', 'exe', 'command', 'date'}:
+        key = {'parent': 'ParentProcessId', 'exe': 'ExecutablePath', 'command': 'CommandLine', 'date': 'CreationDate'}[change]
+        rows[0][key] = '2026-10-17T21:00:00.1234561Z' if change == 'date' else 'NEUTRAL CHANGED'
+    elif change == 'count':
+        data['rows_count'] += 1
+    elif change == 'duplicate':
+        rows.append(dict(rows[0])); data['rows_count'] += 1
+    elif change == 'unknown':
+        rows.append(dict(rows[0], ProcessId=1234, CommandLine='NEUTRAL -m hpc_forest.r2max_worker --session-id UNKNOWN')); data['rows_count'] += 1
+    else:
+        data['captured_at_utc'] = datetime.fromtimestamp(NOW - 121, UTC).isoformat()
+    with pytest.raises(m.Refusal):
+        f.check_census(data, expected, now=NOW)
+
+
+def test_old_owned_luna_identity_refused():
+    old = dict(neutral_rows()[0], ProcessId=1234, CommandLine='NEUTRAL MCP only')
+    with pytest.raises(m.Refusal, match='old owned Luna'):
+        f.check_census(census([*neutral_rows(), old]), neutral_rows(), now=NOW, old_luna=[old])
+
+
+def test_incomplete_cohort_and_job_only_refused():
+    with pytest.raises(m.Refusal):
+        f.check_cohort({'verified': False}, '123', {})
+    with pytest.raises(m.Refusal):
+        f.assemble({'job_id': '123'}, 'NEUTRAL')
+
+
+def test_qualification_archive_and_audit_exact_links(monkeypatch):
+    monkeypatch.setattr(m, 'QARCHIVE', 'a' * 64); monkeypatch.setattr(m, 'QAUDIT', 'b' * 64)
+    m.qualified_reception_links({'archive': {'sha256': 'a' * 64}, 'audit': {'sha256': 'b' * 64}})
+    for key in ('archive', 'audit'):
+        value = {'archive': {'sha256': 'a' * 64}, 'audit': {'sha256': 'b' * 64}}; value[key]['sha256'] = '0' * 64
+        with pytest.raises(m.Refusal):
+            m.qualified_reception_links(value)
+
+
+def test_factories_have_no_process_network_or_secret_content_reads():
+    for name in ('preparer-cellule-max.py', 'assembler-admissions-cellule.py'):
+        text = (ROOT / name).read_text(encoding='utf8'); tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert not ({n.name.split('.')[0] for n in node.names} & {'subprocess', 'socket', 'requests', 'asyncio'})
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                assert node.func.attr not in {'Popen', 'run', 'execvpe', 'system', 'connect'}
+        assert 'm.CONFIG.read_text' not in text and 'm.CONFIG.read_bytes' not in text
+    assert f.m.MAX_NATIVE_WORKERS == 4

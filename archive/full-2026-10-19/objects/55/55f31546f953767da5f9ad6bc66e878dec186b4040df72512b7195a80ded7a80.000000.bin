@@ -1,0 +1,182 @@
+"""Strict receive-only audit of the zero-model allocated qualification; execute no received code."""
+import hashlib
+import io
+import json
+import tarfile
+import zipfile
+from pathlib import Path, PurePosixPath
+from xml.etree import ElementTree
+
+OUT = Path(__file__).resolve().parent
+PREPARATION = OUT.parents[1]
+SOURCE = PREPARATION / "revision-source-r4b/revision-r2"
+ZIP_SHA = "ede293f185e663241c01c22a5fa9edcd54ad66af6a1e0964755eac306c5de0f3"
+PLAN_SHA = "9f04e93c1a28c70f444005b7670ff23731cac838846b99cb1b6742db9e8de33b"
+ARCHIVE_SHA = "8cf60f31eff44cc2aa4ce0ec75009f518f0485b68e0d59d325ce3ba3cf754a11"
+QUALIFICATION_SHA = "6da6680441a519189d7c7817ccb10b1e77ee0e5c284d34b04b0304d4e4f6050c"
+
+
+def need(value, label):
+    if not value:
+        raise ValueError(label)
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def raw_sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path):
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def save(name, value):
+    with (OUT / name).open("x", encoding="utf8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def relative(name):
+    path = PurePosixPath(name)
+    need(name and path.as_posix() == name and not path.is_absolute() and ".." not in path.parts
+         and "\\" not in name and ":" not in name, "Unsafe received member")
+    return path
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        need(not path.is_symlink() and path.resolve().is_relative_to(root.resolve()), "Linked/escaping received artifact")
+        if path.is_file():
+            result[path.relative_to(root).as_posix()] = {"sha256": sha(path), "bytes": path.stat().st_size}
+    return result
+
+
+def restore(root, files):
+    need(not root.exists(), "Fresh evidence restoration required")
+    root.mkdir()
+    for name, raw in files.items():
+        path = root.joinpath(*relative(name).parts)
+        need(path.resolve().is_relative_to(root), "Received path escaped")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(raw)
+    result = inventory(root)
+    need(result == {name: {"sha256": raw_sha(raw), "bytes": len(raw)} for name, raw in files.items()}, "Restored bytes differ")
+    return result
+
+
+status = read(OUT / "statut-terminal-frais.json")["structuredContent"]
+need(status["job_id"] == "752206" and status["state"] == "FAILED" and status["exit_code"] == "1:0"
+     and status["observation"]["current_state_observed"] is True, "True failed terminal observation required")
+envelope = json.loads(read(OUT / "enveloppe-distante-brute.json")["structuredContent"]["content"])
+transfer = read(OUT / "transfert-archive-verifie.json")["structuredContent"]
+archive_path = OUT / "qualification-result.tar.gz"
+need(envelope["archive_sha256"] == sha(archive_path) == ARCHIVE_SHA and transfer["verifie"] is True
+     and all(transfer[key] == ARCHIVE_SHA for key in ("remote_sha256", "empreinte_locale", "empreinte_distante"))
+     and transfer["bytes"] == archive_path.stat().st_size == 334838, "Received archive three-SHA/size differs")
+roots = {"qualification.json", "project.zip", "runtime-manifest.json", "dynamic-plan.json", "target-profile-preflight.json",
+    "preflight-junit.xml", "neutral-tests.log", "tests-compatibles", "prepared", "expected-reference-statuses.json",
+    "run-neutral.py", "qualifier-r4b.py", "payload-manifest.json", "allocated-contract-tests.log",
+    "allocated-contract-tests.xml", "allocated-test-artifacts"}
+files, seen, folded, total = {}, set(), set(), 0
+with tarfile.open(archive_path, "r:gz") as archive:
+    for item in archive:
+        name = item.name.rstrip("/")
+        path = relative(name)
+        need(path.parts[0] in roots and name not in seen and name.casefold() not in folded
+             and len(seen) < 100000 and (item.isdir() or item.isfile()), "Unexpected/link/duplicate qualification member")
+        seen.add(name)
+        folded.add(name.casefold())
+        if item.isdir():
+            continue
+        total += item.size
+        need(0 <= item.size <= 128 * 1024**2 and total <= 1024**3, "Qualification archive exceeds bound")
+        stream = archive.extractfile(item)
+        need(stream is not None, "Missing received bytes")
+        raw = stream.read(item.size + 1)
+        need(len(raw) == item.size, "Received member length differs")
+        files[name] = raw
+root = OUT / "restauration-neuve-01"
+before = restore(root, files)
+save("inventaire-qualification-avant-audit.json", before)
+need(sha(root / "qualification.json") == envelope["qualification_sha256"] == QUALIFICATION_SHA,
+     "Original remote qualification bytes differ")
+q = read(root / "qualification.json")
+q_remote = json.loads(read(OUT / "qualification-distante-brute.json")["structuredContent"]["content"])
+need(q == q_remote and q["verified"] is False and q["native_model_calls"] == 0
+     and q["generation_admitted"] is False and envelope["mechanical_returncode"] == 1,
+     "Failed zero-model qualification must stay negative")
+need(q["source_zip_sha256"] == sha(root / "project.zip") == sha(SOURCE / "HPC-Forest-Mere-Dynamique-R4b-MAX.zip") == ZIP_SHA
+     and q["plan_sha256"] == sha(root / "dynamic-plan.json") == sha(SOURCE / "dynamic-plan-r4b-max.json") == PLAN_SHA,
+     "Exact R4b source/plan differs")
+runtime = read(root / "runtime-manifest.json")
+need(runtime == read(SOURCE / "runtime-manifest.json") == q["source_inventory_before"] and len(runtime) == 103,
+     "Source103 pre-qualification inventory differs")
+source_members = {}
+with zipfile.ZipFile(io.BytesIO((root / "project.zip").read_bytes())) as source:
+    for item in source.infolist():
+        path = relative(item.filename.rstrip("/"))
+        need(path.parts[0] == "HPC-Forest" and len(path.parts) > 1 and not item.is_dir()
+             and ((item.external_attr >> 16) & 0o170000) in {0, 0o100000}
+             and item.filename not in source_members, "Unsafe/duplicate source ZIP member")
+        source_members[item.filename] = source.read(item)
+need({name.removeprefix("HPC-Forest/"): raw_sha(raw) for name, raw in source_members.items()} == runtime,
+     "Source ZIP103 differs from frozen runtime")
+source_before = restore(OUT / "sources103-restaurees", source_members)
+save("inventaire-sources103-avant-audit.json", source_before)
+payload_manifest = read(root / "payload-manifest.json")
+payload_files = {}
+with tarfile.open(SOURCE / "hpc-forest-dynamic-r4b-max-qualification-light.tar.gz", "r:gz") as payload:
+    for item in payload:
+        if item.isfile():
+            need(item.name.startswith("payload/"), "Unrelated local qualification payload")
+            payload_files[item.name.removeprefix("payload/")] = raw_sha(payload.extractfile(item).read())
+need(payload_manifest == {name: value for name, value in payload_files.items() if name != "payload-manifest.json"},
+     "Original payload manifest differs")
+for name, expected in payload_manifest.items():
+    if (root / name).is_file():
+        need(sha(root / name) == expected, "An archived original payload input changed")
+def junit(path):
+    tree = ElementTree.parse(path)
+    cases = tree.findall(".//testcase")
+    failures = [{"name": case.get("name"), "classname": case.get("classname"),
+        "message": element.get("message"), "type": element.get("type"), "text": element.text}
+        for case in cases for element in list(case) if element.tag in {"failure", "error"}]
+    return {"tests": len(cases), "failures_or_errors": len(failures), "skipped": len(tree.findall(".//testcase/skipped")), "failures": failures}
+neutral = junit(root / "preflight-junit.xml")
+allocated = junit(root / "allocated-contract-tests.xml")
+profile = read(root / "target-profile-preflight.json")
+need(q["target_profile_verified"] is True and q["neutral_tests_returncode"] == 0
+     and q["privacy_neutral_tests_passed"] is True and neutral["failures_or_errors"] == 0
+     and q["allocated_contract_tests_returncode"] != 0 and allocated["failures_or_errors"] > 0,
+     "Actual failed phase evidence differs")
+save("junit-metadonnees-reelles.json", {"neutral": neutral, "allocated_C_plumbing": allocated,
+    "zero_model_qualification_only": True})
+need(inventory(root) == before and inventory(OUT / "sources103-restaurees") == source_before, "Readonly reception changed evidence")
+save("inventaire-qualification-apres-audit.json", inventory(root))
+save("inventaire-sources103-apres-audit.json", inventory(OUT / "sources103-restaurees"))
+summary = {"schema": "hpc-forest-r4b-r2-failed-qualification-reception-audit-v1", "verified": False,
+    "job_id": "752206", "scheduler_state": "FAILED", "exit_code": "1:0", "archive_sha256": ARCHIVE_SHA,
+    "qualification_sha256": QUALIFICATION_SHA, "source_zip_sha256": ZIP_SHA, "plan_sha256": PLAN_SHA,
+    "archive_three_sha_and_fresh_restore_verified": True, "received_files": len(before), "source_files": 103,
+    "local_restorations_before_after_byte_identical": True, "remote_source_before_inventory_exact": True,
+    "remote_source_after_inventory_received": False, "source_after_not_claimed_from_unreached_success_branch": True,
+    "allocation": q["allocation"], "cpu_affinity": q["cpu_affinity"], "hostname": q["hostname"],
+    "target_profile_verified_by_driver": True, "target_profile": profile,
+    "actual_neutral_tests": {key: value for key, value in neutral.items() if key != "failures"},
+    "actual_allocated_C_plumbing_tests": {key: value for key, value in allocated.items() if key != "failures"},
+    "error": q["error"], "failed_test_names": [row["name"] for row in allocated["failures"]],
+    "actual_reference_preparation_reached": False, "reference_statuses19_received": False,
+    "mechanically_ready16_or_admitted15_subjects_proved": False,
+    "native_model_calls": 0, "native_generation_admitted": False, "native_contracts_admitted": False,
+    "first_native_call_or_evaluation_proved": False, "received_code_or_C_or_CLI_executed_locally": False,
+    "new_job_or_model_or_replay_or_stop_or_install": False}
+save("AUDIT-QUALIFICATION-NEGATIVE.json", summary)
+print(json.dumps({"audit_sha256": sha(OUT / "AUDIT-QUALIFICATION-NEGATIVE.json"), "received_files": len(before),
+    "source_files": 103, "neutral_tests": neutral["tests"], "allocated_tests": allocated["tests"],
+    "failed_allocated_tests": [row["name"] for row in allocated["failures"]],
+    "failure_messages": [row["message"] for row in allocated["failures"]], "native_model_calls": 0, "verified": False}))
